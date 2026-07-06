@@ -11,8 +11,12 @@ import { parseMarkdown, renderTableLines } from '../util/markdown.js';
 import { highlight } from '../util/highlight.js';
 import type { CodeRole } from '../util/highlight.js';
 import type { MdSpan, MdBlock } from '../util/markdown.js';
-import { renderBrand, renderToolResult, renderToolChild, renderReasoning } from './rows.js';
+import { renderBrand, renderToolResult, renderReasoning } from './rows.js';
 import type { BrandInfo, ToolInfo } from './rows.js';
+
+// the reference client vocabulary: the ⏺ turn bullet + the warm brand orange it's drawn in.
+const ASSISTANT_DOT = process.platform === 'darwin' ? '⏺' : '●';
+const CLAUDE_ORANGE = '#d97757';
 
 // ── types ────────────────────────────────────────────────────────────────────
 
@@ -275,7 +279,7 @@ function blockToLines(block: MdBlock, cols: number, theme: ViewportTheme, keyPre
     case 'code': {
       const codeSpans = highlight(block.code || ' ', block.lang);
       // A contained code block: a labeled top rule, a dim left gutter on each line, and a closing
-      // rule — so code is visually bounded (like Claude Code's boxed blocks) instead of blending
+      // rule — so code is visually bounded (like the reference client's boxed blocks) instead of blending
       // into prose. The gutter also makes wrapped code lines obvious.
       const label = block.lang || 'code';
       out.push({ key: `${keyPrefix}ctop`, spans: [{ text: `╭─ ${label} `, color: theme.dim }] });
@@ -347,6 +351,9 @@ export function flattenItem(
   cols: number,
   collapsed: boolean,
   theme: ViewportTheme,
+  /** True when this assistant item CONTINUES the same turn (a previous assistant item precedes it):
+   *  the ⏺ turn bullet is drawn ONCE per contiguous run, so continuations get the 2-col indent only. */
+  continuation = false,
 ): ViewportLine[] {
   const kp = `i${item.id}`;
   const out: ViewportLine[] = [];
@@ -389,37 +396,65 @@ export function flattenItem(
 
   // ── reasoning (v2: ✻ summary row + expandable body) ──
   if (item.kind === 'reasoning') {
-    renderReasoning(item.text, collapsed, theme).forEach((spans, i) =>
-      out.push(...wrapLine(`${kp}r${i}`, spans, cols)),
-    );
+    // Header: '∴ Thinking' (+ '(ctrl+o to expand)' when collapsed).
+    renderReasoning(item.text, collapsed, theme).forEach((spans, i) => out.push(...wrapLine(`${kp}rh${i}`, spans, cols)));
+    // Expanded: the thought body as DIM markdown, indented 2 — not raw italic (the reference client parity).
+    if (!collapsed && item.text) {
+      out.push({ key: `${kp}rgap`, spans: [{ text: '' }] });
+      parseMarkdown(item.text).forEach((b, bi) => {
+        if (bi > 0) out.push({ key: `${kp}rbgap${bi}`, spans: [{ text: '' }] });
+        for (const ln of blockToLines(b, cols - 2, theme, `${kp}rb${bi}`)) {
+          out.push({ key: ln.key, spans: [{ text: '  ' }, ...ln.spans.map((s) => ({ ...s, color: theme.dim, bold: false }))] });
+        }
+      });
+    }
     return out;
   }
 
   // ── assistant (markdown) ──
   if (item.kind === 'assistant' && !item.lines) {
-    const blocks = parseMarkdown(item.text);
-    blocks.forEach((b, bi) => {
-      // One blank line between blocks — the block-boundary rhythm (matches the streamed committer's
-      // pad spacing, so a fully-rendered item reads the same as one streamed unit-by-unit).
-      if (bi > 0) out.push({ key: `${kp}bg${bi}`, spans: [{ text: '' }] });
-      out.push(...blockToLines(b, cols, theme, `${kp}b${bi}`));
+    // the reference client vocabulary: a ⏺ bullet in a 2-col left gutter marks the assistant turn; the body
+    // aligns under it (continuation rows indented 2). This is what visually distinguishes an answer
+    // from a tool/system row and anchors the turn.
+    const bodyLines: ViewportLine[] = [];
+    parseMarkdown(item.text).forEach((b, bi) => {
+      if (bi > 0) bodyLines.push({ key: `${kp}bg${bi}`, spans: [{ text: '' }] }); // one blank between blocks
+      bodyLines.push(...blockToLines(b, cols - 2, theme, `${kp}b${bi}`));
+    });
+    bodyLines.forEach((ln, i) => {
+      // ⏺ on the first line of a NEW turn only; continuation items (same turn) align under it.
+      const gutter: StyledSpan = i === 0 && !continuation ? { text: `${ASSISTANT_DOT} `, color: CLAUDE_ORANGE } : { text: '  ' };
+      out.push({ key: ln.key, spans: [gutter, ...ln.spans] });
     });
     return out;
   }
 
   // ── tool / blocked / system / banner / user / error (line-array items) ──
   const body = item.lines ?? [{ text: item.text, color, dimColor: item.dimColor, bold: item.bold }];
-  const tag = (item.kind === 'tool' || item.kind === 'blocked') && item.meta ? `⎿ ${item.meta} ` : '';
 
-  if (collapsed && (item.kind === 'tool' || item.kind === 'blocked')) {
-    const label = item.meta ?? 'output';
-    out.push({ key: `${kp}c`, spans: renderToolChild(label, body.length, theme) });
+  // A tool/blocked CHILD block (shell output, diff) is threaded UNDER its ⏺ header with a ⎿ branch:
+  // the first content line carries the branch glyph, the rest align beneath it (indent 4). Collapsed
+  // shows a PREVIEW — the first PREVIEW_LINES lines then a dim '… +N lines · ^O' expander; Ctrl-O
+  // (showAllExpanded) reveals the whole block. Each line is truncated to one row so the indent holds.
+  if ((item.kind === 'tool' || item.kind === 'blocked') && item.meta) {
+    const PREVIEW_LINES = 10;
+    const shown = collapsed ? body.slice(0, PREVIEW_LINES) : body;
+    shown.forEach((l, i) => {
+      const gutter: StyledSpan = i === 0 ? { text: '  ⎿ ', color: theme.dim } : { text: '    ' };
+      out.push({
+        key: `${kp}l${i}`,
+        spans: truncateSpans([gutter, { text: l.text ?? '', color: l.color ?? color, dim: l.dimColor, bold: l.bold }], cols),
+      });
+    });
+    const hidden = body.length - shown.length;
+    if (hidden > 0) {
+      out.push({ key: `${kp}more`, spans: [{ text: `    … +${hidden} ${hidden === 1 ? 'line' : 'lines'} · ^O`, color: theme.dim }] });
+    }
     return out;
   }
 
   body.forEach((l, i) => {
-    const prefix = i === 0 ? tag : '';
-    out.push(...wrapLine(`${kp}l${i}`, [{ text: prefix + (l.text ?? ''), color: l.color ?? color, dim: l.dimColor, bold: l.bold }], cols));
+    out.push(...wrapLine(`${kp}l${i}`, [{ text: l.text ?? '', color: l.color ?? color, dim: l.dimColor, bold: l.bold }], cols));
   });
   return out;
 }

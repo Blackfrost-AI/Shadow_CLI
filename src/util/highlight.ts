@@ -2,7 +2,7 @@
  * Tiny, dependency-free syntax highlighter for the chat canvas's fenced code
  * blocks. Not a full grammar — a single-pass tokenizer that classifies strings,
  * comments, numbers, and a broad cross-language keyword set. Good enough to make
- * code read like Claude Code without pulling in highlight.js; unknown languages
+ * code read like the reference client without pulling in highlight.js; unknown languages
  * still get strings/numbers/comments. Pure + synchronous so it's trivially tested.
  */
 

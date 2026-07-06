@@ -74,20 +74,20 @@ test('renderBrand: narrow terminal falls back to the compact ✦ form', () => {
   assert.equal(rows[0]![1]!.text, 'shadow', 'compact form under a narrow width');
 });
 
-test('renderToolResult: glyph carries status, everything else dim, name once, timing appended', () => {
+test('renderToolResult: a single ⏺ dot carries status by COLOR, name bold, args in parens, dim tail', () => {
   const ok = renderToolResult({ name: 'run_shell', arg: 'npm test', ok: true, durationMs: 10200, summary: '630 pass' }, T);
-  assert.equal(ok[0]!.text, '✓ ');
-  assert.equal(ok[0]!.color, T.green);
+  assert.equal(ok[0]!.text, '⏺ ', 'single dot, not ✓');
+  assert.equal(ok[0]!.color, T.green, 'green = ok (color carries state)');
   assert.equal(ok[1]!.text, 'run_shell');
-  assert.equal(ok[1]!.color, T.dim, 'name is quiet, not bright');
-  assert.ok(ok.some((s) => s.text === ' npm test'), 'arg printed once');
+  assert.equal(ok[1]!.bold, true, 'name is bold');
+  assert.ok(ok.some((s) => s.text === '(npm test)'), 'arg in parens, printed once');
   assert.ok(ok.some((s) => s.text === ' — 630 pass'), 'summary');
   assert.ok(ok.some((s) => s.text === ' (10.2s)'), 'elapsed formatted');
   assert.ok(ok.every((s) => s.dim !== true), 'no faint attribute');
 
   const fail = renderToolResult({ name: 'web_fetch', arg: 'example.com', ok: false, durationMs: 400, summary: '404' }, T);
-  assert.equal(fail[0]!.text, '✗ ');
-  assert.equal(fail[0]!.color, T.red);
+  assert.equal(fail[0]!.text, '⏺ ', 'same dot on failure — shape does not change');
+  assert.equal(fail[0]!.color, T.red, 'red = error');
   assert.ok(fail.some((s) => s.text === ' (0.4s)'));
 });
 
@@ -106,21 +106,20 @@ test('renderToolChild: collapsed output/diff — ⌄ glyph, +2 indent, dim, ^O h
   assert.equal(renderToolChild('diff', 1, T)[0]!.text, '  ⌄ diff 1 line · ^O', 'singular');
 });
 
-test('renderReasoning: collapsed = one ✻ row with count; expanded = header + gray-italic body', () => {
+test('renderReasoning: ∴ Thinking header — same label both states; collapsed adds a ctrl+o hint', () => {
   const collapsed = renderReasoning('a\nb\nc', true, T);
   assert.equal(collapsed.length, 1);
-  assert.equal(collapsed[0]![0]!.text, '✻ ');
+  assert.equal(collapsed[0]![0]!.text, '∴ ', 'therefore glyph, not ✻');
   assert.equal(collapsed[0]![0]!.color, T.cyan);
-  assert.equal(collapsed[0]![1]!.text, 'thought');
+  assert.equal(collapsed[0]![1]!.text, 'Thinking', 'capital-T label, both states');
   assert.equal(collapsed[0]![1]!.italic, true);
-  assert.ok(collapsed[0]![2]!.text.includes('3 lines') && collapsed[0]![2]!.color === T.dim);
+  assert.ok(collapsed[0]![2]!.text.includes('ctrl+o') && collapsed[0]![2]!.color === T.dim, 'ctrl+o hint, no line count');
   assertNoFaint(collapsed, 'reasoning/collapsed');
 
+  // Expanded is header-ONLY now — flattenItem renders the thought body as dim markdown below it.
   const expanded = renderReasoning('line one\nline two', false, T);
-  assert.equal(expanded[0]![1]!.text, 'thinking');
-  assert.equal(expanded.length, 3, 'header + 2 body lines');
-  assert.equal(expanded[1]![0]!.text, '  line one', '+2 indent');
-  assert.equal(expanded[1]![0]!.color, T.dim);
-  assert.equal(expanded[1]![0]!.italic, true);
+  assert.equal(expanded.length, 1, 'expanded returns only the header');
+  assert.equal(expanded[0]![0]!.text, '∴ ');
+  assert.equal(expanded[0]![1]!.text, 'Thinking');
   assertNoFaint(expanded, 'reasoning/expanded');
 });

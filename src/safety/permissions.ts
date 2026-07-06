@@ -16,7 +16,7 @@ export type AutonomyLevel =
 
 export const AUTONOMY_LEVELS: AutonomyLevel[] = ['manual', 'auto-read', 'auto-edit', 'full'];
 
-/** Claude Code permission mode names for parity / display. */
+/** the reference client permission mode names for parity / display. */
 export function claudeModeName(level: AutonomyLevel): string {
   switch (level) {
     case 'manual':

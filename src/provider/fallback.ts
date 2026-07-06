@@ -1,4 +1,4 @@
-/** Classify provider/API errors that should trigger a session model fallback (Claude Code parity). */
+/** Classify provider/API errors that should trigger a session model fallback (the reference client parity). */
 export function isFallbackEligible(code: string, message: string, httpStatus?: number): boolean {
   const m = message.toLowerCase();
   if (httpStatus === 529 || httpStatus === 503 || httpStatus === 502) return true;

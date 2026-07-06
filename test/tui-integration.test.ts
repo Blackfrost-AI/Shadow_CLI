@@ -135,8 +135,8 @@ test('the spinner shows a live elapsed counter while a slow model is responding'
   stdin.write('\r'); // submit → loop starts, provider stalls 3s
   await new Promise((r) => setTimeout(r, 1300)); // let the elapsed counter tick past 1s
   const frame = lastFrame() ?? '';
-  assert.match(frame, /working… [1-9]\d*s/, 'spinner shows elapsed seconds, not a dead spinner');
-  assert.match(frame, /Esc to interrupt/);
+  assert.match(frame, /\([1-9]\d*s\)/, 'spinner shows elapsed seconds, not a dead spinner');
+  assert.match(frame, /Esc interrupt/);
   unmount();
 });
 
@@ -190,7 +190,7 @@ test('type-ahead: a message typed while running is queued, not interrupting, and
   stdin.write('first');
   await new Promise((r) => setTimeout(r, 20));
   stdin.write('\r');
-  await waitFor(() => /working/.test(seen()), 1500);
+  await waitFor(() => /Esc interrupt/.test(seen()), 1500);
 
   // Type-ahead while the first turn is in flight: it should be QUEUED (visible), not run yet.
   stdin.write('second');
@@ -243,7 +243,7 @@ test('type-ahead: a slash command typed while running is queued and runs after t
   stdin.write('go');
   await new Promise((r) => setTimeout(r, 20));
   stdin.write('\r');
-  await waitFor(() => /working/.test(seen()), 1500);
+  await waitFor(() => /Esc interrupt/.test(seen()), 1500);
 
   // A non-informational slash command typed mid-turn is queued, not run immediately.
   stdin.write('/goal ship it');
@@ -464,12 +464,12 @@ test('Esc interrupts a running turn (and the session survives)', async () => {
   await new Promise((r) => setTimeout(r, 20));
   stdin.write('\r');
   await new Promise((r) => setTimeout(r, 200));
-  assert.match(lastFrame() ?? '', /working…/, 'turn is running');
+  assert.match(lastFrame() ?? '', /Esc interrupt/, 'turn is running');
   stdin.write('\x1b'); // Esc → interrupt
   await new Promise((r) => setTimeout(r, 200));
   const frame = lastFrame() ?? '';
   assert.match(frame, /interrupted/, 'Esc reports the interrupt');
-  assert.doesNotMatch(frame, /working…/, 'the running turn stopped');
+  assert.doesNotMatch(frame, /Esc interrupt/, 'the running turn stopped');
   assert.match(frame, /❯/, 'composer still present — the session survived');
   unmount();
 });

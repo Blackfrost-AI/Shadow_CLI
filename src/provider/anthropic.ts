@@ -22,7 +22,7 @@ import { eventsFromAnthropicMessage } from './nonStream.js';
 import { parseToolArgs } from './toolJson.js';
 
 const DEFAULT_ANTHROPIC_BASE = 'https://api.anthropic.com';
-// Claude Code 2.1.187 sends this exact version header — it is the only GA Messages
+// the reference client 2.1.187 sends this exact version header — it is the only GA Messages
 // API version, NOT stale; do not bump to an invented date (verified against corpus).
 const ANTHROPIC_VERSION = '2023-06-01';
 
@@ -138,7 +138,7 @@ interface AntMessage {
 }
 
 /**
- * Claude Code wraps a FAILED tool_result's content in `<tool_use_error>…</tool_use_error>`
+ * the reference client wraps a FAILED tool_result's content in `<tool_use_error>…</tool_use_error>`
  * tags (alongside `is_error: true`) — a stronger in-band error signal the model is trained
  * to recognize than the structured flag alone (verified in corpus: `<tool_use_error>Error:
  * No such tool available: …</tool_use_error>`). Applied only at Anthropic-serialization time,

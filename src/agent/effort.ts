@@ -27,7 +27,7 @@ export const EFFORT_LEVELS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh
 
 export const DEFAULT_EFFORT: Effort = 'high';
 
-/** Unicode depth glyph (matches Claude Code's EffortIndicator vocabulary). */
+/** Unicode depth glyph (matches the reference client's EffortIndicator vocabulary). */
 const SYMBOLS: Record<Effort, string> = {
   low: '◯',
   medium: '◐',

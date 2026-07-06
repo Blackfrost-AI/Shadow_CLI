@@ -8,7 +8,7 @@
  *
  * Detection is conservative: unless the terminal is known to support OSC 8 we
  * render plain text, so a link never shows raw escape codes. Ported (and slimmed)
- * from the reverse-engineered Claude Code `supports-hyperlinks` helper.
+ * from the reverse-engineered the reference client `supports-hyperlinks` helper.
  */
 
 const HYPERLINK_TERMINALS = new Set([

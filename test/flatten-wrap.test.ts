@@ -67,6 +67,46 @@ test('wide table vertical fallback wraps instead of terminal hard-wrapping mid-w
   }
 });
 
+test('assistant ⏺ turn bullet: on the first block, indent-only on continuations (once per turn)', () => {
+  // A streamed answer commits as MANY assistant items; the ⏺ must mark the turn ONCE. The first
+  // block draws the orange ⏺ on line 0; a continuation block (same turn) gets the 2-col indent so it
+  // aligns under the first block's text — never a second dot.
+  const DOT = process.platform === 'darwin' ? '⏺' : '●';
+  const nonBlank = (rows: { spans: { text: string }[] }[]) => rows.filter((r) => r.spans.some((s) => s.text.trim() !== ''));
+
+  const first = nonBlank(flattenItem({ id: 1, kind: 'assistant', text: 'first line\nsecond line' }, 60, false, T));
+  assert.equal(first[0]!.spans[0]!.text, `${DOT} `, 'first block: ⏺ on the first content line');
+  assert.equal(first[0]!.spans[0]!.color, '#d97757', 'the dot is Claude orange');
+  assert.equal(first[1]!.spans[0]!.text, '  ', 'wrapped line of the first block aligns under the dot (indent)');
+  assert.equal(first.filter((r) => r.spans[0]!.text === `${DOT} `).length, 1, 'exactly one ⏺ in the first block');
+
+  const cont = nonBlank(flattenItem({ id: 2, kind: 'assistant', text: 'continued paragraph' }, 60, false, T, true));
+  assert.equal(cont[0]!.spans[0]!.text, '  ', 'continuation block: indent, NOT a second ⏺');
+  assert.ok(cont.every((r) => r.spans[0]!.text !== `${DOT} `), 'no ⏺ anywhere in a continuation block');
+});
+
+test('tool output child: ⎿ branch on line 0, indent-4 under it, 10-line preview + expander', () => {
+  const lines = Array.from({ length: 15 }, (_, i) => ({ text: `line ${i + 1}`, color: T.dim }));
+  const item = { id: 7, kind: 'tool' as const, text: '', meta: 'output', lines };
+
+  const join = (rows: { spans: { text: string }[] }[]) => rows.map((r) => r.spans.map((s) => s.text).join(''));
+
+  // Collapsed → the first 10 lines threaded under ⎿, then a '… +5 lines · ^O' expander.
+  const collapsed = flattenItem(item, 80, true, T);
+  assert.equal(collapsed[0]!.spans[0]!.text, '  ⎿ ', 'branch glyph opens the child, indent 2');
+  assert.equal(collapsed[0]!.spans[0]!.color, T.dim);
+  assert.equal(collapsed[1]!.spans[0]!.text, '    ', 'subsequent lines align under the branch (indent 4)');
+  const collapsedText = join(collapsed);
+  assert.ok(collapsedText.some((r) => r.includes('line 10')), 'shows through line 10');
+  assert.ok(!collapsedText.some((r) => r.includes('line 11')), 'line 11 hidden when collapsed');
+  assert.ok(collapsedText.some((r) => r.includes('… +5 lines · ^O')), 'expander counts the hidden remainder');
+
+  // Expanded (Ctrl-O) → the whole block, no expander.
+  const expanded = join(flattenItem(item, 80, false, T));
+  assert.ok(expanded.some((r) => r.includes('line 15')), 'expanded shows every line');
+  assert.ok(!expanded.some((r) => r.includes('· ^O')), 'no expander when fully expanded');
+});
+
 test('tool rows flatten to EXACTLY one row, even with a huge URL', () => {
   const rows = flattenItem(
     {

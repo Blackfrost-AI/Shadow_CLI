@@ -5,7 +5,7 @@ import { homedir } from 'node:os';
 /**
  * OS-level sandbox for run_shell — the real boundary the env-allowlist/denylist
  * can't provide (an arbitrary subprocess is otherwise unconfined). Mirrors how
- * Claude Code sandboxes bash: macOS seatbelt (`sandbox-exec`), Linux bubblewrap
+ * the reference client sandboxes bash: macOS seatbelt (`sandbox-exec`), Linux bubblewrap
  * (`bwrap`). Policy: filesystem WRITES are confined to the workspace + /tmp;
  * reads of ~/.shadow (the credentials store) are denied; network is allowed by
  * default (agent tasks need installs/fetches) and can be turned off.

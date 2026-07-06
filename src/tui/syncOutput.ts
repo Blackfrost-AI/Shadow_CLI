@@ -4,7 +4,7 @@
 // paints incrementally (notably tmux 3.4+), a viewer can catch a half-drawn frame — the flicker /
 // "glitch" you see during redraws and resizes. Bracketing each frame in BSU (`ESC [ ? 2026 h`) …
 // ESU (`ESC [ ? 2026 l`) tells the terminal to buffer the changes and flip them ATOMICALLY, so a
-// frame is never shown half-drawn. Claude Code enabled exactly this to fix tmux flicker (CHANGELOG
+// frame is never shown half-drawn. the reference client enabled exactly this to fix tmux flicker (CHANGELOG
 // 2.1.200). Terminals without 2026 support silently ignore the private-mode escapes, so it is a
 // no-op there — and `SHADOW_NO_SYNC_OUTPUT=1` disables it entirely as a safety hatch.
 

@@ -118,7 +118,7 @@ function elapsed(durationMs: number): string {
   return s >= 60 ? ` (${Math.floor(s / 60)}m ${Math.round(s % 60)}s)` : ` (${s.toFixed(1)}s)`;
 }
 
-/** Display form of a tool arg: protocol stripped (URLs read as domain/path, the Claude Code way)
+/** Display form of a tool arg: protocol stripped (URLs read as domain/path, the reference client way)
  *  and middle-truncated so one arg can never flood the row. */
 function shortArg(arg: string, max = 56): string {
   let a = arg.replace(/^https?:\/\//, '');
@@ -155,12 +155,17 @@ function shortSummary(summary: string, arg: string | undefined, max = 90): strin
  * ONLY color — name, arg, summary and timing all sit in the quiet gray so a wall of tool calls reads
  * as texture, not noise. The name is printed exactly once.
  */
+/** The signature bullet: ⏺ on macOS, ● elsewhere (the reference client figures.ts). */
+const TOOL_DOT = process.platform === 'darwin' ? '⏺' : '●';
+
 export function renderToolResult(t: ToolInfo, theme: ViewportTheme): StyledSpan[] {
+  // A single ⏺ dot whose COLOR carries state (green ok / red error) — not a ✓/✗ shape swap. Bold
+  // tool name, args in parens 'Name(args)', summary + elapsed as a dim tail. (the reference client vocabulary.)
   const spans: StyledSpan[] = [
-    { text: t.ok ? '✓ ' : '✗ ', color: t.ok ? theme.green : theme.red, bold: true },
-    { text: t.name, color: theme.dim },
+    { text: `${TOOL_DOT} `, color: t.ok ? theme.green : theme.red },
+    { text: t.name, color: theme.bright ?? theme.fg, bold: true },
   ];
-  if (t.arg) spans.push({ text: ` ${shortArg(t.arg)}`, color: theme.dim });
+  if (t.arg) spans.push({ text: `(${shortArg(t.arg)})`, color: theme.dim });
   const s = t.summary ? shortSummary(t.summary, t.arg) : '';
   if (s) spans.push({ text: ` — ${s}`, color: theme.dim });
   const e = elapsed(t.durationMs);
@@ -181,26 +186,14 @@ export function renderToolChild(label: string, lineCount: number, theme: Viewpor
  * full thought in gray italic (+2 indent). The star matches the "thinking" spinner glyph. Raw
  * thought never streams into the transcript live — it commits here, after the fact.
  */
-export function renderReasoning(text: string, collapsed: boolean, theme: ViewportTheme): StyledSpan[][] {
-  const lines = (text || '').split('\n');
-  const n = text ? lines.length : 0;
-  if (collapsed) {
-    return [
-      [
-        { text: '✻ ', color: theme.cyan },
-        { text: 'thought', color: theme.dim, italic: true },
-        { text: `  ⌄ ${n === 1 ? '1 line' : `${n} lines`} · ^O`, color: theme.dim },
-      ],
-    ];
-  }
-  const rows: StyledSpan[][] = [
-    [
-      { text: '✻ ', color: theme.cyan },
-      { text: 'thinking', color: theme.dim, italic: true },
-    ],
+export function renderReasoning(_text: string, collapsed: boolean, theme: ViewportTheme): StyledSpan[][] {
+  // The ∴ Thinking HEADER only. Same glyph + label in both states (the reference client parity); collapsed
+  // adds a dim '(ctrl+o to expand)' hint, expanded shows just the header and flattenItem renders the
+  // thought body as dim markdown below it. (Was '✻ thought · N lines · ^O' — three inconsistent forms.)
+  const header: StyledSpan[] = [
+    { text: '∴ ', color: theme.cyan },
+    { text: 'Thinking', color: theme.dim, italic: true },
   ];
-  for (const line of lines) {
-    rows.push([{ text: `  ${line}`, color: theme.dim, italic: true }]);
-  }
-  return rows;
+  if (collapsed) return [[...header, { text: '  (ctrl+o to expand)', color: theme.dim }]];
+  return [header];
 }

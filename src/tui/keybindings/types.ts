@@ -3,7 +3,7 @@
  * a normalized {@link KeyEvent} (built from Ink's `(input, key)` at the React seam)
  * so the parser/matcher/resolver are unit-testable in isolation.
  *
- * Design mirrors the reverse-engineered Claude Code keybinding contract:
+ * Design mirrors the reverse-engineered the reference client keybinding contract:
  *  - action ids are namespaced strings (`chat:submit`, `app:redraw`, …);
  *  - a binding is a chord (a sequence of one or more keystrokes) → action;
  *  - bindings are scoped to a context; the resolver consults active contexts in

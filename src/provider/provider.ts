@@ -129,12 +129,12 @@ export interface CompletionRequest {
   fastMode?: boolean; // Anthropic "fast mode" (premium low-latency); ignored elsewhere
   /**
    * Force or suppress tool use (Anthropic `tool_choice`). Omitted ⇒ provider default
-   * (`auto` when tools are present). Like Claude Code, this is only sent when a caller
+   * (`auto` when tools are present). Like the reference client, this is only sent when a caller
    * supplies it — the agentic loop leaves it unset. `none` forbids tools this turn;
    * `tool` forces the named tool; `any` forces some tool.
    */
   toolChoice?: ToolChoice;
-  /** Custom stop sequences (Anthropic `stop_sequences`). Omitted by default, as in Claude Code. */
+  /** Custom stop sequences (Anthropic `stop_sequences`). Omitted by default, as in the reference client. */
   stopSequences?: string[];
   signal?: AbortSignal; // user interrupt (ESC/Ctrl-C) — cancels the in-flight request
 }

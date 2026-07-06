@@ -2,7 +2,7 @@
  * User keybinding config: load `~/.shadow/keybindings.json`, validate + merge it
  * over the defaults, and (optionally) hot-reload on file change.
  *
- * File format (matches Claude Code's shape so existing muscle memory / docs map):
+ * File format (matches the reference client's shape so existing muscle memory / docs map):
  *
  *   {
  *     "bindings": [

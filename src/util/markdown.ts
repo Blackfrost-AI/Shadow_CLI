@@ -85,7 +85,7 @@ export function parseInline(text: string): MdSpan[] {
  * every wrapped line renders flush-left. We can't lean on Ink's own wrapping: Ink 5 calls wrap-ansi
  * with `trim:false`, which leaks the wrap-point space onto the next line (the "not flush" look).
  * Whitespace (including source newlines) collapses to a single space, so a hard-wrapped paragraph
- * reflows like Claude Code. Inline formatting is preserved per word; a single word wider than `width`
+ * reflows like the reference client. Inline formatting is preserved per word; a single word wider than `width`
  * is emitted whole rather than split (so URLs / code tokens aren't mangled). Always returns ≥ 1 line.
  */
 export function wrapSpans(spans: MdSpan[], width: number): MdSpan[][] {
@@ -390,7 +390,7 @@ export function renderTableLines(table: Extract<MdBlock, { type: 'table' }>, max
     return out;
   }
 
-  // Box-drawing borders (┌─┬─┐ … │ … ├─┼─┤ … └─┴─┘) — the clean grid Claude Code draws, not
+  // Box-drawing borders (┌─┬─┐ … │ … ├─┼─┤ … └─┴─┘) — the clean grid the reference client draws, not
   // ASCII |/-. Each column segment is width+2 to match `' ' + paddedCell + ' '`, so every line is
   // the same length and the verticals line up. Alignment is applied by padCell (no :---: markers).
   const rule = (l: string, m: string, r: string): string =>

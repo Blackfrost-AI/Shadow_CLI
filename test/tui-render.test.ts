@@ -131,9 +131,30 @@ test('TuiApp auto-collapses reasoning on tool_start (polish: collapse when done)
   await new Promise((r) => setTimeout(r, 20));
 
   frame = lastFrame() ?? '';
-  // Should show the collapsed v2 form (✻ thought · ⌄ N lines · ^O), not the full thinking text.
-  assert.match(frame, /✻ thought/);
+  // Should show the collapsed v2 form (∴ Thinking · ⌄ N lines · ^O), not the full thinking text.
+  assert.match(frame, /∴ Thinking/);
   assert.doesNotMatch(frame, /This is long thinking that should collapse/);
+  unmount();
+});
+
+// Claude Code parity: thinking is NEVER streamed raw into the view — a compact indicator live,
+// then a COLLAPSED row in the transcript (no separate raw-thought preview = no "split").
+test('thinking shows a compact ✻ Thinking… indicator live, never the raw thought', async () => {
+  const bus = new EventBus();
+  const { lastFrame, unmount } = render(React.createElement(TuiApp, { opts: makeOpts({ bus }) }));
+  await new Promise((r) => setTimeout(r, 20));
+
+  bus.emit({ type: 'thinking', delta: 'SECRET_RAW_THOUGHT one\nSECRET_RAW_THOUGHT two\nSECRET_RAW_THOUGHT three' });
+  await new Promise((r) => setTimeout(r, 60)); // > the ~30ms think-flush coalesce window
+  let frame = lastFrame() ?? '';
+  assert.match(frame, /∴ Thinking…/, 'shows the compact live thinking indicator');
+  assert.doesNotMatch(frame, /SECRET_RAW_THOUGHT/, 'never streams the raw thought into the live preview (the split)');
+
+  bus.emit({ type: 'reasoning_done', text: 'SECRET_RAW_THOUGHT one\nSECRET_RAW_THOUGHT two\nSECRET_RAW_THOUGHT three' });
+  await new Promise((r) => setTimeout(r, 60));
+  frame = lastFrame() ?? '';
+  assert.match(frame, /∴ Thinking/, 'commits a COLLAPSED ∴ Thinking row to the transcript');
+  assert.doesNotMatch(frame, /SECRET_RAW_THOUGHT/, 'the raw thought is folded (Ctrl-O), not dumped inline');
   unmount();
 });
 

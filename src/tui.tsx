@@ -256,7 +256,7 @@ export interface StatusLineCtx {
 /**
  * Run a user `/statusline` shell command and hand its first stdout line to `cb`.
  * Session context is provided both as SHADOW_* env vars and as a JSON blob on stdin
- * (the Claude Code statusLine contract), so existing statusline scripts work. Always
+ * (the reference client statusLine contract), so existing statusline scripts work. Always
  * async + bounded: a 2s timeout kills a hung command and any failure yields ''.
  */
 export function runStatusLine(cmd: string, ctx: StatusLineCtx, cb: (line: string) => void): void {
@@ -313,7 +313,25 @@ export function runStatusLine(cmd: string, ctx: StatusLineCtx, cb: (line: string
   }
 }
 
-const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+// ── the reference client visual vocabulary (parity with the reference) ───────────────────────
+// The pulsing sparkle spinner: a dot swells to a star and back (forward then reverse), not a
+// braille wheel. This + the orange brand color is the reference client's single most recognizable identity signal.
+const IS_DARWIN = process.platform === 'darwin';
+const SPARKLE = ['·', '✢', '✳', '✶', '✻', IS_DARWIN ? '✽' : '*'];
+const SPINNER = [...SPARKLE, ...SPARKLE.slice(1, -1).reverse()]; // ·✢✳✶✻✽✻✶✳✢ — smooth pulse
+// The signature left-gutter dot on assistant turns; color (not shape) carries tool state.
+const BLACK_CIRCLE = IS_DARWIN ? '⏺' : '●';
+// Claude's warm brand orange — the spinner glyph + the ⏺ accent.
+const CLAUDE_ORANGE = '#d97757';
+// Slash-menu contrast: a faint slate panel behind the whole command list so it reads as a distinct
+// surface (not lost in the transcript), and a stronger tone on the selected row — a soft highlight
+// bar, not the harsh reverse-video the redesign dropped.
+const MENU_BG = '#1b2331';
+const MENU_SEL_BG = '#31465f';
+// The activity label shown beside the spinner while a turn runs. One brand-consistent word
+// ('Shadowing…') instead of a rotating grab-bag of generic verbs. A CUSTOM per-action label (a tool
+// or the app setting a contextual verb) can override it in future; there is no such source today.
+const DEFAULT_STATUS_VERB = 'Shadowing';
 
 // ── Slash commands (the `/` dropdown) ────────────────────────────────────────
 interface SlashCommand {
@@ -705,7 +723,7 @@ function Banner({ item, cols }: { item: TranscriptItem; cols: number }) {
 }
 
 /**
- * A single transcript entry, de-boxed: plain scrolling text like Claude Code, no
+ * A single transcript entry, de-boxed: plain scrolling text like the reference client, no
  * per-message border. The "you/assistant/tool" header label that the old bordered
  * card carried is gone, so a tool/denial row folds its tool name (meta) inline.
  */
@@ -742,7 +760,7 @@ function codeRoleColor(role: CodeRole): string | undefined {
 /**
  * The chat canvas: render a (possibly still-streaming) markdown string as flowing
  * blocks — headings, paragraphs, lists, blockquotes, fenced code, rules — so every
- * model's chat reads like Claude Code's. Plain text round-trips unchanged.
+ * model's chat reads like the reference client's. Plain text round-trips unchanged.
  */
 /**
  * Split an accumulating markdown stream into completed top-level blocks plus the
@@ -790,7 +808,7 @@ export function extractCompleteBlocks(buf: string): { blocks: string[]; rest: st
 
 /**
  * Like {@link extractCompleteBlocks} but commits at LINE granularity for the smoothest, most stable
- * composer (the Claude Code / Codex feel): a completed PROSE / heading / rule line is flushed to
+ * composer (the reference clients feel): a completed PROSE / heading / rule line is flushed to
  * native scrollback immediately, so the live region shrinks to just the line currently being typed
  * and the input barely moves. Multi-line constructs that MUST render as a unit — fenced code, lists,
  * blockquotes, and pipe/table runs — are kept grouped and flushed only when the construct ends (a
@@ -1043,7 +1061,7 @@ export function clampTail(src: string, maxLines: number): string {
  *  wrapped at the full pane width). */
 const PROSE_MAX_COLS = 100;
 /** Left/right page margin for transcript content — floats content off the terminal edges
- *  like Claude Code instead of running flush to column 1. */
+ *  like the reference client instead of running flush to column 1. */
 const PAGE_MARGIN = 4;
 const MARGIN_PAD = ' '.repeat(PAGE_MARGIN);
 
@@ -1158,7 +1176,10 @@ export function Markdown({ source, color = C.fg, width = PROSE_MAX_COLS }: { sou
 
 /** Large tool/diff output and reasoning are collapsible; everything else renders full.
  *  Collapsible items START collapsed; the `toggled` set flips them (Ctrl-O). */
-const COLLAPSE_THRESHOLD = 8;
+// Fold a tool/process output block to its `⌄ output N lines · ^O` summary once it's more than a
+// couple of lines — the reference client folds tool bodies by default (verbose off), so a run_shell / grep /
+// read doesn't dump a wall of output into the transcript. 1–3 line results still show inline.
+const COLLAPSE_THRESHOLD = 3;
 function transcriptLineCount(item: TranscriptItem): number {
   if (item.lines) return item.lines.length;
   if (typeof item.text === 'string' && item.text) return item.text.split('\n').length;
@@ -1258,32 +1279,52 @@ function StatusStrip({ text, marker }: { text: string; marker?: { text: string; 
   );
 }
 
+/** Empty-composer placeholder — a dim prompt, not an example that could be mistaken for real input. */
+const COMPOSER_PLACEHOLDER = 'Send a message…  ( / for commands )';
+
 function Composer({
   input,
   cursor,
   hint,
   showHint = true,
   borderColor = C.dim,
+  placeholder = COMPOSER_PLACEHOLDER,
 }: {
   input: string;
   cursor: number;
   hint: string;
-  /** Drop the hint row on a very short terminal to keep the composer at 3 rows (border+input+border). */
+  /** Drop the hint row on a very short terminal to keep the composer at 3 rows (rule+input+rule). */
   showHint?: boolean;
-  /** Mode tint for the ONE border in the app: dim at rest, cyan running, yellow in plan mode. */
+  /** Mode tint for the composer rules: dim at rest, cyan running, yellow in plan mode. */
   borderColor?: string;
+  placeholder?: string;
 }) {
   const caret = Math.min(cursor, input.length);
+  const empty = input.length === 0;
   return (
-    <Box flexDirection="column" borderStyle="round" borderColor={borderColor} paddingX={1} flexShrink={0}>
-      <Text>
-        <Text color={C.green}>{'❯ '}</Text>
-        {input.slice(0, caret)}
-        <Text inverse>{input.slice(caret, caret + 1) || ' '}</Text>
-        {input.slice(caret + 1)}
-      </Text>
-      {/* wrap="truncate": the hint is budgeted at ONE row; at cols < ~74 the running-state hint
-          wrapped to 2, silently eating the frame headroom on narrow terminals. */}
+    <Box flexDirection="column" flexShrink={0}>
+      {/* Open-sided input: a top and bottom rule with NO left/right edges — the field reads as a
+          band in the flow, not a popped-up box. The chevron is a neutral dim gray (it brightens
+          only via the mode-tinted rules around it), so an idle prompt doesn't shout. */}
+      <Box borderStyle="single" borderColor={borderColor} borderLeft={false} borderRight={false} paddingX={0}>
+        <Text>
+          <Text color={C.dim}>{'❯ '}</Text>
+          {empty ? (
+            <>
+              <Text inverse> </Text>
+              <Text color={C.dim}>{placeholder}</Text>
+            </>
+          ) : (
+            <>
+              {input.slice(0, caret)}
+              <Text inverse>{input.slice(caret, caret + 1) || ' '}</Text>
+              {input.slice(caret + 1)}
+            </>
+          )}
+        </Text>
+      </Box>
+      {/* Hint sits BELOW the bottom rule (outside the field). wrap="truncate": it is budgeted at ONE
+          row; at cols < ~74 the running-state hint wrapped to 2, eating the frame headroom. */}
       {showHint ? (
         <Text wrap="truncate" color={C.dim}>
           {hint}
@@ -1296,14 +1337,14 @@ function Composer({
 /**
  * Render a committed transcript item using the v2 flatten output (the SAME styling the pinned
  * renderer produces: ✦ brand, one-row tool results, ADA markdown), but as plain Ink <Text> rows
- * inside <Static>. This is the CC architecture — Ink owns the cursor and native scrollback, so the
+ * inside <Static>. This is the reference-client architecture — Ink owns the cursor and native scrollback, so the
  * whole scroll-region/absolute-paint bug class is structurally impossible — with the v2 look intact.
  * A left page margin (PAGE_MARGIN) insets content off the terminal edge.
  */
-function FlatItem({ item, cols, collapsed }: { item: TranscriptItem; cols: number; collapsed: boolean }) {
+function FlatItem({ item, cols, collapsed, continuation = false }: { item: TranscriptItem; cols: number; collapsed: boolean; continuation?: boolean }) {
   const inner = Math.max(20, cols - PAGE_MARGIN * 2);
   const w = item.kind === 'banner' ? inner : Math.min(inner, PROSE_MAX_COLS);
-  const lines = flattenItem(item as Parameters<typeof flattenItem>[0], w, collapsed, PIN_THEME);
+  const lines = flattenItem(item as Parameters<typeof flattenItem>[0], w, collapsed, PIN_THEME, continuation);
   return (
     <Box flexDirection="column" paddingLeft={PAGE_MARGIN}>
       {lines.map((ln) => {
@@ -1341,7 +1382,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const terminalSize = useTerminalSize();
   const [committed, setCommitted] = useState<TranscriptItem[]>([]);
   // (No live-banner state: the welcome card commits to <Static> once at startup — see showBanner.)
-  const [toggled, setToggled] = useState<Set<number>>(() => new Set()); // ids flipped from their default collapsed state
+  const [showAllExpanded, setShowAllExpanded] = useState(false); // Ctrl-O: reveal ALL collapsible blocks (global, not per-item)
   const [stream, setStream] = useState('');
   const [think, setThink] = useState(''); // live extended-reasoning text (dim, cleared per step)
   // Uncommitted tail of the streaming answer: completed markdown blocks are flushed to
@@ -1389,6 +1430,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   }, []);
   useEffect(() => () => void (flushTimerRef.current && clearTimeout(flushTimerRef.current)), []);
   const [toolLine, setToolLine] = useState<string | null>(null);
+  // The tool currently executing — rendered as a persistent live ⏺ Name(args) row that appears the
+  // instant the call starts and resolves in place (into the committed green/red ⏺ row) on tool_end.
+  const [activeTool, setActiveTool] = useState<{ name: string; arg: string } | null>(null);
   const [shellPid, setShellPid] = useState<number | null>(null); // active run_shell child, for the HUD
   const [shellWarn, setShellWarn] = useState<string | null>(null); // set when that child may survive ESC
   const [running, setRunning] = useState(false);
@@ -1422,7 +1466,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   }, []);
   const [todoCollapsed, setTodoCollapsed] = useState(false); // pinned task list folded to its header (Ctrl-T)
   // The transcript is an Ink <Static> that owns the terminal's NATIVE scrollback
-  // (mouse-wheel / scrollbar work, Claude-Code style). `staticEpoch` is bumped to
+  // (mouse-wheel / scrollbar work, reference-client style). `staticEpoch` is bumped to
   // force a re-flush when committed items must repaint (Ctrl-O collapse, /clear).
   const [staticEpoch, setStaticEpoch] = useState(0);
   // ── Hard reflow (user-initiated folds only) ──────────────────────────────────
@@ -1433,17 +1477,16 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // from before shadow started). Known tradeoff: each fold pushes one re-emitted transcript copy
   // into native scrollback — rare and user-initiated, far kinder than nuking history.
   //
-  // RESIZE deliberately does NOT reflow. useTerminalSize() updates cols/rows → the live region
-  // (composer/HUD) re-renders at the new width and the terminal soft-wraps the already-printed
-  // <Static> lines. Wiping + re-emitting on every resize was the source of the "transcript
-  // duplicates on resize" glitch: every re-emit landed a second copy in scrollback. Doing nothing
-  // matches Claude Code — historical lines keep their original breaks, no duplication, ever.
   const hardReflow = useCallback(() => {
     const out = process.stdout;
-    // The WIPE needs a real terminal; the <Static> remount must happen regardless (piped/test
-    // stdout still needs Ctrl-O folds to re-render — the epoch bump is the functional part).
-    if (out.isTTY) out.write('\x1b[2J\x1b[H');
-    setStaticEpoch((n) => n + 1); // remount <Static> → re-emit the transcript, reflowed
+    // Wipe screen AND scrollback (2J+3J) before the <Static> remount re-emits the FULL committed
+    // transcript. Previously this used 2J only (to preserve scrollback), but that left the pre-fold
+    // copy of the whole conversation stacked ABOVE the re-emitted one — every Ctrl-O/Ctrl-T pushed a
+    // duplicate into native scrollback. Since the transcript is fully re-emitted from `committed`,
+    // clearing scrollback loses nothing but the stale copies (and the pre-launch history we already
+    // clear at startup). The epoch bump is the functional part; the wipe just avoids visible stacking.
+    if (out.isTTY) out.write('\x1b[2J\x1b[3J\x1b[H');
+    setStaticEpoch((n) => n + 1);
   }, []);
   // Task-list collapse/expand (Ctrl-T) shrinks/grows the pinned block — reflow so the
   // composer re-locks to the bottom instead of leaving (or jumping over) a blank gap.
@@ -1456,6 +1499,26 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     }
     hardReflow();
   }, [todoCollapsed, hardReflow]);
+  // RESIZE → debounced reflow. When cols/rows change, the terminal rewraps the already-printed
+  // <Static> lines, but Ink erases its live frame against its OWN tracked geometry (now stale) and
+  // leaves the previous composer/rules STRANDED on screen — the "ghost composer" a resize leaves
+  // behind. A hardReflow (2J+3J wipe + <Static> remount) repaints everything clean at the new width;
+  // the 3J clears scrollback so the re-emit can't duplicate (the reason resize-reflow was originally
+  // disabled — no longer true). Debounced so a click-drag (a burst of resize events) reflows ONCE,
+  // after it settles, not on every intermediate size. Mount is skipped (banner already drawn).
+  const didFirstSizeRef = useRef(false);
+  const resizeReflowTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (!didFirstSizeRef.current) {
+      didFirstSizeRef.current = true;
+      return;
+    }
+    if (resizeReflowTimer.current) clearTimeout(resizeReflowTimer.current);
+    resizeReflowTimer.current = setTimeout(() => hardReflow(), 120);
+    return () => {
+      if (resizeReflowTimer.current) clearTimeout(resizeReflowTimer.current);
+    };
+  }, [terminalSize.cols, terminalSize.rows, hardReflow]);
   const lastUsageRef = useRef<{ inputTokens: number; outputTokens: number; costUSD: number; contextPct: number } | null>(null);
   const costWarnedRef = useRef(false);
   // Session-level cost accumulation. The per-turn Budget resets each turn, so we
@@ -1622,7 +1685,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
    *  item — it is deliberately NOT kept as a live, reflowing block. A tall live block sitting above
    *  <Static> ghosts and DUPLICATES whenever the live region's height changes (the model picker
    *  opening/closing, a pushLine, a terminal resize): Ink appends the new line to scrollback while
-   *  redrawing the tall block and leaves a stale copy behind. Real terminals — and Claude Code — print
+   *  redrawing the tall block and leaves a stale copy behind. Real terminals — and the reference client — print
    *  the banner once and let it scroll away; scrollback never reflows, so neither do we. */
   const showBanner = useCallback(() => {
     const lines: BannerLine[] = [
@@ -1676,19 +1739,12 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const kbRegister = kb.register;
   const kbLoadedRef = useRef(kb.loaded);
   kbLoadedRef.current = kb.loaded;
+  // Ctrl-O now toggles ALL collapsible blocks (thoughts + tool output) at once — matching Claude
+  // Code's "reveal everything / hide everything" semantics. The old handler only ever toggled the
+  // single LATEST collapsible item, so every earlier fold was permanently unreachable.
   useEffect(() => kbRegister('transcript:toggleFoldLatest', () => {
-    const latest = [...committedRef.current].reverse().find((it) => isCollapsible(it));
-    if (latest) {
-      setToggled((prev) => {
-        const next = new Set(prev);
-        if (next.has(latest.id)) next.delete(latest.id);
-        else next.add(latest.id);
-        return next;
-      });
-      // hardReflow: wipe the visible screen + remount <Static> so the toggled item re-renders.
-      // (Remounting without wiping appends a full duplicate transcript.)
-      hardReflow();
-    }
+    setShowAllExpanded((v) => !v);
+    hardReflow(); // <Static> caches committed rows; remount + clean re-emit reflects the new state
   }), [kbRegister, hardReflow]);
   useEffect(() => kbRegister('transcript:toggleTaskList', () => setTodoCollapsed((v) => !v)), [kbRegister]);
 
@@ -1779,7 +1835,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           setToolLine(null);
           setCommitted([]);
           committedRef.current = [];
-          setToggled(new Set());
+          setShowAllExpanded(false);
           setStaticEpoch((n) => n + 1); // remount <Static> so it forgets the wiped scrollback items
           setTodoItems([]); // clear the task list (was persisting stale tasks after /clear)
           opts.todoList?.write([]); // clear the backing source so the agent starts fresh
@@ -3047,7 +3103,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             // is synchronous and immune to the stale-closure double-commit React would risk.
             streamBufRef.current += e.delta;
             // Commit at LINE granularity so the live region stays ~1 line and the composer holds still
-            // (Claude Code feel); multi-line constructs stay grouped. Units carry `pad` — a source
+            // (the reference client feel); multi-line constructs stay grouped. Units carry `pad` — a source
             // blank line preceded them — which maps to a rendered gap, so the streamed answer keeps
             // the model's paragraph rhythm instead of gluing into a wall of text.
             const { units, rest, trailingBlank } = extractCommittableUnits(streamBufRef.current, padCarryRef.current);
@@ -3089,18 +3145,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           const finalText = streamed ? streamBufRef.current : (e.text ?? '');
           setStreamNow('');
           setThinkNow('');
-          // Collapse the prior reasoning block when the final answer arrives (fold to ▸).
-          // Reasoning defaults to collapsed; being in `toggled` means expanded, so to
-          // collapse we DELETE it from `toggled` (back to the default folded state).
-          setToggled((prev) => {
-            const lastReasoning = [...committedRef.current].reverse().find((it) => it.kind === 'reasoning');
-            if (lastReasoning && prev.has(lastReasoning.id)) {
-              const n = new Set(prev);
-              n.delete(lastReasoning.id);
-              return n;
-            }
-            return prev;
-          });
+          // (Reasoning is folded by default now — no per-item collapse needed; Ctrl-O reveals all.)
           if (finalText.trim()) {
             // Weak local models re-emit the final line/paragraph after a tool step; committing it
             // again printed the answer twice. Same turn-scoped detector as the streaming path — the
@@ -3123,21 +3168,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           });
           break;
         case 'tool_start':
-          setThinkNow(''); // reasoning for this step is over once it acts
-          // Collapse the last reasoning block once the model moves to action (fold to ▸).
-          setToggled((prev) => {
-            const lastReasoning = [...committedRef.current].reverse().find((it) => it.kind === 'reasoning');
-            if (lastReasoning && prev.has(lastReasoning.id)) {
-              const n = new Set(prev);
-              n.delete(lastReasoning.id);
-              return n;
-            }
-            return prev;
-          });
+          setThinkNow(''); // reasoning for this step is over once it acts (folded by default now)
+          setActiveTool({ name: e.call.name, arg: previewOf(e.call.input) });
           setToolLine(`↳ ${e.call.name} ${previewOf(e.call.input)}`);
           break;
         case 'tool_end': {
           setToolLine(null);
+          setActiveTool(null);
           setShellPid(null);
           setShellWarn(null);
           pushLine({
@@ -3155,7 +3192,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           });
           // Shell output (run_shell / bash_output) is shown as a COLLAPSIBLE block — visible but folded
           // to "▸ output +N lines · Ctrl-O" once it passes the collapse threshold, so a noisy command
-          // (a big cat/print) can't flood the transcript. Short output shows inline. (Claude Code parity.)
+          // (a big cat/print) can't flood the transcript. Short output shows inline. (the reference client parity.)
           const sd = e.result.data as { stdout?: string; stderr?: string } | undefined;
           const shellOut = [sd?.stdout ?? '', sd?.stderr ?? ''].join('\n').replace(/^\n+|\n+$/g, '');
           if (shellOut.trim()) {
@@ -3185,6 +3222,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         }
         case 'tool_denied':
           setToolLine(null);
+          setActiveTool(null);
           pushLine({ kind: 'blocked', text: `  blocked ${friendlyDeniedReason(e.reason)}`, color: C.yellow, meta: e.call.name });
           break;
         case 'retry':
@@ -3738,7 +3776,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       }
 
       // 4) Tab / Shift+Tab — cycle the working mode (applies live to a running loop too).
-      //    Ring (Claude-Code style): manual → auto-read → auto-edit → full → plan → (wraps).
+      //    Ring (reference-client style): manual → auto-read → auto-edit → full → plan → (wraps).
       //    Plan mode is the last stop; leaving it restarts the ring at the most cautious level.
       if (key.tab) {
         const pm = opts.planMode;
@@ -3811,7 +3849,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         if (runningRef.current) {
           // Type-ahead: a turn is in flight. Informational slash commands run live;
           // everything else is QUEUED (FIFO) and flushed when the turn ends — the turn
-          // is NOT interrupted (Claude-Code style). Esc clears the queue; Ctrl-C aborts.
+          // is NOT interrupted (reference-client style). Esc clears the queue; Ctrl-C aborts.
           if (task.startsWith('/')) {
             const cmdName = task.split(/\s+/)[0] ?? '';
             const cmd = findSlashCommand(cmdName);
@@ -3857,7 +3895,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         const c = cursorRef.current;
         const s = inputRef.current;
         if (isBigPaste(ch)) {
-          // Condense a big paste into a compact [Pasted text #N] chip (Claude Code / Codex feel) so
+          // Condense a big paste into a compact [Pasted text #N] chip (the reference clients feel) so
           // the composer never balloons; the full text is restored at submit via expandPastes.
           const id = (pasteCounterRef.current += 1);
           const lines = (ch.match(/\n/g)?.length ?? 0) + 1;
@@ -3954,10 +3992,14 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // never moves mid-turn — finished lines scroll up into <Static> as they commit. Capped at 2: each
   // row here is one row the composer rises when the turn ends and the slot collapses (the answer has
   // committed to scrollback by then, so the content stays visible — the jump is just the slot going
-  // away). Tighter = smaller turn-end settle. (CC pins its input the same way: content scrolls above.)
+  // away). Tighter = smaller turn-end settle. (the reference client pins its input the same way: content scrolls above.)
   const liveWant = Math.min(hudStreamRows, 2);
-  const hudStatusLine = running
-    ? `${spinner} working… ${formatDuration(elapsedSec)}${shellPid ? ` · shell pid ${shellPid}` : ''}${toolLine ? ` · ${toolLine.trim()}` : ''} · Esc to interrupt${shellPid && shellWarn ? ' · ⚠ may survive ESC' : elapsedSec >= 20 && !toolLine ? ' · model slow to respond' : ''}`
+  // reference-client style activity line: an orange pulsing sparkle (rendered separately, below) + a playful
+  // per-turn verb + a quiet metric tail. No 'working… 0s · Esc to interrupt' clutter — the elapsed
+  // only appears after a beat, and the interrupt hint already lives in the composer footer.
+  const statusVerb = running ? `${DEFAULT_STATUS_VERB}…` : '';
+  const statusTail = running
+    ? `${elapsedSec >= 1 ? ` (${formatDuration(elapsedSec)})` : ''}${toolLine ? ` · ${toolLine.trim()}` : ''}${shellPid ? ` · shell ${shellPid}` : ''}${shellPid && shellWarn ? ' · ⚠ may survive Esc' : elapsedSec >= 25 && !toolLine ? ' · model slow to respond' : ''}`
     : '';
   // Pinned agent state collapses to ONE line while running (the full PinnedState block is a 3→14-row
   // accordion that shoved the composer around mid-turn); the full list still renders between turns.
@@ -4034,17 +4076,20 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           the live region below stays small. `staticEpoch` (Ctrl-O fold, /clear) forces a
           fresh flush when a committed item's rendered state must change. */}
       <Static key={staticEpoch} items={committed}>
-        {(item) => (
+        {(item, index) => (
           <FlatItem
             key={String(item.id)}
             item={item}
             cols={terminalSize.cols}
-            collapsed={isCollapsible(item) && !toggled.has(item.id)}
+            collapsed={isCollapsible(item) && !showAllExpanded}
+            // ⏺ once per contiguous assistant run: continuation if the previous committed item was
+            // also an assistant block — so a multi-line/multi-paragraph answer reads as ONE turn.
+            continuation={item.kind === 'assistant' && index > 0 && committed[index - 1]?.kind === 'assistant'}
           />
         )}
       </Static>
 
-      {/* ── Live stream (pinned, CC-style) ── split into two parts so the composer NEVER snaps up
+      {/* ── Live stream (pinned, reference-client style) ── split into two parts so the composer NEVER snaps up
           at turn end:
           (1) a fixed-height TAIL slot (latest ~liveRows streaming lines, bottom-aligned) — mounted
               only while a turn is active. Constant height ⇒ the composer holds still mid-turn.
@@ -4060,38 +4105,79 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
               terminal too short to afford it — then the preview is dropped so the frame stays under
               the wipe threshold. */}
           {!menuOpen && hudFit.liveRows > 0 && (running || stream !== '' || think !== '') ? (
-            <Box flexDirection="column" height={hudFit.liveRows} overflow="hidden" justifyContent="flex-end" paddingLeft={PAGE_MARGIN}>
-              {think ? (
-                // Live reasoning streams visibly (dim italic), not hidden behind a spinner count.
-                <Text italic color={C.dim}>{clampTail(think, hudFit.liveRows)}</Text>
+            // The live turn — rendered as the DIRECT CONTINUATION of the transcript, not a detached
+            // preview. The height is bounded to hudFit.liveRows ONLY while an answer is actively
+            // streaming (there, overflow:hidden clips any wrap/gap past the budget so a long open block
+            // can't trip Ink's wipe). A lone '∴ Thinking…' or tool row is exactly ONE line — no reserved
+            // rectangular slot with empty rows above it (that reserved space was the "tiny thinking
+            // port" — peephole scaffolding). The uncommitted answer tail flows through the SAME FlatItem
+            // path as committed blocks (identical ⏺/indent + markdown), growing out of the same column
+            // it will scroll away in. Finished lines commit to <Static> as they stream (native scrollback).
+            <Box flexDirection="column" height={previewStream ? hudFit.liveRows : 1} overflow="hidden" justifyContent="flex-end">
+              {activeTool && !previewStream ? (
+                // Persistent live tool row: the ⏺ is orange while the call runs (matches the spinner),
+                // then tool_end commits the resolved green/red ⏺ row to <Static> in its place.
+                <Box paddingLeft={PAGE_MARGIN}>
+                  <Text wrap="truncate">
+                    <Text color={CLAUDE_ORANGE}>{BLACK_CIRCLE} </Text>
+                    <Text bold>{activeTool.name}</Text>
+                    {activeTool.arg ? <Text color={C.dim}>{`(${activeTool.arg})`}</Text> : null}
+                  </Text>
+                </Box>
+              ) : null}
+              {think && !previewStream ? (
+                // While the model thinks, a single compact ∴ Thinking… indicator aligned under the
+                // gutter — NEVER the raw multi-line thought (that was the ugly split). The full thought
+                // still commits COLLAPSED to the transcript ('∴ Thinking · ^O') on reasoning_done.
+                <Box paddingLeft={PAGE_MARGIN}>
+                  <Text italic color={C.dim}>{'∴ Thinking…'}</Text>
+                </Box>
               ) : null}
               {previewStream ? (
                 (() => {
                   const clamped = clampTail(previewStream, hudFit.liveRows);
                   // An OPEN code fence would render as a bordered code box needing ~4 rows — in this
-                  // 2-row slot Ink clips it to a broken/empty box. Show the newest raw code lines as
-                  // plain dim text instead (no box), so the latest line is always visible.
+                  // short slot Ink clips it to a broken/empty box. Show the newest raw code lines as
+                  // plain dim text (no box), indented under the gutter so it aligns with the answer.
                   if (/^\s*(```|~~~)/.test(clamped)) {
                     const codeTail = previewStream
                       .split('\n')
                       .filter((l) => !/^\s*(```|~~~)/.test(l))
                       .slice(-hudFit.liveRows);
                     return (
-                      <>
+                      <Box flexDirection="column" paddingLeft={PAGE_MARGIN}>
                         {codeTail.map((l, k) => (
-                          <Text key={k} color={C.dim} wrap="truncate">{l || ' '}</Text>
+                          <Text key={k} wrap="truncate"><Text>{'  '}</Text><Text color={C.dim}>{l || ' '}</Text></Text>
                         ))}
-                      </>
+                      </Box>
                     );
                   }
-                  return <Markdown source={clamped} width={Math.min(terminalSize.cols - PAGE_MARGIN * 2, PROSE_MAX_COLS)} />;
+                  // The uncommitted tail as a real transcript node: ⏺ only when nothing has committed
+                  // yet (turn start); once a line is in <Static> the tail is a continuation and aligns
+                  // under it — one seamless answer, live and committed rendered identically.
+                  return (
+                    <FlatItem
+                      item={{ id: -1, kind: 'assistant', text: clamped, color: C.fg } as TranscriptItem}
+                      cols={terminalSize.cols}
+                      collapsed={false}
+                      continuation={answerOpenRef.current}
+                    />
+                  );
                 })()
               ) : null}
             </Box>
           ) : null}
           {hudFit.status ? (
             <Box paddingLeft={PAGE_MARGIN}>
-              <Text wrap="truncate" color={C.yellow}>{hudStatusLine || ' '}</Text>
+              {running ? (
+                <Text wrap="truncate">
+                  <Text color={CLAUDE_ORANGE}>{spinner}</Text>
+                  <Text> {statusVerb}</Text>
+                  {statusTail ? <Text color={C.dim}>{statusTail}</Text> : null}
+                </Text>
+              ) : (
+                <Text> </Text>
+              )}
             </Box>
           ) : null}
         </>
@@ -4143,10 +4229,12 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
                     const selected = activeQuestionSelection.includes(o.label);
                     const isCursor = i === cursor;
                     const isRec = i === rec;
-                    const mark = activeQuestion.multiSelect ? (selected ? '☑' : '☐') : selected ? '●' : '○';
+                    // ❯ points at the cursor row; a green ✓ marks a chosen option (multi-select only).
+                    // Single-select needs no glyph — the ❯ pointer IS the selection. No radio/checkbox.
+                    const mark = activeQuestion.multiSelect ? (selected ? '✓ ' : '  ') : '';
                     return (
                       <Text key={o.label} wrap="truncate" color={selected ? C.green : isCursor ? C.fg : C.dim} bold={isCursor}>
-                        {`${isCursor ? '❯' : ' '} ${i + 1}. ${mark} ${o.label}`}
+                        {`${isCursor ? '❯' : ' '} ${i + 1}. ${mark}${o.label}`}
                         {isRec ? <Text color={C.yellow}>{'  ★ recommended'}</Text> : ''}
                         {o.description ? <Text color={C.dim}>{`  — ${o.description}`}</Text> : ''}
                       </Text>
@@ -4225,10 +4313,15 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             }
             const e = r.entry;
             const active = e.provider === current.provider && e.model === current.model;
+            const cur = i === pickerSel;
+            // ❯ points at the cursor row (bright); a green ● marks the model in use. No reverse-video
+            // bar — the pointer + brightness carry the cursor, siblings recede into the dim gray.
             return (
-              <Text key={`m${i}`} wrap="truncate" inverse={i === pickerSel} color={i === pickerSel ? C.green : C.fg}>
-                {`   ${active ? '●' : ' '} ${e.label.padEnd(14)} `}
-                <Text color={i === pickerSel ? undefined : C.dim}>{`${e.provider}/${e.model}`}</Text>
+              <Text key={`m${i}`} wrap="truncate">
+                <Text color={cur ? C.green : C.dim}>{cur ? '❯ ' : '  '}</Text>
+                <Text color={active ? C.green : C.dim}>{active ? '● ' : '  '}</Text>
+                <Text color={cur ? C.fg : C.dim} bold={cur}>{e.label.padEnd(14)} </Text>
+                <Text color={C.dim}>{`${e.provider}/${e.model}`}</Text>
               </Text>
             );
           })}
@@ -4288,30 +4381,48 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             borderColor={running ? C.cyan : planMode.mode === 'planning' ? C.yellow : C.dim}
           />
         </Box>
-        {/* Slash-command dropdown — BELOW the composer (Claude Code style), so typing "/" never
+        {/* Slash-command dropdown — BELOW the composer (the reference client style), so typing "/" never
             moves the input box: the menu grows downward, shifting only the status strip. `menuOpen`
             already accounts for the terminal being tall enough to hold the box under the wipe line. */}
         {menuOpen ? (
-          <Box flexDirection="column" borderStyle="single" borderColor="gray" paddingX={1}>
-            <Text bold color={C.dim}>
-              {`Commands (${selIndex + 1}/${menu.length})`}
-            </Text>
-            {menuStart > 0 ? <Text italic color={C.dim}>{`  ↑ ${menuStart} more`}</Text> : null}
-            {menu.slice(menuStart, menuStart + MENU_MAX).map((c, j) => {
-              const i = menuStart + j;
-              return (
-                // wrap="truncate": a long command description must never wrap to a 2nd row —
-                // every extra physical row eats the frame budget the HUD math reserved.
-                <Text key={c.name} wrap="truncate" inverse={i === selIndex} color={i === selIndex ? C.green : C.fg}>
-                  {` ${c.name.padEnd(SLASH_NAME_WIDTH)} `}
-                  <Text color={i === selIndex ? undefined : C.dim}>{c.desc} </Text>
+          // A borderless but SHADED command list: a faint slate panel (MENU_BG) sits behind every row
+          // so the menu reads as its own surface instead of blending into the transcript, and the
+          // selected row gets a brighter bar (MENU_SEL_BG). Every row is padded to a common width so
+          // the panel is a clean rectangle. (No box, no reverse-video — the contrast carries it.)
+          (() => {
+            const BAR_W = Math.max(24, Math.min(terminalSize.cols - PAGE_MARGIN * 2 - 1, 74));
+            const bar = (s: string) => (s.length >= BAR_W ? s.slice(0, BAR_W) : s + ' '.repeat(BAR_W - s.length));
+            return (
+              <Box flexDirection="column" paddingLeft={PAGE_MARGIN}>
+                <Text wrap="truncate" backgroundColor={MENU_BG} color={C.cyan} bold>
+                  {bar(` Commands (${selIndex + 1}/${menu.length})`)}
                 </Text>
-              );
-            })}
-            {menuStart + MENU_MAX < menu.length ? (
-              <Text italic color={C.dim}>{`  ↓ ${menu.length - menuStart - MENU_MAX} more`}</Text>
-            ) : null}
-          </Box>
+                {menuStart > 0 ? (
+                  <Text wrap="truncate" backgroundColor={MENU_BG} color={C.dim} italic>{bar(`   ↑ ${menuStart} more`)}</Text>
+                ) : null}
+                {menu.slice(menuStart, menuStart + MENU_MAX).map((c, j) => {
+                  const i = menuStart + j;
+                  const cur = i === selIndex;
+                  const bg = cur ? MENU_SEL_BG : MENU_BG;
+                  const namePart = c.name.padEnd(SLASH_NAME_WIDTH);
+                  const used = 2 + namePart.length + 1 + c.desc.length; // pointer + name + space + desc
+                  const pad = used < BAR_W ? ' '.repeat(BAR_W - used) : '';
+                  // wrap="truncate": a long row must never wrap to a 2nd line — it eats the frame budget.
+                  return (
+                    <Text key={c.name} wrap="truncate">
+                      <Text backgroundColor={bg} color={cur ? C.green : C.dim} bold={cur}>{cur ? '❯ ' : '  '}</Text>
+                      <Text backgroundColor={bg} color={C.fg} bold={cur}>{`${namePart} `}</Text>
+                      <Text backgroundColor={bg} color={cur ? C.fg : C.dim}>{c.desc}</Text>
+                      {pad ? <Text backgroundColor={bg}>{pad}</Text> : null}
+                    </Text>
+                  );
+                })}
+                {menuStart + MENU_MAX < menu.length ? (
+                  <Text wrap="truncate" backgroundColor={MENU_BG} color={C.dim} italic>{bar(`   ↓ ${menu.length - menuStart - MENU_MAX} more`)}</Text>
+                ) : null}
+              </Box>
+            );
+          })()
         ) : null}
         {hudFit.strip ? (
           <Box paddingLeft={PAGE_MARGIN}>

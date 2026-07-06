@@ -130,7 +130,7 @@ function stripXmlToolTags(s: string): string {
 /**
  * DeepSeek's native tool-call token form (R1 / V3 chat template). DeepSeek-R1 in particular
  * frequently emits these as assistant TEXT instead of via the OpenAI `tool_calls` channel — it
- * runs fine in harnesses that recover it (e.g. Claude Code), so Shadow must too:
+ * runs fine in harnesses that recover it (e.g. the reference client), so Shadow must too:
  *
  *   <｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>NAME
  *   ```json
