@@ -33,37 +33,35 @@ Per-version detail lives in **[CHANGELOG.md](CHANGELOG.md)**. Working toward **v
 
 ## Install
 
-Requires **Node.js ≥ 20** and **git**. Shadow installs by **cloning this repo and linking** a global `shadow` command — `dist/` is committed, so there's no compile step. (Clone-and-link, not `npm i -g <url>`: this is a private repo and npm's tarball fetch isn't authenticated for it, but `git`/`gh` use your existing credentials.)
+Shadow ships as a single self-contained binary (no Node needed to run it). The installer is served from **this GitHub repo** so its pinned signing key can't be swapped by the download host.
 
-> **Private repo — authenticate first.** On a fresh box, confirm you can clone it. Git Credential Manager (bundled with Git for Windows and macOS `git`) handles auth via a browser popup; or use the GitHub CLI: `gh repo clone Blackfrost-AI/shadow-cli`.
-
-### macOS / Linux (bash / zsh)
+### macOS / Linux
 
 ```bash
-git clone https://github.com/Blackfrost-AI/shadow-cli.git && cd shadow-cli && npm install && npm link
+curl -fsSL https://raw.githubusercontent.com/Blackfrost-AI/Shadow_CLI/main/install.sh | sh
 ```
 
 ### Windows (PowerShell)
 
-Windows PowerShell 5.1 (the default) does **not** support `&&`, so run these as **four separate lines**:
-
 ```powershell
-git clone https://github.com/Blackfrost-AI/shadow-cli.git
-cd shadow-cli
-npm install
-npm link
+irm https://raw.githubusercontent.com/Blackfrost-AI/Shadow_CLI/main/install.ps1 | iex
 ```
 
-(PowerShell 7+ supports `&&`, so you can use the macOS one-liner instead if you prefer.)
+The installer detects your platform, downloads the matching binary, **verifies it** (see below), and drops it on your `PATH`. **Update:** `shadow update`. **Uninstall:** delete the binary (`rm "$(command -v shadow)"`).
 
-### Then, from any terminal, anywhere
+### Verifying the download 🔒
+
+Shadow is a security tool, so the installer **fails closed**. It downloads `SHASUMS256.txt` plus an ECDSA‑P256 signature (`SHASUMS256.txt.sig`) made with an **offline** release key, verifies that signature against the public key **pinned in the installer**, and only then checks the binary's SHA‑256 against the signed manifest. A compromised download host can't forge the signature, so a tampered binary is rejected — the install aborts. (Signature verification uses `openssl` on macOS/Linux and PowerShell 7+ on Windows; Windows PowerShell 5.1 falls back to the checksum with a warning.) The release public key is [`public/bin/SHASUMS256.pub`](https://shadow.redpillreader.com/bin/SHASUMS256.pub) and is embedded in `install.sh`/`install.ps1` — read them before piping to a shell.
+
+### Build from source (optional)
+
+Requires **Node.js ≥ 20** and **git**:
 
 ```bash
-shadow --help
-shadow --version
+git clone https://github.com/Blackfrost-AI/Shadow_CLI.git && cd Shadow_CLI && npm install && npm run build && npm link
 ```
 
-Keep the cloned folder — the global command links to it. **Update:** run `shadow update` from anywhere — it fetches and **hard-resets the checkout to the remote**, so a rebuilt `dist/` or a re-resolved `package-lock.json` (which makes plain `git pull --ff-only` refuse) never blocks the update; then it refreshes deps. It deliberately **refuses** if the box has unpushed local commits (i.e. the source/master box). Manual equivalent on a mirror box: `git fetch origin && git reset --hard origin/main && npm install`. **Uninstall:** `npm rm -g shadow`.
+Then `shadow --help` from anywhere.
 
 ## First run — connect your model
 
