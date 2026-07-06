@@ -859,6 +859,53 @@ export function repeatStep(run: string[], pos: number, key: string): { suppress:
   }
   return { suppress: false, run: [...run, key], pos: 0 };
 }
+
+/** Which optional live-frame rows fit, and the composer hint. See fitHud. */
+export interface HudFit {
+  liveRows: number;   // height of the streaming preview region (0..liveWant)
+  status: boolean;    // the 'working… Ns' / spacer line above the composer
+  pinned: boolean;    // the 1-row pinned goal/task summary while running
+  queued: boolean;    // the type-ahead queue line
+  custom: boolean;    // the customStatus (/statusline) strip
+  hint: boolean;      // the composer's keybinding hint row
+  marginTop: boolean; // the blank spacer above the composer group
+  strip: boolean;     // the main status strip
+  height: number;     // total live-frame height this produces (always < rows for rows >= 4)
+}
+
+/**
+ * Bound the LIVE (non-<Static>) frame so its height stays STRICTLY below `rows`. Ink wipes the whole
+ * screen + scrollback and re-dumps the entire transcript on EVERY render when `outputHeight >= rows`
+ * (node_modules/ink/build/ink.js:121) — the flicker/duplication you get on a short or split-pane
+ * terminal. The composer's input + its two borders (3 rows) are mandatory; every other row is added
+ * only while it still fits under `rows - 1`, in priority order, so as the terminal shrinks the least
+ * important rows drop first (custom status → queued → pinned → margin → live preview → status line →
+ * strip → hint) and the frame never reaches the terminal height. Pure; the invariant is unit-tested.
+ */
+export function fitHud(
+  rows: number,
+  want: { liveWant: number; pinned: boolean; queued: boolean; custom: boolean },
+): HudFit {
+  const cap = rows - 1; // outputHeight must be <= rows - 1 to stay under Ink's wipe threshold
+  const f: HudFit = {
+    liveRows: 0, status: false, pinned: false, queued: false, custom: false,
+    hint: false, marginTop: false, strip: false, height: 3,
+  };
+  // Added high-priority → low: whatever doesn't fit as the terminal shrinks drops from the bottom of
+  // this list first (cosmetic blank spacer goes first, then custom status, queued, pinned, …).
+  // `liveWant` is the desired streaming-preview height (0 when there's nothing live to show).
+  const add = (n: number, on: () => void): void => { if (f.height + n <= cap) { f.height += n; on(); } };
+  add(1, () => (f.strip = true));   // status strip: model / mode / context / tokens
+  add(1, () => (f.status = true));  // 'working…' status line (liveness)
+  for (let i = 0; i < want.liveWant; i++) add(1, () => (f.liveRows += 1)); // streaming preview
+  add(1, () => (f.hint = true));    // composer hint (keybindings)
+  if (want.pinned) add(1, () => (f.pinned = true));  // goal / task summary
+  if (want.queued) add(1, () => (f.queued = true));
+  if (want.custom) add(1, () => (f.custom = true));
+  add(1, () => (f.marginTop = true)); // cosmetic blank above the composer — first to go
+  return f;
+}
+
 /** Does this text START with a distinct markdown block? Used by the leftover-commit sites
  *  (assistant_done / stop / error teardown) to space a block leftover correctly. */
 export function leadsWithBlock(text: string): boolean {
@@ -1215,11 +1262,14 @@ function Composer({
   input,
   cursor,
   hint,
+  showHint = true,
   borderColor = C.dim,
 }: {
   input: string;
   cursor: number;
   hint: string;
+  /** Drop the hint row on a very short terminal to keep the composer at 3 rows (border+input+border). */
+  showHint?: boolean;
   /** Mode tint for the ONE border in the app: dim at rest, cyan running, yellow in plan mode. */
   borderColor?: string;
 }) {
@@ -1234,9 +1284,11 @@ function Composer({
       </Text>
       {/* wrap="truncate": the hint is budgeted at ONE row; at cols < ~74 the running-state hint
           wrapped to 2, silently eating the frame headroom on narrow terminals. */}
-      <Text wrap="truncate" color={C.dim}>
-        {hint}
-      </Text>
+      {showHint ? (
+        <Text wrap="truncate" color={C.dim}>
+          {hint}
+        </Text>
+      ) : null}
     </Box>
   );
 }
@@ -3887,8 +3939,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // and the queued row ALL yield their rows to the menu — measured, that is the only arithmetic that
   // keeps the frame under terminal rows down to 17-row terminals (menu 8 + composer 4 + margins 2 +
   // strip 1 + customStatus 1 = 16). The composer itself still doesn't move (menu renders BELOW it),
-  // and everything returns the moment the menu closes.
-  const menuOpen = menu.length > 0;
+  // and everything returns the moment the menu closes. On a terminal too short to hold the dropdown
+  // box + composer + strip under the wipe threshold, the menu simply doesn't open (you can still type
+  // the whole command); MENU_MAX+5 for the box, +5 for composer(4)+strip(1), +1 headroom.
+  const menuOpen = menu.length > 0 && terminalSize.rows >= MENU_MAX + 5 + 5 + 1;
   const hudStreamRows = menuOpen ? 0 : streamTail;
   // Stock live-region cap: keep the preview short so the input bar below it barely moves as an answer
   // streams (the "bar still jumps" tradeoff). The CONTENT tail and the Box height MUST use this same
@@ -3901,7 +3955,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // row here is one row the composer rises when the turn ends and the slot collapses (the answer has
   // committed to scrollback by then, so the content stays visible — the jump is just the slot going
   // away). Tighter = smaller turn-end settle. (CC pins its input the same way: content scrolls above.)
-  const liveRows = Math.min(hudStreamRows, 2);
+  const liveWant = Math.min(hudStreamRows, 2);
   const hudStatusLine = running
     ? `${spinner} working… ${formatDuration(elapsedSec)}${shellPid ? ` · shell pid ${shellPid}` : ''}${toolLine ? ` · ${toolLine.trim()}` : ''} · Esc to interrupt${shellPid && shellWarn ? ' · ⚠ may survive ESC' : elapsedSec >= 20 && !toolLine ? ' · model slow to respond' : ''}`
     : '';
@@ -3913,6 +3967,21 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     showPlan ? `${planMode.mode === 'planning' ? 'plan' : 'implement'}: ${planMode.title ?? ''}` : '',
     showTodo ? `▸ tasks ${todoDone}/${todoItems.length}${todoCurrent ? ` · ${todoCurrent}` : ''} · Ctrl-T` : '',
   ].filter(Boolean).join('   ·   ');
+  // Frame budget: keep the live (non-Static) frame strictly under the terminal height so Ink never
+  // trips its whole-screen wipe on a short/split-pane terminal. Drives which optional rows render.
+  const hasLive = running || stream !== '' || think !== '';
+  // Pinned zone: the full multi-row PinnedState block only renders IDLE on a comfortably tall terminal
+  // (it's ~5 rows of chrome + items); running, or idle on a short/split-pane terminal, it collapses to
+  // the single-row summary so it can't push the live frame past Ink's wipe threshold.
+  const idlePinned = !running && !!(showPlan || showTodo || goal);
+  const showFullPinned = idlePinned && terminalSize.rows >= 16;
+  const wantPinnedLine = hudPinnedLine !== '' && !menuOpen && (running || (idlePinned && !showFullPinned));
+  const hudFit = fitHud(terminalSize.rows, {
+    liveWant: menuOpen || !hasLive ? 0 : liveWant,
+    pinned: wantPinnedLine,
+    queued: queued.length > 0 && !menuOpen,
+    custom: !!customStatus,
+  });
   const pickerRows = modelRows(opts.cfg);
   let pickerSel = Math.min(pickerIndex, Math.max(0, pickerRows.length - 1));
   if (pickerRows[pickerSel]?.kind !== 'model') pickerSel = firstSelectableRow(pickerRows);
@@ -3987,16 +4056,18 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       {!pending && !pickerOpen ? (
         <>
           {/* Live region yields to the menu (its rows go to the command box); the status spacer below
-              stays so the composer never shifts up when the menu opens. */}
-          {!menuOpen && (running || stream !== '' || think !== '') ? (
-            <Box flexDirection="column" height={liveRows} overflow="hidden" justifyContent="flex-end" paddingLeft={PAGE_MARGIN}>
+              stays so the composer never shifts up when the menu opens. hudFit.liveRows is 0 on a
+              terminal too short to afford it — then the preview is dropped so the frame stays under
+              the wipe threshold. */}
+          {!menuOpen && hudFit.liveRows > 0 && (running || stream !== '' || think !== '') ? (
+            <Box flexDirection="column" height={hudFit.liveRows} overflow="hidden" justifyContent="flex-end" paddingLeft={PAGE_MARGIN}>
               {think ? (
                 // Live reasoning streams visibly (dim italic), not hidden behind a spinner count.
-                <Text italic color={C.dim}>{clampTail(think, liveRows)}</Text>
+                <Text italic color={C.dim}>{clampTail(think, hudFit.liveRows)}</Text>
               ) : null}
               {previewStream ? (
                 (() => {
-                  const clamped = clampTail(previewStream, liveRows);
+                  const clamped = clampTail(previewStream, hudFit.liveRows);
                   // An OPEN code fence would render as a bordered code box needing ~4 rows — in this
                   // 2-row slot Ink clips it to a broken/empty box. Show the newest raw code lines as
                   // plain dim text instead (no box), so the latest line is always visible.
@@ -4004,7 +4075,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
                     const codeTail = previewStream
                       .split('\n')
                       .filter((l) => !/^\s*(```|~~~)/.test(l))
-                      .slice(-liveRows);
+                      .slice(-hudFit.liveRows);
                     return (
                       <>
                         {codeTail.map((l, k) => (
@@ -4018,9 +4089,11 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
               ) : null}
             </Box>
           ) : null}
-          <Box paddingLeft={PAGE_MARGIN}>
-            <Text wrap="truncate" color={C.yellow}>{hudStatusLine || ' '}</Text>
-          </Box>
+          {hudFit.status ? (
+            <Box paddingLeft={PAGE_MARGIN}>
+              <Text wrap="truncate" color={C.yellow}>{hudStatusLine || ' '}</Text>
+            </Box>
+          ) : null}
         </>
       ) : null}
 
@@ -4054,7 +4127,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             // terminal height, re-triggering Ink's clearTerminal fallback — the whole transcript
             // flickers and wipes every frame while the dialog is open. (audit P0 #3)
             (() => {
-              const OPTION_MAX = 8;
+              // Cap the visible options by terminal height too: the dialog (borders/header/question/
+              // hint ≈ 6) + the composer + strip below must stay under the wipe threshold on a short
+              // terminal. rows-14 keeps ~8 on a normal screen and shrinks the window as it gets short.
+              const OPTION_MAX = Math.max(1, Math.min(8, terminalSize.rows - 14));
               const opts_ = activeQuestion.options;
               const cursor = questionCursor[activeQuestionIndex] ?? recommendedIndex(activeQuestion);
               const rec = recommendedIndex(activeQuestion);
@@ -4169,15 +4245,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           (goal · plan · tasks n/m · current subject), so the 3→14-row PinnedState accordion can't
           shove the composer around mid-turn. The full block still renders between turns, where the
           composer is stationary anyway. Cell path keeps the full block (fixed-height viewport). */}
-      {menuOpen ? null : running ? (
-        hudPinnedLine ? (
-          // Inset to the page margin like every other row (only `cell` is excluded above, and it
-          // never reaches here). Stock previously left this at column 0 — misaligned with the content.
-          <Text wrap="truncate" color={C.green}>
-            {MARGIN_PAD + hudPinnedLine}
-          </Text>
-        ) : null
-      ) : showPlan || showTodo || goal ? (
+      {menuOpen ? null : showFullPinned ? (
         <PinnedState
           goal={goal}
           plan={planMode}
@@ -4188,12 +4256,18 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           cols={layout.cols}
           maxItems={pinnedMaxItems(terminalSize.rows, !!goal, !!(showPlan && planMode.path), !!customStatus)}
         />
+      ) : hudFit.pinned ? (
+        // Single-row summary — used while running, and idle on a terminal too short for the full block.
+        // Dropped entirely (hudFit.pinned false) when even one row would breach Ink's wipe threshold.
+        <Text wrap="truncate" color={C.green}>
+          {MARGIN_PAD + hudPinnedLine}
+        </Text>
       ) : null}
 
-      <Box flexDirection="column" flexShrink={0} marginTop={1}>
+      <Box flexDirection="column" flexShrink={0} marginTop={hudFit.marginTop ? 1 : 0}>
         {/* Type-ahead queue — what the user submitted while the turn is running, flushed
             in order when it finishes. Visible so they know the input was accepted (Esc clears). */}
-        {queued.length > 0 && !menuOpen ? (
+        {hudFit.queued ? (
           // wrap="truncate": 3+ queued items would wrap to a 2nd row and shift the composer mid-turn.
           // Hidden while the menu is open — those rows belong to the menu's frame budget. Inset to the
           // page margin in stock so it lines up with the composer/strip rather than sitting flush-left.
@@ -4210,12 +4284,14 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             input={input}
             cursor={cursor}
             hint={composerHint}
+            showHint={hudFit.hint}
             borderColor={running ? C.cyan : planMode.mode === 'planning' ? C.yellow : C.dim}
           />
         </Box>
         {/* Slash-command dropdown — BELOW the composer (Claude Code style), so typing "/" never
-            moves the input box: the menu grows downward, shifting only the status strip. */}
-        {menu.length > 0 ? (
+            moves the input box: the menu grows downward, shifting only the status strip. `menuOpen`
+            already accounts for the terminal being tall enough to hold the box under the wipe line. */}
+        {menuOpen ? (
           <Box flexDirection="column" borderStyle="single" borderColor="gray" paddingX={1}>
             <Text bold color={C.dim}>
               {`Commands (${selIndex + 1}/${menu.length})`}
@@ -4237,10 +4313,12 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             ) : null}
           </Box>
         ) : null}
-        <Box paddingLeft={PAGE_MARGIN}>
-          <StatusStrip text={statusStrip} marker={opts.offline ? { text: 'OFFLINE', color: C.cyan } : undefined} />
-        </Box>
-        {customStatus ? (
+        {hudFit.strip ? (
+          <Box paddingLeft={PAGE_MARGIN}>
+            <StatusStrip text={statusStrip} marker={opts.offline ? { text: 'OFFLINE', color: C.cyan } : undefined} />
+          </Box>
+        ) : null}
+        {customStatus && hudFit.custom ? (
           // Same page-margin inset as the main strip above — a custom /statusline was flush-left in stock.
           <Box paddingLeft={PAGE_MARGIN}>
             <StatusStrip text={customStatus} />
@@ -4252,14 +4330,28 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
 }
 
 // ── Entry point ────────────────────────────────────────────────────────────────
+/**
+ * Escape sequence to emit ONCE at TUI launch on a real TTY. Two privacy measures:
+ *   1. Set the terminal title to "Shadow" (pushed onto the xterm title stack, popped on exit) so the
+ *      working-directory path terminals show by default doesn't leak in screenshots / over-the-shoulder.
+ *   2. Wipe the visible screen AND the scrollback (`2J` + `3J`, then home) so your PRE-LAUNCH shell
+ *      history — earlier commands, other work, secrets — can't be scrolled up to from inside the
+ *      Shadow session. Same escape `/clear` uses; the transcript then accumulates in a fresh
+ *      scrollback below. Opt out with `SHADOW_KEEP_SCROLLBACK=1` to preserve your terminal history.
+ * Returns '' when not a TTY (piped / CI writes stay clean). Pure — the sequencing is unit-tested.
+ */
+export function startupSequence(isTTY: boolean, env: NodeJS.ProcessEnv = process.env): string {
+  if (!isTTY) return '';
+  let seq = '\x1b[22;2t\x1b]2;Shadow\x07'; // push prior title, set to "Shadow"
+  if (env.SHADOW_KEEP_SCROLLBACK !== '1') seq += '\x1b[2J\x1b[3J\x1b[H'; // wipe screen + scrollback, home
+  return seq;
+}
+
 export function runTui(opts: TuiOpts): Promise<void> {
-  // Set the terminal window/tab title to "Shadow" so it does NOT leak the working-directory
-  // path (which terminals show by default) in screenshots or over-the-shoulder. Push the prior
-  // title onto the xterm title stack first and pop it on exit; on terminals without title-stack
-  // support the push/pop are no-ops and the title simply stays "Shadow" until the shell's next
-  // prompt resets it. Only when attached to a real TTY (piped/CI runs must stay clean).
+  // Launch-time privacy: title → "Shadow" (hide cwd) + wipe scrollback (hide pre-launch shell
+  // history from scroll-up). See startupSequence. Title is popped on exit via cleanup.
   const ownsTitle = !!process.stdout.isTTY;
-  if (ownsTitle) process.stdout.write('\x1b[22;2t\x1b]2;Shadow\x07');
+  if (ownsTitle) process.stdout.write(startupSequence(true));
   const cleanup = (): void => {
     if (ownsTitle) process.stdout.write('\x1b[23;2t');
   };
