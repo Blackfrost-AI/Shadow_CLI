@@ -1,0 +1,11 @@
+{
+  "_comment": "Copy to eval/models.json and edit. baseUrl/provider/apiKey are defaults applied to every model unless the entry overrides them. For a local Ollama box, provider 'openai' + the /v1 base URL; the apiKey is ignored by Ollama but must be present so shadow doesn't think it's unconfigured.",
+  "provider": "openai",
+  "baseUrl": "http://your-host:11434/v1",
+  "apiKey": "ollama-local",
+  "models": [
+    { "label": "local", "model": "my-model:latest" },
+    { "label": "gemma", "model": "gemma3:27b" },
+    { "label": "glm", "model": "glm-4.6:latest" }
+  ]
+}

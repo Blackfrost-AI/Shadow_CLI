@@ -1,0 +1,83 @@
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync } from 'node:fs';
+
+/**
+ * User-level config + credentials written by `shadow onboard`, so subsequent runs
+ * connect with no flags. Non-secret preferences (provider, model) live in
+ * config.json; secrets (api keys / tokens) and the per-provider base URL live in
+ * credentials.json (chmod 600). Env vars still override everything at runtime.
+ */
+export const GLOBAL_DIR = join(homedir(), '.shadow');
+const CONFIG_PATH = join(GLOBAL_DIR, 'config.json');
+const CREDS_PATH = join(GLOBAL_DIR, 'credentials.json');
+
+const LAYOUT_DIRS = ['agents', 'commands', 'rules', 'workflows', 'projects', 'tasks', 'checkpoints', 'memories'] as const; // deeper ~/.shadow for Claude parity + recovery
+
+/** Ensure the extended `~/.shadow` layout exists (idempotent). */
+export function ensureShadowLayout(): void {
+  mkdirSync(GLOBAL_DIR, { recursive: true, mode: 0o700 });
+  try {
+    chmodSync(GLOBAL_DIR, 0o700);
+  } catch {
+    /* best-effort */
+  }
+  for (const d of LAYOUT_DIRS) {
+    mkdirSync(join(GLOBAL_DIR, d), { recursive: true, mode: 0o700 });
+  }
+}
+
+export interface CredentialEntry {
+  apiKey?: string;
+  authToken?: string;
+  baseUrl?: string;
+}
+type Credentials = Record<string, CredentialEntry>;
+
+function readJson<T>(path: string, fallback: T): T {
+  try {
+    return JSON.parse(readFileSync(path, 'utf8')) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+function writeJsonAtomic(path: string, data: unknown, mode = 0o600): void {
+  // ~/.shadow holds credentials.json (and config.json may carry creds in baseUrl),
+  // so default to owner-only perms — set on the dir AND on the temp file BEFORE it is
+  // renamed into place (no world-readable window, regardless of umask).
+  mkdirSync(GLOBAL_DIR, { recursive: true, mode: 0o700 });
+  try {
+    chmodSync(GLOBAL_DIR, 0o700); // tighten a pre-existing 0755 dir (best-effort)
+  } catch {
+    /* not fatal */
+  }
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', { mode });
+  chmodSync(tmp, mode); // force perms even if umask widened the create mode
+  renameSync(tmp, path);
+}
+
+/** Non-secret global preferences (provider, model, …) — merged below the project config. */
+export function loadGlobalConfig(): Record<string, unknown> {
+  ensureShadowLayout();
+  return readJson<Record<string, unknown>>(CONFIG_PATH, {});
+}
+
+export function saveGlobalConfig(patch: Record<string, unknown>): void {
+  writeJsonAtomic(CONFIG_PATH, { ...loadGlobalConfig(), ...patch });
+}
+
+export function loadCredentials(): Credentials {
+  return readJson<Credentials>(CREDS_PATH, {});
+}
+
+export function getCredential(provider: string): CredentialEntry | undefined {
+  return loadCredentials()[provider];
+}
+
+export function saveCredential(provider: string, entry: CredentialEntry): void {
+  const all = loadCredentials();
+  all[provider] = { ...all[provider], ...entry };
+  writeJsonAtomic(CREDS_PATH, all, 0o600);
+}

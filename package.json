@@ -1,0 +1,56 @@
+{
+  "name": "shadow",
+  "version": "2.0.1",
+  "description": "Shadow — a high-performance, agentic CLI runtime that lets an LLM operate as a coding/sysadmin agent over a local workspace.",
+  "type": "module",
+  "private": true,
+  "files": [
+    "dist",
+    "prompts"
+  ],
+  "bin": {
+    "shadow": "./dist/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "build": "tsc && node -e \"require('fs').chmodSync('dist/index.js',0o755)\"",
+    "embed:prompts": "node scripts/embed-prompts.mjs",
+    "build:binary": "bash scripts/build-binary.sh",
+    "typecheck": "tsc --noEmit",
+    "typecheck:all": "tsc -p tsconfig.all.json",
+    "eval": "tsx eval/harness-eval.ts",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "test": "node --import tsx/esm --test test/**/*.test.ts",
+    "verify:plan": "bash scripts/verify-plan.sh",
+    "check:release-gate": "bash scripts/check-release-gate.sh",
+    "prepublishOnly": "bash scripts/check-release-gate.sh",
+    "release:dev": "npm version prerelease --preid=dev -m \"release: %s\" && git push --follow-tags",
+    "release:patch": "npm version patch -m \"release: %s\" && git push --follow-tags",
+    "release:minor": "npm version minor -m \"release: %s\" && git push --follow-tags",
+    "setup:hooks": "git config core.hooksPath .githooks"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "ink": "^5.1.0",
+    "react": "^18.3.1",
+    "undici": "^8.5.0",
+    "zod": "^3.24.1",
+    "zod-to-json-schema": "^3.23.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.17.0",
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.2.17",
+    "eslint": "^9.17.0",
+    "ink-testing-library": "^4.0.0",
+    "prettier": "^3.4.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "typescript-eslint": "^8.18.0"
+  }
+}

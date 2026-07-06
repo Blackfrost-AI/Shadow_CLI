@@ -1,0 +1,20 @@
+node_modules/
+.tmp/
+*.log
+.shadow/
+.DS_Store
+.env
+eval/results/
+eval/models.json
+*.bak
+*.bak-*
+
+# single-file binary build output
+dist-bin/
+*.bun-build
+eval/drive-*.log
+eval/models-*.json
+eval/RESULTS-*.md
+eval/FINDINGS-*.md
+research/
+dist/

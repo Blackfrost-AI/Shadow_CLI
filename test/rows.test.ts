@@ -1,0 +1,126 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { renderBrand, renderToolResult, renderToolChild, renderReasoning } from '../src/tui/rows.js';
+import type { ViewportTheme } from '../src/tui/flatten.js';
+
+// The v2 palette (matches PIN_THEME): dim is the EXPLICIT ADA gray, never a faint attribute.
+const T: ViewportTheme = {
+  fg: '#ffffff',
+  dim: '#b6bcc3',
+  green: '#22c55e',
+  cyan: '#38bdf8',
+  yellow: '#eab308',
+  red: '#ef4444',
+  purple: '#a78bfa',
+};
+
+// Guard the design law: NO row renderer may emit the faint `dim: true` boolean — quiet text must
+// carry the explicit gray color. This is the ADA rule made executable.
+function assertNoFaint(rows: { text: string; dim?: boolean; color?: string }[][], where: string): void {
+  for (const row of rows) {
+    for (const span of row) {
+      assert.notEqual(span.dim, true, `${where}: span "${span.text}" used the banned faint attribute`);
+      // A quiet (non-fg, non-accent) run must be explicitly the dim gray, not undefined.
+    }
+  }
+}
+
+test('renderBrand: ✦ sparkle mark, bright name, dim meta — no bordered card', () => {
+  const rows = renderBrand(
+    { version: '1.0.0', providerModel: 'openai/LUMIX-35B', workspace: '~/app', help: '/help', yolo: false },
+    T,
+    80,
+  );
+  assert.equal(rows.length, 2, 'compact form (no art) → two rows when not yolo');
+  assert.equal(rows[0]![0]!.text, '✦ ');
+  assert.equal(rows[0]![0]!.color, T.cyan);
+  assert.equal(rows[0]![1]!.text, 'shadow');
+  assert.equal(rows[0]![1]!.bold, true);
+  assert.ok(rows[0]![2]!.text.includes('v1.0.0') && rows[0]![2]!.color === T.dim, 'version in dim gray');
+  assert.ok(rows[1]![0]!.text.includes('openai/LUMIX-35B') && rows[1]![0]!.text.includes('~/app'));
+  assert.equal(rows[1]![0]!.color, T.dim, 'meta line is the explicit gray');
+  assertNoFaint(rows, 'brand');
+});
+
+test('renderBrand: yolo adds a yellow warning row (compact, no art)', () => {
+  const rows = renderBrand({ version: '1', providerModel: 'p/m', workspace: '/w', help: '/help', yolo: true }, T, 80);
+  assert.equal(rows.length, 3);
+  assert.ok(rows[2]![0]!.text.includes('yolo') && rows[2]![0]!.color === T.yellow);
+});
+
+test('renderBrand: two-column — wordmark left, meta right-aligned to the width', () => {
+  const art = ['████', '█  █', '████', '█  █', '████', '████']; // 4-wide, 6 rows
+  const rows = renderBrand(
+    { version: '1.0.0', providerModel: 'openai/LUMIX-35B', workspace: '~/app', help: '/help · /model', yolo: true, art },
+    T,
+    60,
+  );
+  assert.equal(rows.length, 6, 'six rows (art height), meta paired into the first five');
+  const row0Text = rows[0]!.map((s) => s.text).join('');
+  assert.ok(row0Text.startsWith('████'), 'wordmark hard-left');
+  assert.ok(row0Text.includes('✦ ') && row0Text.includes('v1.0.0'), 'version on the right');
+  // The meta block is right-positioned: its WIDEST line (the yolo warning) hits the screen edge.
+  assert.equal(rows[4]!.map((s) => s.text).join('').length, 60, 'widest meta row spans the full width');
+  assert.ok(rows[4]!.some((s) => s.text.includes('yolo') && s.color === T.yellow), 'yolo in the right column');
+  // The meta block shares ONE left edge across rows (clean column, not ragged left).
+  const metaLeft = (r: number) => rows[r]!.slice(0, 2).reduce((n, s) => n + s.text.length, 0); // art + pad
+  assert.equal(metaLeft(0), metaLeft(1), 'meta column left edge is constant');
+  assert.equal(metaLeft(0), 60 - Math.max(...['✦ v1.0.0', 'openai/LUMIX-35B', '~/app', '/help · /model', '⚠ yolo — all permission checks disabled'].map((s) => s.length)), 'meta hugs the right edge');
+});
+
+test('renderBrand: narrow terminal falls back to the compact ✦ form', () => {
+  const art = ['████████████████████████████████████████████████████']; // 52 wide
+  const rows = renderBrand({ version: '1', providerModel: 'p/m', workspace: '/w', help: '/h', art }, T, 20);
+  assert.equal(rows[0]![1]!.text, 'shadow', 'compact form under a narrow width');
+});
+
+test('renderToolResult: glyph carries status, everything else dim, name once, timing appended', () => {
+  const ok = renderToolResult({ name: 'run_shell', arg: 'npm test', ok: true, durationMs: 10200, summary: '630 pass' }, T);
+  assert.equal(ok[0]!.text, '✓ ');
+  assert.equal(ok[0]!.color, T.green);
+  assert.equal(ok[1]!.text, 'run_shell');
+  assert.equal(ok[1]!.color, T.dim, 'name is quiet, not bright');
+  assert.ok(ok.some((s) => s.text === ' npm test'), 'arg printed once');
+  assert.ok(ok.some((s) => s.text === ' — 630 pass'), 'summary');
+  assert.ok(ok.some((s) => s.text === ' (10.2s)'), 'elapsed formatted');
+  assert.ok(ok.every((s) => s.dim !== true), 'no faint attribute');
+
+  const fail = renderToolResult({ name: 'web_fetch', arg: 'example.com', ok: false, durationMs: 400, summary: '404' }, T);
+  assert.equal(fail[0]!.text, '✗ ');
+  assert.equal(fail[0]!.color, T.red);
+  assert.ok(fail.some((s) => s.text === ' (0.4s)'));
+});
+
+test('renderToolResult: sub-100ms calls omit the (0.0s) noise; minutes format as Xm Ys', () => {
+  const fast = renderToolResult({ name: 'read', ok: true, durationMs: 12, summary: '' }, T);
+  assert.ok(!fast.some((s) => /\(.*s\)/.test(s.text)), 'no timing under 100ms');
+  assert.ok(!fast.some((s) => s.text.includes('—')), 'no summary dash when summary empty');
+  const slow = renderToolResult({ name: 'build', ok: true, durationMs: 95_000, summary: 'done' }, T);
+  assert.ok(slow.some((s) => s.text === ' (1m 35s)'), 'minute formatting');
+});
+
+test('renderToolChild: collapsed output/diff — ⌄ glyph, +2 indent, dim, ^O hint', () => {
+  const c = renderToolChild('output', 29, T);
+  assert.equal(c[0]!.text, '  ⌄ output 29 lines · ^O');
+  assert.equal(c[0]!.color, T.dim);
+  assert.equal(renderToolChild('diff', 1, T)[0]!.text, '  ⌄ diff 1 line · ^O', 'singular');
+});
+
+test('renderReasoning: collapsed = one ✻ row with count; expanded = header + gray-italic body', () => {
+  const collapsed = renderReasoning('a\nb\nc', true, T);
+  assert.equal(collapsed.length, 1);
+  assert.equal(collapsed[0]![0]!.text, '✻ ');
+  assert.equal(collapsed[0]![0]!.color, T.cyan);
+  assert.equal(collapsed[0]![1]!.text, 'thought');
+  assert.equal(collapsed[0]![1]!.italic, true);
+  assert.ok(collapsed[0]![2]!.text.includes('3 lines') && collapsed[0]![2]!.color === T.dim);
+  assertNoFaint(collapsed, 'reasoning/collapsed');
+
+  const expanded = renderReasoning('line one\nline two', false, T);
+  assert.equal(expanded[0]![1]!.text, 'thinking');
+  assert.equal(expanded.length, 3, 'header + 2 body lines');
+  assert.equal(expanded[1]![0]!.text, '  line one', '+2 indent');
+  assert.equal(expanded[1]![0]!.color, T.dim);
+  assert.equal(expanded[1]![0]!.italic, true);
+  assertNoFaint(expanded, 'reasoning/expanded');
+});
