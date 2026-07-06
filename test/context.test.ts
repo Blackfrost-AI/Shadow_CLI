@@ -34,7 +34,24 @@ test('maybeSummarize(force) compacts even below the trigger threshold', async ()
   assert.ok(after.length < before, 'history shrank');
   const note = after[1]!;
   assert.equal(note.content[0]!.type, 'text');
-  if (note.content[0]!.type === 'text') assert.match(note.content[0]!.text, /summary of earlier turns/);
+  if (note.content[0]!.type === 'text') {
+    const t = note.content[0]!.text;
+    assert.match(t, /SUMMARY/, 'carries the generated summary');
+    assert.match(t, /compacted to free up context/i, 'framed as a mid-task compaction, not a fresh start');
+    assert.match(t, /Resuming the task now|pick up exactly where I left off/i, 'includes the continuation directive that prevents the greeting');
+    assert.match(t, /will not greet/i, 'explicitly forbids greeting/asking after compaction');
+  }
+});
+
+test('maybeSummarize aborts (keeps history) if the summary comes back empty', async () => {
+  const ctx = new Context({ contextBudget: 1_000_000, triggerRatio: 0.75, keepLastTurns: 1 });
+  ctx.pinTask({ role: 'user', content: [{ type: 'text', text: 'the task' }] });
+  for (let i = 0; i < 4; i++) ctx.append({ role: i % 2 ? 'user' : 'assistant', content: [{ type: 'text', text: `m${i}` }] });
+  const before = ctx.messages().length;
+  // Provider yields no text → empty summary. Must NOT destroy history for nothing.
+  const provider = new MockProvider([[{ type: 'done', stopReason: 'end_turn' }]]);
+  assert.equal(await ctx.maybeSummarize(provider, 'mock', true), false, 'empty summary → no-op');
+  assert.equal(ctx.messages().length, before, 'history intact');
 });
 
 test('maybeSummarize without force is a no-op under the threshold', async () => {

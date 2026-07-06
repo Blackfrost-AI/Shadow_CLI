@@ -123,12 +123,24 @@ export class Context {
     try {
       for await (const ev of provider.send({
         model,
+        // Structured summary — not a terse blob. The agent reads this to RESUME with zero loss, so
+        // it must carry the task, the current work, and the concrete next step (not just "what
+        // happened"). The TASK section is load-bearing: it's what stops the model treating the
+        // compaction as a fresh session and greeting the user.
         system:
-          'You compress agent transcripts. Output a terse summary preserving decisions, ' +
-          'file paths touched, command outcomes, and any unfinished work. No preamble.',
+          'You are compacting an IN-PROGRESS agent session so it can continue with a smaller ' +
+          'context window. Write a structured summary the agent will read to resume its work with ' +
+          'ZERO loss of task or momentum. Use exactly these sections, terse but complete:\n' +
+          '1. TASK — the user\'s original request and current goal, stated so it cannot be misread. ' +
+          'This is the most important line; never drop or soften it.\n' +
+          '2. DECISIONS & FACTS — key findings, constraints, and choices made so far.\n' +
+          '3. FILES & COMMANDS — paths created/edited and notable command outcomes.\n' +
+          '4. CURRENT WORK — precisely what was underway at the moment of this summary.\n' +
+          '5. NEXT STEP — the single concrete next action to take to keep going.\n' +
+          'No preamble, no meta-commentary, no sign-off.',
         messages: [{ role: 'user', content: [{ type: 'text', text: transcript }] }],
         tools: [],
-        maxOutputTokens: 1024,
+        maxOutputTokens: 2048, // room for the structured form; a truncated summary is a lost task
       })) {
         if (ev.type === 'text') summary += ev.delta;
       }
@@ -136,10 +148,24 @@ export class Context {
       // If summarization fails, leave history intact rather than losing it.
       return false;
     }
+    if (!summary.trim()) return false; // empty summary → don't destroy history for nothing
 
+    // The note is framed in the assistant's OWN voice as an explicit mid-task continuation, not a
+    // detached report. This is what prevents the post-compaction "Hey! What can I help you with?"
+    // greeting: the model reads that it is resuming, sees the NEXT STEP, and acts — it does not
+    // restart. (The pinned original task still precedes this note; the kept recent turns follow it.)
     const note: Message = {
       role: 'assistant',
-      content: [{ type: 'text', text: `[summary of earlier turns]\n${summary.trim()}` }],
+      content: [
+        {
+          type: 'text',
+          text:
+            `[Earlier turns were compacted to free up context. This is the state of my in-progress ` +
+            `work so I can continue without losing anything:]\n\n${summary.trim()}\n\n` +
+            `[Resuming the task now from NEXT STEP above. I will not greet, ask what to help with, ` +
+            `or recap — I pick up exactly where I left off and keep working.]`,
+        },
+      ],
     };
     this.msgs = [...this.msgs.slice(0, this.pinnedPrefix), note, ...this.msgs.slice(end)];
     // History just shrank; drop the stale (larger) real count so it doesn't re-trigger
