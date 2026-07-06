@@ -22,12 +22,17 @@ try {
 
 function Say  ($m) { Write-Host 'shadow ' -ForegroundColor Cyan   -NoNewline; Write-Host $m }
 function Warn ($m) { Write-Host 'shadow ' -ForegroundColor Yellow -NoNewline; Write-Host $m }
-function Die  ($m) { Write-Host 'shadow ' -ForegroundColor Red    -NoNewline; Write-Host $m; exit 1 }
+function Die  ($m) {
+  # remove any unverified download before aborting (no exit trap in PowerShell)
+  if ($script:CleanupPaths) { foreach ($p in $script:CleanupPaths) { Remove-Item -Force -Recurse -ErrorAction SilentlyContinue $p } }
+  Write-Host 'shadow ' -ForegroundColor Red -NoNewline; Write-Host $m; exit 1
+}
+$script:CleanupPaths = @()
 
 # ── verify: signature over SHASUMS256.txt, then the binary's SHA-256 ───────────
-# Fails CLOSED on macOS/Linux; on Windows the checksum always runs and the signature
-# runs when the runtime supports it (PowerShell 7+). Set SHADOW_INSECURE_SKIP_VERIFY=1
-# to bypass entirely (don't, except to debug).
+# Fails CLOSED: the signature must verify against the pinned key (needs PowerShell 7.1+),
+# then the binary's SHA-256 must match the signed manifest. Set SHADOW_INSECURE_SKIP_VERIFY=1
+# to bypass entirely (don't, except to debug on a runtime without signature support).
 function Verify-Download($binPath, $assetName, $baseUrl) {
   if ($env:SHADOW_INSECURE_SKIP_VERIFY -eq '1') {
     Warn 'WARNING: SHADOW_INSECURE_SKIP_VERIFY=1 - skipping signature + checksum verification.'
@@ -35,25 +40,35 @@ function Verify-Download($binPath, $assetName, $baseUrl) {
   }
   $vtmp = Join-Path ([IO.Path]::GetTempPath()) ('shadow-verify-' + [IO.Path]::GetRandomFileName())
   New-Item -ItemType Directory -Force -Path $vtmp | Out-Null
+  $script:CleanupPaths += $vtmp   # Die removes it too (finally may not run under `exit`)
   try {
     $sumsPath = Join-Path $vtmp 'SHASUMS256.txt'
     $sigPath  = Join-Path $vtmp 'SHASUMS256.txt.sig'
     try { Invoke-WebRequest -Uri "$baseUrl/SHASUMS256.txt"     -OutFile $sumsPath -UseBasicParsing } catch { Die "cannot fetch SHASUMS256.txt from $baseUrl" }
     try { Invoke-WebRequest -Uri "$baseUrl/SHASUMS256.txt.sig" -OutFile $sigPath  -UseBasicParsing } catch { Die "cannot fetch SHASUMS256.txt.sig - this release is unsigned; refusing to install unverified." }
 
-    # 1) authenticity: SHASUMS256.txt must be signed by Shadow's release key
-    $sigChecked = $false
-    try {
+    # 1) authenticity: SHASUMS256.txt must be signed by Shadow's release key.
+    # ImportFromPem + the DSASignatureFormat overload are .NET 5+, i.e. PowerShell 7.1+.
+    # PowerShell 7.0 (.NET Core 3.1) and Windows PowerShell 5.1 lack them → abort (fail closed).
+    $v = $PSVersionTable.PSVersion
+    $sigCapable = ($v.Major -gt 7) -or ($v.Major -eq 7 -and $v.Minor -ge 1)
+    if ($sigCapable) {
       $sumsBytes = [IO.File]::ReadAllBytes($sumsPath)
       $sigBytes  = [IO.File]::ReadAllBytes($sigPath)
-      $ec = [System.Security.Cryptography.ECDsa]::Create()
-      $ec.ImportFromPem($ShadowPubKey)   # .NET 5+ / PowerShell 7+
-      $ok = $ec.VerifyData($sumsBytes, $sigBytes, [System.Security.Cryptography.HashAlgorithmName]::SHA256, [System.Security.Cryptography.DSASignatureFormat]::Rfc3279DerSequence)
+      $ok = $false
+      try {
+        $ec = [System.Security.Cryptography.ECDsa]::Create()
+        $ec.ImportFromPem($ShadowPubKey)
+        $ok = $ec.VerifyData($sumsBytes, $sigBytes, [System.Security.Cryptography.HashAlgorithmName]::SHA256, [System.Security.Cryptography.DSASignatureFormat]::Rfc3279DerSequence)
+      } catch {
+        # any error here (bad key/sig/DER) on a capable runtime = treat as failure, fail closed
+        Die "signature verification error: $($_.Exception.Message) - aborting (possible tampering)."
+      }
       if (-not $ok) { Die "SIGNATURE VERIFICATION FAILED for SHASUMS256.txt - the download host may be compromised. Aborting." }
-      $sigChecked = $true
-    } catch [System.Management.Automation.RuntimeException] {
-      Warn "signature verification needs PowerShell 7+ (this is Windows PowerShell). Falling back to checksum-only."
-      Warn "for full tamper protection install PowerShell 7 (https://aka.ms/powershell) and re-run."
+    } else {
+      # FAIL CLOSED: checksum-only would verify the binary against an attacker-controlled
+      # manifest (a compromised host rewrites SHASUMS too), which is no protection at all.
+      Die "signature verification requires PowerShell 7.1+ (this is PowerShell $v).`n       install PowerShell 7 (https://aka.ms/powershell) and re-run:`n         irm https://raw.githubusercontent.com/Blackfrost-AI/Shadow_CLI/main/install.ps1 | iex`n       or, ONLY if you accept an unverified download:  `$env:SHADOW_INSECURE_SKIP_VERIFY=1"
     }
 
     # 2) integrity: our binary's hash must match the signed list
@@ -66,7 +81,8 @@ function Verify-Download($binPath, $assetName, $baseUrl) {
     $actual = (Get-FileHash -Algorithm SHA256 -Path $binPath).Hash.ToLower()
     if ($actual -ne $expected) { Die "CHECKSUM MISMATCH for $assetName`n       expected (signed): $expected`n       actual (download): $actual`n       aborting (corrupted or tampered)." }
 
-    if ($sigChecked) { Say 'verified signature + checksum ✓' } else { Say 'verified checksum ✓ (signature not checked - see warning above)' }
+    # only reachable once the signature verified (PS < 7.1 aborts above)
+    Say 'verified signature + checksum ✓'
   } finally {
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $vtmp
   }
@@ -80,8 +96,9 @@ $url   = "$base/$asset"
 # Pinned ECDSA P-256 public key for Shadow's OFFLINE release-signing key. SHASUMS256.txt is
 # signed with the matching private key (never on the server); the installer verifies that
 # signature before trusting any hash, so a compromised host can't ship a tampered binary that
-# passes. Full signature verification needs PowerShell 7+ (.NET 5+); on Windows PowerShell 5.1
-# it falls back to the checksum check with a warning.
+# passes. Signature verification needs PowerShell 7.1+ (.NET 5+); on older PowerShell the install
+# ABORTS (checksum-only against an attacker-controlled manifest is no protection) unless the user
+# explicitly sets SHADOW_INSECURE_SKIP_VERIFY=1.
 $ShadowPubKey = @'
 -----BEGIN PUBLIC KEY-----
 MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE+5WMu9iMUEp0j1eehkH/xGts2NHZ
@@ -100,23 +117,19 @@ catch { Die "cannot create install directory: $dir`n       $($_.Exception.Messag
 # ── download to a temp file first, then move into place ───────────────────────
 Say "downloading $asset ..."
 $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ('shadow-' + [System.IO.Path]::GetRandomFileName() + '.exe')
+$script:CleanupPaths += $tmp   # so any Die removes the unverified download
 try {
   Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing
 } catch {
   Die "download failed: $url`n       - check your network connection`n       - confirm the platform asset exists at that URL`n       $($_.Exception.Message)"
 }
 if (-not (Test-Path $tmp) -or (Get-Item $tmp).Length -eq 0) {
-  Remove-Item -Force $tmp -ErrorAction SilentlyContinue
   Die "downloaded file is empty: $url"
 }
 
-# ── verify BEFORE trusting the binary ─────────────────────────────────────────
-try {
-  Verify-Download $tmp $asset $base
-} catch {
-  Remove-Item -Force $tmp -ErrorAction SilentlyContinue
-  throw
-}
+# ── verify BEFORE trusting the binary (fails closed) ──────────────────────────
+Verify-Download $tmp $asset $base
+$script:CleanupPaths = @($script:CleanupPaths | Where-Object { $_ -ne $tmp })  # verified — keep it
 
 # ── install into place ────────────────────────────────────────────────────────
 # Windows won't OVERWRITE a running exe, but it WILL let you RENAME it. So when
