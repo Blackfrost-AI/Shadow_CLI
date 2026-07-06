@@ -7,6 +7,18 @@ import { existsSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import type { ModelEntry } from './config.js';
 
+/** Actionable install guidance shown whenever llama-server can't be found OR fails to launch.
+ *  Lives here (the lowest-level GGUF module) so both the setup-time check and the runtime spawn
+ *  failure surface the SAME help; re-exported from local/garage.ts for its existing importers. */
+export const LLAMA_INSTALL_HINT =
+  'llama-server (llama.cpp) is required to run local GGUF models, and was not found.\n' +
+  '  Install it:\n' +
+  '    macOS:        brew install llama.cpp\n' +
+  '    Linux:        brew install llama.cpp   (or build from source)\n' +
+  '    from source:  https://github.com/ggml-org/llama.cpp\n' +
+  "  Or point Shadow at an existing binary: set $SHADOW_LLAMA_SERVER, or the model preset's\n" +
+  '  "ggufServer": "/path/to/llama-server" in ~/.shadow/config.json.';
+
 interface Running {
   proc?: ChildProcess; // undefined when we reuse a server we didn't start
   baseUrl: string;
@@ -105,10 +117,7 @@ export async function ensureGgufServer(
   try {
     proc = spawn(bin, args, { stdio: 'ignore', detached: false });
   } catch (e) {
-    throw new Error(
-      `could not launch "${bin}": ${(e as Error).message}. Install llama.cpp (llama-server) ` +
-        `or set the model entry's "ggufServer" / $SHADOW_LLAMA_SERVER to its path.`,
-    );
+    throw new Error(`could not launch "${bin}": ${(e as Error).message}.\n${LLAMA_INSTALL_HINT}`);
   }
   let spawnErr = '';
   proc.on('error', (e) => {
@@ -121,9 +130,7 @@ export async function ensureGgufServer(
   while (Date.now() < deadline) {
     if (spawnErr) {
       servers.delete(baseUrl);
-      throw new Error(
-        `"${bin}" failed to start: ${spawnErr}. Install llama.cpp or set "ggufServer".`,
-      );
+      throw new Error(`"${bin}" failed to start: ${spawnErr}.\n${LLAMA_INSTALL_HINT}`);
     }
     if (proc.exitCode !== null) {
       servers.delete(baseUrl);

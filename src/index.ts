@@ -400,6 +400,55 @@ function findLlamaServer(): string | undefined {
   }
 }
 
+/** Is Homebrew available (the one-command install path for llama.cpp on macOS/Linux)? */
+function hasBrew(): boolean {
+  try {
+    execFileSync('sh', ['-c', 'command -v brew'], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Ensure llama-server is available, OFFERING to `brew install llama.cpp` when it's missing and we're
+ * on an interactive TTY with Homebrew. Returns the resolved binary path, or undefined (after printing
+ * the manual install hint). Used by `local add`/`test` and the session pre-flight so a user setting up
+ * a local GGUF gets a one-keypress fix instead of a dead end.
+ */
+async function ensureLlamaServer(stdout: NodeJS.WriteStream): Promise<string | undefined> {
+  const found = findLlamaServer();
+  if (found) return found;
+  const interactive = !!process.stdin.isTTY && !!process.stdout.isTTY;
+  if (interactive && hasBrew()) {
+    const rl = createInterface({ input: process.stdin, output: stdout });
+    let ans = '';
+    try {
+      ans = (await rl.question(lc.yellow('llama-server (llama.cpp) is not installed. Install it now with `brew install llama.cpp`? [y/N] '))).trim().toLowerCase();
+    } finally {
+      rl.close();
+    }
+    if (ans === 'y' || ans === 'yes') {
+      stdout.write(lc.gray('  running: brew install llama.cpp …') + '\n');
+      try {
+        execFileSync('brew', ['install', 'llama.cpp'], { stdio: 'inherit' });
+      } catch {
+        stdout.write(lc.red('  brew install failed.\n') + LLAMA_INSTALL_HINT + '\n');
+        return undefined;
+      }
+      const now = findLlamaServer();
+      if (now) {
+        stdout.write(lc.green(`  ✓ llama.cpp installed → ${now}`) + '\n');
+        return now;
+      }
+      stdout.write(lc.yellow('  installed, but llama-server is still not on your PATH.\n') + LLAMA_INSTALL_HINT + '\n');
+      return undefined;
+    }
+  }
+  stdout.write(lc.yellow('  ⚠ ' + LLAMA_INSTALL_HINT.split('\n').join('\n    ')) + '\n');
+  return undefined;
+}
+
 function localUsage(): string {
   return [
     'usage: shadow local <command>',
@@ -453,8 +502,8 @@ async function runLocal(args: string[]): Promise<void> {
     stdout.write(`    ctx:        ${e.ctx}\n`);
     stdout.write(`    gpu-layers: ${e.gpuLayers}\n`);
     if (!findLlamaServer()) {
-      stdout.write(lc.yellow('  ⚠ ' + LLAMA_INSTALL_HINT.split('\n').join('\n    ')) + '\n');
-      stdout.write(lc.gray('    Preset saved — `local test`/`use` need llama-server.') + '\n');
+      stdout.write(lc.gray('    Preset saved. To run it, llama.cpp (llama-server) is needed:') + '\n');
+      await ensureLlamaServer(stdout); // offers `brew install llama.cpp` on an interactive TTY
     }
     stdout.write(lc.gray(`  Next: shadow local test ${e.label}`) + '\n');
     return;
@@ -498,8 +547,7 @@ async function runLocal(args: string[]): Promise<void> {
       process.exitCode = 1;
       return;
     }
-    if (!entry.ggufServer && !findLlamaServer()) {
-      process.stderr.write(lc.red('✗ ' + LLAMA_INSTALL_HINT) + '\n');
+    if (!entry.ggufServer && !(await ensureLlamaServer(stdout))) {
       process.exitCode = 1;
       return;
     }
@@ -563,6 +611,7 @@ async function runDoctorModel(name: string | undefined, cwd: string): Promise<vo
   const authToken = entry?.authToken ?? resolveAuthToken(provider);
 
   if (entry?.gguf) {
+    if (!entry.ggufServer) await ensureLlamaServer(stdout); // offer `brew install llama.cpp` before we try to spawn it
     try {
       const r = await ensureGgufServer(entry, (m) => stdout.write(lc.gray(`  ${m}`) + '\n'));
       startProvider = 'openai';

@@ -19,13 +19,9 @@ export const DEFAULT_LOCAL_CTX = 32768;
 /** GPU offload layers (-ngl) applied when `--gpu-layers` is omitted (999 = all; llama clamps). */
 export const DEFAULT_LOCAL_GPU_LAYERS = 999;
 
-/** Friendly install hint shown when the llama-server binary can't be found. */
-export const LLAMA_INSTALL_HINT =
-  "llama-server (llama.cpp) was not found on your PATH.\n" +
-  '  Install it to test/run local models:\n' +
-  '    macOS:  brew install llama.cpp\n' +
-  '    source: https://github.com/ggml-org/llama.cpp (build llama-server)\n' +
-  "  Or point shadow at the binary: set $SHADOW_LLAMA_SERVER or the preset's ggufServer.";
+/** The llama-server install hint now lives in gguf.ts (single source of truth for setup-time AND
+ *  runtime-failure messaging); re-exported here for existing importers. */
+export { LLAMA_INSTALL_HINT } from '../gguf.js';
 
 /** Sanitize a raw string into a safe, readable preset label (alnum . _ -). */
 export function sanitizeLocalName(raw: string): string {

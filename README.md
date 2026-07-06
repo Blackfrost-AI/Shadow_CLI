@@ -311,17 +311,19 @@ ANTHROPIC_BASE_URL=http://your-host:11434 ANTHROPIC_AUTH_TOKEN=ollama ANTHROPIC_
 
 This has been verified end to end (multi-step `read_file`→`write_file` tool calling, plus larger multi-file builds) against a self-hosted Ollama model. Note: smaller "thinking" models emit verbose reasoning that Shadow discards — give them generous `maxOutputTokens` so the budget isn't consumed before the tool call. OpenAI-compatible endpoints (e.g. Ollama's `/v1`) work the same way via `--provider openai --base-url http://your-host:11434/v1`.
 
-### Local `.gguf` files — auto-served (ollama-style)
+### Local `.gguf` files — auto-served
 
-Point a model entry at a local `.gguf` and Shadow launches a `llama.cpp` server for it on activation (and shuts it down on exit), then talks to it over the OpenAI endpoint — no separate `llama-server` / Ollama process to manage:
+> **Requires [llama.cpp](https://github.com/ggml-org/llama.cpp)** — Shadow *launches and manages* the server for you, but the `llama-server` binary must be installed. Install it with `brew install llama.cpp` (macOS/Linux) or build from source, or point Shadow at an existing binary via `ggufServer` / `$SHADOW_LLAMA_SERVER`. When it's missing, `shadow local add`/`test` offers to install it for you.
+
+Point a model entry at a local `.gguf` and Shadow starts a `llama.cpp` server for it on activation (and shuts it down on exit), then talks to it over the OpenAI endpoint — no Ollama/LM Studio process to run:
 
 ```jsonc
 "models": [
   {
-    "label": "red-apex (local)",
+    "label": "my-model (local)",
     "provider": "openai",          // ignored for gguf entries; routed to the local server
-    "model": "red-apex",
-    "gguf": "/opt/models/red-apex-Q8_0.gguf",
+    "model": "my-model",
+    "gguf": "/opt/models/my-model-Q8_0.gguf",
     // optional:
     "ggufPort": 8123,              // default: a deterministic per-path port
     "ggufArgs": ["-ngl", "999", "-c", "32768", "--jinja"],  // default shown
@@ -330,7 +332,7 @@ Point a model entry at a local `.gguf` and Shadow launches a `llama.cpp` server 
 ]
 ```
 
-Pick it from `/model` (or set it as the default) and Shadow serves it locally — first load shows a "loading the model into memory" note. Requires `llama-server` (llama.cpp) on `PATH` or via `ggufServer` / `$SHADOW_LLAMA_SERVER`. An already-running server on the same port is reused. The context budget is capped under the server's `-c` automatically.
+Pick it from `/model` (or set it as the default) and Shadow serves it locally — first load shows a "loading the model into memory" note. An already-running server on the same port is reused. The context budget is capped under the server's `-c` automatically.
 
 ## Model compatibility — tested models
 
