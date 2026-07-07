@@ -307,7 +307,9 @@ export function shrinkMaxTokens(body: unknown): boolean {
   if (!body || typeof body !== 'object') return false;
   const b = body as Record<string, unknown>;
   let changed = false;
-  for (const field of ['max_tokens', 'max_completion_tokens']) {
+  for (const field of ['max_tokens', 'max_completion_tokens', 'max_output_tokens']) {
+    // 'max_output_tokens' is the Responses API (/v1/responses) field — without it the token-overflow
+    // 400 → shrink-and-retry self-correction was a no-op on that wire and the run died on turn 1.
     const v = b[field];
     if (typeof v === 'number' && v > 4096) {
       b[field] = Math.max(4096, Math.floor(v / 2));
@@ -336,21 +338,25 @@ export function looksLikeVisionUnsupported(msg: string): boolean {
  */
 export function stripImagesFromBody(body: unknown): boolean {
   if (!body || typeof body !== 'object') return false;
-  const msgs = (body as Record<string, unknown>).messages;
-  if (!Array.isArray(msgs)) return false;
+  const b = body as Record<string, unknown>;
+  // Chat-completions carries messages under `messages`; the Responses API (/v1/responses) carries them
+  // under `input`. Without the `input` fallback the vision-unsupported 400 → strip-and-retry never fired
+  // on that wire and every subsequent turn re-sent the image and 400'd, wedging the run.
+  const msgs = Array.isArray(b.messages) ? b.messages : Array.isArray(b.input) ? b.input : null;
+  if (!msgs) return false;
+  const isImg = (t?: string): boolean => t === 'image_url' || t === 'image' || t === 'input_image';
+  const isTxt = (t?: string): boolean => t === 'text' || t === 'input_text';
   let stripped = false;
   for (const m of msgs) {
     const msg = m as { content?: unknown };
     if (!Array.isArray(msg.content)) continue;
-    const hasImage = msg.content.some(
-      (p) => p && ((p as { type?: string }).type === 'image_url' || (p as { type?: string }).type === 'image'),
-    );
+    const hasImage = msg.content.some((p) => p && isImg((p as { type?: string }).type));
     if (!hasImage) continue;
     // Keep the text parts, drop the images, and collapse to a plain STRING — a text-only endpoint
     // accepts that where it 400s on a typed image part. A short note tells the model an image was
     // there but it can't see it, so it doesn't keep waiting on visual input it will never get.
     const texts = (msg.content as { type?: string; text?: string }[])
-      .filter((p) => p && p.type === 'text' && typeof p.text === 'string')
+      .filter((p) => p && isTxt(p.type) && typeof p.text === 'string')
       .map((p) => p.text as string);
     texts.push('[image omitted — the current model has no vision support]');
     msg.content = texts.join('\n');

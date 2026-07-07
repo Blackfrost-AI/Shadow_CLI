@@ -217,8 +217,9 @@ const CONFIG_FILE = 'shadow.config.json';
  *
  * Critically, it also cannot run arbitrary shell at startup before any LLM call:
  * `hooks` (e.g. session_start → spawnSync shell:true), `mcpServers` (`.command` →
- * spawn), and `statusLine` (shell command on TUI mount) are all zero-interaction
- * drive-by-RCE vectors, so they are stripped too.
+ * spawn), `statusLine` (shell command on TUI mount), and a model preset's
+ * `gguf`/`ggufServer`/`ggufArgs` (ensureGgufServer → spawn) are all zero-interaction
+ * drive-by-RCE vectors, so they are stripped too (preset fields below).
  * These come only from ~/.shadow (global), env, or CLI flags.
  */
 const PROJECT_UNTRUSTED_KEYS = ['baseUrl', 'shellEnvAllowlist', 'autonomy', 'denylistExtra', 'systemPromptPath', 'sandbox', 'sandboxNetwork', 'additionalDirectories', 'hooks', 'statusLine'];
@@ -260,23 +261,32 @@ export function loadConfig(cwd: string, cliOverrides: Record<string, unknown> = 
     delete fromFile.mcpServers;
   }
 
-  // Project-declared model presets are untrusted for the fields that can redirect your API key: a preset
-  // `baseUrl`/`apiKey` could point your provider + key at an attacker host (bypassing the top-level
-  // `baseUrl` strip above). Drop those two fields from every project-file preset; the benign
-  // label/model/group survive so a repo can still SUGGEST a model without hijacking your credentials.
+  // Project-declared model presets are UNTRUSTED for every field that can (a) redirect your key/traffic
+  // or (b) run arbitrary shell at STARTUP. `baseUrl`/`apiKey`/`authToken` could point your provider +
+  // credential at an attacker host (bypassing the top-level `baseUrl` strip above). Critically, a
+  // `gguf`/`ggufServer`/`ggufArgs`/`ggufPort` preset is `spawn()`'d by ensureGgufServer BEFORE any LLM
+  // call — so a merely-cloned repo with a crafted preset would get ZERO-INTERACTION RCE. Drop all of
+  // these from every project-file preset; only the benign label/model/group survive, so a repo can still
+  // SUGGEST a model without hijacking your credentials or executing code.
+  const PRESET_UNTRUSTED_FIELDS = ['baseUrl', 'apiKey', 'authToken', 'gguf', 'ggufServer', 'ggufArgs', 'ggufPort'];
   if (Array.isArray(fromFile.models)) {
     let redacted = 0;
     for (const m of fromFile.models as Array<Record<string, unknown>>) {
-      if (m && typeof m === 'object' && ('baseUrl' in m || 'apiKey' in m)) {
-        delete m.baseUrl;
-        delete m.apiKey;
-        redacted++;
+      if (m && typeof m === 'object') {
+        let hit = false;
+        for (const k of PRESET_UNTRUSTED_FIELDS) {
+          if (k in m) {
+            delete m[k];
+            hit = true;
+          }
+        }
+        if (hit) redacted++;
       }
     }
     if (redacted > 0) {
       process.stderr.write(
-        `shadow: stripped baseUrl/apiKey from ${redacted} untrusted ${CONFIG_FILE} model preset(s) — ` +
-          `a project file cannot redirect your key.\n`,
+        `shadow: stripped credential/exec fields (${PRESET_UNTRUSTED_FIELDS.join('/')}) from ${redacted} untrusted ${CONFIG_FILE} model preset(s) — ` +
+          `a project file cannot redirect your key or run shell.\n`,
       );
     }
   }
@@ -305,7 +315,24 @@ export function loadConfig(cwd: string, cliOverrides: Record<string, unknown> = 
       .join('\n');
     throw new Error(`invalid configuration:\n${msg}`);
   }
-  return result.data;
+  const cfg = result.data;
+  // Safety backstop: `maxIterations: 0` ("unlimited") is only safe while SOME budget cap exists. If the
+  // user opted into 0 with no token/cost/wall-clock limit, a model looping on slightly-varying tool args
+  // (dodging the consecutive-identical loop guard) would run forever on paid requests. Inject a wall-clock
+  // ceiling so "unlimited iterations" can never silently mean "no backstop at all".
+  if (
+    cfg.maxIterations === 0 &&
+    cfg.budget.maxTotalTokens == null &&
+    cfg.budget.maxCostUSD == null &&
+    cfg.budget.maxWallClockSec == null
+  ) {
+    cfg.budget.maxWallClockSec = 6 * 60 * 60; // 6h default ceiling
+    process.stderr.write(
+      'shadow: maxIterations:0 with no budget backstop — applied a 6h wall-clock ceiling ' +
+        '(set budget.maxWallClockSec / maxCostUSD / maxTotalTokens to override).\n',
+    );
+  }
+  return cfg;
 }
 
 /**

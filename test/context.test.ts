@@ -33,13 +33,16 @@ test('maybeSummarize(force) compacts even below the trigger threshold', async ()
   const after = ctx.messages();
   assert.ok(after.length < before, 'history shrank');
   const note = after[1]!;
+  // The note is a USER turn (not assistant) so it never coalesces into the kept assistant turn and
+  // break Anthropic thinking-first ordering / strict-local role alternation.
+  assert.equal(note.role, 'user', 'continuation note is a user turn, not assistant');
   assert.equal(note.content[0]!.type, 'text');
   if (note.content[0]!.type === 'text') {
     const t = note.content[0]!.text;
     assert.match(t, /SUMMARY/, 'carries the generated summary');
     assert.match(t, /compacted to free up context/i, 'framed as a mid-task compaction, not a fresh start');
-    assert.match(t, /Resuming the task now|pick up exactly where I left off/i, 'includes the continuation directive that prevents the greeting');
-    assert.match(t, /will not greet/i, 'explicitly forbids greeting/asking after compaction');
+    assert.match(t, /NEXT STEP|pick up exactly where you left off/i, 'includes the continuation directive that prevents the greeting');
+    assert.match(t, /do NOT greet|not greet/i, 'explicitly forbids greeting/asking after compaction');
   }
 });
 

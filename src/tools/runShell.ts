@@ -271,21 +271,53 @@ export function makeRunShell(
         let timedOut = false;
         let aborted = false;
         let settled = false;
+        let timer: ReturnType<typeof setTimeout>;
+        let graceTimer: ReturnType<typeof setTimeout> | undefined;
+        const GRACE_MS = 3000;
 
-        const timer = setTimeout(() => {
+        // If killTree can't actually stop the child (an unkillable root/sudo process — the EPERM is
+        // swallowed by killTree), the 'close' event never fires and this Promise would never settle,
+        // hanging the WHOLE agent turn on ESC/timeout. After a kill, arm a grace timer that force-resolves
+        // with the aborted/timeout result so control always returns to the user.
+        const graceResolve = (): void => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (graceTimer) clearTimeout(graceTimer);
+          ctx.signal.removeEventListener('abort', onAbort);
+          const data: RunShellData = {
+            command: input.command,
+            stdout: clamp(stdout, STDOUT_CLAMP),
+            stderr: clamp(stderr, STDERR_CLAMP),
+            exitCode: null,
+            signal: 'SIGKILL',
+            timedOut,
+            aborted,
+            sandboxed: sandbox.sandboxed,
+          };
+          const msg = timedOut
+            ? sbWarn + `command timed out after ${timeoutMs}ms and could not be killed — it may still be running.`
+            : sbWarn + 'command was aborted but could not be killed — it may still be running.';
+          resolve(result(start, false, timedOut ? 'timeout' : 'aborted', msg, data));
+        };
+
+        timer = setTimeout(() => {
           timedOut = true;
           killTree(child, 'SIGKILL');
+          graceTimer = setTimeout(graceResolve, GRACE_MS);
         }, timeoutMs);
 
         const onAbort = (): void => {
           aborted = true;
           killTree(child, 'SIGKILL');
+          graceTimer = setTimeout(graceResolve, GRACE_MS);
         };
         if (ctx.signal.aborted) onAbort();
         else ctx.signal.addEventListener('abort', onAbort, { once: true });
 
         const cleanup = (): void => {
           clearTimeout(timer);
+          if (graceTimer) clearTimeout(graceTimer);
           ctx.signal.removeEventListener('abort', onAbort);
         };
 

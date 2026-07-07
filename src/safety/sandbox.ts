@@ -52,7 +52,12 @@ function seatbeltProfile(allowNetwork: boolean, extraWrite: string[]): string {
     '  (subpath "/private/var/folders")',
     '  (literal "/dev/null") (literal "/dev/zero") (literal "/dev/urandom")',
     '  (literal "/dev/stdout") (literal "/dev/stderr") (literal "/dev/tty") (literal "/dev/dtracehelper"))',
-    '(deny file-read* (subpath (param "SD")))', // protect the credentials store
+    // Protect the credential store even when ~/.shadow sits INSIDE the workspace (the common `shadow`
+    // run-from-$HOME case): these denies come AFTER the workspace file-write* allow, and in seatbelt the
+    // LAST matching rule wins — so writes/reads to ~/.shadow are blocked regardless of WS containment.
+    // Without the write deny, a sandboxed run_shell could overwrite config.json with an attacker baseUrl+key.
+    '(deny file-write* (subpath (param "SD")))',
+    '(deny file-read* (subpath (param "SD")))',
     allowNetwork ? '' : '(deny network*)',
   ]
     .filter(Boolean)

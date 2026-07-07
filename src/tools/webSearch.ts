@@ -77,7 +77,7 @@ export const webSearch: Tool<WebSearchInput, WebSearchData> = {
           res = await undiciFetch(target.href, {
             method: 'GET',
             redirect: 'manual',
-            signal: ctx.signal,
+            signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(30_000)]),
             dispatcher: agent,
             headers: { 'user-agent': 'Mozilla/5.0 (compatible; Shadow/0.1)' },
           });
@@ -87,7 +87,7 @@ export const webSearch: Tool<WebSearchInput, WebSearchData> = {
         const location = res.status >= 300 && res.status < 400 ? res.headers.get('location') : null;
         if (!location) break;
         if (hop >= 3) return fail('web_search', 'network', Date.now() - start, 'too_many_redirects', 'exceeded 3 redirects');
-        await res.arrayBuffer().catch(() => undefined);
+        await res.body?.cancel().catch(() => undefined); // discard redirect body without buffering (was arrayBuffer → OOM risk)
         let next: string;
         try {
           next = new URL(location, currentUrl).href;

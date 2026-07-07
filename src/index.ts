@@ -26,6 +26,7 @@ import {
 import { defaultModelPatch, findModelPreset } from './config/modelPresets.js';
 import type { Message } from './provider/provider.js';
 import { ToolRegistry } from './tools/registry.js';
+import { BgRegistry } from './tools/bgShell.js';
 import {
   makeAgentTool,
   makeAskUserQuestionTool,
@@ -906,7 +907,11 @@ async function main(): Promise<void> {
   });
 
   const registry = new ToolRegistry();
+  // Own the background-shell registry so we can kill orphaned children on shutdown (killAll had no
+  // call site — quitting left dev servers holding their ports across sessions).
+  const bg = new BgRegistry();
   registerBuiltinTools(registry, {
+    bg,
     shellEnvAllowlist: cfg.shellEnvAllowlist,
     shellTimeoutMs: cfg.shellTimeoutMs,
     sandbox: cfg.sandbox,
@@ -1027,12 +1032,41 @@ async function main(): Promise<void> {
 
   // Offline mode: skip MCP servers entirely — they are outbound connectors (another egress
   // vector), so an offline session keeps nothing but the local model.
+  let mcpClients: Array<{ stop(): void }> = [];
   if (offline) {
     const mcpCount = Object.keys(cfg.mcpServers ?? {}).length;
     if (mcpCount > 0) stdout.write(lc.gray(`Offline: skipping ${mcpCount} MCP server(s).`) + '\n');
   } else {
-    await registerMcpServers(registry, cfg.mcpServers, workspaceRoot);
+    mcpClients = await registerMcpServers(registry, cfg.mcpServers, workspaceRoot);
   }
+
+  // Shutdown cleanup: kill orphaned background shells + stdio MCP children + gguf servers on exit.
+  // killAll() and client.stop() previously had no call sites, so every session leaked stray processes
+  // holding ports/FDs across launches. All calls are synchronous (safe in an 'exit' handler). Registered
+  // once and idempotent, so multiple exit paths (natural return, SIGINT-abort, SIGTERM) all clean up.
+  let cleanedUp = false;
+  const shutdownCleanup = (): void => {
+    if (cleanedUp) return;
+    cleanedUp = true;
+    try {
+      bg.killAll();
+    } catch {
+      /* best effort */
+    }
+    for (const c of mcpClients) {
+      try {
+        c.stop();
+      } catch {
+        /* best effort */
+      }
+    }
+    stopGgufServers();
+  };
+  process.on('exit', shutdownCleanup);
+  process.on('SIGTERM', () => {
+    shutdownCleanup();
+    process.exit(143);
+  });
 
   // Expose send_notification path for 'notification' hook phase (Claude parity)
   const zNotif = (await import('zod')).z;

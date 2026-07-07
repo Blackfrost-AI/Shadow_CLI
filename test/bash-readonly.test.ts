@@ -46,3 +46,14 @@ test('isBashReadOnly never auto-allows a command substitution / subshell', () =>
   // ...but plain parameter expansion does not execute, so it stays read-only.
   assert.equal(isBashReadOnly('echo ${HOME}'), true);
 });
+test('isBashReadOnly: fd-numbered file redirects are NOT read-only (security — no silent auto-write)', () => {
+  // The old `[^0-9&]>` guard exempted any digit-before-`>`, so `1> f` slipped through and auto-wrote.
+  assert.equal(isBashReadOnly('grep foo file 1> important.txt'), false, '1> writes a file — must gate');
+  assert.equal(isBashReadOnly('grep foo file 2> out.txt'), false, '2> writes a file — must gate');
+  assert.equal(isBashReadOnly('grep foo file 3> z'), false, '3> writes a file — must gate');
+  assert.equal(isBashReadOnly('cat data > f'), false, 'plain > writes');
+  assert.equal(isBashReadOnly('cat data >> f'), false, 'append writes');
+  // fd DUPLICATION (2>&1) also gates conservatively (the `&` splits the chain) — safe: it never
+  // auto-runs a write, it just asks. The security invariant is only that FILE redirects never slip through.
+  assert.equal(isBashReadOnly('grep foo file 2>&1'), false, 'conservatively gates (safe over convenient)');
+});

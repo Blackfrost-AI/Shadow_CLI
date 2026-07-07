@@ -75,8 +75,17 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
       const systemPrefix = def?.systemPrompt ? `${def.systemPrompt}\n\n` : '';
       subContext.pinTask({ role: 'user', content: [{ type: 'text', text: input.prompt }] });
 
-      const maxIter = def?.maxIterations ?? Math.min(deps.maxIterations, 15);
-      const budget = new Budget({ maxIterations: maxIter }, def?.model ?? base.model, deps.priceTable, Date.now());
+      // A sub-agent MUST always keep at least one working backstop. `Math.min(deps.maxIterations, 15)`
+      // yields 0 when the parent set maxIterations:0 ("unlimited"), which disabled EVERY Budget guard and
+      // let a stuck sub-agent burn unbounded API cost. Clamp iterations to ≥1 AND always attach a
+      // wall-clock ceiling so a runaway sub-agent can never run forever regardless of the iteration count.
+      const maxIter = Math.max(1, def?.maxIterations || Math.min(deps.maxIterations || 15, 15));
+      const budget = new Budget(
+        { maxIterations: maxIter, maxWallClockSec: 30 * 60 },
+        def?.model ?? base.model,
+        deps.priceTable,
+        Date.now(),
+      );
 
       let registry = base.registry;
       if (def?.tools?.length) {

@@ -165,7 +165,9 @@ export const webFetch: Tool<WebFetchInput, WebFetchData> = {
           res = await undiciFetch(target.href, {
             method: 'GET',
             redirect: 'manual', // we follow + re-validate (and re-pin) each hop ourselves
-            signal: ctx.signal,
+            // ESC (ctx.signal) OR a 30s per-request deadline — a host that trickles bytes must not hold
+            // a fetch open for undici's ~5min default with no per-tool timeout.
+            signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(30_000)]),
             dispatcher: agent,
             headers: {
               'user-agent': 'Shadow/0.1 (+local coding agent)',
@@ -182,7 +184,7 @@ export const webFetch: Tool<WebFetchInput, WebFetchData> = {
         if (hop >= MAX_REDIRECTS) {
           return fail('web_fetch', 'network', Date.now() - start, 'too_many_redirects', `exceeded ${MAX_REDIRECTS} redirects`);
         }
-        await res.arrayBuffer().catch(() => undefined); // drain to free the socket
+        await res.body?.cancel().catch(() => undefined); // discard the redirect body WITHOUT buffering it (arrayBuffer() drained the whole — possibly huge — body into memory each hop → OOM)
 
         let next: string;
         try {

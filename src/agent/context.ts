@@ -150,20 +150,23 @@ export class Context {
     }
     if (!summary.trim()) return false; // empty summary → don't destroy history for nothing
 
-    // The note is framed in the assistant's OWN voice as an explicit mid-task continuation, not a
-    // detached report. This is what prevents the post-compaction "Hey! What can I help you with?"
-    // greeting: the model reads that it is resuming, sees the NEXT STEP, and acts — it does not
-    // restart. (The pinned original task still precedes this note; the kept recent turns follow it.)
+    // The note is a USER turn (a system-style directive), NOT an assistant turn. An assistant note
+    // spliced directly before the kept region — which begins on an assistant turn carrying leading
+    // SIGNED thinking + tool_use — coalesces with it on Anthropic, pushing the thinking block off the
+    // front → 400 "thinking blocks must be first"; it also emitted two back-to-back assistant messages
+    // that strict local (GLM/Lumix) chat templates reject. As a user turn it alternates cleanly with the
+    // kept assistant turn across every adapter. The directive still prevents the post-compaction
+    // "Hey! What can I help you with?" greeting: it tells the model to resume from NEXT STEP.
     const note: Message = {
-      role: 'assistant',
+      role: 'user',
       content: [
         {
           type: 'text',
           text:
-            `[Earlier turns were compacted to free up context. This is the state of my in-progress ` +
-            `work so I can continue without losing anything:]\n\n${summary.trim()}\n\n` +
-            `[Resuming the task now from NEXT STEP above. I will not greet, ask what to help with, ` +
-            `or recap — I pick up exactly where I left off and keep working.]`,
+            `[System note: earlier turns in this session were compacted to free up context. Below is the ` +
+            `preserved state of the in-progress work. Continue the task directly from NEXT STEP — do NOT ` +
+            `greet, ask what to help with, or recap; pick up exactly where you left off and keep working.]` +
+            `\n\n${summary.trim()}`,
         },
       ],
     };

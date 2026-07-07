@@ -99,24 +99,50 @@ function collectEntries(obj: unknown): Array<{ name: string; args: unknown }> {
  */
 function collectXmlFunctions(text: string): Array<{ name: string; args: Record<string, string>; raw: string }> {
   const out: Array<{ name: string; args: Record<string, string>; raw: string }> = [];
-  const fnRe = /<function(?:=|\s+name\s*=\s*["'])\s*([A-Za-z_]\w*)\s*["']?\s*>([\s\S]*?)(?:<\/function\s*>|(?=<function[=\s])|$)/gi;
-  let fm: RegExpExecArray | null;
-  while ((fm = fnRe.exec(text)) !== null) {
-    if (!fm[0]) {
-      fnRe.lastIndex++; // never spin on a zero-width match
+  // Split by the OPENING tags at BOTH levels (function, then parameter) rather than lazily matching to the
+  // FIRST inner close tag. A value that legitimately contains tag-like text — e.g. a write_file whose
+  // content documents `<function=…>`/`</function>`/`</parameter>` syntax — was silently TRUNCATED by the
+  // old `([\s\S]*?)` regexes (data loss / file corruption). We take each region up to the LAST close tag
+  // in it (so a value's own `</function>`/`</parameter>` in the MIDDLE survives while trailing prose after
+  // the real close is still excluded). Only a literal OPENING tag (`<function=`/`<parameter=`) inside a
+  // value can still mis-split — far rarer. Dropped close tags stay tolerated (weak models drop them).
+  const fnOpenRe = /<function(?:=|\s+name\s*=\s*["'])\s*([A-Za-z_]\w*)\s*["']?\s*>/gi;
+  const fnOpens: Array<{ name: string; tagStart: number; bodyStart: number }> = [];
+  let fo: RegExpExecArray | null;
+  while ((fo = fnOpenRe.exec(text)) !== null) {
+    if (!fo[0]) {
+      fnOpenRe.lastIndex++;
       continue;
     }
+    fnOpens.push({ name: fo[1]!, tagStart: fo.index, bodyStart: fo.index + fo[0].length });
+  }
+  for (let f = 0; f < fnOpens.length; f++) {
+    const regionEnd = f + 1 < fnOpens.length ? fnOpens[f + 1]!.tagStart : text.length;
+    const region = text.slice(fnOpens[f]!.bodyStart, regionEnd);
+    // Greedy up to the LAST </function> (backtracks past inner ones), so a value containing </function>
+    // is preserved; if none, keep the whole region (a dropped close tag).
+    const closeM = region.match(/[\s\S]*<\/function\s*>/i);
+    const body = closeM ? closeM[0]!.replace(/<\/function\s*>\s*$/i, '') : region;
+    const rawEnd = closeM ? fnOpens[f]!.bodyStart + closeM[0]!.length : regionEnd;
+    const raw = text.slice(fnOpens[f]!.tagStart, rawEnd);
+
     const args: Record<string, string> = {};
-    const pRe = /<parameter(?:=|\s+name\s*=\s*["'])\s*([A-Za-z_]\w*)\s*["']?\s*>([\s\S]*?)(?:<\/parameter\s*>|(?=<parameter[=\s])|(?=<\/function\s*>)|$)/gi;
-    let pm: RegExpExecArray | null;
-    while ((pm = pRe.exec(fm[2]!)) !== null) {
-      if (!pm[0]) {
-        pRe.lastIndex++;
+    const openRe = /<parameter(?:=|\s+name\s*=\s*["'])\s*([A-Za-z_]\w*)\s*["']?\s*>/gi;
+    const opens: Array<{ key: string; tagStart: number; valStart: number }> = [];
+    let om: RegExpExecArray | null;
+    while ((om = openRe.exec(body)) !== null) {
+      if (!om[0]) {
+        openRe.lastIndex++;
         continue;
       }
-      args[pm[1]!] = pm[2]!.trim();
+      opens.push({ key: om[1]!, tagStart: om.index, valStart: om.index + om[0].length });
     }
-    out.push({ name: fm[1]!, args, raw: fm[0]! });
+    for (let i = 0; i < opens.length; i++) {
+      const stop = i + 1 < opens.length ? opens[i + 1]!.tagStart : body.length;
+      const val = body.slice(opens[i]!.valStart, stop).replace(/\s*<\/parameter\s*>\s*$/i, '');
+      args[opens[i]!.key] = val.trim();
+    }
+    out.push({ name: fnOpens[f]!.name, args, raw });
   }
   return out;
 }
@@ -222,10 +248,17 @@ export function sniffToolCalls(text: string, isKnownTool: (name: string) => bool
   }
   for (const r of toRemove) cleaned = cleaned.replace(r, '');
 
-  // 3) JSON envelopes containing tool_calls / writables / a bare {name,args}.
+  // 3) JSON envelopes. Recover ONLY when the object is an explicit tool_calls/writables ENVELOPE, or
+  //    when the model's WHOLE message IS that JSON object (a deliberate call) — NOT a bare {name,input}
+  //    object embedded in explanatory prose. Answering "how do I write a file?" with an illustrative
+  //    JSON blob must never actually run write_file against the user's filesystem.
+  const trimmedCleaned = cleaned.trim();
   for (const { raw } of balancedObjects(cleaned)) {
     const obj = parseLoose(raw);
-    if (!obj) continue;
+    if (!obj || typeof obj !== 'object') continue;
+    const isEnvelope = Array.isArray((obj as Entry).tool_calls) || Array.isArray((obj as Entry).writables);
+    const isWholeMessage = raw.trim() === trimmedCleaned;
+    if (!isEnvelope && !isWholeMessage) continue;
     const entries = collectEntries(obj);
     if (!entries.length) continue;
     let any = false;

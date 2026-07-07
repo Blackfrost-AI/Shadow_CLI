@@ -133,3 +133,21 @@ test('XML form: no false positive on an unknown tool name', () => {
     0,
   );
 });
+
+test('XML value containing </function> / </parameter> is preserved, not truncated (data-loss fix)', () => {
+  const content = 'doc line\n</function> and </parameter> shown literally here\nlast line';
+  const r = sniffToolCalls(
+    `<function=write_file><parameter=path>a.txt</parameter><parameter=content>${content}</parameter></function>`,
+    known,
+  );
+  assert.equal(r.calls.length, 1, 'the call is recovered');
+  assert.equal((r.calls[0]!.input as { content?: string }).content, content, 'the full value survives inner tag-like text');
+});
+
+test('a JSON tool-call printed as a prose EXAMPLE is not executed (over-recovery fix)', () => {
+  const r = sniffToolCalls(
+    'To write a file, you emit: {"name":"write_file","input":{"path":"demo.txt","content":"hello"}} — that would run write_file.',
+    known,
+  );
+  assert.equal(r.calls.length, 0, 'a bare {name,input} embedded in explanatory prose must NOT run the tool');
+});

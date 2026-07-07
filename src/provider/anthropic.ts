@@ -454,6 +454,18 @@ export async function* parseAnthropicSSE(lines: AsyncIterable<string>): AsyncIte
           yield { type: 'redacted_thinking_block', data: b.data };
         } else if (b && b.type === 'tool_use') {
           b.done = true;
+          if (!b.name) {
+            // A stream that omitted content_block_start gives us input_json_delta with no name/id — there
+            // is nothing to reconstruct the call from. Surface a recoverable error (the loop retries)
+            // instead of emitting an empty-named tool_call (→ confusing "unknown tool: ") or dropping it.
+            yield {
+              type: 'error',
+              recoverable: true,
+              code: 'nameless_tool_call',
+              message: 'tool call streamed without a name (endpoint omitted content_block_start) — resend the call',
+            };
+            break;
+          }
           const parsed = parseToolArgs(b.json); // repair ladder before giving up
           if (parsed.ok) {
             yield { type: 'tool_call', call: { id: b.id, name: b.name, input: parsed.value } };

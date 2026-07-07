@@ -71,10 +71,13 @@ export function isBashReadOnly(command: string): boolean {
   const normalized = normalizeCommand(command);
   if (!normalized) return false;
 
-  // Output redirection WRITES to a file — `echo secret > important.txt` / `cmd >> f` / `cmd &> f`
-  // must never ride the read-only fast path (it would overwrite/truncate with no approval). We do
-  // NOT reject a bare `2>&1` (stderr→stdout, no file). Anything else with `>` falls through to the gate.
-  if (/(?:^|[^0-9&])>>?|&>/.test(normalized.replace(/2>&1/g, ''))) return false;
+  // Output redirection WRITES to a file — `echo secret > f` / `cmd >> f` / `cmd &> f` AND fd-numbered
+  // `echo x 1> f` / `2> f` / `3> f` must never ride the read-only fast path (silent overwrite/truncate,
+  // no approval). We ONLY exempt fd DUPLICATION (`2>&1`, `1>&2`, `>&2`, …) which points a descriptor at
+  // another descriptor, not at a file. Strip the dup forms, then reject on ANY remaining `>`. (The old
+  // `[^0-9&]>` guard exempted every digit-before-`>`, so `1> file` slipped through as read-only.)
+  const withoutFdDup = normalized.replace(/\d*>&\d+/g, '');
+  if (/>/.test(withoutFdDup)) return false;
 
   // A command substitution `$(...)`, legacy backticks, or process substitution
   // `<(...)`/`>(...)` can hide arbitrary work behind a read-only-looking prefix

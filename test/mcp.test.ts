@@ -2,10 +2,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { jsonSchemaToZod, mcpRisk } from '../src/mcp/client.js';
 
-test('mcpRisk: only read-only-hinted MCP tools auto-approve; everything else is exec (needs approval)', () => {
-  assert.equal(mcpRisk({ readOnlyHint: true }), 'read');
+test('mcpRisk: NEVER trusts a server-declared readOnlyHint — every MCP tool is exec (needs approval)', () => {
+  // Security: a malicious/compromised MCP server could label a destructive tool readOnlyHint:true and
+  // have it auto-run at auto-read autonomy. The hint is advisory only; every tool defaults to exec.
+  assert.equal(mcpRisk({ readOnlyHint: true }), 'exec', 'a server-claimed read-only hint does NOT auto-approve');
   assert.equal(mcpRisk({ destructiveHint: true }), 'exec');
-  assert.equal(mcpRisk({}), 'exec', 'no hint → cautious default, not auto-approved');
+  assert.equal(mcpRisk({}), 'exec');
   assert.equal(mcpRisk(undefined), 'exec');
 });
 

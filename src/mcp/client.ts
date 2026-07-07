@@ -38,7 +38,7 @@ interface McpToolInfo {
 
 interface JsonRpcRequest {
   jsonrpc: '2.0';
-  id: number;
+  id?: number; // omitted for NOTIFICATIONS (a notification is a request with no id per JSON-RPC 2.0)
   method: string;
   params?: unknown;
 }
@@ -114,12 +114,19 @@ export class McpClient implements McpConnection {
     const start = Date.now();
     try {
       const res = (await this.request('tools/call', { name, arguments: args })) as {
-        content?: Array<{ type: string; text?: string }>;
+        content?: Array<{ type: string; text?: string; resource?: { uri?: string; text?: string } }>;
         isError?: boolean;
       };
-      const text = (res.content ?? []).map((c) => c.text ?? '').join('\n');
-      if (res.isError) return fail(`mcp_${this.name}_${name}`, risk, Date.now() - start, 'mcp_error', text || 'MCP tool error');
-      return ok(`mcp_${this.name}_${name}`, risk, Date.now() - start, text || 'ok', { content: text });
+      const parts = res.content ?? [];
+      const text = parts.map((c) => c.text ?? c.resource?.text ?? '').filter(Boolean).join('\n');
+      // Non-text MCP content (image/audio/resource) has no `.text`. Surface its PRESENCE instead of
+      // reporting an empty 'ok' — otherwise the model acts as if the tool returned nothing (a lost
+      // screenshot / fetched resource). Include a resource uri when the server gives one.
+      const nonText = parts.filter((c) => c.type !== 'text' && !c.resource?.text);
+      const noteTail = nonText.map((c) => `[${c.type}${c.resource?.uri ? ` ${c.resource.uri}` : ''}]`).join(' ');
+      const body = [text, noteTail].filter(Boolean).join('\n');
+      if (res.isError) return fail(`mcp_${this.name}_${name}`, risk, Date.now() - start, 'mcp_error', body || 'MCP tool error');
+      return ok(`mcp_${this.name}_${name}`, risk, Date.now() - start, body || (parts.length ? 'tool returned non-text content' : 'ok'), { content: body });
     } catch (e) {
       return fail(`mcp_${this.name}_${name}`, risk, Date.now() - start, 'mcp_failed', (e as Error).message);
     }
@@ -132,6 +139,20 @@ export class McpClient implements McpConnection {
 
   private onData(chunk: string): void {
     this.buf += chunk;
+    // A broken/malicious server that writes megabytes with no newline would grow `buf` unbounded → OOM.
+    // Cap it: on overflow, fail every pending request with a framing error and kill the child rather
+    // than accumulating forever.
+    if (this.buf.length > 16 * 1024 * 1024) {
+      this.buf = '';
+      for (const [, p] of this.pending) p.reject(new Error(`MCP server "${this.name}" framing error: response exceeded 16MB with no newline`));
+      this.pending.clear();
+      try {
+        this.child?.kill();
+      } catch {
+        /* already gone */
+      }
+      return;
+    }
     let nl: number;
     while ((nl = this.buf.indexOf('\n')) >= 0) {
       const line = this.buf.slice(0, nl).trim();
@@ -151,7 +172,9 @@ export class McpClient implements McpConnection {
   }
 
   private notify(method: string, params: unknown): Promise<void> {
-    this.send({ jsonrpc: '2.0', id: this.nextId++, method, params });
+    // A JSON-RPC NOTIFICATION must NOT carry an `id` (an id-bearing message is a request; a strict
+    // server may reply to or error on it, breaking the handshake). Omit id and do not burn a counter.
+    this.send({ jsonrpc: '2.0', method, params });
     return Promise.resolve();
   }
 
@@ -372,12 +395,14 @@ export async function registerMcpServers(
 }
 
 /**
- * Permission tier for an MCP tool. Auto-approvable (`read`) ONLY when the server
- * explicitly marks it read-only; otherwise `exec` — needs approval until `full`,
- * because we can't know what an arbitrary MCP tool does.
+ * Permission tier for an MCP tool. Always `exec` — needs approval until `full`.
+ * We deliberately DO NOT trust a server's self-declared `readOnlyHint` to auto-approve: a malicious or
+ * compromised MCP server could label a destructive tool (`delete_files`) `readOnlyHint:true` and have it
+ * run with no prompt at `auto-read` autonomy. The hint is advisory only; the operator confirms (or sets
+ * `full`). (A future per-server operator allowlist could re-enable the fast path for trusted servers.)
  */
-export function mcpRisk(annotations?: McpToolAnnotations): ToolRisk {
-  return annotations?.readOnlyHint === true ? 'read' : 'exec';
+export function mcpRisk(_annotations?: McpToolAnnotations): ToolRisk {
+  return 'exec';
 }
 
 interface JsonSchemaNode {

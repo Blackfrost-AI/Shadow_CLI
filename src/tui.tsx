@@ -4489,33 +4489,53 @@ const A = {
 };
 
 /** A lightweight renderer for the headless path that writes directly to stdout. */
+/** Strip terminal control sequences (ESC / CSI / OSC / BEL / C1) from UNTRUSTED content before the
+ *  headless renderer writes it RAW to stdout. Model output, tool output, and fetched web / file content
+ *  can smuggle OSC 52 (clipboard write), window-retitle, forged clickable hyperlinks, or cursor moves
+ *  that hide output. Keeps \t \n \r; drops everything else dangerous. The renderer's own A.* color
+ *  constants are trusted and applied AFTER this, so they still render. (The interactive Ink TUI is
+ *  already safe — Ink escapes — so only this raw path needed it.) */
+function stripCtl(s: string): string {
+  return (
+    s
+      // OSC … terminated by BEL or ST
+      .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/g, '')
+      // Fe / single-char escapes
+      .replace(/\x1b[@-Z\\-_]/g, '')
+      // CSI sequences
+      .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
+      // stray C0 controls (keep \t \n \r) + C1 CSI/OSC introducers
+      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x9b\x9d]/g, '')
+  );
+}
+
 export function attachRenderer(bus: EventBus, _opts?: { animate: boolean }): () => void {
   return bus.on((e) => {
     switch (e.type) {
       case 'text':
-        if (e.delta) process.stdout.write(e.delta);
+        if (e.delta) process.stdout.write(stripCtl(e.delta));
         break;
       case 'tool_start':
-        process.stdout.write(`\n${A.dim}↳ ${e.call.name} ${previewOf(e.call.input)}${A.reset}\n`);
+        process.stdout.write(`\n${A.dim}↳ ${e.call.name} ${stripCtl(previewOf(e.call.input))}${A.reset}\n`);
         break;
       case 'tool_end': {
         const mark = e.result.ok ? `${A.green}ok${A.reset}` : `${A.red}err${A.reset}`;
-        process.stdout.write(`  ${mark} ${oneLine(e.result.summary)}\n`);
+        process.stdout.write(`  ${mark} ${stripCtl(oneLine(e.result.summary))}\n`);
         break;
       }
       case 'tool_denied':
-        process.stdout.write(`  ${A.yellow}blocked${A.reset} ${friendlyDeniedReason(e.reason)}\n`);
+        process.stdout.write(`  ${A.yellow}blocked${A.reset} ${stripCtl(friendlyDeniedReason(e.reason))}\n`);
         break;
       case 'reasoning_done':
-        process.stdout.write(`\n${A.dim}▸ Reasoning${A.reset}\n${A.dim}${e.text}${A.reset}\n`);
+        process.stdout.write(`\n${A.dim}▸ Reasoning${A.reset}\n${A.dim}${stripCtl(e.text)}${A.reset}\n`);
         break;
       case 'finding': {
         const color = e.severity === 'error' ? A.red : e.severity === 'warn' ? A.yellow : A.cyan;
-        process.stdout.write(`\n${color}▣ ${e.title}${A.reset}\n${e.body}\n`);
+        process.stdout.write(`\n${color}▣ ${stripCtl(e.title)}${A.reset}\n${stripCtl(e.body)}\n`);
         break;
       }
       case 'shell_output':
-        process.stdout.write(e.chunk);
+        process.stdout.write(stripCtl(e.chunk));
         break;
       case 'shell_pid':
         if (e.warn) process.stderr.write(`  ${A.yellow}⚠ shell pid ${e.pid}: ${e.warn} — kill manually if needed${A.reset}\n`);

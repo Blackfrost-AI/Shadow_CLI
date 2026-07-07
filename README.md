@@ -6,7 +6,7 @@
 
 > **A true gift of freedom and privacy.**
 > Zero-telemetry · provider-neutral · phone home to no one.
-> The **v1.0** launch — your models, your hardware, your rules.
+> Your models, your hardware, your rules.
 
 **Shadow is a zero-telemetry, provider-neutral coding agent that runs on your terms.** Point it at any model — Anthropic, any OpenAI-compatible endpoint, Gemini, or a local model on your own box — and it works as a coding / sysadmin agent over your workspace. **No Shadow account, no signup, no phone-home:** the only outbound traffic is the provider *you* chose and the web tools the agent explicitly invokes. Your config stays local and readable (`~/.shadow/config.json`), your keys never leave your machine, and you can switch models mid-session **without losing context**.
 
@@ -29,7 +29,7 @@ This is **not a chat app** — it is a tool-calling runtime.
 | M6 | Claude Code harness parity: plan/ask/export, approval taxonomy, fallback, permission rules, hooks, MCP/skills/agent | ✅ |
 | M7 | **Format-adaptive universality** — dual transport + auto-detect, text-tool-call recovery, control-token scrub, three tool-call signature regimes (Anthropic signed / Gemini `thought_signature` / plain OpenAI); validated against a 9-model test program | 🚧 |
 
-Per-version detail lives in **[CHANGELOG.md](CHANGELOG.md)**. Working toward **v1.0**.
+Per-version detail lives in **[CHANGELOG.md](CHANGELOG.md)**.
 
 ## Install
 
@@ -132,8 +132,8 @@ npm run build && node dist/index.js --help   # or link `shadow` via package.json
 --model <id>         model id (default claude-opus-4-8)
 --base-url <url>     override provider base URL (also ANTHROPIC_BASE_URL / OPENAI_BASE_URL)
 --max-output-tokens <n>  per-call output cap (raise for verbose "thinking" models)
---max-iterations <n>     loop iteration cap (default 25; raise for big multi-file tasks)
---context-budget <n>     token budget before summarization (default 100000)
+--max-iterations <n>     loop iteration cap (default 200; raise for big multi-file tasks)
+--context-budget <n>     token budget before summarization (default 128000)
 --max-wall-sec <n>       wall-clock ceiling in seconds (safety stop for long autonomous runs)
 --workspace <path>   workspace root (default cwd) — all file paths resolve under this
 --style <name>       proactive | explanatory | learning | procedural
@@ -296,7 +296,7 @@ shadow --task "<big task>" --autonomy full \
   --max-iterations 40 --max-output-tokens 24000 --context-budget 200000 --max-wall-sec 1800
 ```
 
-`--max-iterations` raises the turn cap (default 25 suits small tasks; a multi-file build with a test→fix loop wants more); `--context-budget` is how many tokens accumulate before summarization kicks in (a self-hosted model with a 256K window rarely needs to summarize at all); `--max-wall-sec` is a wall-clock safety stop so a long autonomous run still terminates. The termination guarantee is preserved at every setting — you can always raise the ceilings, but there is always *a* ceiling (and Ctrl-C).
+`--max-iterations` raises the turn cap (default 200 suits most tasks; a multi-file build with a test→fix loop wants more); `--context-budget` is how many tokens accumulate before summarization kicks in (a self-hosted model with a 256K window rarely needs to summarize at all); `--max-wall-sec` is a wall-clock safety stop so a long autonomous run still terminates. The termination guarantee is preserved at every setting — you can always raise the ceilings, but there is always *a* ceiling (and Ctrl-C).
 
 API keys are read from the environment only: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`.
 

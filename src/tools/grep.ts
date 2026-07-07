@@ -80,6 +80,13 @@ export const grep: Tool<GrepInput, GrepData> = {
     } catch (e) {
       return fail('grep', 'read', Date.now() - start, 'invalid_regex', `invalid regular expression: ${(e as Error).message}`);
     }
+    // Reject the classic ReDoS shape — a quantified group whose body is itself unbounded-quantified
+    // (e.g. `(a+)+`, `(.*)*`, `(\d+){2,}`). Backed by catastrophic backtracking, one `re.exec` can pin
+    // the event loop for minutes with NO way to interrupt (the nodeGrep fallback is synchronous). ripgrep
+    // (RE2-class) is immune, but this is the LIVE path whenever no real `rg` binary exists.
+    if (/\([^()]*[*+][^()]*\)[*+{]/.test(input.pattern)) {
+      return fail('grep', 'read', Date.now() - start, 'invalid_regex', 'pattern rejected: nested unbounded quantifier (ReDoS risk) — rewrite without `(x+)+`/`(x*)*`-style constructs.');
+    }
 
     let targetStat;
     try {
@@ -100,7 +107,7 @@ export const grep: Tool<GrepInput, GrepData> = {
     }
 
     const globRe = input.glob ? globToRegExp(input.glob) : null;
-    const res = nodeGrep(re, root, globRe, maxResults);
+    const res = nodeGrep(re, root, globRe, maxResults, ctx.signal);
     return finish(res, 'node', start);
   },
 };
@@ -149,7 +156,16 @@ function ripgrep(
     const child = spawn('rg', args, { cwd: root, signal, windowsHide: true });
     let out = '';
     let errored = false;
+    const OUT_CAP = 16 * 1024 * 1024; // bound the JSON buffer so a huge tree can't balloon memory
     child.stdout.on('data', (d) => {
+      if (out.length > OUT_CAP) {
+        try {
+          child.kill();
+        } catch {
+          /* already gone */
+        }
+        return;
+      }
       out += d.toString();
     });
     child.on('error', () => {
@@ -227,14 +243,17 @@ function nodeGrep(
   root: string,
   globRe: RegExp | null,
   maxResults: number,
+  signal: AbortSignal,
 ): { matches: GrepMatch[]; truncated: boolean } {
   const matches: GrepMatch[] = [];
   let truncated = false;
   let scanned = 0;
   const MAX_SCAN = 100_000; // bound the walk so a huge tree can't hang the fallback
+  const t0 = Date.now();
+  const TIME_LIMIT_MS = 15_000; // wall-clock ceiling so ESC returns control and the scan can't run away
 
   const walk = (dir: string): void => {
-    if (matches.length >= maxResults || scanned >= MAX_SCAN) {
+    if (matches.length >= maxResults || scanned >= MAX_SCAN || signal.aborted || Date.now() - t0 > TIME_LIMIT_MS) {
       truncated = true;
       return;
     }
@@ -276,6 +295,10 @@ function nodeGrep(
       if (looksBinary(buf)) continue;
       const lines = buf.toString('utf8').split('\n');
       for (let i = 0; i < lines.length; i++) {
+        if ((i & 1023) === 0 && (signal.aborted || Date.now() - t0 > TIME_LIMIT_MS)) {
+          truncated = true;
+          return;
+        }
         const line = lines[i]!;
         const hit = re.exec(line);
         if (hit) {
