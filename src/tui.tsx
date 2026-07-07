@@ -4015,9 +4015,14 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // Pinned zone: the full multi-row PinnedState block only renders IDLE on a comfortably tall terminal
   // (it's ~5 rows of chrome + items); running, or idle on a short/split-pane terminal, it collapses to
   // the single-row summary so it can't push the live frame past Ink's wipe threshold.
-  const idlePinned = !running && !!(showPlan || showTodo || goal);
-  const showFullPinned = idlePinned && terminalSize.rows >= 16;
-  const wantPinnedLine = hudPinnedLine !== '' && !menuOpen && (running || (idlePinned && !showFullPinned));
+  // A GOAL alone must NOT spawn the multi-row PinnedState block: that block (a full-width rule +
+  // marginTop sitting above <Static>) ghosts/DUPLICATES when it re-renders, and a standing goal is a
+  // one-line indicator, not an accordion. Only a plan or todo list — which genuinely needs several
+  // rows — drives the full block. The goal always rides the stable single-row summary line in the
+  // bottom info zone (hudPinnedLine already carries `🎯 <goal>`), so setting a goal never glitches.
+  const idleFullBlock = !running && !!(showPlan || showTodo);
+  const showFullPinned = idleFullBlock && terminalSize.rows >= 16;
+  const wantPinnedLine = hudPinnedLine !== '' && !menuOpen && (running || !showFullPinned);
   const hudFit = fitHud(terminalSize.rows, {
     liveWant: menuOpen || !hasLive ? 0 : liveWant,
     pinned: wantPinnedLine,
