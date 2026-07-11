@@ -11,6 +11,7 @@
  * telemetry path (a source guard, test/no-telemetry.test.ts, keeps it that way).
  */
 import { isLocalBaseUrl } from '../safety/offline.js';
+import { mlxOfflineReady } from '../gguf.js';
 import { vaultExists } from '../auth/vault.js';
 import { legacyCredentialsExist } from '../state/globalStore.js';
 import { available as keychainAvailable } from '../auth/keychain.js';
@@ -53,7 +54,7 @@ export interface PrivacyConfigView {
   baseUrl?: string;
   updateCheck?: boolean;
   mcpServers?: Record<string, { url?: string; command?: string; args?: string[] }>;
-  models?: Array<{ label?: string; baseUrl?: string; gguf?: string }>;
+  models?: Array<{ label?: string; baseUrl?: string; gguf?: string; mlx?: string }>;
 }
 
 export interface PrivacyEnv {
@@ -168,7 +169,9 @@ export function buildPrivacyReport(cfg: PrivacyConfigView, env: PrivacyEnv): Pri
   if (env.credStore === 'plaintext') warnings.push('API keys are stored in plaintext (~/.shadow/credentials.json). Encrypt them with `shadow onboard --web`.');
 
   // Offline eligibility.
-  const hasLocalPreset = (cfg.models ?? []).some((m) => m.gguf || isLocalBaseUrl(m.baseUrl));
+  // An mlx REPO-ID preset counts only once its weights are cached — an eligibility claim that
+  // would trigger a HuggingFace download on first serve would falsify this report.
+  const hasLocalPreset = (cfg.models ?? []).some((m) => m.gguf || (m.mlx && mlxOfflineReady(m.mlx)) || isLocalBaseUrl(m.baseUrl));
   const offlineEligible = providerIsLocal
     ? { eligible: true, reason: 'the active model is a local endpoint — offline mode fully usable' }
     : hasLocalPreset

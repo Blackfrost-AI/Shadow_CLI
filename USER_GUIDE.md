@@ -53,6 +53,11 @@ To add a preset without the wizard:
 /model add "My Local 80B" openai my-local-model http://127.0.0.1:8807/v1
 ```
 
+**Local models (no key, no cloud):** `shadow local add <path-to.gguf>` on any platform, or on Apple
+Silicon an MLX folder / `mlx-community/<model>` repo id (one-time HuggingFace download, then fully
+local). Then `shadow local test <name>` and `shadow local use <name>` — Shadow launches and manages
+the server itself.
+
 ---
 
 ## Secure your keys (encrypted vault)

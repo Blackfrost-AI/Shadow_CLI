@@ -105,6 +105,9 @@ const ModelEntrySchema = z.object({
   // Local .gguf auto-serve (ollama-style): when set, shadow launches a llama.cpp server
   // for this file on activation and talks to it over the OpenAI endpoint (see src/gguf.ts).
   gguf: z.string().optional(),
+  // Local MLX auto-serve (Apple Silicon): a model DIRECTORY or an mlx-community/... repo id;
+  // shadow launches `mlx_lm.server` for it on activation (see src/gguf.ts ensureMlxServer).
+  mlx: z.string().optional(),
   ggufPort: z.number().optional(), // fixed port (default: deterministic per path)
   ggufArgs: z.array(z.string()).optional(), // extra llama-server args (overrides ctx/gpuLayers below when set)
   ggufServer: z.string().optional(), // llama-server binary path (default: PATH or $SHADOW_LLAMA_SERVER)
@@ -276,7 +279,7 @@ export function loadConfig(cwd: string, cliOverrides: Record<string, unknown> = 
   // call — so a merely-cloned repo with a crafted preset would get ZERO-INTERACTION RCE. Drop all of
   // these from every project-file preset; only the benign label/model/group survive, so a repo can still
   // SUGGEST a model without hijacking your credentials or executing code.
-  const PRESET_UNTRUSTED_FIELDS = ['baseUrl', 'apiKey', 'authToken', 'gguf', 'ggufServer', 'ggufArgs', 'ggufPort'];
+  const PRESET_UNTRUSTED_FIELDS = ['baseUrl', 'apiKey', 'authToken', 'gguf', 'ggufServer', 'ggufArgs', 'ggufPort', 'mlx'];
   if (Array.isArray(fromFile.models)) {
     let redacted = 0;
     for (const m of fromFile.models as Array<Record<string, unknown>>) {

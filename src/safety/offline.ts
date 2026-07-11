@@ -55,8 +55,11 @@ export function isLocalBaseUrl(baseUrl: string | undefined | null): boolean {
  * A model target is local when it auto-serves a local `.gguf` (llama.cpp) OR its
  * baseUrl host is local (Ollama / LM Studio / any LAN OpenAI-compatible server).
  */
-export function isLocalModelTarget(target: { gguf?: string; baseUrl?: string }): boolean {
+export function isLocalModelTarget(target: { gguf?: string; mlx?: string; baseUrl?: string }): boolean {
   if (target.gguf) return true;
+  // MLX auto-serve is loopback too. (A repo-id's one-time HF download is documented — after
+  // that first fetch the weights are cached and serving is fully local.)
+  if (target.mlx) return true;
   return isLocalBaseUrl(target.baseUrl);
 }
 
@@ -74,6 +77,7 @@ export interface OfflineDecision {
 export function evaluateOffline(active: {
   label?: string;
   gguf?: string;
+  mlx?: string;
   baseUrl?: string;
 }): OfflineDecision {
   if (isLocalModelTarget(active)) return { ok: true };

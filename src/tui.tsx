@@ -45,7 +45,7 @@ import {
   saveGlobalMcpServers,
   type McpServers,
 } from './mcp/manage.js';
-import { ensureGgufServer } from './gguf.js';
+import { ensureLocalServer, isLocalServedEntry, mlxOfflineReady } from './gguf.js';
 import { runModelCheck } from './doctor/modelCheck.js';
 import {
   resolveApiKey,
@@ -350,7 +350,7 @@ const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/goal', desc: 'Set a standing goal the model works toward (/goal clear to remove)' },
   { name: '/model', desc: 'Switch, list, add, remove, enable, disable, or test (capability check) model presets' },
   { name: '/provider', desc: 'Show active provider, endpoint, auth status, and model presets' },
-  { name: '/local', desc: 'Add / test / switch a local .gguf model' },
+  { name: '/local', desc: 'Add / test / switch a local model (.gguf or MLX)' },
   { name: '/onboard', desc: 'Show provider setup guidance' },
   { name: '/style', desc: 'Cycle output style' },
   { name: '/output-style', desc: 'Cycle output style (alias for /style)', dispatch: '/style' },
@@ -1967,13 +1967,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
                 }
                 label = entry.label;
                 model = entry.model;
-                isLocal = Boolean(entry.gguf);
+                isLocal = isLocalServedEntry(entry);
                 let p = entry.provider;
                 let baseUrl = resolveBaseUrl(entry.provider, entry.baseUrl);
                 let apiKey = entry.apiKey ?? resolveApiKey(entry.provider, { model: entry.model });
-                if (entry.gguf) {
+                if (isLocalServedEntry(entry)) {
                   try {
-                    const r = await ensureGgufServer(entry, (m) => pushLine({ text: m, dimColor: true }));
+                    const r = await ensureLocalServer(entry, (m) => pushLine({ text: m, dimColor: true }));
                     p = 'openai';
                     baseUrl = r.baseUrl;
                     apiKey = entry.apiKey ?? 'sk-local';
@@ -2078,7 +2078,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
               text: 'local',
               lines: [
                 { text: `Added local model: ${e.label}`, color: C.cyan },
-                { text: `  ${e.gguf}  ·  ctx ${e.ctx}  ·  gpu-layers ${e.gpuLayers}`, dimColor: true },
+                { text: e.mlx ? `  ${e.mlx}  ·  mlx` : `  ${e.gguf}  ·  ctx ${e.ctx}  ·  gpu-layers ${e.gpuLayers}`, dimColor: true },
                 { text: `  Switch to it now: /local use ${e.label}`, dimColor: true },
               ],
             });
@@ -2111,7 +2111,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             break;
           }
           pushLine({
-            text: 'Usage: /local [list | add <path-to.gguf> [--name <n>] [--ctx <n>] [--gpu-layers <n>] | use <name> | remove <name>]',
+            text: 'Usage: /local [list | add <path-to.gguf | mlx-folder | mlx-community/model> [--name <n>] [--ctx <n>] [--gpu-layers <n>] | use <name> | remove <name>]',
             dimColor: true,
           });
           break;
@@ -2997,7 +2997,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       let apiKey = entry.apiKey ?? resolveApiKey(entry.provider);
       // Offline Shadow Mode: a mid-session /model switch must not silently break the no-egress
       // contract — refuse anything that isn't a local target (gguf or loopback/LAN base URL).
-      if (opts.offline && !isLocalModelTarget({ gguf: entry.gguf, baseUrl })) {
+      const mlxReadyOffline = entry.mlx ? mlxOfflineReady(entry.mlx) : false;
+      if (opts.offline && !isLocalModelTarget({ gguf: entry.gguf, mlx: mlxReadyOffline ? entry.mlx : undefined, baseUrl })) {
         pushLine({
           text: `Offline mode: "${entry.label}" is a cloud endpoint — switch refused. Local models only (see /local list, then /local use <name>).`,
           color: C.yellow,
@@ -3005,9 +3006,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         return;
       }
       // Local .gguf model: ensure a llama.cpp server is up and route to it (ollama-style).
-      if (entry.gguf) {
+      if (isLocalServedEntry(entry)) {
         try {
-          const r = await ensureGgufServer(entry, (m) => pushLine({ text: m, dimColor: true }));
+          const r = await ensureLocalServer(entry, (m) => pushLine({ text: m, dimColor: true }), { offline: opts.offline });
           provider = 'openai';
           baseUrl = r.baseUrl;
           apiKey = entry.apiKey ?? 'sk-local';
@@ -3021,7 +3022,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       // at ~109k — long past the server window — and die on a 400. Switching back to a cloud model
       // restores the session's original budget. (Mirrors the startup clamp in index.ts.)
       if (baseBudgetRef.current == null) baseBudgetRef.current = opts.cfg.contextBudget;
-      const nextBudget = entry.gguf
+      const nextBudget = entry.gguf || entry.mlx
         ? Math.min(baseBudgetRef.current, 30_000, Math.max(2_048, (entry.ctx ?? 32_768) - 2_048))
         : baseBudgetRef.current;
       if (nextBudget !== opts.cfg.contextBudget) {

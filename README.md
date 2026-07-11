@@ -29,7 +29,7 @@ This is **not a chat app** — it is a tool-calling runtime.
 | M6 | Anthropic-compatible harness parity: plan/ask/export, approval taxonomy, fallback, permission rules, hooks, MCP/skills/agent | ✅ |
 | M7 | **Format-adaptive universality** — dual transport + auto-detect, text-tool-call recovery, control-token scrub, three tool-call signature regimes (Anthropic signed / Gemini `thought_signature` / plain OpenAI); validated against a 9-model test program | 🚧 |
 
-Per-version detail lives in **[CHANGELOG.md](CHANGELOG.md)**.
+Per-version detail ships with each release.
 
 ## Install
 
@@ -74,7 +74,7 @@ shadow
 On first run it opens with the **mode chooser** — the real first question:
 
 ```
-1. Local file    — a .gguf on this machine (auto-served via llama.cpp)
+1. Local file    — a .gguf or MLX model on this machine (auto-served)
 2. Local server  — Ollama / LM Studio / llama.cpp already running
 3. Cloud         — Anthropic, OpenAI, Z.ai (GLM), OpenRouter, …
 ```
@@ -322,7 +322,16 @@ ANTHROPIC_BASE_URL=http://your-host:11434 ANTHROPIC_AUTH_TOKEN=ollama ANTHROPIC_
 
 This has been verified end to end (multi-step `read_file`→`write_file` tool calling, plus larger multi-file builds) against a self-hosted Ollama model. Note: smaller "thinking" models emit verbose reasoning that Shadow discards — give them generous `maxOutputTokens` so the budget isn't consumed before the tool call. OpenAI-compatible endpoints (e.g. Ollama's `/v1`) work the same way via `--provider openai --base-url http://your-host:11434/v1`.
 
-### Local `.gguf` files — auto-served
+### Local models — auto-served: `.gguf` and MLX
+
+> **MLX on Apple Silicon:** `shadow local add` also takes an MLX model *folder* or an `mlx-community/<model>` repo id — a repo id downloads from HuggingFace once, then serves fully local via `mlx_lm.server` (`uv tool install mlx-lm`):
+>
+> ```bash
+> shadow local add mlx-community/Qwen2.5-0.5B-Instruct-4bit   # repo id (one-time download)
+> shadow local add ~/models/My-MLX-Model                       # or a local MLX folder
+> shadow local test <name> && shadow local use <name>
+> ```
+
 
 > **Requires [llama.cpp](https://github.com/ggml-org/llama.cpp)** — Shadow *launches and manages* the server for you, but the `llama-server` binary must be installed. Install it with `brew install llama.cpp` (macOS/Linux) or build from source, or point Shadow at an existing binary via `ggufServer` / `$SHADOW_LLAMA_SERVER`. When it's missing, `shadow local add`/`test` offers to install it for you.
 

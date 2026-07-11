@@ -4,13 +4,14 @@
 // the `shadow local` CLI subcommand and the `/local` TUI command. Keep it pure where it
 // can be (name derivation, arg parsing, building/adding/removing presets) so the same
 // code drives both surfaces and is unit-testable without spawning llama-server.
-import { existsSync } from 'node:fs';
+import { existsSync, statSync } from 'node:fs';
 import { resolve, basename, join } from 'node:path';
 import { homedir } from 'node:os';
 import type { ModelEntry } from '../config.js';
 import { addModelPreset, removeModelPreset, type PresetResult } from '../config/modelPresets.js';
-import { ensureGgufServer } from '../gguf.js';
+import { ensureLocalServer } from '../gguf.js';
 import { createProvider } from '../provider/index.js';
+import { scrubControlTokens } from '../util/scrub.js';
 import type { Message } from '../provider/provider.js';
 
 /** Context window (-c) applied when `--ctx` is omitted. Must stay >= the gguf compaction
@@ -105,11 +106,57 @@ export function buildLocalEntry(opts: LocalAddOptions): PresetResult<ModelEntry>
       ok: false,
       message: 'Usage: local add <path-to.gguf> [--name <name>] [--ctx <n>] [--gpu-layers <n>]',
     };
-  if (!/\.gguf$/i.test(raw)) return { ok: false, message: `Not a .gguf file: ${raw}` };
   // Expand a leading ~ — the interactive onboarding prompt is the first surface where the raw
   // string reaches us without a shell to expand it, and "~/models/x.gguf" is how humans type it.
   const expanded = raw === '~' || raw.startsWith('~/') ? join(homedir(), raw.slice(1)) : raw;
-  const abs = resolve(expanded);
+
+  // MLX targets (Apple Silicon): a model FOLDER (config.json + safetensors) or a HuggingFace
+  // repo id like mlx-community/Qwen2.5-0.5B-Instruct-4bit. Detected before the .gguf rule so
+  // `local add` is one verb for both backends.
+  const absMaybe = resolve(expanded);
+  const looksMlxDir = existsSync(absMaybe) && statSync(absMaybe).isDirectory();
+  const looksRepoId = !existsSync(absMaybe) && /^[\w.-]+\/[\w.-]+$/.test(raw) && !/\.gguf$/i.test(raw);
+  if (looksMlxDir || looksRepoId) {
+    if (process.platform !== 'darwin' || process.arch !== 'arm64') {
+      return { ok: false, message: 'MLX models run on Apple Silicon Macs only — use a .gguf file here instead.' };
+    }
+    if (looksMlxDir && !existsSync(join(absMaybe, 'config.json'))) {
+      return {
+        ok: false,
+        message: `Not an MLX model folder (no config.json inside): ${absMaybe}\n  Expected a folder like one from mlx-community (config.json + *.safetensors), or a .gguf file.`,
+      };
+    }
+    if (opts.gpuLayers !== undefined) {
+      return { ok: false, message: '--gpu-layers is a llama.cpp (.gguf) option — mlx_lm.server manages its own memory.' };
+    }
+    // --ctx for MLX is a BUDGET HINT: mlx_lm.server has no -c flag, but Shadow still needs to
+    // know the model's window to compact before it overflows (default assumption: 32k).
+    if (opts.ctx !== undefined && (!Number.isInteger(opts.ctx) || opts.ctx < 2048)) {
+      return { ok: false, message: `--ctx ${opts.ctx} is not usable (minimum 2048) — for MLX it bounds Shadow's context budget, not the server.` };
+    }
+    const target = looksMlxDir ? absMaybe : raw;
+    const name = opts.name ? sanitizeLocalName(opts.name) : sanitizeLocalName(basename(target));
+    if (!name) return { ok: false, message: 'Could not derive a model name; pass --name <name>.' };
+    const entry: ModelEntry = {
+      label: name,
+      provider: 'openai', // mlx_lm.server speaks the OpenAI wire
+      // Unlike llama-server, mlx_lm.server HONORS the request's model field (it can hot-load
+      // repos by id) — so the wire model MUST be the real target, not the friendly label, or
+      // the server tries to resolve the label as a HuggingFace repo and 404s.
+      model: target,
+      mlx: target,
+      ...(opts.ctx !== undefined ? { ctx: opts.ctx } : {}),
+      group: 'Local',
+    };
+    return looksRepoId
+      ? { ok: true, value: entry, note: `repo id — the weights download from HuggingFace on first use (cached after).` }
+      : { ok: true, value: entry };
+  }
+
+  if (!/\.gguf$/i.test(raw)) {
+    return { ok: false, message: `Not a recognizable local model: ${raw}\n  Accepted: a .gguf file, an MLX model folder, or an mlx-community/<model> repo id (Apple Silicon).` };
+  }
+  const abs = absMaybe;
   if (!existsSync(abs)) return { ok: false, message: `File not found: ${abs}` };
 
   const name = opts.name ? sanitizeLocalName(opts.name) : deriveLocalName(abs);
@@ -167,7 +214,7 @@ export function addLocalModel(
 
 /** Every registered local (gguf) preset, in config order. */
 export function listLocalModels(models: ModelEntry[]): ModelEntry[] {
-  return models.filter((m) => typeof m.gguf === 'string' && m.gguf.length > 0);
+  return models.filter((m) => Boolean(m.gguf) || Boolean(m.mlx));
 }
 
 /** Remove a local preset by name (rejects unknown / non-local names). */
@@ -175,8 +222,8 @@ export function removeLocalModel(models: ModelEntry[], name: string): PresetResu
   if (!name) return { ok: false, message: 'Usage: local remove <name>' };
   const target = models.find((m) => m.label.trim().toLowerCase() === name.trim().toLowerCase());
   if (!target) return { ok: false, message: `No local model named "${name}".` };
-  if (!target.gguf)
-    return { ok: false, message: `"${name}" is not a local (.gguf) model; use /model remove.` };
+  if (!target.gguf && !target.mlx)
+    return { ok: false, message: `"${name}" is not a locally-served model; use /model remove.` };
   return removeModelPreset(models, name);
 }
 
@@ -184,12 +231,16 @@ export function removeLocalModel(models: ModelEntry[], name: string): PresetResu
 export function formatLocalList(models: ModelEntry[]): string[] {
   const locals = listLocalModels(models);
   if (locals.length === 0)
-    return ['No local models registered. Add one with: local add <path-to.gguf>'];
+    return ['No local models registered. Add one with: local add <path-to.gguf | mlx-folder | mlx-community/model>'];
   return locals.map((m) => {
+    const state = m.disabled ? 'disabled' : 'enabled';
+    if (m.mlx) {
+      const target = m.mlx.includes('/') && !m.mlx.startsWith('/') ? m.mlx : basename(m.mlx);
+      return `${m.label}  ·  ${target}  ·  mlx  ·  ${state}`;
+    }
     const file = m.gguf ? basename(m.gguf) : '(unknown)';
     const ctx = m.ctx ?? DEFAULT_LOCAL_CTX;
     const ngl = m.gpuLayers ?? DEFAULT_LOCAL_GPU_LAYERS;
-    const state = m.disabled ? 'disabled' : 'enabled';
     return `${m.label}  ·  ${file}  ·  ctx ${ctx}  ·  gpu-layers ${ngl}  ·  ${state}`;
   });
 }
@@ -212,10 +263,10 @@ export async function testLocalModel(
   entry: ModelEntry,
   log?: (msg: string) => void,
 ): Promise<LocalTestResult> {
-  if (!entry.gguf) return { ok: false, error: `"${entry.label}" is not a local (.gguf) model.` };
+  if (!entry.gguf && !entry.mlx) return { ok: false, error: `"${entry.label}" is not a locally-served model.` };
   let baseUrl: string;
   try {
-    ({ baseUrl } = await ensureGgufServer(entry, log));
+    ({ baseUrl } = await ensureLocalServer(entry, log));
   } catch (e) {
     return { ok: false, error: (e as Error).message };
   }
@@ -255,5 +306,6 @@ export async function testLocalModel(
 
   const elapsedSec = (Date.now() - start) / 1000;
   const tokensPerSec = outputTokens > 0 && elapsedSec > 0 ? outputTokens / elapsedSec : undefined;
-  return { ok: true, endpoint: baseUrl, reply: reply.trim(), outputTokens, tokensPerSec };
+  // Scrub raw control tokens (<|im_end|> etc.) — sessions scrub them; the test display should too.
+  return { ok: true, endpoint: baseUrl, reply: scrubControlTokens(reply).trim(), outputTokens, tokensPerSec };
 }

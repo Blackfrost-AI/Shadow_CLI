@@ -3,7 +3,7 @@ import { stdin, stdout } from 'node:process';
 import { execSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { PROVIDERS, providersForMode, type ProviderPreset, type OnboardMode } from './catalog.js';
 import { createProvider, type ProviderName } from '../provider/index.js';
 import { saveCredential, saveGlobalConfig, loadGlobalConfig, GLOBAL_DIR } from '../state/globalStore.js';
@@ -249,7 +249,7 @@ export async function runOnboard(): Promise<boolean> {
           writeCentered([c.bold('How do you want to run Shadow?')]);
           stdout.write('\n');
           writeCentered([
-            `${c.bold('1')}. Local file    ${c.gray('— a .gguf on this machine (auto-served via llama.cpp)')}`,
+            `${c.bold('1')}. Local file    ${c.gray('— a .gguf or MLX model on this machine (auto-served)')}`,
             `${c.bold('2')}. Local server  ${c.gray('— Ollama / LM Studio / llama.cpp already running')}`,
             `${c.bold('3')}. Cloud         ${c.gray('— Anthropic, OpenAI, Z.ai (GLM), OpenRouter, …')}`,
           ]);
@@ -273,7 +273,7 @@ export async function runOnboard(): Promise<boolean> {
         }
 
         case 'ggufPath': {
-          const ans = await askText(rl, `Path to your .gguf model file ${backHint()}: `);
+          const ans = await askText(rl, `Model to run: .gguf path, MLX folder, or mlx-community/<model> id ${backHint()}: `);
           if (ans === QUIT) return quitOutcome(); // a previously saved model stays saved
           if (ans === BACK) {
             step = 'mode';
@@ -287,7 +287,12 @@ export async function runOnboard(): Promise<boolean> {
           // Re-entry with an already-registered file (e.g. `back` from a later step) must not
           // dead-end on "already exists" — reuse the existing entry and move forward.
           const resolved = ans.startsWith('~/') || ans === '~' ? join(homedir(), ans.slice(1)) : ans;
-          const existing = models.find((m) => m.gguf && (m.gguf === resolved || m.gguf.endsWith(`/${resolved.split('/').pop() ?? resolved}`)));
+          const abs = resolve(resolved);
+          const existing = models.find(
+            (m) =>
+              (m.gguf && (m.gguf === abs || m.gguf.endsWith(`/${resolved.split('/').pop() ?? resolved}`))) ||
+              (m.mlx && (m.mlx === abs || m.mlx === resolved || m.mlx === ans)),
+          );
           let entry: ModelEntry;
           if (existing) {
             saveGlobalConfig(defaultModelPatch(existing));
@@ -302,7 +307,7 @@ export async function runOnboard(): Promise<boolean> {
             entry = res.value.entry;
             // Persist the preset AND make it the active model (same patch `shadow local use` writes).
             saveGlobalConfig({ models: res.value.models, ...defaultModelPatch(entry) });
-            stdout.write(c.green(`\n✓ Added local model "${entry.label}"`) + c.gray(` (ctx ${entry.ctx}, auto-served on demand)\n`));
+            stdout.write(c.green(`\n✓ Added local model "${entry.label}"`) + c.gray(entry.mlx ? ' (MLX, auto-served on demand)\n' : ` (ctx ${entry.ctx}, auto-served on demand)\n`));
             if (res.note) stdout.write(c.yellow(`  ⚠ ${res.note}\n`));
           }
           savedGguf = entry;

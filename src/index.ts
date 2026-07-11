@@ -13,7 +13,7 @@ import {
   type ModelEntry,
 } from './config.js';
 import { createProvider } from './provider/index.js';
-import { ensureGgufServer, stopGgufServers, ggufServerUp } from './gguf.js';
+import { ensureLocalServer, stopGgufServers, ggufServerUp, isLocalServedEntry, MLX_INSTALL_HINT, mlxOfflineReady } from './gguf.js';
 import {
   addLocalModel,
   formatLocalList,
@@ -149,7 +149,7 @@ function helpText(): string {
     '  update               self-update: git checkout → pull+rebuild; binary install → re-fetch from host',
     '  export [path.md]     export session log to markdown (--session, --out)',
     '  mcp <list|enable|disable>  manage MCP servers (e.g. `mcp enable context-cooler`)',
-    '  local <add|list|test|use|remove>  manage local .gguf models (no Ollama/LM Studio needed)',
+    '  local <add|list|test|use|remove>  manage local models — .gguf or MLX (no Ollama/LM Studio needed)',
     '  doctor               diagnose Node, ripgrep, credentials, provider, guardrails',
     '  doctor --privacy     prove this config\'s privacy posture: egress, keys-at-rest, offline (no network)',
     '  doctor model [name]  capability test: can this model code agentically? (active model or a preset)',
@@ -342,7 +342,7 @@ function needsOnboarding(cfg: ShadowConfig): boolean {
   // A local .gguf model is self-sufficient by definition — Shadow serves it itself; there is no
   // key or endpoint to configure. Without this, a pure-local user (no cloud key anywhere) got
   // bounced into the onboarding wizard on EVERY launch.
-  if (entry?.gguf) return false;
+  if (entry?.gguf || entry?.mlx) return false;
   if (entry?.apiKey || entry?.authToken || entry?.baseUrl) return false;
   if (resolveApiKey(cfg.provider) || resolveAuthToken(cfg.provider)) return false;
   if (resolveBaseUrl(cfg.provider, cfg.baseUrl)) return false;
@@ -396,6 +396,18 @@ const lc = {
 };
 
 /** Locate the llama-server binary: explicit override, then PATH (command -v / where). */
+/** Locate mlx_lm.server: $SHADOW_MLX_SERVER, else PATH. (Apple Silicon backend.) */
+function findMlxServer(): string | undefined {
+  const explicit = process.env.SHADOW_MLX_SERVER;
+  if (explicit) return existsSync(explicit) ? explicit : undefined;
+  try {
+    const out = execFileSync('sh', ['-c', 'command -v mlx_lm.server'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    return out.toString().trim().split(/\r?\n/)[0] || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function findLlamaServer(): string | undefined {
   const explicit = process.env.SHADOW_LLAMA_SERVER;
   if (explicit) return existsSync(explicit) ? explicit : undefined;
@@ -464,7 +476,7 @@ function localUsage(): string {
   return [
     'usage: shadow local <command>',
     '',
-    '  add <path-to.gguf> [--name <name>] [--ctx <n>] [--gpu-layers <n>]   register a local model',
+    '  add <path-to.gguf | mlx-folder | mlx-community/model> [--name <n>] [--ctx <n>] [--gpu-layers <n>]   register a local model',
     '  list                                                               list registered local models',
     '  test <name>                                                        start it + run a connection test',
     '  use <name>                                                         make it the default model',
@@ -509,11 +521,18 @@ async function runLocal(args: string[]): Promise<void> {
     saveGlobalConfig({ models: res.value.models });
     const e = res.value.entry;
     stdout.write(lc.green(`✓ Added local model "${e.label}"`) + '\n');
-    stdout.write(`    file:       ${e.gguf}\n`);
-    stdout.write(`    ctx:        ${e.ctx}\n`);
-    stdout.write(`    gpu-layers: ${e.gpuLayers}\n`);
+    if (e.mlx) {
+      stdout.write(`    target:     ${e.mlx}  (mlx)\n`);
+    } else {
+      stdout.write(`    file:       ${e.gguf}\n`);
+      stdout.write(`    ctx:        ${e.ctx}\n`);
+      stdout.write(`    gpu-layers: ${e.gpuLayers}\n`);
+    }
     if (res.note) stdout.write(lc.yellow(`    ⚠ ${res.note}`) + '\n');
-    if (!findLlamaServer()) {
+    if (e.mlx) {
+      // MLX backend: no brew formula — print the pip/uv hint when mlx_lm.server is missing.
+      if (!findMlxServer()) stdout.write(lc.yellow('    ⚠ ' + MLX_INSTALL_HINT.split('\n').join('\n      ')) + '\n');
+    } else if (!findLlamaServer()) {
       stdout.write(lc.gray('    Preset saved. To run it, llama.cpp (llama-server) is needed:') + '\n');
       await ensureLlamaServer(stdout); // offers `brew install llama.cpp` on an interactive TTY
     }
@@ -545,7 +564,7 @@ async function runLocal(args: string[]): Promise<void> {
       return;
     }
     saveGlobalConfig(defaultModelPatch(entry));
-    stdout.write(lc.green(`✓ Active model → ${entry.label}`) + lc.gray(` (local: ${entry.gguf})`) + '\n');
+    stdout.write(lc.green(`✓ Active model → ${entry.label}`) + lc.gray(` (local: ${entry.gguf ?? entry.mlx})`) + '\n');
     stdout.write(lc.gray('  Run `shadow` to start a session with it.') + '\n');
     return;
   }
@@ -559,7 +578,7 @@ async function runLocal(args: string[]): Promise<void> {
       process.exitCode = 1;
       return;
     }
-    if (!entry.ggufServer && !(await ensureLlamaServer(stdout))) {
+    if (entry.gguf && !entry.ggufServer && !(await ensureLlamaServer(stdout))) {
       process.exitCode = 1;
       return;
     }
@@ -616,7 +635,7 @@ async function runDoctorModel(name: string | undefined, cwd: string): Promise<vo
   const provider = entry?.provider ?? cfg.provider;
   const model = entry?.model ?? cfg.model;
   const label = entry?.label ?? `${provider}/${model}`;
-  const isLocal = Boolean(entry?.gguf);
+  const isLocal = isLocalServedEntry(entry);
   const allowImport = process.env.SHADOW_ALLOW_IMPORT === '1';
 
   let startProvider = provider;
@@ -624,10 +643,11 @@ async function runDoctorModel(name: string | undefined, cwd: string): Promise<vo
   let apiKey = entry?.apiKey ?? resolveApiKey(provider, { model, allowImport });
   const authToken = entry?.authToken ?? resolveAuthToken(provider);
 
-  if (entry?.gguf) {
-    if (!entry.ggufServer) await ensureLlamaServer(stdout); // offer `brew install llama.cpp` before we try to spawn it
+  if (entry && isLocalServedEntry(entry)) {
+    if (entry.gguf && !entry.ggufServer) await ensureLlamaServer(stdout); // offer `brew install llama.cpp` before we try to spawn it
+    if (entry.mlx && !findMlxServer()) stdout.write(lc.yellow('  ⚠ ' + MLX_INSTALL_HINT.split('\n').join('\n    ')) + '\n');
     try {
-      const r = await ensureGgufServer(entry, (m) => stdout.write(lc.gray(`  ${m}`) + '\n'));
+      const r = await ensureLocalServer(entry, (m) => stdout.write(lc.gray(`  ${m}`) + '\n'));
       startProvider = 'openai';
       baseUrl = r.baseUrl;
       apiKey = entry.apiKey ?? 'sk-local';
@@ -911,6 +931,9 @@ async function main(): Promise<void> {
     const decision = evaluateOffline({
       label: activeModelEntry?.label ?? `${cfg.provider}/${cfg.model}`,
       gguf: activeModelEntry?.gguf,
+      // A repo-id MLX target only counts as local once its weights are CACHED — otherwise the
+      // first serve would download from huggingface.co mid-"offline" session.
+      mlx: activeModelEntry?.mlx && mlxOfflineReady(activeModelEntry.mlx) ? activeModelEntry.mlx : undefined,
       baseUrl: resolvedBaseUrl,
     });
     if (!decision.ok) {
@@ -929,7 +952,7 @@ async function main(): Promise<void> {
   let startBaseUrl = resolvedBaseUrl;
   let startApiKey = apiKey;
   // Local .gguf model: launch a llama.cpp server before connecting (ollama-style).
-  if (activeModelEntry?.gguf) {
+  if (isLocalServedEntry(activeModelEntry)) {
     // Session pre-flight: on an interactive TTY, a missing llama-server gets the one-keypress
     // brew offer HERE — previously only `local add`/`local test`/`doctor model` offered it, and a
     // fresh user launching `shadow` with a gguf active hit a raw spawn error instead.
@@ -941,25 +964,29 @@ async function main(): Promise<void> {
       !flags.task &&
       process.stdin.isTTY &&
       process.stdout.isTTY &&
-      !activeModelEntry.ggufServer &&
+      activeModelEntry!.gguf &&
+      !activeModelEntry!.ggufServer &&
       !process.env.SHADOW_LLAMA_SERVER &&
-      !(await ggufServerUp(activeModelEntry))
+      !(await ggufServerUp(activeModelEntry!))
     ) {
       await ensureLlamaServer(process.stdout as NodeJS.WriteStream);
     }
+    if (activeModelEntry?.mlx && !findMlxServer() && !(await ggufServerUp(activeModelEntry))) {
+      process.stderr.write(lc.yellow('  ⚠ ' + MLX_INSTALL_HINT.split('\n').join('\n    ')) + '\n');
+    }
     try {
-      const r = await ensureGgufServer(activeModelEntry, (m) => console.error(`  ${m}`));
+      const r = await ensureLocalServer(activeModelEntry!, (m) => console.error(`  ${m}`), { offline });
       startProvider = 'openai';
       startBaseUrl = r.baseUrl;
-      startApiKey = activeModelEntry.apiKey ?? 'sk-local';
+      startApiKey = activeModelEntry!.apiKey ?? 'sk-local';
       // A local llama.cpp server is bounded by its -c: keep the context budget under BOTH the
       // historical 30k gguf clamp AND this entry's actual window MINUS real headroom (a --ctx
       // 8192 model must compact well before 8192, or long sessions die on a provider 400 instead
       // of compacting). The 2048 floor keeps a degenerate window functional rather than zero.
-      const window = activeModelEntry.ctx ?? 32_768;
+      const window = activeModelEntry!.ctx ?? 32_768;
       cfg = { ...cfg, contextBudget: Math.min(cfg.contextBudget, 30_000, Math.max(2_048, window - 2_048)) };
     } catch (e) {
-      console.error(`local gguf model failed: ${(e as Error).message}`);
+      console.error(`local model failed: ${(e as Error).message}`);
       process.exit(1);
     }
   }
