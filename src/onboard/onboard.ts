@@ -4,9 +4,12 @@ import { execSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { PROVIDERS, type ProviderPreset } from './catalog.js';
+import { PROVIDERS, providersForMode, type ProviderPreset, type OnboardMode } from './catalog.js';
 import { createProvider, type ProviderName } from '../provider/index.js';
-import { saveCredential, saveGlobalConfig, GLOBAL_DIR } from '../state/globalStore.js';
+import { saveCredential, saveGlobalConfig, loadGlobalConfig, GLOBAL_DIR } from '../state/globalStore.js';
+import { addLocalModel, testLocalModel } from '../local/garage.js';
+import { defaultModelPatch } from '../config/modelPresets.js';
+import type { ModelEntry } from '../config.js';
 import { looksAnthropicDistilled, toAnthropicBaseUrl } from '../util/transport.js';
 import { normalizeBaseUrl } from '../config.js';
 import type { Message } from '../provider/provider.js';
@@ -93,7 +96,9 @@ const BACK = Symbol('back');
 const QUIT = Symbol('quit');
 type PromptResult = string | typeof BACK | typeof QUIT;
 type SetupStep =
+  | 'mode'
   | 'provider'
+  | 'ggufPath'
   | 'customCompatibility'
   | 'customBaseUrl'
   | 'customSecret'
@@ -196,19 +201,37 @@ async function offerContextCooler(rl: readline.Interface): Promise<'done' | 'bac
 export async function runOnboard(): Promise<boolean> {
   const rl = readline.createInterface({ input: stdin, output: stdout });
   try {
-    let step: SetupStep = 'provider';
+    let step: SetupStep = 'mode';
+    let mode: OnboardMode = 'cloud';
+    let savedGguf: ModelEntry | undefined; // set when the 'file' mode has already persisted a model
+    let ggufTestFailed = false; // the inline test failed — the finale must not claim a working setup
     const draft: DraftSetup = {};
 
-    const showProviderMenu = () => {
+    // Quitting mid-wizard: if the ggufPath step already persisted + activated a model, that work
+    // is durable — say so and report success. Only a truly empty run is "cancelled".
+    const quitOutcome = (): boolean => {
+      if (savedGguf) {
+        stdout.write(c.gray(`Setup closed — local model "${savedGguf.label}" is saved and active. Run \`shadow\` to use it.\n`));
+        return true;
+      }
+      stdout.write(c.gray('Setup cancelled — nothing saved.\n'));
+      return false;
+    };
+
+    const showBanner = () => {
       stdout.write('\n');
       writeCentered(SHADOW_ART.map((l) => c.cyan(l)));
       stdout.write('\n');
       writeCentered(boxed(DISCLAIMER).map((l) => c.gray(l)));
       stdout.write('\n');
+    };
+
+    const showProviderMenu = (list: ProviderPreset[]) => {
+      stdout.write('\n');
       writeCentered([c.bold('Connect a model provider')]);
       writeCentered([c.gray('No Shadow account — bring your own provider; keys stay local in ~/.shadow.')]);
       stdout.write('\n');
-      const menu = PROVIDERS.map((p, i) => {
+      const menu = list.map((p, i) => {
         const n = c.bold(String(i + 1).padStart(2));
         return p.comingSoon ? `${n}. ${c.gray(p.label)}` : `${n}. ${p.label}`;
       });
@@ -219,20 +242,105 @@ export async function runOnboard(): Promise<boolean> {
 
     while (true) {
       switch (step) {
-        case 'provider': {
-          showProviderMenu();
-          const firstReal = Math.max(0, PROVIDERS.findIndex((p) => !p.comingSoon));
-          const pick = await askText(rl, `Choose a provider ${c.gray(`[${firstReal + 1}]`)} ${backHint()}: `);
-          if (pick === QUIT) {
-            stdout.write(c.gray('Setup cancelled — nothing saved.\n'));
-            return false;
-          }
+        case 'mode': {
+          // The positioning choice comes FIRST: local is a front door, not a submenu buried
+          // under nine cloud vendors. Enter defaults to Cloud (the most common fresh-user key).
+          showBanner();
+          writeCentered([c.bold('How do you want to run Shadow?')]);
+          stdout.write('\n');
+          writeCentered([
+            `${c.bold('1')}. Local file    ${c.gray('— a .gguf on this machine (auto-served via llama.cpp)')}`,
+            `${c.bold('2')}. Local server  ${c.gray('— Ollama / LM Studio / llama.cpp already running')}`,
+            `${c.bold('3')}. Cloud         ${c.gray('— Anthropic, OpenAI, Z.ai (GLM), OpenRouter, …')}`,
+          ]);
+          stdout.write('\n');
+          const pick = await askText(rl, `Choose ${c.gray('[3]')} ${backHint()}: `);
+          if (pick === QUIT) return quitOutcome();
           if (pick === BACK) {
             stdout.write(c.gray('Already at the first step.\n'));
             continue;
           }
+          const choice = pick === '' ? '3' : pick;
+          if (choice === '1') mode = 'file';
+          else if (choice === '2') mode = 'server';
+          else if (choice === '3') mode = 'cloud';
+          else {
+            stdout.write(c.red('Choose 1, 2, or 3.\n'));
+            continue;
+          }
+          step = mode === 'file' ? 'ggufPath' : 'provider';
+          break;
+        }
+
+        case 'ggufPath': {
+          const ans = await askText(rl, `Path to your .gguf model file ${backHint()}: `);
+          if (ans === QUIT) return quitOutcome(); // a previously saved model stays saved
+          if (ans === BACK) {
+            step = 'mode';
+            break;
+          }
+          if (!ans) {
+            stdout.write(c.red('Enter the path to a .gguf file.\n'));
+            continue;
+          }
+          const models = (loadGlobalConfig().models as ModelEntry[] | undefined) ?? [];
+          // Re-entry with an already-registered file (e.g. `back` from a later step) must not
+          // dead-end on "already exists" — reuse the existing entry and move forward.
+          const resolved = ans.startsWith('~/') || ans === '~' ? join(homedir(), ans.slice(1)) : ans;
+          const existing = models.find((m) => m.gguf && (m.gguf === resolved || m.gguf.endsWith(`/${resolved.split('/').pop() ?? resolved}`)));
+          let entry: ModelEntry;
+          if (existing) {
+            saveGlobalConfig(defaultModelPatch(existing));
+            entry = existing;
+            stdout.write(c.gray(`\n"${existing.label}" is already registered — made it the active model.\n`));
+          } else {
+            const res = addLocalModel(models, { path: ans });
+            if (!res.ok) {
+              stdout.write(c.red(`${res.message}\n`));
+              continue;
+            }
+            entry = res.value.entry;
+            // Persist the preset AND make it the active model (same patch `shadow local use` writes).
+            saveGlobalConfig({ models: res.value.models, ...defaultModelPatch(entry) });
+            stdout.write(c.green(`\n✓ Added local model "${entry.label}"`) + c.gray(` (ctx ${entry.ctx}, auto-served on demand)\n`));
+            if (res.note) stdout.write(c.yellow(`  ⚠ ${res.note}\n`));
+          }
+          savedGguf = entry;
+          ggufTestFailed = false;
+
+          const t = await askText(rl, `Test it now? Loads the model — can take a minute. ${c.gray('[Y/n/back]')}: `);
+          if (t === QUIT) return quitOutcome(); // model is already saved; quitting here loses nothing
+          if (t === BACK) {
+            step = 'mode';
+            break;
+          }
+          if (t === '' || t.toLowerCase() === 'y' || t.toLowerCase() === 'yes') {
+            stdout.write(c.gray('\nStarting llama-server and running a tiny completion…\n'));
+            const result = await testLocalModel(entry, (m) => stdout.write(c.gray(`  ${m}\n`)));
+            if (result.ok) {
+              stdout.write(c.green(`✓ PASS`) + c.gray(` — ${result.endpoint}${result.tokensPerSec ? ` · ${result.tokensPerSec.toFixed(1)} tok/s` : ''}\n`));
+            } else {
+              ggufTestFailed = true;
+              stdout.write(c.red(`✗ test failed: ${result.error}\n`));
+              stdout.write(c.gray(`  The model is saved — fix the issue above, then verify with: shadow local test ${entry.label}\n`));
+            }
+          }
+          step = 'contextCooler';
+          break;
+        }
+
+        case 'provider': {
+          const list = providersForMode(mode);
+          showProviderMenu(list);
+          const firstReal = Math.max(0, list.findIndex((p) => !p.comingSoon));
+          const pick = await askText(rl, `Choose a provider ${c.gray(`[${firstReal + 1}]`)} ${backHint()}: `);
+          if (pick === QUIT) return quitOutcome();
+          if (pick === BACK) {
+            step = 'mode';
+            break;
+          }
           const idx = pick === '' ? firstReal : parseInt(pick, 10) - 1;
-          const preset = PROVIDERS[idx];
+          const preset = list[idx];
           if (!preset) {
             stdout.write(c.red('Invalid choice. Choose a number from the menu.\n'));
             continue;
@@ -441,10 +549,27 @@ export async function runOnboard(): Promise<boolean> {
 
         case 'contextCooler': {
           const result = await offerContextCooler(rl);
-          if (result === 'quit') return false;
+          // A COMPLETED cloud/server draft always takes precedence over an earlier gguf save:
+          // the user who backed out of file mode and finished a cloud setup typed a key and
+          // watched it test green — discarding that (the old savedGguf-first order) silently
+          // dropped their credentials and misreported what was saved.
+          const draftComplete = Boolean(draft.preset && draft.adapter && draft.model);
+          if (result === 'quit') return savedGguf !== undefined; // durable gguf work survives a quit
           if (result === 'back') {
-            step = 'model';
+            step = draftComplete ? 'model' : savedGguf ? 'ggufPath' : 'model';
             break;
+          }
+          // Local-file mode (no completed draft): the model + activation were already saved.
+          if (savedGguf && !draftComplete) {
+            const finale = ggufTestFailed
+              ? `\n${c.yellow('⚠ Saved, but the test FAILED')} — ${c.bold(savedGguf.label)} ${c.gray('·')} ${c.bold('local .gguf')}\n` +
+                c.gray(`  file: ${savedGguf.gguf}\n  config: ${GLOBAL_DIR}/config.json\n`) +
+                `\nFix the issue above, then verify with ${c.bold(`shadow local test ${savedGguf.label}`)} before starting a session.\n`
+              : `\n${c.green('✓ Saved')} — ${c.bold(savedGguf.label)} ${c.gray('·')} ${c.bold('local .gguf')}\n` +
+                c.gray(`  file: ${savedGguf.gguf}\n  config: ${GLOBAL_DIR}/config.json\n`) +
+                `\nRun ${c.bold('shadow')} to start — the server launches automatically. ${c.gray('(manage local models with `shadow local`)')}\n`;
+            stdout.write(finale);
+            return true;
           }
           const { preset, adapter, model, baseUrl, apiKey, authToken } = draft;
           if (!preset || !adapter || !model) {

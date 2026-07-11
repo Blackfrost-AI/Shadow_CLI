@@ -5,7 +5,8 @@
 // can be (name derivation, arg parsing, building/adding/removing presets) so the same
 // code drives both surfaces and is unit-testable without spawning llama-server.
 import { existsSync } from 'node:fs';
-import { resolve, basename } from 'node:path';
+import { resolve, basename, join } from 'node:path';
+import { homedir } from 'node:os';
 import type { ModelEntry } from '../config.js';
 import { addModelPreset, removeModelPreset, type PresetResult } from '../config/modelPresets.js';
 import { ensureGgufServer } from '../gguf.js';
@@ -94,9 +95,10 @@ export function parseLocalAddArgs(tokens: string[]): PresetResult<LocalAddOption
 
 /**
  * Validate inputs and build a gguf ModelEntry. Pure — touches the filesystem only to
- * confirm the .gguf exists; does NOT persist anything.
+ * confirm the .gguf exists; does NOT persist anything. The ok arm may carry a `note`
+ * (non-fatal heads-up the caller should surface, e.g. a small --ctx).
  */
-export function buildLocalEntry(opts: LocalAddOptions): PresetResult<ModelEntry> {
+export function buildLocalEntry(opts: LocalAddOptions): PresetResult<ModelEntry> & { note?: string } {
   const raw = opts.path?.trim();
   if (!raw)
     return {
@@ -104,7 +106,10 @@ export function buildLocalEntry(opts: LocalAddOptions): PresetResult<ModelEntry>
       message: 'Usage: local add <path-to.gguf> [--name <name>] [--ctx <n>] [--gpu-layers <n>]',
     };
   if (!/\.gguf$/i.test(raw)) return { ok: false, message: `Not a .gguf file: ${raw}` };
-  const abs = resolve(raw);
+  // Expand a leading ~ — the interactive onboarding prompt is the first surface where the raw
+  // string reaches us without a shell to expand it, and "~/models/x.gguf" is how humans type it.
+  const expanded = raw === '~' || raw.startsWith('~/') ? join(homedir(), raw.slice(1)) : raw;
+  const abs = resolve(expanded);
   if (!existsSync(abs)) return { ok: false, message: `File not found: ${abs}` };
 
   const name = opts.name ? sanitizeLocalName(opts.name) : deriveLocalName(abs);
@@ -113,6 +118,14 @@ export function buildLocalEntry(opts: LocalAddOptions): PresetResult<ModelEntry>
   const ctx = opts.ctx ?? DEFAULT_LOCAL_CTX;
   if (!Number.isInteger(ctx) || ctx <= 0)
     return { ok: false, message: `ctx must be a positive integer (got ${opts.ctx}).` };
+  // Hard floor: below 8k the system prompt + one tool round-trip can't fit alongside the 2k
+  // compaction headroom the session reserves — it 400s on an early request, which reads as
+  // "local models are broken" to a fresh user.
+  if (ctx < 8192)
+    return {
+      ok: false,
+      message: `--ctx ${ctx} is too small to run an agent turn (minimum 8192; ${DEFAULT_LOCAL_CTX} recommended) — the server window must hold the system prompt, a full tool round-trip, and compaction headroom.`,
+    };
   const gpuLayers = opts.gpuLayers ?? DEFAULT_LOCAL_GPU_LAYERS;
   if (!Number.isInteger(gpuLayers) || gpuLayers < 0)
     return { ok: false, message: `gpu-layers must be a non-negative integer (got ${opts.gpuLayers}).` };
@@ -126,19 +139,30 @@ export function buildLocalEntry(opts: LocalAddOptions): PresetResult<ModelEntry>
     gpuLayers,
     group: 'Local',
   };
+  // Below the default the session still works (Shadow keeps its context budget under the server
+  // window — see the startup clamp in index.ts), but it compacts sooner. Say so instead of
+  // surprising the user mid-session.
+  if (ctx < DEFAULT_LOCAL_CTX) {
+    return {
+      ok: true,
+      value: entry,
+      note: `--ctx ${ctx} is below the ${DEFAULT_LOCAL_CTX} default — sessions will auto-compact sooner to stay under the server window.`,
+    };
+  }
   return { ok: true, value: entry };
 }
 
-/** Build + add a local gguf preset to a models array (no disk I/O). */
+/** Build + add a local gguf preset to a models array (no disk I/O). Propagates buildLocalEntry's
+ *  non-fatal `note` (e.g. small --ctx heads-up) for the caller to surface. */
 export function addLocalModel(
   models: ModelEntry[],
   opts: LocalAddOptions,
-): PresetResult<{ models: ModelEntry[]; entry: ModelEntry }> {
+): PresetResult<{ models: ModelEntry[]; entry: ModelEntry }> & { note?: string } {
   const built = buildLocalEntry(opts);
   if (!built.ok) return built;
   const next = addModelPreset(models, built.value);
   if (!next.ok) return next;
-  return { ok: true, value: { models: next.value, entry: built.value } };
+  return { ok: true, value: { models: next.value, entry: built.value }, ...(built.note ? { note: built.note } : {}) };
 }
 
 /** Every registered local (gguf) preset, in config order. */

@@ -15,6 +15,8 @@ export const LLAMA_INSTALL_HINT =
   '  Install it:\n' +
   '    macOS:        brew install llama.cpp\n' +
   '    Linux:        brew install llama.cpp   (or build from source)\n' +
+  '    Windows:      download a release from https://github.com/ggml-org/llama.cpp/releases\n' +
+  '                  and put llama-server.exe on your PATH\n' +
   '    from source:  https://github.com/ggml-org/llama.cpp\n' +
   "  Or point Shadow at an existing binary: set $SHADOW_LLAMA_SERVER, or the model preset's\n" +
   '  "ggufServer": "/path/to/llama-server" in ~/.shadow/config.json.';
@@ -58,6 +60,13 @@ function installExitHook(): void {
   });
 }
 
+/** True when a server already answers on this entry's port (ours or the user's own) — used by the
+ *  startup pre-flight to skip the install prompt when there is nothing to install FOR. */
+export async function ggufServerUp(entry: ModelEntry): Promise<boolean> {
+  if (!entry.gguf && !entry.ggufPort) return false;
+  return isUp(`http://127.0.0.1:${portFor(entry)}/v1`);
+}
+
 /** Kill every llama.cpp server shadow started this session (best-effort). */
 export function stopGgufServers(): void {
   for (const { proc } of servers.values()) {
@@ -80,17 +89,67 @@ export interface GgufStartResult {
  * OpenAI-compatible base URL. Reuses an already-listening server on the same port
  * (ours or the user's). First load of a large model is slow, so we wait up to 180s.
  */
+/** Ask an already-running server what model it serves (llama-server exposes OpenAI /v1/models with
+ *  the gguf path as the id). Returns the ids, or null when the endpoint is absent/unparseable. */
+async function servedModelIds(baseUrl: string): Promise<string[] | null> {
+  try {
+    const r = await fetch(`${baseUrl}/models`, { signal: AbortSignal.timeout(1500) });
+    if (!r.ok) return null;
+    const j = (await r.json()) as { data?: { id?: string }[] };
+    if (!Array.isArray(j.data)) return null;
+    return j.data.map((m) => m.id ?? '').filter(Boolean);
+  } catch {
+    return null;
+  }
+}
+
 export async function ensureGgufServer(
   entry: ModelEntry,
   log?: (msg: string) => void,
 ): Promise<GgufStartResult> {
   if (!entry.gguf) throw new Error('ensureGgufServer called on a non-gguf model entry');
-  if (!existsSync(entry.gguf)) throw new Error(`gguf file not found: ${entry.gguf}`);
+  if (!existsSync(entry.gguf)) {
+    throw new Error(
+      `gguf file not found: ${entry.gguf}\n` +
+        '  The file may have been moved or deleted since it was registered.\n' +
+        '  Check your models with `shadow local list`, then re-add it: `shadow local add <path-to.gguf>`.',
+    );
+  }
 
   const port = portFor(entry);
   const baseUrl = `http://127.0.0.1:${port}/v1`;
   if (servers.has(baseUrl)) return { baseUrl, started: false };
   if (await isUp(baseUrl)) {
+    // Something is already serving on this model's port. Verify what we can before adopting it —
+    // the port is hash-derived, so a stranger here would route the session to the WRONG model.
+    // Evidence rules (reviewed): only PATH-LIKE ids (…/x.gguf) are strong enough to prove a
+    // mismatch — llama-server started with `--alias main` reports "main", which proves nothing,
+    // so alias ids reuse with a visible note instead of a false hard failure. Case-insensitive.
+    const ids = await servedModelIds(baseUrl);
+    const stem = (entry.gguf.split('/').pop() ?? entry.gguf).toLowerCase().replace(/\.gguf$/, '');
+    if (ids === null || ids.length === 0) {
+      // Answers /health but not /v1/models → almost certainly NOT a llama-server. Refuse rather
+      // than silently routing the session (and its context) to an unknown local process.
+      throw new Error(
+        `port ${port} is occupied by a process that answers /health but not /v1/models — probably not a llama-server.\n` +
+          `  Stop it, or give this model its own port: set "ggufPort" on the model entry in\n` +
+          `  ~/.shadow/config.json (e.g. "ggufPort": ${port + 1}).`,
+      );
+    }
+    const pathLike = ids.filter((id) => /\.gguf$/i.test(id) || id.includes('/'));
+    const matches = (id: string): boolean => {
+      const t = (id.split('/').pop() ?? id).toLowerCase().replace(/\.gguf$/, '');
+      return t === stem || t.includes(stem) || stem.includes(t);
+    };
+    if (pathLike.length > 0 && !pathLike.some(matches)) {
+      throw new Error(
+        `port ${port} is already serving a DIFFERENT model (${pathLike[0]}), not ${stem}.\n` +
+          `  Either stop that server, or give this model its own port: set "ggufPort" on the\n` +
+          `  model entry in ~/.shadow/config.json (e.g. "ggufPort": ${port + 1}).`,
+      );
+    }
+    const aliasNote = pathLike.length === 0 ? ` (reports alias "${ids[0]}" — assuming it serves ${stem})` : ` (${ids[0]})`;
+    log?.(`Reusing the llama-server already running on port ${port}${aliasNote}.`);
     servers.set(baseUrl, { baseUrl }); // reuse; don't track a proc we didn't spawn
     return { baseUrl, started: false };
   }
@@ -115,10 +174,27 @@ export async function ensureGgufServer(
 
   let proc: ChildProcess;
   try {
-    proc = spawn(bin, args, { stdio: 'ignore', detached: false });
+    // Capture stderr: llama-server's own diagnostics (port bind conflict, bad gguf magic, OOM,
+    // unsupported quant) are the ONLY way to state a cause when it dies — stdio:'ignore' used to
+    // discard them, so every failure surfaced as a causeless "exited (code N)".
+    proc = spawn(bin, args, { stdio: ['ignore', 'ignore', 'pipe'], detached: false });
   } catch (e) {
     throw new Error(`could not launch "${bin}": ${(e as Error).message}.\n${LLAMA_INSTALL_HINT}`);
   }
+  // Ring buffer of the last ~30 stderr lines (bounded — a chatty load can emit megabytes).
+  const errTail: string[] = [];
+  proc.stderr?.on('data', (chunk: Buffer) => {
+    for (const line of chunk.toString().split('\n')) {
+      const l = line.trim();
+      if (!l) continue;
+      errTail.push(l);
+      if (errTail.length > 30) errTail.shift();
+    }
+  });
+  const tail = (n: number): string => {
+    const t = errTail.slice(-n).join('\n    ');
+    return t ? `\n  Server output (last lines):\n    ${t}` : '';
+  };
   let spawnErr = '';
   proc.on('error', (e) => {
     spawnErr = (e as Error).message;
@@ -134,7 +210,11 @@ export async function ensureGgufServer(
     }
     if (proc.exitCode !== null) {
       servers.delete(baseUrl);
-      throw new Error(`"${bin}" exited (code ${proc.exitCode}) before it began serving`);
+      // A bind conflict is the classic silent killer here — name it when stderr shows it.
+      const bindHint = /bind|address already in use|EADDRINUSE/i.test(errTail.join('\n'))
+        ? `\n  Port ${port} looks taken — stop the other process, or set "ggufPort" on this model entry in ~/.shadow/config.json.`
+        : '';
+      throw new Error(`"${bin}" exited (code ${proc.exitCode}) before it began serving.${bindHint}${tail(12)}`);
     }
     if (await isUp(baseUrl)) {
       log?.(`Local model ready on ${baseUrl}`);
@@ -152,5 +232,9 @@ export async function ensureGgufServer(
   } catch {
     /* ignore */
   }
-  throw new Error(`"${bin}" did not become ready within 180s — check the model path and resources`);
+  throw new Error(
+    `"${bin}" did not become ready within 180s.\n` +
+      '  Likely causes: the model is larger than available RAM/VRAM, or the context (-c) is too big\n' +
+      `  for this machine. Try a smaller quant, or lower the context: shadow local add <path> --ctx 16384.${tail(12)}`,
+  );
 }

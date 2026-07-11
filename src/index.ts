@@ -13,7 +13,7 @@ import {
   type ModelEntry,
 } from './config.js';
 import { createProvider } from './provider/index.js';
-import { ensureGgufServer, stopGgufServers } from './gguf.js';
+import { ensureGgufServer, stopGgufServers, ggufServerUp } from './gguf.js';
 import {
   addLocalModel,
   formatLocalList,
@@ -24,6 +24,7 @@ import {
   LLAMA_INSTALL_HINT,
 } from './local/garage.js';
 import { defaultModelPatch, findModelPreset } from './config/modelPresets.js';
+import { resolveParallelTools } from './config/familyProfiles.js';
 import type { Message } from './provider/provider.js';
 import { ToolRegistry } from './tools/registry.js';
 import { BgRegistry } from './tools/bgShell.js';
@@ -338,6 +339,10 @@ function needsOnboarding(cfg: ShadowConfig): boolean {
   // picker — see the activeModelEntry resolution below). If the active entry is
   // self-sufficient, we're already configured; don't force the onboarding wizard.
   const entry = cfg.models.find((m) => m.provider === cfg.provider && m.model === cfg.model);
+  // A local .gguf model is self-sufficient by definition — Shadow serves it itself; there is no
+  // key or endpoint to configure. Without this, a pure-local user (no cloud key anywhere) got
+  // bounced into the onboarding wizard on EVERY launch.
+  if (entry?.gguf) return false;
   if (entry?.apiKey || entry?.authToken || entry?.baseUrl) return false;
   if (resolveApiKey(cfg.provider) || resolveAuthToken(cfg.provider)) return false;
   if (resolveBaseUrl(cfg.provider, cfg.baseUrl)) return false;
@@ -507,6 +512,7 @@ async function runLocal(args: string[]): Promise<void> {
     stdout.write(`    file:       ${e.gguf}\n`);
     stdout.write(`    ctx:        ${e.ctx}\n`);
     stdout.write(`    gpu-layers: ${e.gpuLayers}\n`);
+    if (res.note) stdout.write(lc.yellow(`    ⚠ ${res.note}`) + '\n');
     if (!findLlamaServer()) {
       stdout.write(lc.gray('    Preset saved. To run it, llama.cpp (llama-server) is needed:') + '\n');
       await ensureLlamaServer(stdout); // offers `brew install llama.cpp` on an interactive TTY
@@ -924,13 +930,34 @@ async function main(): Promise<void> {
   let startApiKey = apiKey;
   // Local .gguf model: launch a llama.cpp server before connecting (ollama-style).
   if (activeModelEntry?.gguf) {
+    // Session pre-flight: on an interactive TTY, a missing llama-server gets the one-keypress
+    // brew offer HERE — previously only `local add`/`local test`/`doctor model` offered it, and a
+    // fresh user launching `shadow` with a gguf active hit a raw spawn error instead.
+    // Guards (reviewed): never in --task runs (they are non-interactive by design, even under a
+    // PTY wrapper); never when the entry names its OWN binary or $SHADOW_LLAMA_SERVER is set
+    // (PATH lookup would false-nag); never when a server is ALREADY answering on the entry's
+    // port (nothing to install for).
+    if (
+      !flags.task &&
+      process.stdin.isTTY &&
+      process.stdout.isTTY &&
+      !activeModelEntry.ggufServer &&
+      !process.env.SHADOW_LLAMA_SERVER &&
+      !(await ggufServerUp(activeModelEntry))
+    ) {
+      await ensureLlamaServer(process.stdout as NodeJS.WriteStream);
+    }
     try {
       const r = await ensureGgufServer(activeModelEntry, (m) => console.error(`  ${m}`));
       startProvider = 'openai';
       startBaseUrl = r.baseUrl;
       startApiKey = activeModelEntry.apiKey ?? 'sk-local';
-      // A local llama.cpp server is bounded by its -c; keep the context budget under it.
-      cfg = { ...cfg, contextBudget: Math.min(cfg.contextBudget, 30_000) };
+      // A local llama.cpp server is bounded by its -c: keep the context budget under BOTH the
+      // historical 30k gguf clamp AND this entry's actual window MINUS real headroom (a --ctx
+      // 8192 model must compact well before 8192, or long sessions die on a provider 400 instead
+      // of compacting). The 2048 floor keeps a degenerate window functional rather than zero.
+      const window = activeModelEntry.ctx ?? 32_768;
+      cfg = { ...cfg, contextBudget: Math.min(cfg.contextBudget, 30_000, Math.max(2_048, window - 2_048)) };
     } catch (e) {
       console.error(`local gguf model failed: ${(e as Error).message}`);
       process.exit(1);
@@ -1177,7 +1204,8 @@ async function main(): Promise<void> {
         hooks: cfg.hooks,
         models: cfg.models,
         fallbackModel: cfg.fallbackModel,
-        parallelTools: cfg.parallelTools,
+        // explicit config > family profile > global default (resolved on the LIVE sub-agent model)
+        parallelTools: resolveParallelTools(cfg, activeAgentModel),
         streamShell: false,
       }),
       getAutonomy: () => autonomy,
@@ -1262,7 +1290,8 @@ async function main(): Promise<void> {
       hooks: cfg.hooks,
       models: cfg.models,
       fallbackModel: cfg.fallbackModel,
-      parallelTools: cfg.parallelTools,
+      // explicit config > family profile > global default
+      parallelTools: resolveParallelTools(cfg, cfg.model),
       streamShell: !headless,
       sessionLog,
     };

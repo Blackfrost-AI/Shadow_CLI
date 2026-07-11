@@ -206,7 +206,11 @@ const ConfigSchema = z.object({
   logLevel: z.enum(['silent', 'error', 'info', 'debug']).default('info'),
 });
 
-export type ShadowConfig = z.infer<typeof ConfigSchema>;
+export type ShadowConfig = z.infer<typeof ConfigSchema> & {
+  /** Top-level keys the user explicitly wrote (any source) — recorded by loadConfig BEFORE zod
+   *  defaults erase the distinction. Family profiles defer to explicit settings (familyProfiles.ts). */
+  explicitKeys?: string[];
+};
 export type ModelEntry = z.infer<typeof ModelEntrySchema>;
 
 const CONFIG_FILE = 'shadow.config.json';
@@ -320,6 +324,15 @@ export function loadConfig(cwd: string, cliOverrides: Record<string, unknown> = 
     throw new Error(`invalid configuration:\n${msg}`);
   }
   const cfg = result.data;
+  // Record which keys the user ACTUALLY wrote — from TRUSTED sources only (global file, env,
+  // CLI), before zod's .default() erased the distinction. Family profiles use this for
+  // precedence: an explicit setting beats a profile default (config/familyProfiles.ts).
+  // The UNTRUSTED project file is deliberately excluded: a cloned repo must not be able to
+  // mark a safety-relevant default (e.g. parallelTools) as "explicit" and thereby out-rank a
+  // family profile. Its VALUES still apply per normal precedence; it just can't claim intent.
+  (cfg as ShadowConfig).explicitKeys = Object.keys(
+    deepMerge(deepMerge(fromGlobal, fromEnv), prune(cliOverrides)),
+  );
   // Safety backstop: `maxIterations: 0` ("unlimited") is only safe while SOME budget cap exists. If the
   // user opted into 0 with no token/cost/wall-clock limit, a model looping on slightly-varying tool args
   // (dodging the consecutive-identical loop guard) would run forever on paid requests. Inject a wall-clock

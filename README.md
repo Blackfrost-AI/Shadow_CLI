@@ -71,7 +71,15 @@ A fresh install ships with **no provider configured** — Shadow won't run until
 shadow
 ```
 
-On first run it opens a guided menu: pick a provider (Anthropic, OpenAI, OpenRouter, Groq, DeepSeek, Mistral, xAI, Gemini, Together, Z.ai (GLM), Ollama, LM Studio, or a custom endpoint), paste your API key (masked as you type), choose a model, and Shadow runs a **live connection test** before saving. Type `back` or `b` at any onboarding prompt to return to the previous step without restarting. Re-run it anytime to switch:
+On first run it opens with the **mode chooser** — the real first question:
+
+```
+1. Local file    — a .gguf on this machine (auto-served via llama.cpp)
+2. Local server  — Ollama / LM Studio / llama.cpp already running
+3. Cloud         — Anthropic, OpenAI, Z.ai (GLM), OpenRouter, …
+```
+
+**Local file** asks for a `.gguf` path, registers + activates it, and offers a live test — no key, no cloud, done. **Local server** and **Cloud** open the provider menu filtered to what fits (Anthropic, OpenAI, OpenRouter, Groq, DeepSeek, Mistral, xAI, Gemini, Together, Z.ai (GLM), Ollama, LM Studio, or a custom endpoint), where you paste your API key (masked as you type), choose a model, and Shadow runs a **live connection test** before saving. Type `back` or `b` at any onboarding prompt to return to the previous step without restarting. Re-run it anytime to switch:
 
 ```bash
 shadow onboard          # change provider / model / key (terminal flow)
@@ -360,6 +368,11 @@ Per workspace, under `<workspace>/.shadow/`:
 - `skills/` — optional `SKILL.md` files for progressive-disclosure skill injection.
 
 ## Security model
+
+> **The full picture — including what Shadow does *not* protect against — lives in
+> [THREAT_MODEL.md](THREAT_MODEL.md)** (also shipped as a print-ready
+> [PDF](THREAT_MODEL.pdf)). Limits are stated with the same prominence as guarantees.
+
 
 - **Workspace jail** — every file path resolves to an absolute path contained within the workspace root; `..` traversal, absolute-outside paths, and symlinks pointing outside the root are rejected (including for not-yet-created files).
 - **Shell** — `spawn` (never `exec`) with `cwd` = workspace root and an **env allowlist**; provider API keys are never passed into subprocesses.

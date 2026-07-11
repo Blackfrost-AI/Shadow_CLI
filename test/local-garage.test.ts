@@ -117,14 +117,54 @@ test('formatLocalList renders an empty hint and populated rows', () => {
   assert.match(formatLocalList([])[0]!, /No local models registered/);
 
   const path = fakeGguf('Fmt.gguf');
-  const added = addLocalModel([], { path, ctx: 2048, gpuLayers: 5 });
+  const added = addLocalModel([], { path, ctx: 8192, gpuLayers: 5 });
   assert.equal(added.ok, true);
   if (!added.ok) return;
   const lines = formatLocalList(added.value.models);
   assert.equal(lines.length, 1);
   assert.match(lines[0]!, /Fmt/);
   assert.match(lines[0]!, /Fmt\.gguf/); // basename, not full path
-  assert.match(lines[0]!, /ctx 2048/);
+  assert.match(lines[0]!, /ctx 8192/);
   assert.match(lines[0]!, /gpu-layers 5/);
   assert.match(lines[0]!, /enabled/);
+});
+
+// ── ctx floor + small-ctx note (local hardening, Phase 1) ─────────────────────
+
+test('buildLocalEntry: --ctx below 4096 is rejected with an actionable message', () => {
+  const r = buildLocalEntry({ path: fakeGguf(), ctx: 2048 });
+  assert.equal(r.ok, false);
+  if (!r.ok) assert.match(r.message, /too small.*minimum 8192/s);
+});
+
+test('buildLocalEntry: a small-but-valid --ctx succeeds WITH a compaction heads-up note', () => {
+  const r = buildLocalEntry({ path: fakeGguf(), ctx: 8192 });
+  assert.equal(r.ok, true);
+  if (r.ok) {
+    assert.equal(r.value.ctx, 8192);
+    assert.match(r.note ?? '', /below the 32768 default/);
+  }
+});
+
+test('buildLocalEntry: the default ctx carries NO note', () => {
+  const r = buildLocalEntry({ path: fakeGguf() });
+  assert.equal(r.ok, true);
+  if (r.ok) assert.equal((r as { note?: string }).note, undefined);
+});
+
+test('addLocalModel propagates the small-ctx note', () => {
+  const r = addLocalModel([], { path: fakeGguf(), ctx: 16384 });
+  assert.equal(r.ok, true);
+  if (r.ok) assert.match((r as { note?: string }).note ?? '', /auto-compact sooner/);
+});
+
+test('buildLocalEntry expands a leading ~ (how humans type paths in the onboarding prompt)', () => {
+  // ~/nonexistent resolves under the real home — proves expansion happened (error names the
+  // expanded absolute path, not a literal "~" fragment glued to cwd).
+  const r = buildLocalEntry({ path: '~/definitely-missing-shadow-test.gguf' });
+  assert.equal(r.ok, false);
+  if (!r.ok) {
+    assert.ok(!r.message.includes('/~/'), 'no literal ~ segment in the resolved path');
+    assert.match(r.message, /File not found: \//, 'expanded to an absolute path');
+  }
 });

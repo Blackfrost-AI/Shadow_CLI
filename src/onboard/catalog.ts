@@ -164,3 +164,17 @@ export const PROVIDERS: ProviderPreset[] = [
 export function findPreset(id: string): ProviderPreset | undefined {
   return PROVIDERS.find((p) => p.id === id);
 }
+
+// ── first-run mode chooser ────────────────────────────────────────────────────
+
+/** The three doors of first-run: run a model file, talk to a local server, or use a cloud key. */
+export type OnboardMode = 'file' | 'server' | 'cloud';
+
+/** The catalog subset shown for a chosen mode. 'file' has no provider menu (it prompts for a
+ *  .gguf path instead); 'custom' appears under BOTH server and cloud — a self-hosted endpoint
+ *  is legitimately either. Pure + unit-tested. */
+export function providersForMode(mode: OnboardMode): ProviderPreset[] {
+  if (mode === 'file') return [];
+  if (mode === 'server') return PROVIDERS.filter((p) => p.kind === 'local' || p.kind === 'custom');
+  return PROVIDERS.filter((p) => p.kind === 'cloud' || p.kind === 'custom');
+}

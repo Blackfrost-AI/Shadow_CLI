@@ -87,7 +87,7 @@ export function evaluateOffline(active: {
       `Fix it by switching to a local model:\n` +
       `  • shadow local list                     list installed .gguf models\n` +
       `  • shadow local use <name>               activate one\n` +
-      `  • shadow local add <name> <path.gguf>   add a new one\n` +
+      `  • shadow local add <path-to.gguf>       add a new one (optional --name <name>)\n` +
       `or point --base-url / a model preset at a localhost / LAN / Ollama / LM Studio endpoint.`,
   };
 }

@@ -33,6 +33,7 @@ import {
 import { cycleAutonomy, type AutonomyLevel } from './safety/permissions.js';
 import { applyPermissionCommand } from './safety/permissionCmd.js';
 import { isLocalModelTarget } from './safety/offline.js';
+import { familyProfile, resolveParallelTools } from './config/familyProfiles.js';
 import { SessionLog } from './state/session.js';
 import { createProvider } from './provider/index.js';
 import {
@@ -1571,6 +1572,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // `currentRef` mirrors the displayed {provider, model} NAMES for the key handler.
   const providerRef = useRef(opts.provider);
   const currentRef = useRef(current);
+  // The session's ORIGINAL context budget — /model switches to a gguf clamp under its window,
+  // and switching back to a cloud model restores this (see selectModel).
+  const baseBudgetRef = useRef<number | null>(null);
   const pickerOpenRef = useRef(false);
   const pickerIndexRef = useRef(0);
   const styleRef = useRef(style);
@@ -2995,7 +2999,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       // contract — refuse anything that isn't a local target (gguf or loopback/LAN base URL).
       if (opts.offline && !isLocalModelTarget({ gguf: entry.gguf, baseUrl })) {
         pushLine({
-          text: `Offline mode: "${entry.label}" is a cloud endpoint — switch refused. Local models only.`,
+          text: `Offline mode: "${entry.label}" is a cloud endpoint — switch refused. Local models only (see /local list, then /local use <name>).`,
           color: C.yellow,
         });
         return;
@@ -3011,6 +3015,18 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           pushLine({ text: `Local model failed: ${(e as Error).message}`, color: C.red });
           return;
         }
+      }
+      // Context budget must track the ACTIVE model's window across mid-session switches: a session
+      // started on a 128k cloud model that switches to a 32k llama-server would otherwise compact
+      // at ~109k — long past the server window — and die on a 400. Switching back to a cloud model
+      // restores the session's original budget. (Mirrors the startup clamp in index.ts.)
+      if (baseBudgetRef.current == null) baseBudgetRef.current = opts.cfg.contextBudget;
+      const nextBudget = entry.gguf
+        ? Math.min(baseBudgetRef.current, 30_000, Math.max(2_048, (entry.ctx ?? 32_768) - 2_048))
+        : baseBudgetRef.current;
+      if (nextBudget !== opts.cfg.contextBudget) {
+        opts.cfg.contextBudget = nextBudget;
+        pushLine({ text: `  context budget → ${nextBudget.toLocaleString()} tokens (fits the model's window)`, dimColor: true });
       }
       const newProvider = createProvider({
         provider,
@@ -3029,6 +3045,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         // best-effort persistence; the live switch already applies this session
       }
       pushLine({ text: `Model → ${entry.label} (${provider}/${entry.model})`, color: C.cyan });
+      // Family-profile knowledge surfaces at the moment of selection — matrix verdicts and
+      // adapter floors are useless in a README table nobody reads mid-session.
+      const prof = familyProfile(entry.model);
+      if (prof?.note) pushLine({ text: `  ${prof.family}: ${prof.note}`, dimColor: true });
     },
     [pushLine],
   );
@@ -3447,7 +3467,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         hooks: opts.cfg.hooks,
         models: opts.cfg.models,
         fallbackModel: opts.cfg.fallbackModel,
-        parallelTools: opts.cfg.parallelTools,
+        // Resolved per turn on the LIVE model (a /model switch changes the family mid-session):
+        // explicit config > family profile > global default.
+        parallelTools: resolveParallelTools(opts.cfg, currentRef.current.model),
         streamShell: true,
         sessionLog,
       };
