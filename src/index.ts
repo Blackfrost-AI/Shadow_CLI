@@ -27,6 +27,8 @@ import { defaultModelPatch, findModelPreset } from './config/modelPresets.js';
 import type { Message } from './provider/provider.js';
 import { ToolRegistry } from './tools/registry.js';
 import { BgRegistry } from './tools/bgShell.js';
+import { runWebOnboard } from './onboard/webOnboard.js';
+import { ensureVaultReady } from './auth/unlock.js';
 import {
   makeAgentTool,
   makeAskUserQuestionTool,
@@ -77,6 +79,7 @@ import { makeTodoTool } from './tools/todo.js';
 import { type OutputStyle } from './styles.js';
 import { runDoctor, formatDoctorReport } from './doctor.js';
 import { runModelCheck, formatModelCheckReport } from './doctor/modelCheck.js';
+import { buildPrivacyReport, gatherPrivacyEnv, formatPrivacyReport, type PrivacyConfigView } from './doctor/privacy.js';
 import { DEV_UNRESTRICTED, resolveUnrestricted } from './buildProfile.js';
 import { runTui, attachRenderer } from './tui.js';
 import { runOnboard } from './onboard/onboard.js';
@@ -141,11 +144,13 @@ function helpText(): string {
     '',
     'Commands:',
     '  onboard              guided provider setup — pick a provider, key, model; tested + saved',
+    '  onboard --web        secure setup in a local browser form → encrypted vault + master password',
     '  update               self-update: git checkout → pull+rebuild; binary install → re-fetch from host',
     '  export [path.md]     export session log to markdown (--session, --out)',
     '  mcp <list|enable|disable>  manage MCP servers (e.g. `mcp enable context-cooler`)',
     '  local <add|list|test|use|remove>  manage local .gguf models (no Ollama/LM Studio needed)',
     '  doctor               diagnose Node, ripgrep, credentials, provider, guardrails',
+    '  doctor --privacy     prove this config\'s privacy posture: egress, keys-at-rest, offline (no network)',
     '  doctor model [name]  capability test: can this model code agentically? (active model or a preset)',
     '  resume [--session]   resume a prior session from its latest context snapshot',
     '  login codex|grok     OAuth login (codex only; grok uses API key)',
@@ -582,6 +587,8 @@ async function runLocal(args: string[]): Promise<void> {
  */
 async function runDoctorModel(name: string | undefined, cwd: string): Promise<void> {
   const cfg = loadConfig(cwd, {});
+  // Unlock/migrate the vault so resolveApiKey() below can read the encrypted key when probing.
+  await ensureVaultReady((s) => stdout.write(s));
   let entry: ModelEntry | undefined;
   if (name) {
     entry = findModelPreset(cfg.models, name);
@@ -707,6 +714,19 @@ async function main(): Promise<void> {
   }
 
   if (argv[0] === 'onboard') {
+    // `--web` opens the browser-based SECURE onboarding (encrypted vault + master password); the plain
+    // form stays the terminal flow. Keys go into ~/.shadow/vault.enc, not a plaintext file.
+    if (argv.includes('--web')) {
+      const r = await runWebOnboard((s) => stdout.write(s));
+      if (r.ok) {
+        const what = r.merged ? `Key added to your vault (${r.provider})` : `Vault created (${r.provider})`;
+        stdout.write(lc.green(`✓ ${what}${r.cached ? ', unlocked via keychain' : ''}. Run \`shadow\` to start.`) + '\n');
+      } else {
+        stdout.write(lc.gray(`onboarding not completed${r.reason ? ` — ${r.reason}` : ''}.`) + '\n');
+        process.exitCode = 1;
+      }
+      return;
+    }
     await runOnboard();
     return;
   }
@@ -729,6 +749,14 @@ async function main(): Promise<void> {
   if (argv[0] === 'doctor') {
     if (argv[1] === 'model') {
       await runDoctorModel(argv[2], process.cwd());
+      return;
+    }
+    if (argv[1] === 'privacy' || argv.includes('--privacy')) {
+      // Prove the active config's privacy posture. Makes NO network calls (and no vault unlock — it only
+      // checks whether a vault exists, never reads it). `--offline` shows the offline posture.
+      const cfg = loadConfig(process.cwd(), {});
+      const report = buildPrivacyReport(cfg as unknown as PrivacyConfigView, gatherPrivacyEnv(argv.includes('--offline')));
+      stdout.write(formatPrivacyReport(report, stdout.isTTY) + '\n');
       return;
     }
     const report = runDoctor(process.cwd());
@@ -773,6 +801,16 @@ async function main(): Promise<void> {
   };
   if (flags.maxWallSec != null) overrides.budget = { maxWallClockSec: flags.maxWallSec };
   let cfg = loadConfig(cwd, overrides);
+
+  // Unlock the encrypted credential vault (or migrate a legacy plaintext credentials.json into it)
+  // BEFORE any credential is resolved — needsOnboarding() below and the provider build later both
+  // call getCredential(), which reads from the unlocked vault once this runs. No vault + no legacy
+  // file → no-op, so env-var / fresh-install flows are unaffected.
+  const vaultOk = await ensureVaultReady((s) => stdout.write(s));
+  if (!vaultOk) {
+    process.stderr.write('Could not unlock your credential vault. Set SHADOW_VAULT_PASSWORD or re-run to retry.\n');
+    process.exit(1);
+  }
 
   // Default to the last model picked via `/model`, unless the user explicitly
   // chose one this run (--model / SHADOW_MODEL always win) or the saved label no

@@ -87,13 +87,22 @@ export function renderBrand(b: BrandInfo, theme: ViewportTheme, cols: number): S
     return rows;
   }
 
-  // Compact: too narrow for the wordmark at all → the ✦ name form.
+  // Compact: too narrow for the wordmark at all → the ✦ name form. The meta joins onto ONE line
+  // only when it fits; otherwise each segment gets its own row — word-wrap would split the
+  // workspace PATH mid-token ("…/shad / ow-cli"), the ugliest possible header.
   rows.push([
     { text: '✦ ', color: theme.cyan, bold: true },
     { text: 'shadow', color: theme.fg, bold: true },
     { text: `  v${b.version}`, color: theme.dim },
   ]);
-  rows.push([{ text: `  ${b.providerModel}${SEP}${b.workspace}${SEP}${b.help}`, color: theme.dim }]);
+  const joined = `  ${b.providerModel}${SEP}${b.workspace}${SEP}${b.help}`;
+  if (joined.length <= cols) {
+    rows.push([{ text: joined, color: theme.dim }]);
+  } else {
+    for (const seg of [b.providerModel, b.workspace, b.help]) {
+      rows.push([{ text: `  ${seg}`, color: theme.dim }]);
+    }
+  }
   if (b.yolo) rows.push([{ text: '  ⚠ yolo — all permission checks disabled', color: theme.yellow, bold: true }]);
   return rows;
 }

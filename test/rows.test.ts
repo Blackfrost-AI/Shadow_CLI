@@ -123,3 +123,14 @@ test('renderReasoning: ∴ Thinking header — same label both states; collapsed
   assert.equal(expanded[0]![1]!.text, 'Thinking');
   assertNoFaint(expanded, 'reasoning/expanded');
 });
+
+test('renderBrand compact: an over-wide meta line splits at SEGMENTS, never mid-path', () => {
+  const rows = renderBrand(
+    { version: '2.6.0', providerModel: 'openai/glm-4.6', workspace: '/Users/someone/very/long/project-path', help: '/help · /model · Shift+Tab mode' },
+    T, 40,
+  );
+  const lines = rows.map((r) => r.map((s) => s.text).join(''));
+  // No line exceeds the width by wrapping assumptions; the path appears INTACT on its own row.
+  assert.ok(lines.some((l) => l.includes('/Users/someone/very/long/project-path')), 'path is whole on one row');
+  assert.ok(lines.some((l) => l.trim() === 'openai/glm-4.6'), 'provider/model is its own row');
+});

@@ -1,6 +1,7 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, chmodSync, renameSync, existsSync, statSync, rmSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 
 /**
  * User-level config + credentials written by `shadow onboard`, so subsequent runs
@@ -68,7 +69,18 @@ export function saveGlobalConfig(patch: Record<string, unknown>): void {
   writeJsonAtomic(CONFIG_PATH, { ...loadGlobalConfig(), ...patch });
 }
 
+/** Secrets decrypted from the vault for THIS session (set by the unlock flow at startup). When set,
+ *  it is the source of truth — the plaintext credentials.json is legacy/pre-migration only. */
+let _unlockedVault: Credentials | null = null;
+
+/** Install (or clear) the session's decrypted vault. Callers: the unlock flow / `/lock`. */
+export function setUnlockedVault(v: Credentials | null): void {
+  _unlockedVault = v;
+}
+
 export function loadCredentials(): Credentials {
+  // Prefer the encrypted vault once unlocked; fall back to the legacy plaintext file (unmigrated users).
+  if (_unlockedVault) return _unlockedVault;
   return readJson<Credentials>(CREDS_PATH, {});
 }
 
@@ -79,5 +91,38 @@ export function getCredential(provider: string): CredentialEntry | undefined {
 export function saveCredential(provider: string, entry: CredentialEntry): void {
   const all = loadCredentials();
   all[provider] = { ...all[provider], ...entry };
+  // Note: when a vault is unlocked, this only mutates the in-memory copy; persisting a rotation into
+  // the vault is a vault-write (see auth/unlock.ts saveIntoVault). Legacy path writes the plaintext.
+  if (_unlockedVault) {
+    _unlockedVault = all;
+    return;
+  }
   writeJsonAtomic(CREDS_PATH, all, 0o600);
+}
+
+// ── legacy plaintext migration ────────────────────────────────────────────────
+export function credentialsPath(): string {
+  return CREDS_PATH;
+}
+
+/** Read the plaintext credentials.json DIRECTLY (bypasses the vault cache) — for one-time migration. */
+export function loadLegacyCredentials(): Credentials {
+  return readJson<Credentials>(CREDS_PATH, {});
+}
+
+export function legacyCredentialsExist(): boolean {
+  return existsSync(CREDS_PATH);
+}
+
+/** Overwrite-then-remove the plaintext credentials.json after it has been sealed into the vault, so the
+ *  keys don't linger on disk (a plain unlink leaves the bytes recoverable). Best-effort. */
+export function shredLegacyCredentials(): void {
+  try {
+    if (!existsSync(CREDS_PATH)) return;
+    const size = Math.max(64, statSync(CREDS_PATH).size);
+    writeFileSync(CREDS_PATH, randomBytes(size), { mode: 0o600 });
+    rmSync(CREDS_PATH, { force: true });
+  } catch {
+    /* best-effort */
+  }
 }

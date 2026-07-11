@@ -78,3 +78,51 @@ test('header is padded when the separator has more columns than the header', () 
   // header row (line 1, after the top border) has 3 cells → 4 vertical bars
   assert.equal((lines[1]!.match(/│/g) ?? []).length, 4);
 });
+
+test('emoji cells: borders stay aligned by DISPLAY width (✅ is 2 columns, not 1)', () => {
+  const md = ['| Feature | Status |', '| --- | --- |', '| Tables | ✅ done |', '| Lists | no |'].join('\n');
+  const block = parseMarkdown(md).find((b) => b.type === 'table')!;
+  const lines = renderTableLines(block as never, 80);
+  // Measure every line by the same display-width rule (emoji=2): all must be equal, so the │
+  // verticals align in a real terminal even with a ✅ in one cell.
+  const width = (s: string): number => [...s].reduce((n, ch) => {
+    const cp = ch.codePointAt(0)!;
+    return n + (cp === 0x2705 || cp >= 0x1f000 ? 2 : 1);
+  }, 0);
+  const widths = lines.map(width);
+  assert.ok(widths.every((w) => w === widths[0]), `all lines equal display width, saw ${widths.join(',')}`);
+});
+
+test('a WIDE table WRAPS ITS CELLS into a grid instead of collapsing to key:value (the screenshot bug)', () => {
+  // The exact failure: a 3-column table whose natural width exceeds the terminal rendered as
+  // "— row N — / Subject: … / What it is: …" labeled lines. It must render a real grid with
+  // wrapped cells at any sane width.
+  const md = [
+    '| Subject | What it is | Why it matters |',
+    '| --- | --- | --- |',
+    '| Aerodynamics | Lift, drag, stalls, spins, turns | Understand why the plane behaves — not just what to do |',
+    '| Weather / Meteorology | Clouds, fronts, METARs, TAFs, winds, icing | Weather kills pilots. Learn to read it cold. |',
+  ].join('\n');
+  const t = parseMarkdown(md).find((b) => b.type === 'table')!;
+  const lines = renderTableLines(t as Extract<typeof t, { type: 'table' }>, 100);
+  assert.ok(lines[0]!.startsWith('┌'), 'renders a GRID, not the vertical fallback');
+  assert.ok(!lines.some((l) => l.startsWith('— row')), 'no "— row N —" labels');
+  // Every line fits and all lines are the same width (verticals align).
+  for (const l of lines) assert.ok(l.length <= 100, `line fits: ${l.length}`);
+  assert.ok(new Set(lines.map((l) => l.length)).size === 1, 'all lines equal width');
+  // Nothing lost: every word of the longest cell survives the wrap.
+  const joined = lines.join(' ');
+  for (const wordText of ['Understand', 'behaves', 'cold.', 'METARs,', 'Aerodynamics']) {
+    assert.ok(joined.includes(wordText), `cell content preserved: ${wordText}`);
+  }
+  // Wrapped rows are separated by inter-row rules for legibility.
+  assert.ok(lines.filter((l) => l.startsWith('├')).length >= 2, 'header rule + at least one inter-row rule');
+});
+
+test('a table that fits at natural width keeps the tight single-line form (no inter-row rules)', () => {
+  const md = ['| a | b |', '| --- | --- |', '| 1 | 2 |', '| 3 | 4 |'].join('\n');
+  const t = parseMarkdown(md).find((b) => b.type === 'table')!;
+  const lines = renderTableLines(t as Extract<typeof t, { type: 'table' }>, 80);
+  assert.equal(lines.filter((l) => l.startsWith('├')).length, 1, 'only the header separator');
+  assert.equal(lines.length, 6, '┌ header ├ row row └');
+});

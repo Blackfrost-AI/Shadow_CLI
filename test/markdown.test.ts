@@ -14,10 +14,10 @@ test('parseInline splits bold, italic, and inline code', () => {
   ]);
 });
 
-test('parseInline splits links into label + a dim "(url)" span, and leaves code contents literal', () => {
+test('parseInline splits links into an accented label + a dim "(url)" span, and leaves code contents literal', () => {
   assert.deepEqual(parseInline('see [docs](https://x.y)'), [
     { text: 'see ' },
-    { text: 'docs' },
+    { text: 'docs', linkLabel: true },
     { text: ' (https://x.y)', link: true },
   ]);
   assert.deepEqual(parseInline('`a**b**c`'), [{ text: 'a**b**c', code: true }]);

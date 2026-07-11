@@ -6,6 +6,7 @@ import type { Message, Provider, ToolCall, ContentBlock, ImageBlock, Effort } fr
 import type { ToolRegistry } from './tools/registry.js';
 import { EventBus } from './agent/events.js';
 import { Budget } from './agent/budget.js';
+import { maybeNotifyUpdate } from './update/checkUpdate.js';
 import { parseMarkdown, renderTableLines, wrapSpans, isTableSeparator, FENCE as MD_FENCE, LIST_ITEM as MD_LIST_ITEM, QUOTE as MD_QUOTE, type MdSpan } from './util/markdown.js';
 import { isBigPaste, expandPastes, isPathLikeSlashToken, pathExistsSafe } from './tui/composer.js';
 import { withSynchronizedOutput } from './tui/syncOutput.js';
@@ -31,6 +32,7 @@ import {
 } from './agent/approval.js';
 import { cycleAutonomy, type AutonomyLevel } from './safety/permissions.js';
 import { applyPermissionCommand } from './safety/permissionCmd.js';
+import { isLocalModelTarget } from './safety/offline.js';
 import { SessionLog } from './state/session.js';
 import { createProvider } from './provider/index.js';
 import {
@@ -314,11 +316,11 @@ export function runStatusLine(cmd: string, ctx: StatusLineCtx, cb: (line: string
 }
 
 // ── the reference client visual vocabulary (parity with the reference) ───────────────────────
-// The pulsing sparkle spinner: a dot swells to a star and back (forward then reverse), not a
-// braille wheel. This + the orange brand color is the reference client's single most recognizable identity signal.
+// The Shadow spinner: a circle spinning between LIGHT and DARK — the half-disc rotates through
+// four phases (founder pick, 2026-07-11; replaced the sparkle pulse). Reads as an eclipse: on
+// brand for a client named Shadow, and it's the ◐ "working" glyph the redesign spec already used.
 const IS_DARWIN = process.platform === 'darwin';
-const SPARKLE = ['·', '✢', '✳', '✶', '✻', IS_DARWIN ? '✽' : '*'];
-const SPINNER = [...SPARKLE, ...SPARKLE.slice(1, -1).reverse()]; // ·✢✳✶✻✽✻✶✳✢ — smooth pulse
+const SPINNER = ['◐', '◓', '◑', '◒']; // light/dark halves chase around the circle
 // The signature left-gutter dot on assistant turns; color (not shape) carries tool state.
 const BLACK_CIRCLE = IS_DARWIN ? '⏺' : '●';
 // Claude's warm brand orange — the spinner glyph + the ⏺ accent.
@@ -2989,6 +2991,15 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       let provider = entry.provider;
       let baseUrl = resolveBaseUrl(entry.provider, entry.baseUrl);
       let apiKey = entry.apiKey ?? resolveApiKey(entry.provider);
+      // Offline Shadow Mode: a mid-session /model switch must not silently break the no-egress
+      // contract — refuse anything that isn't a local target (gguf or loopback/LAN base URL).
+      if (opts.offline && !isLocalModelTarget({ gguf: entry.gguf, baseUrl })) {
+        pushLine({
+          text: `Offline mode: "${entry.label}" is a cloud endpoint — switch refused. Local models only.`,
+          color: C.yellow,
+        });
+        return;
+      }
       // Local .gguf model: ensure a llama.cpp server is up and route to it (ollama-style).
       if (entry.gguf) {
         try {
@@ -3023,9 +3034,16 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   );
   selectModelRef.current = selectModel;
 
-  // Welcome card.
+  // Welcome card + optional (OPT-IN) update notice.
   useEffect(() => {
     showBanner();
+    // Only runs when the user set `updateCheck: true` (OFF by default). Payload-free, once/day, silent
+    // on any error/offline — prints ONE system line if a newer release exists. Never sends user data.
+    // Suppressed entirely in --offline mode: that contract is "nothing leaves the machine but the local
+    // model", and the check is a web call, so opt-in or not it must not fire offline.
+    void maybeNotifyUpdate(opts.version, !opts.offline && (opts.cfg.updateCheck ?? false), (line) =>
+      pushLine({ kind: 'system', text: line, color: C.cyan }),
+    );
   }, []);
 
   // Wire the interactive gate to React state.

@@ -141,3 +141,63 @@ test('renderToolResult: de-noising the arg from the summary is TOKEN-anchored, n
   assert.ok(s.includes('terror') && s.includes('errors'), 'words containing the arg substring are intact');
   assert.ok(s.includes('3 files'), 'the informative tail survives');
 });
+
+// ── v2.6 formatting fix pack ──────────────────────────────────────────────────
+
+test('wrapSpansWord: leading indentation at a logical-line start is PRESERVED (nested bullets)', () => {
+  const rows = text(wrapSpansWord([{ text: '    indented start of a line' }], 40));
+  assert.equal(rows[0], '    indented start of a line', 'the 4-space indent survives');
+  // …but the space at a WRAP point is still dropped (flush-left continuations).
+  const wrapped = text(wrapSpansWord([{ text: 'aaaa bbbb cccc' }], 4));
+  assert.deepEqual(wrapped, ['aaaa', 'bbbb', 'cccc'], 'wrap-point spaces still dropped');
+});
+
+test('wrapSpansWord: indent + over-wide token keeps the indent and splits after it', () => {
+  const rows = text(wrapSpansWord([{ text: '  ' }, { text: 'x'.repeat(30) }], 10));
+  assert.equal(rows[0], '  ' + 'x'.repeat(8), 'first row: indent kept, token split after it');
+  assert.ok(rows.join('').includes('x'.repeat(30).slice(0, 8)), 'nothing lost');
+  for (const r of rows) assert.ok(r.length <= 10);
+});
+
+test('nested list items keep their depth indent AND wrap with a hanging indent under the text', () => {
+  const md = ['- top level item that is long enough to wrap onto a second row for sure', '  - nested item'].join('\n');
+  const rows = flattenItem({ id: 1, kind: 'assistant', text: md }, 40, false, T);
+  const lines = rows.map((r) => r.spans.map((s) => s.text).join('')).filter((l) => l.trim() !== '');
+  // Body indent is 2 (the ⏺ gutter). Top-level marker at col 2; its wrapped row aligns under the TEXT.
+  const top = lines.find((l) => l.includes('top level'))!;
+  const topCont = lines[lines.indexOf(top) + 1]!;
+  assert.match(top, /^(⏺|●) • top level/, 'marker on the first row');
+  assert.match(topCont, /^ {4}\S/, 'continuation aligns under the text (hanging indent), not the margin');
+  const nested = lines.find((l) => l.includes('nested item'))!;
+  assert.match(nested, /^ {2} {2}◦ nested item/, 'nested bullet keeps its 2-space depth indent + ◦ glyph');
+});
+
+test('blockquote: the │ bar repeats on EVERY wrapped row', () => {
+  const md = '> a quoted sentence that is definitely long enough to wrap onto a second row here';
+  const rows = flattenItem({ id: 1, kind: 'assistant', text: md }, 40, false, T);
+  const quoteRows = rows.filter((r) => r.spans.some((s) => s.text.includes('│')));
+  assert.ok(quoteRows.length >= 2, `quote wrapped to ${quoteRows.length} rows, bar on each`);
+  for (const r of quoteRows) {
+    const bar = r.spans.find((s) => s.text.includes('│'))!;
+    assert.equal(bar.color, T.yellow, 'bar keeps the accent color on every row');
+  }
+});
+
+test('table: the HEADER TEXT row is bold, the top border is not (was bolding line 0 = ┌─┐)', () => {
+  const md = ['| Name | State |', '| --- | --- |', '| alpha | ok |'].join('\n');
+  const rows = flattenItem({ id: 1, kind: 'assistant', text: md }, 60, false, T);
+  const tbl = rows.map((r) => ({ text: r.spans.map((s) => s.text).join(''), bold: r.spans.some((s) => s.bold) }));
+  const border = tbl.find((r) => r.text.includes('┌'))!;
+  const header = tbl.find((r) => r.text.includes('Name'))!;
+  assert.equal(border.bold, false, 'top border NOT bold');
+  assert.equal(header.bold, true, 'header text row IS bold');
+});
+
+test('link label renders in the cyan link accent; the (url) tail stays dim', () => {
+  const rows = flattenItem({ id: 1, kind: 'assistant', text: 'see [the docs](https://example.com) now' }, 60, false, T);
+  const spans = rows.flatMap((r) => r.spans);
+  const label = spans.find((s) => s.text.includes('docs'))!;
+  const url = spans.find((s) => s.text.includes('example.com'))!;
+  assert.equal(label.color, T.cyan, 'label = link accent');
+  assert.equal(url.color, T.dim, 'url tail = dim');
+});

@@ -113,6 +113,17 @@ export const PROVIDERS: ProviderPreset[] = [
     promptModel: true,
   },
   {
+    // Defaults to the GLM Coding Plan endpoint (what Z.ai sells for coding agents); a pay-as-you-go
+    // general-API key uses https://api.z.ai/api/paas/v4 instead — editable at the base-URL prompt.
+    id: 'zai',
+    label: 'Z.ai (GLM Coding Plan)',
+    adapter: 'openai',
+    baseUrl: 'https://api.z.ai/api/coding/paas/v4',
+    defaultModel: 'glm-4.6',
+    kind: 'cloud',
+    keyUrl: 'https://z.ai/manage-apikey/apikey-list',
+  },
+  {
     id: 'ollama',
     label: 'Ollama (local, OpenAI API)',
     adapter: 'openai',

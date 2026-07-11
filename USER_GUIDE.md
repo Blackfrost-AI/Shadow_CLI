@@ -55,6 +55,40 @@ To add a preset without the wizard:
 
 ---
 
+## Secure your keys (encrypted vault)
+
+By default a key you enter in `shadow onboard` is saved to `~/.shadow/credentials.json` (`chmod 600`,
+plain JSON). If you'd rather your keys were **encrypted at rest**, use the secure setup instead:
+
+```bash
+shadow onboard --web
+```
+
+This opens a small form in your browser served **only** on `127.0.0.1` (a one-time token guards it and a
+strict CSP blocks every outbound request — a key typed there physically cannot leave your machine). You
+pick a provider, paste your key, and set a **master password**. Shadow seals the key into
+`~/.shadow/vault.enc` — **scrypt → AES-256-GCM** (authenticated: a wrong password or a tampered file
+simply won't open). No plaintext key file is written.
+
+**Unlocking on later runs**, in order:
+
+1. **OS keychain** (macOS Keychain / Linux libsecret / Windows DPAPI) — Shadow caches the derived *key*
+   (never the password) so on a machine with a keychain you type the password **once** and future launches
+   unlock silently.
+2. **`SHADOW_VAULT_PASSWORD`** environment variable — for headless / CI boxes with no keychain.
+3. **Interactive prompt** — masked, three tries, if neither of the above applies.
+
+**Adding more providers.** Re-run `shadow onboard --web` any time to add another key — it **merges** into
+your existing vault (unlocking silently via the keychain, or asking for your master password), so you can
+hold an Anthropic key and a Z.ai/GLM key in the same vault without one clobbering the other.
+
+If you already have a plaintext `credentials.json`, the first interactive run **offers to encrypt it into
+the vault and then shreds the plaintext** (overwrite-then-remove). Environment variables
+(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, …) still override everything, so key-in-env and CI workflows are
+unchanged whether or not you use the vault.
+
+---
+
 ## Output length (`maxOutputTokens`)
 
 `maxOutputTokens` is the per-call cap on how many tokens the model may generate in one turn. **The
@@ -142,9 +176,24 @@ sandbox you don't mind losing. Outside `--yolo`/`full`, file writes stay inside 
 | `renderer` | `stock` (native scrollback, default) or `cell` (owned viewport) |
 | `lastTheme` | color theme |
 | `mcpServers` | MCP servers to auto-connect |
+| `updateCheck` | opt-in update notice (default `false`) — see below |
+
+Secrets live **outside** this file: either `credentials.json` (`chmod 600`) or, if you ran
+`shadow onboard --web`, the encrypted `vault.enc` (see [Secure your keys](#secure-your-keys-encrypted-vault)).
 
 Base URLs are sanitized on load — a stray `[http://…]` or quotes get normalized to a valid URL — so a
 copy-paste slip won't silently break every request.
+
+**Verify your privacy posture.** Run `shadow doctor --privacy` to see exactly what the active config can
+send — every egress path (model provider, web tools, MCP servers, the opt-in update check) marked live or
+inactive, where your keys live (encrypted vault vs plaintext), and whether offline mode is usable. It makes
+**no network calls**. Add `--offline` to preview the offline posture.
+
+> **Update check (opt-in, off by default).** Set `"updateCheck": true` and Shadow will, at most **once a
+> day**, do a single payload-free `GET` of the public `package.json` version and print a one-line notice if
+> a newer release exists. It sends **no** identifiers, usage data, or key material, and never downloads
+> anything on its own. Left at the default it makes **zero** network calls — this is the only outbound
+> traffic Shadow can ever originate beyond your chosen model endpoint and the explicit web tools.
 
 > **Trust boundary:** your global `~/.shadow/config.json` is trusted. A project-local config inside a repo
 > is **de-fanged** — it cannot set base URLs, keys, hooks, or MCP command servers — so cloning an untrusted
@@ -176,3 +225,10 @@ scrollback). `cell` is the pinned alt-screen viewport (PageUp/PageDown only).
 
 **Text looks too dim / low-contrast.** Update — recent builds use a WCAG-AA palette with white primary
 text and a readable secondary gray.
+
+**Vault won't unlock / keeps asking for the master password.** The OS-keychain cache may be missing (a
+headless box, or a machine with no keychain). Either type the password each session, or set
+`SHADOW_VAULT_PASSWORD` in your environment for unattended runs. If you've genuinely forgotten the master
+password there's no recovery by design — delete `~/.shadow/vault.enc` and re-run `shadow onboard --web`
+(or `shadow onboard` to go back to a plaintext key). An `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` in the
+environment bypasses the vault entirely.

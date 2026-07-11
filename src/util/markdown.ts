@@ -17,6 +17,8 @@ export interface MdSpan {
   code?: boolean;
   /** The " (url)" tail of a link — rendered dim so the URL recedes behind the label. */
   link?: boolean;
+  /** The [label] of a link — rendered in the link accent so it reads as a link, not prose. */
+  linkLabel?: boolean;
 }
 
 export type MdBlock =
@@ -72,7 +74,7 @@ export function parseInline(text: string): MdSpan[] {
     else if (m[3]) push(m[4]!, { bold: true });
     else if (m[5]) push(m[6]!, { italic: true });
     else {
-      push(m[7]!); // link label — normal text
+      push(m[7]!, { linkLabel: true }); // link label — link accent
       push(` (${m[8]})`, { link: true }); // dim URL tail
     }
     rest = rest.slice(m.index + m[0].length);
@@ -254,14 +256,45 @@ export function parseMarkdown(src: string): MdBlock[] {
 // ── GFM tables ────────────────────────────────────────────────────────────────
 
 /** Visible width: ANSI/control stripped, surrogate pairs counted as one cell. */
+/** Display width of one code point: 0 for zero-width marks, 2 for East-Asian-Wide + emoji, else 1.
+ *  A compact wcwidth: the old ">BMP = wide" rule missed every BMP emoji (✅ U+2705, ⚠, ▶ …), so any
+ *  table with a status column rendered crooked borders in a real terminal. */
+function charWidth(cp: number): number {
+  // Zero-width: combining marks, ZWJ/ZWNJ, variation selectors, BOM.
+  if (
+    (cp >= 0x0300 && cp <= 0x036f) ||
+    (cp >= 0x1ab0 && cp <= 0x1aff) ||
+    (cp >= 0x20d0 && cp <= 0x20ff) ||
+    cp === 0x200d || cp === 0x200c || cp === 0xfe0f || cp === 0xfe0e || cp === 0xfeff
+  ) return 0;
+  // East Asian Wide / Fullwidth + BMP emoji-presentation symbols.
+  if (
+    (cp >= 0x1100 && cp <= 0x115f) || // Hangul Jamo
+    cp === 0x231a || cp === 0x231b || cp === 0x2329 || cp === 0x232a ||
+    (cp >= 0x23e9 && cp <= 0x23f3) || (cp >= 0x25fd && cp <= 0x25fe) ||
+    (cp >= 0x2614 && cp <= 0x2615) || (cp >= 0x2648 && cp <= 0x2653) ||
+    cp === 0x267f || cp === 0x2693 || cp === 0x26a1 || (cp >= 0x26aa && cp <= 0x26ab) ||
+    (cp >= 0x26bd && cp <= 0x26be) || (cp >= 0x26c4 && cp <= 0x26c5) || cp === 0x26ce ||
+    cp === 0x26d4 || cp === 0x26ea || (cp >= 0x26f2 && cp <= 0x26f3) || cp === 0x26f5 ||
+    cp === 0x26fa || cp === 0x26fd || cp === 0x2705 || (cp >= 0x270a && cp <= 0x270b) ||
+    cp === 0x2728 || cp === 0x274c || cp === 0x274e || (cp >= 0x2753 && cp <= 0x2755) ||
+    cp === 0x2757 || (cp >= 0x2795 && cp <= 0x2797) || cp === 0x27b0 || cp === 0x27bf ||
+    (cp >= 0x2b1b && cp <= 0x2b1c) || cp === 0x2b50 || cp === 0x2b55 ||
+    (cp >= 0x2e80 && cp <= 0x303e) || // CJK radicals, punctuation
+    (cp >= 0x3041 && cp <= 0x33ff) || // kana, CJK symbols
+    (cp >= 0x3400 && cp <= 0x4dbf) || (cp >= 0x4e00 && cp <= 0x9fff) || // CJK ideographs
+    (cp >= 0xa000 && cp <= 0xa4cf) || (cp >= 0xac00 && cp <= 0xd7a3) || // Yi, Hangul syllables
+    (cp >= 0xf900 && cp <= 0xfaff) || (cp >= 0xfe30 && cp <= 0xfe4f) || // compat ideographs
+    (cp >= 0xff00 && cp <= 0xff60) || (cp >= 0xffe0 && cp <= 0xffe6) || // fullwidth forms
+    (cp >= 0x1f000 && cp <= 0x1fffd) // supplementary emoji/symbol planes
+  ) return 2;
+  return 1;
+}
+
 function visibleWidth(s: string): number {
   const stripped = s.replace(/\x1b\[[0-9;]*m/g, ''); // strip any ANSI we might inject later
   let w = 0;
-  for (const ch of stripped) {
-    w += ch.codePointAt(0)! > 0xffff ? 2 : 1; // rough: outside-BMP (emoji) is wide
-  }
-  // Most CJK/counted-as-wide ranges would need a full table; for chat tables this
-  // ASCII+emoji approximation is close enough and never panics on bad input.
+  for (const ch of stripped) w += charWidth(ch.codePointAt(0)!);
   return w;
 }
 
@@ -358,51 +391,138 @@ function padCell(text: string, width: number, align: TableAlign): string {
  * vertical key:value layout when the table would exceed `maxWidth` columns, so a
  * wide table never wraps mid-cell on a narrow terminal. Pure + testable.
  */
+/** Hard-split a token into chunks of at most `w` DISPLAY columns (emoji/CJK aware). */
+function splitByWidth(word: string, w: number): string[] {
+  const chunks: string[] = [];
+  let cur = '';
+  let curW = 0;
+  for (const ch of word) {
+    const cw = charWidth(ch.codePointAt(0)!);
+    if (curW + cw > w && cur) {
+      chunks.push(cur);
+      cur = '';
+      curW = 0;
+    }
+    cur += ch;
+    curW += cw;
+  }
+  if (cur) chunks.push(cur);
+  return chunks.length ? chunks : [''];
+}
+
+/** Word-wrap plain cell text to `w` display columns; an over-wide token hard-splits. Always ≥1 line. */
+function wrapCellText(text: string, w: number): string[] {
+  const lines: string[] = [];
+  let cur = '';
+  let curW = 0;
+  for (const word of text.split(/\s+/).filter(Boolean)) {
+    const parts = visibleWidth(word) > w ? splitByWidth(word, w) : [word];
+    for (const part of parts) {
+      const pw = visibleWidth(part);
+      if (curW === 0) {
+        cur = part;
+        curW = pw;
+      } else if (curW + 1 + pw <= w) {
+        cur += ' ' + part;
+        curW += 1 + pw;
+      } else {
+        lines.push(cur);
+        cur = part;
+        curW = pw;
+      }
+    }
+  }
+  lines.push(cur);
+  return lines;
+}
+
 export function renderTableLines(table: Extract<MdBlock, { type: 'table' }>, maxWidth = 100): string[] {
   const colCount = table.align.length;
   const headerText = table.header.map(spanText);
   const rowsText = table.rows.map((r) => r.map(spanText));
 
-  const colWidths: number[] = new Array(colCount).fill(0);
+  const natural: number[] = new Array(colCount).fill(0);
   for (let c = 0; c < colCount; c++) {
-    colWidths[c] = Math.max(colWidths[c], visibleWidth(headerText[c] ?? ''));
+    natural[c] = Math.max(natural[c], visibleWidth(headerText[c] ?? ''));
   }
   for (const row of rowsText) {
     for (let c = 0; c < colCount; c++) {
-      colWidths[c] = Math.max(colWidths[c], visibleWidth(row[c] ?? ''));
+      natural[c] = Math.max(natural[c], visibleWidth(row[c] ?? ''));
     }
   }
 
-  // `| cell |` per column = width + 3, plus a leading `|` → +1.
-  const totalWidth = colWidths.reduce((a, w) => a + w + 3, 0) + 1;
+  // `│ cell │` chrome: 3 cols per column (`│ ` + ` `) plus the closing `│`.
+  const chrome = 3 * colCount + 1;
+  const budget = maxWidth - chrome;
+  const MIN_COL = 5;
+  let widths = natural.slice();
+  const naturalSum = natural.reduce((a, w) => a + w, 0);
 
-  if (totalWidth > maxWidth && colCount > 0) {
-    // Vertical fallback: each row as labeled key:value pairs under a header.
-    const out: string[] = [];
-    table.rows.forEach((row, ri) => {
-      if (table.rows.length > 1) out.push(`— row ${ri + 1} —`);
-      for (let c = 0; c < colCount; c++) {
-        const key = headerText[c] ?? `col ${c + 1}`;
-        const val = rowsText[ri]?.[c] ?? '';
-        out.push(`${key}: ${val}`);
+  if (naturalSum > budget) {
+    // Too wide at natural size → WRAP THE CELLS, don't give up on the grid. Columns shrink
+    // proportionally to their natural width (floor MIN_COL, never wider than natural), then any
+    // leftover budget goes to the neediest column. The old behavior jumped straight to the
+    // "— row N — / key: value" fallback, so every 3-column table on a normal terminal rendered
+    // as a wall of labeled lines instead of a table.
+    if (budget >= colCount * MIN_COL && naturalSum > 0) {
+      widths = natural.map((n) => Math.max(MIN_COL, Math.min(n, Math.floor((n * budget) / naturalSum))));
+      let leftover = budget - widths.reduce((a, w) => a + w, 0);
+      while (leftover > 0) {
+        let best = -1;
+        let deficit = 0;
+        for (let c = 0; c < colCount; c++) {
+          const d = natural[c]! - widths[c]!;
+          if (d > deficit) {
+            deficit = d;
+            best = c;
+          }
+        }
+        if (best < 0) break;
+        widths[best]!++;
+        leftover--;
       }
-    });
-    return out;
+    }
+    if (widths.reduce((a, w) => a + w, 0) > budget || colCount === 0) {
+      // GENUINELY impossible (tiny terminal / too many columns) → vertical key:value fallback.
+      const out: string[] = [];
+      table.rows.forEach((row, ri) => {
+        if (table.rows.length > 1) out.push(`— row ${ri + 1} —`);
+        for (let c = 0; c < colCount; c++) {
+          const key = headerText[c] ?? `col ${c + 1}`;
+          const val = rowsText[ri]?.[c] ?? '';
+          out.push(`${key}: ${val}`);
+        }
+      });
+      return out;
+    }
   }
 
   // Box-drawing borders (┌─┬─┐ … │ … ├─┼─┤ … └─┴─┘) — the clean grid the reference client draws, not
   // ASCII |/-. Each column segment is width+2 to match `' ' + paddedCell + ' '`, so every line is
   // the same length and the verticals line up. Alignment is applied by padCell (no :---: markers).
+  // Cells WRAP within their column: a logical row renders as `height` terminal lines.
   const rule = (l: string, m: string, r: string): string =>
-    l + colWidths.map((w) => '─'.repeat(w + 2)).join(m) + r;
-  const renderRow = (texts: string[]): string =>
-    '│' + texts.map((t, c) => ' ' + padCell(t, colWidths[c]!, table.align[c]!) + ' ').join('│') + '│';
+    l + widths.map((w) => '─'.repeat(w + 2)).join(m) + r;
+  const renderRow = (texts: string[]): string[] => {
+    const cells = texts.map((t, c) => wrapCellText(t ?? '', widths[c]!));
+    const height = Math.max(1, ...cells.map((cl) => cl.length));
+    const lines: string[] = [];
+    for (let li = 0; li < height; li++) {
+      lines.push('│' + cells.map((cl, c) => ' ' + padCell(cl[li] ?? '', widths[c]!, table.align[c]!) + ' ').join('│') + '│');
+    }
+    return lines;
+  };
 
-  return [
-    rule('┌', '┬', '┐'),
-    renderRow(headerText),
-    rule('├', '┼', '┤'),
-    ...rowsText.map(renderRow),
-    rule('└', '┴', '┘'),
-  ];
+  const headerLines = renderRow(headerText);
+  const bodyBlocks = rowsText.map(renderRow);
+  // When any row wraps to multiple lines, separate the body rows with rules so rows stay legible;
+  // a fully single-line table keeps the tight border-free body it always had.
+  const multiline = headerLines.length > 1 || bodyBlocks.some((b) => b.length > 1);
+  const out = [rule('┌', '┬', '┐'), ...headerLines, rule('├', '┼', '┤')];
+  bodyBlocks.forEach((b, i) => {
+    if (i > 0 && multiline) out.push(rule('├', '┼', '┤'));
+    out.push(...b);
+  });
+  out.push(rule('└', '┴', '┘'));
+  return out;
 }

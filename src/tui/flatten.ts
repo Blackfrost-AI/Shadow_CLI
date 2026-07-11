@@ -119,31 +119,66 @@ export function wrapSpansWord(spans: StyledSpan[], cols: number): StyledSpan[][]
     cur = [];
     curLen = 0;
   };
+  // True until the first WORD of the current LOGICAL line is emitted. Leading whitespace at a
+  // logical-line start is INDENTATION (nested bullets, user-typed alignment) and must be kept;
+  // only the space at a WRAP point (row start mid-line) is droppable. The old unconditional
+  // "never lead a row with space" ate every nested list's indent.
+  let atLineStart = true;
   for (const sp of spans) {
     const parts = sp.text.split('\n');
     for (let p = 0; p < parts.length; p++) {
-      if (p > 0) flush();
+      if (p > 0) {
+        flush();
+        atLineStart = true; // an explicit newline starts a new logical line
+      }
       // Tokenize into word / whitespace runs, styling each with the span's format.
       for (const tok of parts[p]!.split(/(\s+)/)) {
         if (tok === '') continue;
         const isSpace = /^\s+$/.test(tok);
         if (isSpace) {
-          if (curLen === 0) continue; // never lead a row with the wrap-point space
+          if (curLen === 0 && !atLineStart) continue; // drop only the wrap-point space
           if (curLen + tok.length <= w) {
             cur.push({ ...sp, text: tok });
             curLen += tok.length;
+          } else if (atLineStart) {
+            // Indentation wider than the measure — hard-split like an over-wide token.
+            let rest = tok;
+            while (rest.length > w - curLen) {
+              cur.push({ ...sp, text: rest.slice(0, w - curLen) });
+              rest = rest.slice(w - curLen);
+              flush();
+            }
+            if (rest) { cur.push({ ...sp, text: rest }); curLen += rest.length; }
           } else {
             flush(); // the space IS the wrap point
           }
           continue;
         }
+        atLineStart = false;
         if (curLen + tok.length <= w) {
           cur.push({ ...sp, text: tok });
           curLen += tok.length;
           continue;
         }
-        // Doesn't fit. Start a fresh row (dropping any trailing space), then hard-split if the
-        // token alone is wider than the measure.
+        // Doesn't fit. If the row so far is ONLY indentation, keep it and split the word right
+        // after it (popping it would erase the indent and flush a bogus empty row). Otherwise
+        // start a fresh row (dropping the trailing wrap space), then hard-split an over-wide token.
+        if (curLen > 0 && curLen < w && cur.every((s) => /^\s+$/.test(s.text))) {
+          let rest = tok;
+          cur.push({ ...sp, text: rest.slice(0, w - curLen) });
+          rest = rest.slice(w - curLen);
+          flush();
+          while (rest.length > w) {
+            cur.push({ ...sp, text: rest.slice(0, w) });
+            rest = rest.slice(w);
+            flush();
+          }
+          if (rest) {
+            cur.push({ ...sp, text: rest });
+            curLen = rest.length;
+          }
+          continue;
+        }
         if (curLen > 0) {
           if (cur.length && /^\s+$/.test(cur[cur.length - 1]!.text)) cur.pop();
           flush();
@@ -205,6 +240,27 @@ function wrapLine(keyPrefix: string, spans: StyledSpan[], cols: number, mode: 'w
   }));
 }
 
+/**
+ * Wrap `body` with a HANGING prefix: the first row carries `first` (bullet/quote-bar/etc.), every
+ * continuation row carries `cont` (alignment spaces, or the repeated quote bar). Both prefixes must
+ * render at the same width so wrapped rows align under the text, not under the marker — the wrapped
+ * "second line of a bullet" flushing left was the single most un-clean thing in transcript prose.
+ */
+function wrapHanging(
+  keyPrefix: string,
+  first: StyledSpan[],
+  cont: StyledSpan[],
+  body: StyledSpan[],
+  cols: number,
+): ViewportLine[] {
+  const prefixW = first.reduce((n, s) => n + s.text.length, 0);
+  const inner = Math.max(4, cols - prefixW);
+  return wrapSpansWord(body, inner).map((rowSpans, i) => ({
+    key: `${keyPrefix}.${i}`,
+    spans: [...(i === 0 ? first : cont), ...rowSpans],
+  }));
+}
+
 // ── code role → color ─────────────────────────────────────────────────────────
 
 function codeStyle(role: CodeRole, theme: ViewportTheme): { color: string; dim: boolean } {
@@ -220,9 +276,11 @@ function codeStyle(role: CodeRole, theme: ViewportTheme): { color: string; dim: 
 // ── markdown block → styled spans ─────────────────────────────────────────────
 
 function mdSpanToStyled(s: MdSpan, theme: ViewportTheme): StyledSpan {
-  // Inline code → cyan on a subtle chip (the bg is the non-color cue). Link URL tail → dim.
+  // Inline code → cyan on a subtle chip (the bg is the non-color cue). Link LABEL → cyan (it must
+  // read as a link, not blend into prose); the " (url)" tail → dim so the address recedes.
   // Bold gets the BRIGHT tier so it pops against the softer body gray (weight + brightness).
   if (s.code) return { text: s.text, color: theme.cyan, bg: theme.codeBg, italic: s.italic };
+  if (s.linkLabel) return { text: s.text, color: theme.cyan, italic: s.italic };
   if (s.link) return { text: s.text, color: theme.dim, italic: s.italic };
   if (s.bold) return { text: s.text, color: theme.bright ?? theme.fg, bold: true, italic: s.italic };
   return { text: s.text, color: theme.fg, italic: s.italic };
@@ -260,20 +318,32 @@ function blockToLines(block: MdBlock, cols: number, theme: ViewportTheme, keyPre
           block.ordered && depth === 0
             ? `${ordinal++}. `
             : `${bullets[Math.min(depth, bullets.length - 1)]} `;
-        const spans: StyledSpan[] = [
-          { text: indent + marker, color: theme.fg },
-          ...itemSpans.map(s => mdSpanToStyled(s, theme)),
-        ];
-        out.push(...wrapLine(`${keyPrefix}l${j}`, spans, cols));
+        // Hanging wrap: continuation rows align under the TEXT (not the bullet), and the nested
+        // indent survives because it lives in the prefix, not in wrappable body spans.
+        out.push(
+          ...wrapHanging(
+            `${keyPrefix}l${j}`,
+            [{ text: indent + marker, color: theme.fg }],
+            [{ text: ' '.repeat(indent.length + marker.length) }],
+            itemSpans.map(s => mdSpanToStyled(s, theme)),
+            cols,
+          ),
+        );
       });
       break;
     }
     case 'quote': {
-      const spans: StyledSpan[] = [
-        { text: '│ ', color: theme.yellow },
-        ...block.spans.map(s => ({ text: s.text, color: theme.dim, italic: s.italic })),
-      ];
-      out.push(...wrapLine(`${keyPrefix}q`, spans, cols));
+      // The │ bar repeats on EVERY wrapped row — a quote whose second line loses the bar just reads
+      // as a stray dim paragraph.
+      out.push(
+        ...wrapHanging(
+          `${keyPrefix}q`,
+          [{ text: '│ ', color: theme.yellow }],
+          [{ text: '│ ', color: theme.yellow }],
+          block.spans.map(s => ({ text: s.text, color: theme.dim, italic: s.italic })),
+          cols,
+        ),
+      );
       break;
     }
     case 'code': {
@@ -292,11 +362,17 @@ function blockToLines(block: MdBlock, cols: number, theme: ViewportTheme, keyPre
     }
     case 'table': {
       const lines = renderTableLines(block, cols);
+      // In the grid form, the HEADER TEXT is every line between the ┌─┐ top border and the first
+      // ├─┼─┤ separator (wrapped header cells span several lines) — bold those, never the borders.
+      // (The vertical fallback has no borders; nothing gets bolded there.)
+      const isGrid = lines[0]?.startsWith('┌') ?? false;
+      const sepIdx = isGrid ? lines.findIndex((l) => l.startsWith('├')) : -1;
       lines.forEach((l, j) => {
+        const isHeader = isGrid && j > 0 && (sepIdx < 0 || j < sepIdx);
         // Wrap each table line at cols — the wide-table vertical fallback ("key: <long value>") can
         // exceed the width, and an unwrapped over-long line gets hard-char-wrapped by the terminal
         // (the mid-word DOS look the redesign killed everywhere else).
-        out.push(...wrapLine(`${keyPrefix}t${j}`, [{ text: l, color: j === 0 ? theme.bright ?? theme.fg : theme.fg, bold: j === 0 }], cols, 'char'));
+        out.push(...wrapLine(`${keyPrefix}t${j}`, [{ text: l, color: isHeader ? theme.bright ?? theme.fg : theme.fg, bold: isHeader }], cols, 'char'));
       });
       break;
     }

@@ -451,7 +451,9 @@ export async function runOnboard(): Promise<boolean> {
             step = 'provider';
             break;
           }
-          saveGlobalConfig({ provider: adapter, model, ...(baseUrl ? { baseUrl } : {}) });
+          // Clear lastModel so this fresh pick actually becomes active — otherwise a previously
+          // `/model`-selected preset overrides the newly-onboarded provider at launch.
+          saveGlobalConfig({ provider: adapter, model, lastModel: undefined, ...(baseUrl ? { baseUrl } : {}) });
           if (apiKey) saveCredential(adapter, { apiKey, ...(baseUrl ? { baseUrl } : {}) });
           if (authToken) saveCredential(adapter, { authToken, ...(baseUrl ? { baseUrl } : {}) });
 

@@ -26,7 +26,7 @@ This is **not a chat app** — it is a tool-calling runtime.
 | M3 | Ink TUI HUD (streaming output / status bar / inline approval dialog / two-stage Ctrl-C) | ✅ |
 | M4 | Append-only redacted session logs + project-facts memory (`memory` tool) | ✅ |
 | M5 | Real providers (Anthropic + OpenAI-compatible, streaming, prompt caching, retry), web tools | ✅ |
-| M6 | Claude Code harness parity: plan/ask/export, approval taxonomy, fallback, permission rules, hooks, MCP/skills/agent | ✅ |
+| M6 | Anthropic-compatible harness parity: plan/ask/export, approval taxonomy, fallback, permission rules, hooks, MCP/skills/agent | ✅ |
 | M7 | **Format-adaptive universality** — dual transport + auto-detect, text-tool-call recovery, control-token scrub, three tool-call signature regimes (Anthropic signed / Gemini `thought_signature` / plain OpenAI); validated against a 9-model test program | 🚧 |
 
 Per-version detail lives in **[CHANGELOG.md](CHANGELOG.md)**.
@@ -71,13 +71,16 @@ A fresh install ships with **no provider configured** — Shadow won't run until
 shadow
 ```
 
-On first run it opens a guided menu: pick a provider (Anthropic, OpenAI, OpenRouter, Groq, DeepSeek, Mistral, xAI, Gemini, Together, Ollama, LM Studio, or a custom endpoint), paste your API key (masked as you type), choose a model, and Shadow runs a **live connection test** before saving. Type `back` or `b` at any onboarding prompt to return to the previous step without restarting. Re-run it anytime to switch:
+On first run it opens a guided menu: pick a provider (Anthropic, OpenAI, OpenRouter, Groq, DeepSeek, Mistral, xAI, Gemini, Together, Z.ai (GLM), Ollama, LM Studio, or a custom endpoint), paste your API key (masked as you type), choose a model, and Shadow runs a **live connection test** before saving. Type `back` or `b` at any onboarding prompt to return to the previous step without restarting. Re-run it anytime to switch:
 
 ```bash
-shadow onboard          # change provider / model / key
+shadow onboard          # change provider / model / key (terminal flow)
+shadow onboard --web     # secure setup in a local browser form → encrypted vault + master password
 ```
 
-Your choice is saved per-machine to `~/.shadow/` — `config.json` (provider + model) and `credentials.json` (key/token, `chmod 600`). **Nothing is committed to the repo; every machine sets up its own.** Environment variables (`ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `OPENAI_API_KEY`, …) and CLI flags still override the saved config, so CI and scripted runs can stay key-in-env. In a non-interactive context (`--task`, piped, no TTY) with nothing configured, Shadow exits with `Run \`shadow onboard\` to set one up` instead of hanging.
+For encrypted-at-rest keys, use `shadow onboard --web`: it opens a self-contained form on `127.0.0.1` and seals your key into a password-protected vault (`~/.shadow/vault.enc`) rather than a plaintext file — see [Security model](#security-model). Re-running it **merges** another provider's key into the same vault. The plain `shadow onboard` terminal flow remains available.
+
+Your choice is saved per-machine to `~/.shadow/` — `config.json` (provider + model) and either the encrypted `vault.enc` (with `--web`) or `credentials.json` (key/token, `chmod 600`). **Nothing is committed to the repo; every machine sets up its own.** Environment variables (`ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `OPENAI_API_KEY`, …) and CLI flags still override the saved config, so CI and scripted runs can stay key-in-env. In a non-interactive context (`--task`, piped, no TTY) with nothing configured, Shadow exits with `Run \`shadow onboard\` to set one up` instead of hanging.
 
 ## Quickstart
 
@@ -260,9 +263,9 @@ Layered precedence: **CLI flags > env > `shadow.config.json` > defaults**, valid
 
 The loop always terminates — on natural completion, the iteration cap (`maxIterations`), a budget ceiling (`maxTotalTokens` / `maxCostUSD` / `maxWallClockSec`), or Ctrl-C — and never hangs silently on a provider error (retryable errors back off and surface; 400/401/403 surface immediately).
 
-### Claude Code harness parity
+### Anthropic-compatible harness parity
 
-Shadow implements the same tool/mode contracts as Claude Code so Anthropic models (and compatible endpoints) run without feature surprises. See [`plans/claude-parity.md`](plans/claude-parity.md) for the full build spec.
+Shadow implements the same tool/mode contracts as the reference Anthropic client, so Anthropic models (and compatible endpoints) run without feature surprises.
 
 | Capability | Shadow tool / surface |
 |---|---|
@@ -363,10 +366,15 @@ Per workspace, under `<workspace>/.shadow/`:
 - **OS sandbox for `run_shell`** — on macOS (seatbelt / `sandbox-exec`) and Linux (bubblewrap / `bwrap`), shell commands run confined: **filesystem writes are restricted to the workspace + `/tmp`**, and reads of `~/.shadow` (the credentials store) are denied — so a command can't trash files outside the workspace or read your API key. Network is allowed by default (installs/fetches); set `sandboxNetwork: false` to deny it, or `sandbox: "off"` / `--no-sandbox` to disable confinement entirely. This is the real boundary; the env-allowlist + denylist are defense-in-depth. (No OS sandbox on Windows — `run_shell` is unconfined there.)
 - **Web tools** — gated as `network` risk; an SSRF guard blocks `file://`/non-http schemes and any host resolving to loopback / private / link-local / cloud-metadata (`169.254.169.254`) addresses, **pins the connection to the validated IP** (defeats DNS-rebinding), and re-validates + re-pins each redirect hop. Fetched content is treated as untrusted **data** — instructions inside it are never followed.
 - **Secret hygiene** — keys from env/credentials store only; the project `shadow.config.json` cannot set security-critical fields (baseUrl/autonomy/etc.); session logs and surfaced errors are redacted (resolved keys masked by value; best-effort, not a guarantee).
+- **Encrypted credential vault (optional)** — instead of a plaintext `credentials.json`, keys can be sealed in `~/.shadow/vault.enc` with a **master password**: scrypt (N=2¹⁶) → AES-256-GCM (authenticated — a wrong password or a tampered file simply fails to open). Set it up with `shadow onboard --web`, which opens a **local, self-contained browser form** (bound to `127.0.0.1`, one-time token, a strict CSP that blocks *any* outbound request — a key typed there physically cannot leave the machine) and encrypts on submit; re-running it merges more providers into the same vault. On the next run Shadow unlocks the vault via the **OS keychain** (macOS Keychain / libsecret / Windows DPAPI) so you type the password once; on a box with no keychain it falls back to prompting each session, or reads `SHADOW_VAULT_PASSWORD` for headless/CI. If you already have a plaintext `credentials.json`, the first interactive run **offers to encrypt it into the vault and then shreds the plaintext** (overwrite-then-remove). Env vars still override everything, so nothing about existing key-in-env workflows changes.
 
 ## Zero telemetry
 
 Shadow makes **no analytics, crash-reporting, or phone-home calls of any kind.** The only outbound network traffic is (a) the configured LLM provider and (b) the explicit `web_fetch` / `web_search` tools when the agent invokes them. There is no exception.
+
+**Verify it yourself:** `shadow doctor --privacy` prints exactly what the active config can send — every outbound egress path (model provider, web tools, MCP servers, the opt-in update check) with each marked live or inactive, plus where your keys live (encrypted vault vs plaintext) and whether offline mode is usable. The report **makes no network calls** — it inspects your config and local state only. Add `--offline` to see the offline posture (everything but a local model blocked).
+
+**One opt-in exception you can enable:** an **update check** (`updateCheck: true` in `~/.shadow/config.json`, **off by default**). When on, Shadow does a single payload-free `GET` of the public `package.json` version, at most **once per day**, and prints a one-line notice if a newer release exists — it sends **no** identifiers, usage data, or key material, and never auto-downloads anything. It is suppressed entirely in `--offline` mode. Left at the default it makes **zero** calls; this is a user-initiated check for public information, not telemetry.
 
 ## OS support
 

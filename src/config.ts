@@ -142,6 +142,10 @@ const ConfigSchema = z.object({
   /** Rule-based permission classifier stub (NOT LLM). Extends auto-read with finer gating. */
   autoClassifier: z.boolean().default(false),
   dryRun: z.boolean().default(false),
+  // OPT-IN update discovery. OFF by default (zero-telemetry stance): when true, at most once a day on
+  // launch Shadow does a plain payload-free GET of the PUBLIC version and prints one line if a newer
+  // release exists. Never sends anything about the user. See src/update/checkUpdate.ts.
+  updateCheck: z.boolean().default(false),
 
   maxIterations: z.number().int().nonnegative().default(200), // 0 = unlimited (dead-drop / long engagements); real backstop = tokens/cost/wall-clock
   // Generous default so reasoning models (incl. custom LOCAL reasoners that isReasoningModel
