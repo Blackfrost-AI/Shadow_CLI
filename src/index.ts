@@ -29,6 +29,7 @@ import type { Message } from './provider/provider.js';
 import { ToolRegistry } from './tools/registry.js';
 import { BgRegistry } from './tools/bgShell.js';
 import { runWebOnboard } from './onboard/webOnboard.js';
+import { windowsPowerShell } from './update/winShell.js';
 import { ensureVaultReady } from './auth/unlock.js';
 import {
   makeAgentTool,
@@ -269,7 +270,7 @@ function updateBinary(): never {
   stdout.write(`Updating Shadow binary in ${dir} (current v${VERSION})…\n`);
   try {
     if (process.platform === 'win32') {
-      execFileSync('powershell', ['-NoProfile', '-Command', 'irm $env:SHADOW_INSTALL_URL | iex'], {
+      execFileSync(windowsPowerShell(), ['-NoProfile', '-Command', 'irm $env:SHADOW_INSTALL_URL | iex'], {
         stdio: 'inherit',
         env: { ...process.env, SHADOW_INSTALL_DIR: dir, SHADOW_INSTALL_URL: shUrl.replace(/install\.sh$/, 'install.ps1') },
       });

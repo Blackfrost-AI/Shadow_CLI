@@ -1,6 +1,6 @@
 {
   "name": "shadow",
-  "version": "2.8.2",
+  "version": "2.8.3",
   "description": "Shadow — a high-performance, agentic CLI runtime that lets an LLM operate as a coding/sysadmin agent over a local workspace.",
   "type": "module",
   "private": true,
