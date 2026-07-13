@@ -487,6 +487,30 @@ export function flattenItem(
     return out;
   }
 
+  // ── user prompt (❯ gutter + quiet body) ──
+  // The typed prompt is CONTEXT, not output: a green ❯ in a 2-col gutter marks the turn (mirroring
+  // the assistant's ⏺) and the body renders in the quiet dim tier — not full-width bold green,
+  // which shouted over the answer it precedes. Text is verbatim (no markdown pass — rendering
+  // would rewrite what the user actually typed); each typed line keeps a hanging 2-col indent so
+  // wrapped rows align under the text, and the user's own leading whitespace survives inside it.
+  if (item.kind === 'user' && !item.lines) {
+    // Both push sites bake '❯ ' into `text` (it must survive in the plain-text fallback);
+    // strip it here so the styled gutter below is the only marker.
+    const raw = item.text.startsWith('❯ ') ? item.text.slice(2) : item.text;
+    raw.split('\n').forEach((ln, i) => {
+      out.push(
+        ...wrapHanging(
+          `${kp}u${i}`,
+          i === 0 ? [{ text: '❯ ', color: theme.green, bold: true }] : [{ text: '  ' }],
+          [{ text: '  ' }],
+          [{ text: ln, color: theme.dim }],
+          cols,
+        ),
+      );
+    });
+    return out;
+  }
+
   // ── assistant (markdown) ──
   if (item.kind === 'assistant' && !item.lines) {
     // the reference client vocabulary: a ⏺ bullet in a 2-col left gutter marks the assistant turn; the body

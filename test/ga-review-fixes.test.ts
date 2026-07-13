@@ -119,7 +119,7 @@ test('isLocalHost validates real IPs and rejects look-alike public hostnames', (
     assert.equal(isLocalHost(h), true, `${h} is local`);
   }
   // the attack: a public hostname that merely starts with a private-range prefix
-  for (const h of ['127.0.0.1.evil.com', '10.0.0.1.attacker.net', '192.168.1.1.evil.com', '172.16.0.1.evil.com', 'evil.com', '8.8.8.8', 'api.example.com']) {
+  for (const h of ['127.0.0.1.evil.com', '10.0.0.1.attacker.net', '192.168.1.1.evil.com', '172.16.0.1.evil.com', 'evil.com', '8.8.8.8', 'api.z.ai']) {
     assert.equal(isLocalHost(h), false, `${h} must NOT be treated as local`);
   }
 });

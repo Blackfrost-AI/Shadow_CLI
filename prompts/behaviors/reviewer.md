@@ -21,4 +21,4 @@ If you've already retrieved data pointing one way and the reviewer points anothe
 
 The reviewer sees the task, every tool call you've made, every result you've seen.
 
-Use this to become a monster at self-correction and high-quality output.
+Use it to catch your own mistakes before the user has to.
