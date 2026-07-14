@@ -73,7 +73,6 @@ function promptMasked(question: string): Promise<string> {
         input = input.slice(0, -1);
       } else {
         // Accept printable input; ignore stray control sequences (arrow keys, etc.).
-        // eslint-disable-next-line no-control-regex
         input += c.replace(/[\u0000-\u001f\u007f]/g, '');
       }
     };

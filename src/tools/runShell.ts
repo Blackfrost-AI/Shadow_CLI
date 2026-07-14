@@ -271,7 +271,6 @@ export function makeRunShell(
         let timedOut = false;
         let aborted = false;
         let settled = false;
-        let timer: ReturnType<typeof setTimeout>;
         let graceTimer: ReturnType<typeof setTimeout> | undefined;
         const GRACE_MS = 3000;
 
@@ -301,7 +300,8 @@ export function makeRunShell(
           resolve(result(start, false, timedOut ? 'timeout' : 'aborted', msg, data));
         };
 
-        timer = setTimeout(() => {
+        // Assigned once; graceResolve/cleanup close over it and only run after this line.
+        const timer = setTimeout(() => {
           timedOut = true;
           killTree(child, 'SIGKILL');
           graceTimer = setTimeout(graceResolve, GRACE_MS);

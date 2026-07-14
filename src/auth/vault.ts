@@ -27,7 +27,6 @@ export type VaultData = Record<string, unknown>;
 /** scrypt cost — N=2^16, r=8, p=1 → ~64MB / a few hundred ms per derive. Strong for a one-time unlock;
  *  bumped maxmem so Node doesn't refuse the allocation. Stored in the file so params can evolve. */
 const KDF = { N: 1 << 16, r: 8, p: 1, keylen: 32 } as const;
-const KDF_MAXMEM = 128 * KDF.N * KDF.r * 2; // scrypt needs 128*N*r bytes; give headroom
 
 const VAULT_VERSION = 1;
 

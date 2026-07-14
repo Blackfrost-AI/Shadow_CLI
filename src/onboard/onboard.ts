@@ -4,7 +4,7 @@ import { execSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { PROVIDERS, providersForMode, type ProviderPreset, type OnboardMode } from './catalog.js';
+import { providersForMode, type ProviderPreset, type OnboardMode } from './catalog.js';
 import { createProvider, type ProviderName } from '../provider/index.js';
 import { saveCredential, saveGlobalConfig, loadGlobalConfig, GLOBAL_DIR } from '../state/globalStore.js';
 import { addLocalModel, testLocalModel } from '../local/garage.js';
