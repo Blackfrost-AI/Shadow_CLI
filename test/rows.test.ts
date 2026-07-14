@@ -106,17 +106,18 @@ test('renderToolChild: collapsed output/diff — ⌄ glyph, +2 indent, dim, ^O h
   assert.equal(renderToolChild('diff', 1, T)[0]!.text, '  ⌄ diff 1 line · ^O', 'singular');
 });
 
-test('renderReasoning: ∴ Thinking header — same label both states; collapsed adds a ctrl+o hint', () => {
-  const collapsed = renderReasoning('a\nb\nc', true, T);
-  assert.equal(collapsed.length, 1);
-  assert.equal(collapsed[0]![0]!.text, '∴ ', 'therefore glyph, not ✻');
+test('renderReasoning: collapsed = thought-for header + ⌄ N lines · ^O; expanded = header only', () => {
+  const collapsed = renderReasoning('a\nb\nc', true, T, 9_000);
+  assert.equal(collapsed.length, 2, 'header + fold child');
+  assert.equal(collapsed[0]![0]!.text, '∴ ', 'therefore glyph');
   assert.equal(collapsed[0]![0]!.color, T.cyan);
-  assert.equal(collapsed[0]![1]!.text, 'Thinking', 'capital-T label, both states');
+  assert.equal(collapsed[0]![1]!.text, 'thought for 9s', 'duration when known');
   assert.equal(collapsed[0]![1]!.italic, true);
-  assert.ok(collapsed[0]![2]!.text.includes('ctrl+o') && collapsed[0]![2]!.color === T.dim, 'ctrl+o hint, no line count');
+  assert.equal(collapsed[1]![0]!.text, '  ⌄ 3 lines · ^O', 'fold child with line count');
+  assert.equal(collapsed[1]![0]!.color, T.dim);
   assertNoFaint(collapsed, 'reasoning/collapsed');
 
-  // Expanded is header-ONLY now — flattenItem renders the thought body as dim markdown below it.
+  // No duration → plain "Thinking". Expanded is header-ONLY (body is flattenItem's job).
   const expanded = renderReasoning('line one\nline two', false, T);
   assert.equal(expanded.length, 1, 'expanded returns only the header');
   assert.equal(expanded[0]![0]!.text, '∴ ');
@@ -133,4 +134,12 @@ test('renderBrand compact: an over-wide meta line splits at SEGMENTS, never mid-
   // No line exceeds the width by wrapping assumptions; the path appears INTACT on its own row.
   assert.ok(lines.some((l) => l.includes('/Users/someone/very/long/project-path')), 'path is whole on one row');
   assert.ok(lines.some((l) => l.trim() === 'openai/glm-4.6'), 'provider/model is its own row');
+});
+
+test('renderReasoning duration: 59.7s rounds into the minute branch, never "60s"', () => {
+  const at = (ms: number) => renderReasoning('x', false, T, ms)[0]!.map((s) => s.text).join('');
+  assert.ok(at(59_700).includes('1m 0s'), '59.7s → 1m 0s');
+  assert.ok(at(59_400).includes('59s'), '59.4s stays seconds');
+  assert.ok(at(60_100).includes('1m 0s'), '60.1s → 1m 0s');
+  assert.ok(!at(59_700).includes('60s'), 'the impossible "thought for 60s" never renders');
 });

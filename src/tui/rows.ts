@@ -191,18 +191,33 @@ export function renderToolChild(label: string, lineCount: number, theme: Viewpor
 // ── reasoning (one summary row + expandable body) ─────────────────────────────
 
 /**
- * ✻ reasoning: collapsed → a single quiet row with the line count; expanded → a header plus the
- * full thought in gray italic (+2 indent). The star matches the "thinking" spinner glyph. Raw
- * thought never streams into the transcript live — it commits here, after the fact.
+ * Collapsed reasoning (default):
+ *   ∴ thought for 9s
+ *     ⌄ 26 lines · ^O
+ * Expanded: header only — flattenItem paints the body as dim markdown underneath.
+ * `durationMs` is optional (unknown for some providers); falls back to "Thinking".
  */
-export function renderReasoning(_text: string, collapsed: boolean, theme: ViewportTheme): StyledSpan[][] {
-  // The ∴ Thinking HEADER only. Same glyph + label in both states (the reference client parity); collapsed
-  // adds a dim '(ctrl+o to expand)' hint, expanded shows just the header and flattenItem renders the
-  // thought body as dim markdown below it. (Was '✻ thought · N lines · ^O' — three inconsistent forms.)
+export function renderReasoning(
+  text: string,
+  collapsed: boolean,
+  theme: ViewportTheme,
+  durationMs = 0,
+): StyledSpan[][] {
+  const lineCount = text ? text.split('\n').length : 0;
+  let label = 'Thinking';
+  if (durationMs >= 1000) {
+    // Branch on the ROUNDED seconds, not raw ms: 59.7s rounds to 60 and must render '1m 0s',
+    // never the impossible 'thought for 60s'.
+    const s = Math.round(durationMs / 1000);
+    label = s >= 60 ? `thought for ${Math.floor(s / 60)}m ${s % 60}s` : `thought for ${s}s`;
+  } else if (durationMs >= 100) {
+    label = `thought for ${(durationMs / 1000).toFixed(1)}s`;
+  }
   const header: StyledSpan[] = [
     { text: '∴ ', color: theme.cyan },
-    { text: 'Thinking', color: theme.dim, italic: true },
+    { text: label, color: theme.dim, italic: true },
   ];
-  if (collapsed) return [[...header, { text: '  (ctrl+o to expand)', color: theme.dim }]];
-  return [header];
+  if (!collapsed) return [header];
+  const n = lineCount === 1 ? '1 line' : `${Math.max(lineCount, 1)} lines`;
+  return [header, [{ text: `  ⌄ ${n} · ^O`, color: theme.dim }]];
 }

@@ -108,9 +108,13 @@ export function formatStatusStrip(input: StatusStripInput, cols: number): string
   const extras = `${input.effortStatus ?? ''}${input.planStatus ?? ''}${input.todoStatus ?? ''}${input.sandboxStatus ?? ''}`;
   const full = `${core}${extras} · ${ctx}`;
   const narrow = `${core} · ${ctx}`;
+  // Usage (tokens/ctx%/cost) outlives the mode label as width shrinks: it is the strip's only
+  // early warning of context exhaustion, so it drops LAST — before it, lose extras, then mode.
+  const slim = `${input.model} · ${ctx}`;
   const min = `${input.model} · ${input.autonomy}`;
   if (full.length <= cols) return full;
   if (narrow.length <= cols) return narrow;
+  if (slim.length <= cols && ctx) return slim;
   if (min.length <= cols) return min;
   return min.slice(0, Math.max(8, cols - 1)) + '…';
 }

@@ -71,10 +71,30 @@ test('usage events update the status line', async () => {
   const frame = lastFrame() ?? '';
   assert.match(frame, /2\.0k tokens/, 'totals input+output and humanizes the count');
   assert.match(frame, /ctx 42%/);
+  assert.match(frame, /\$0\.0123/, 'non-zero cost still shown');
   unmount();
 });
 
-test('TuiApp surfaces plan mode and todo state in panels', async () => {
+test('usage events hide $0.0000 cost (local / free runs stay calm)', async () => {
+  const bus = new EventBus();
+  const { lastFrame, unmount } = render(React.createElement(TuiApp, { opts: makeOpts({ bus }) }));
+  await new Promise((r) => setTimeout(r, 20));
+  bus.emit({
+    type: 'usage',
+    inputTokens: 500,
+    outputTokens: 100,
+    costUSD: 0,
+    contextPct: 0.1,
+  });
+  await new Promise((r) => setTimeout(r, 20));
+  const frame = lastFrame() ?? '';
+  assert.match(frame, /600 tokens/, 'token total still shown');
+  assert.match(frame, /ctx 10%/);
+  assert.doesNotMatch(frame, /\$0\.0000/, 'zero cost is suppressed in chrome');
+  unmount();
+});
+
+test('TuiApp surfaces plan mode and todo state on the one-line chrome summary', async () => {
   const bus = new EventBus();
   const planMode = new PlanModeState(true);
   planMode.recordPlan('TUI Redesign', '/tmp/shadow/plans/tui-redesign.md');
@@ -89,11 +109,13 @@ test('TuiApp surfaces plan mode and todo state in panels', async () => {
   });
   await new Promise((r) => setTimeout(r, 20));
   const frame = lastFrame() ?? '';
-  assert.match(frame, /Plan mode/);
-  assert.match(frame, /TUI Redesign/);
-  assert.match(frame, /Task list 1\/2/);
-  assert.match(frame, /Refactor transcript/);
+  // Default is one-line chrome (accordion dead): plan title + tasks N/M + current subject + Ctrl-T.
+  assert.match(frame, /plan: TUI Redesign|implement: TUI Redesign|TUI Redesign/);
+  assert.match(frame, /▸ tasks 1\/2/);
   assert.match(frame, /Wire composer queue/);
+  assert.match(frame, /Ctrl-T/);
+  // Full list items stay hidden until Ctrl-T expands.
+  assert.doesNotMatch(frame, /Refactor transcript/);
   unmount();
 });
 
@@ -158,8 +180,8 @@ test('thinking shows a compact ✻ Thinking… indicator live, never the raw tho
   unmount();
 });
 
-// Collapsible task list: Ctrl-T folds the pinned todo box to its header and back.
-test('Ctrl-T folds the pinned task list (header stays, items hide)', async () => {
+// Collapsible task list: default one-line chrome; Ctrl-T expands the full list and folds it back.
+test('Ctrl-T expands the pinned task list from the one-line summary', async () => {
   const bus = new EventBus();
   const { lastFrame, stdin, unmount } = render(React.createElement(TuiApp, { opts: makeOpts({ bus }) }));
   await new Promise((r) => setTimeout(r, 20));
@@ -172,22 +194,23 @@ test('Ctrl-T folds the pinned task list (header stays, items hide)', async () =>
   });
   await new Promise((r) => setTimeout(r, 20));
 
-  // Expanded by default: ▾ header + items visible.
+  // Collapsed by default: one-line ▸ tasks N/M · current · Ctrl-T (no accordion dump).
   let frame = lastFrame() ?? '';
-  assert.match(frame, /▾ Task list 1\/2/, 'task list starts expanded');
+  assert.match(frame, /▸ tasks 1\/2/, 'task list starts as one-line chrome');
+  assert.doesNotMatch(frame, /Refactor transcript/, 'completed items hidden when collapsed');
+
+  // Ctrl-T (0x14) expands the full list.
+  stdin.write('\x14');
+  await new Promise((r) => setTimeout(r, 20));
+  frame = lastFrame() ?? '';
   assert.match(frame, /Refactor transcript/, 'items visible when expanded');
+  assert.match(frame, /Wire composer queue/);
 
-  // Ctrl-T (0x14) folds it: ▸ header with the Ctrl-T hint, items hidden.
+  // Ctrl-T again folds back to one line.
   stdin.write('\x14');
   await new Promise((r) => setTimeout(r, 20));
   frame = lastFrame() ?? '';
-  assert.match(frame, /▸ Task list 1\/2 · Ctrl-T/, 'collapsed header shows ▸, count, and hint');
-  assert.doesNotMatch(frame, /Refactor transcript/, 'items hidden when collapsed');
-
-  // Ctrl-T again expands.
-  stdin.write('\x14');
-  await new Promise((r) => setTimeout(r, 20));
-  frame = lastFrame() ?? '';
-  assert.match(frame, /Refactor transcript/, 'items visible again after re-expand');
+  assert.match(frame, /▸ tasks 1\/2/, 'collapsed header returns');
+  assert.doesNotMatch(frame, /Refactor transcript/, 'items hidden again after re-fold');
   unmount();
 });

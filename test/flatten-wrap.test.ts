@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { wrapSpansWord, truncateSpans, flattenItem } from '../src/tui/flatten.js';
+import { wrapSpansWord, truncateSpans, flattenItem, TOOL_BODY_EXPAND_CAP, itemIsCollapsible } from '../src/tui/flatten.js';
 import { renderToolResult } from '../src/tui/rows.js';
 import type { ViewportTheme } from '../src/tui/flatten.js';
 
@@ -104,26 +104,78 @@ test('user prompt: ❯ gutter on line 0, dim body, hanging indent on wraps and t
   for (const r of rows) assert.ok(r.spans.map((s) => s.text).join('').length <= 30, 'fits the measure');
 });
 
-test('tool output child: ⎿ branch on line 0, indent-4 under it, 10-line preview + expander', () => {
+test('tool output child: collapsed = one-row ⌄ fold; expanded = ⎿ body (no 10-line preview)', () => {
   const lines = Array.from({ length: 15 }, (_, i) => ({ text: `line ${i + 1}`, color: T.dim }));
   const item = { id: 7, kind: 'tool' as const, text: '', meta: 'output', lines };
 
   const join = (rows: { spans: { text: string }[] }[]) => rows.map((r) => r.spans.map((s) => s.text).join(''));
 
-  // Collapsed → the first 10 lines threaded under ⎿, then a '… +5 lines · ^O' expander.
+  // Collapsed → exactly ONE row: `  ⌄ output 15 lines · ^O` (design law: no multi-line teaser).
   const collapsed = flattenItem(item, 80, true, T);
-  assert.equal(collapsed[0]!.spans[0]!.text, '  ⎿ ', 'branch glyph opens the child, indent 2');
-  assert.equal(collapsed[0]!.spans[0]!.color, T.dim);
-  assert.equal(collapsed[1]!.spans[0]!.text, '    ', 'subsequent lines align under the branch (indent 4)');
-  const collapsedText = join(collapsed);
-  assert.ok(collapsedText.some((r) => r.includes('line 10')), 'shows through line 10');
-  assert.ok(!collapsedText.some((r) => r.includes('line 11')), 'line 11 hidden when collapsed');
-  assert.ok(collapsedText.some((r) => r.includes('… +5 lines · ^O')), 'expander counts the hidden remainder');
+  assert.equal(collapsed.length, 1, 'collapsed body is a single fold row');
+  const foldText = join(collapsed)[0]!;
+  assert.match(foldText, /⌄ output 15 lines · \^O/);
+  assert.ok(!foldText.includes('line 1'), 'raw body never peeks when collapsed');
 
-  // Expanded (Ctrl-O) → the whole block, no expander.
-  const expanded = join(flattenItem(item, 80, false, T));
-  assert.ok(expanded.some((r) => r.includes('line 15')), 'expanded shows every line');
-  assert.ok(!expanded.some((r) => r.includes('· ^O')), 'no expander when fully expanded');
+  // Expanded (Ctrl-O) → full body under ⎿, no fold glyph.
+  const expanded = flattenItem(item, 80, false, T);
+  const expandedText = join(expanded);
+  assert.equal(expanded[0]!.spans[0]!.text, '  ⎿ ', 'branch glyph opens the child');
+  assert.equal(expanded[1]!.spans[0]!.text, '    ', 'subsequent lines align under the branch');
+  assert.ok(expandedText.some((r) => r.includes('line 15')), 'expanded shows every line');
+  assert.ok(!expandedText.some((r) => r.includes('· ^O')), 'no fold hint when fully expanded');
+});
+
+test('tool output child: short body (≤3 lines) stays inline even when collapsed=true', () => {
+  const lines = [
+    { text: 'a', color: T.dim },
+    { text: 'b', color: T.dim },
+    { text: 'c', color: T.dim },
+  ];
+  const item = { id: 8, kind: 'tool' as const, text: '', meta: 'output', lines };
+  const rows = flattenItem(item, 80, true, T);
+  assert.equal(rows.length, 3, '≤3 lines never fold');
+  assert.equal(rows[0]!.spans[0]!.text, '  ⎿ ');
+  assert.ok(!rows.some((r) => r.spans.map((s) => s.text).join('').includes('⌄')));
+});
+
+test('tool header + nested body: one ⏺ row + fold child when collapsed', () => {
+  const item = {
+    id: 9,
+    kind: 'tool' as const,
+    text: '',
+    meta: 'output',
+    tool: { name: 'run_shell', arg: '$ npm test', ok: true, durationMs: 1200, summary: 'exit 0' },
+    lines: Array.from({ length: 12 }, (_, i) => ({ text: `out ${i + 1}`, color: T.dim })),
+  };
+  const collapsed = flattenItem(item, 80, true, T);
+  assert.equal(collapsed.length, 2, 'header + one fold row');
+  const h = collapsed[0]!.spans.map((s) => s.text).join('');
+  assert.ok(h.includes('run_shell'), 'header carries tool name');
+  assert.match(collapsed[1]!.spans.map((s) => s.text).join(''), /⌄ output 12 lines · \^O/);
+});
+
+test('tool body expanded hard-caps at TOOL_BODY_EXPAND_CAP, keeping the TAIL (the signal end)', () => {
+  const n = TOOL_BODY_EXPAND_CAP + 25;
+  const lines = Array.from({ length: n }, (_, i) => ({ text: `L${i + 1}`, color: T.dim }));
+  const item = { id: 10, kind: 'tool' as const, text: '', meta: 'output', lines };
+  const rows = flattenItem(item, 80, false, T);
+  // 1 elision note + TOOL_BODY_EXPAND_CAP content rows
+  assert.equal(rows.length, TOOL_BODY_EXPAND_CAP + 1);
+  const first = rows[0]!.spans.map((s) => s.text).join('');
+  assert.match(first, /\+25 earlier lines elided/, 'elision note leads');
+  const last = rows[rows.length - 1]!.spans.map((s) => s.text).join('');
+  assert.ok(last.includes(`L${n}`), 'the LAST line of the output is visible — tail is kept');
+  const texts = rows.map((r) => r.spans.map((s) => s.text).join('').trim());
+  assert.ok(!texts.includes('L25'), 'the elided head (L1–L25) is gone');
+  assert.ok(texts.includes('L26'), 'the first kept line is L26');
+});
+
+test('itemIsCollapsible: threshold 3, header-only tools never fold', () => {
+  assert.equal(itemIsCollapsible({ kind: 'reasoning', text: 'x' }), true);
+  assert.equal(itemIsCollapsible({ kind: 'tool', tool: {}, lines: [{}, {}, {}] }), false, '3 lines stay inline');
+  assert.equal(itemIsCollapsible({ kind: 'tool', tool: {}, lines: [{}, {}, {}, {}] }), true, '4+ folds');
+  assert.equal(itemIsCollapsible({ kind: 'tool', tool: {}, text: 'ok' }), false, 'header-only (no lines) not collapsible');
 });
 
 test('tool rows flatten to EXACTLY one row, even with a huge URL', () => {

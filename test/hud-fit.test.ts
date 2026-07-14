@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { fitHud } from '../src/tui.js';
+import { fitHud, reflowSequence } from '../src/tui.js';
 
 // Every combination of "what the HUD wants to show". The invariant must hold for ALL of them.
 const WANTS = [
@@ -35,6 +35,27 @@ test('fitHud: a normal-size terminal shows everything', () => {
   assert.ok(f.strip && f.status && f.hint && f.pinned && f.queued && f.custom && f.marginTop);
 });
 
+test('fitHud: strip:false reclaims the permanent status-strip row (Phase B merge)', () => {
+  const withStrip = fitHud(40, { liveWant: 0, pinned: false, queued: false, custom: false });
+  const merged = fitHud(40, { liveWant: 0, pinned: false, queued: false, custom: false, strip: false });
+  assert.equal(withStrip.strip, true);
+  assert.equal(merged.strip, false);
+  assert.equal(merged.height, withStrip.height - 1, 'merged chrome is one row shorter');
+});
+
+test('fitHud: constant liveWant=2 (idle or running) still stays under terminal height', () => {
+  // Phase C: live slot is always reserved so the composer never jumps at turn boundaries.
+  for (const rows of [17, 24, 40, 80]) {
+    const f = fitHud(rows, { liveWant: 2, pinned: true, queued: false, custom: false, strip: false });
+    assert.ok(f.height < rows, `rows=${rows} height=${f.height}`);
+    assert.equal(f.liveRows, 2, 'full 2-row slot when the budget allows');
+  }
+  // Tiny terminal: live rows drop first as needed, still under height.
+  const tiny = fitHud(8, { liveWant: 2, pinned: true, queued: true, custom: true, strip: false });
+  assert.ok(tiny.height < 8);
+  assert.ok(tiny.liveRows <= 2);
+});
+
 test('fitHud: drops lowest-priority rows first as the terminal shrinks', () => {
   const want = { liveWant: 2, pinned: true, queued: true, custom: true };
   // Everything fits at rows>=13 (height 12); at rows=12 the cosmetic blank is the first casualty.
@@ -52,4 +73,26 @@ test('fitHud: liveRows honors liveWant (the caller zeroes it when nothing is liv
   assert.equal(fitHud(40, { liveWant: 0, pinned: false, queued: false, custom: false }).liveRows, 0);
   assert.equal(fitHud(40, { liveWant: 1, pinned: false, queued: false, custom: false }).liveRows, 1);
   assert.equal(fitHud(40, { liveWant: 2, pinned: false, queued: false, custom: false }).liveRows, 2);
+});
+
+test('reflowSequence: soft keeps scrollback; hard wipes it', () => {
+  assert.equal(reflowSequence('soft'), '\x1b[2J\x1b[H');
+  assert.equal(reflowSequence('hard'), '\x1b[2J\x1b[3J\x1b[H');
+  assert.ok(!reflowSequence('soft').includes('3J'), 'soft must not nuke scrollback');
+  assert.ok(reflowSequence('hard').includes('3J'), 'hard clears scrollback for resize/clear');
+});
+
+test('fitHud liveBlank: the hint outranks BLANK idle live-slot rows on short terminals', () => {
+  // 7-row split pane, idle: base 3 + status 1 leaves 2 spare rows (cap rows-1=6).
+  // Without liveBlank the two blank slot rows consumed them and the hint vanished.
+  const idle = fitHud(7, { liveWant: 2, liveBlank: true, pinned: false, queued: false, custom: false, strip: false });
+  assert.ok(idle.hint, 'hint (merged strip: model/mode/ctx/OFFLINE) survives');
+  assert.ok(idle.liveRows < 2, 'blank rows are what gets dropped');
+  // Running (liveBlank false): the streaming preview keeps its priority above the hint.
+  const run = fitHud(7, { liveWant: 2, liveBlank: false, pinned: false, queued: false, custom: false, strip: false });
+  assert.equal(run.liveRows, 2, 'live preview wins while running');
+  // On a tall terminal both fit either way — constant-height invariant intact.
+  const tallIdle = fitHud(40, { liveWant: 2, liveBlank: true, pinned: true, queued: false, custom: false, strip: false });
+  const tallRun = fitHud(40, { liveWant: 2, liveBlank: false, pinned: true, queued: false, custom: false, strip: false });
+  assert.equal(tallIdle.height, tallRun.height, 'idle and running frames match on tall terminals');
 });

@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react';
 import { render, Box, Text, Static, useApp, useInput, useStdout } from 'ink';
-import { flattenItem } from './tui/flatten.js';
+import { flattenItem, itemIsCollapsible } from './tui/flatten.js';
+import { MENU_BG, MENU_SEL_BG, PendingOverlay, ModelPickerOverlay } from './tui/overlays.js';
 import { execFileSync, spawn } from 'node:child_process';
 import type { Message, Provider, ToolCall, ContentBlock, ImageBlock, Effort } from './provider/provider.js';
 import type { ToolRegistry } from './tools/registry.js';
@@ -89,8 +90,7 @@ import { loadAgentDefs } from './agent/defs.js';
 import { existsSync, writeFileSync, statSync, readFileSync, readdirSync } from 'node:fs';
 import { join, resolve, isAbsolute } from 'node:path';
 import { friendlyDeniedReason } from './util/deniedReason.js';
-import type { UserAnswer, UserQuestion } from './agent/approval.js';
-import { computeLayout, fitsWideBanner, formatStatusStrip, pinnedMaxItems } from './tui/layout.js';
+import { computeLayout, formatStatusStrip, pinnedMaxItems } from './tui/layout.js';
 import { vimNormalKey, type VimMode } from './tui/vim.js';
 import { runHookPhase } from './hooks/runner.js';
 import { discoverSkills } from './skills/loader.js';
@@ -326,11 +326,6 @@ const SPINNER = ['◐', '◓', '◑', '◒']; // light/dark halves chase around 
 const BLACK_CIRCLE = IS_DARWIN ? '⏺' : '●';
 // Claude's warm brand orange — the spinner glyph + the ⏺ accent.
 const CLAUDE_ORANGE = '#d97757';
-// Slash-menu contrast: a faint slate panel behind the whole command list so it reads as a distinct
-// surface (not lost in the transcript), and a stronger tone on the selected row — a soft highlight
-// bar, not the harsh reverse-video the redesign dropped.
-const MENU_BG = '#1b2331';
-const MENU_SEL_BG = '#31465f';
 // The activity label shown beside the spinner while a turn runs. One brand-consistent word
 // ('Shadowing…') instead of a rotating grab-bag of generic verbs. A CUSTOM per-action label (a tool
 // or the app setting a contextual verb) can override it in future; there is no such source today.
@@ -572,6 +567,8 @@ interface TranscriptBase {
    *  fallback the stock Ink components read, so both paths stay in sync. */
   brand?: BrandInfo;
   tool?: ToolInfo;
+  /** Reasoning wall-clock (ms) when known — fold header shows `thought for Ns`. */
+  durationMs?: number;
 }
 type TranscriptItem = TranscriptBase;
 // Idle-countdown config: when the model asks a question and the user is away, auto-pick the
@@ -675,54 +672,6 @@ function useTerminalSize(): { cols: number; rows: number } {
     };
   }, [stdout]);
   return size;
-}
-
-function Banner({ item, cols }: { item: TranscriptItem; cols: number }) {
-  const lines = item.lines ?? [];
-  const leftMax = Math.max(0, ...lines.map((l) => l.text.length));
-
-  if (fitsWideBanner(cols, leftMax)) {
-    // Wide: two-column — build info left, SHADOW logo right (only when both fit).
-    return (
-      <Box
-        borderStyle="round"
-        borderColor="cyan"
-        paddingX={2}
-        marginTop={1}
-        flexDirection="row"
-        justifyContent="space-between"
-        width={cols}
-      >
-        <Box flexDirection="column" justifyContent="center" flexShrink={0}>
-          {lines.map((l, i) => (
-            <Text key={i} color={l.color ?? (l.dimColor ? C.dim : undefined)} bold={l.bold}>
-              {l.text}
-            </Text>
-          ))}
-        </Box>
-        <Box flexDirection="column" flexShrink={0}>
-          {SHADOW_ART.map((l, i) => (
-            <Text key={i} color={C.cyan} bold>
-              {l}
-            </Text>
-          ))}
-        </Box>
-      </Box>
-    );
-  }
-
-  // Narrow fallback: compact stacked card. lines[0] is the version — pair it with the wordmark.
-  const [version, ...rest] = lines;
-  return (
-    <Box flexDirection="column" width={cols} borderStyle="round" borderColor="cyan" paddingX={1} marginTop={1}>
-      <Text color={C.cyan} bold>{`✻ Shadow ${version?.text ?? ''}`}</Text>
-      {rest.map((l, i) => (
-        <Text key={i} color={l.color ?? (l.dimColor ? C.dim : undefined)} bold={l.bold}>
-          {l.text}
-        </Text>
-      ))}
-    </Box>
-  );
 }
 
 /**
@@ -905,7 +854,7 @@ export interface HudFit {
  */
 export function fitHud(
   rows: number,
-  want: { liveWant: number; pinned: boolean; queued: boolean; custom: boolean },
+  want: { liveWant: number; pinned: boolean; queued: boolean; custom: boolean; /** The live slot is currently BLANK (idle reserve): rank it below the hint so short terminals keep real content over empty rows. */ liveBlank?: boolean; /** Separate status strip row. Default true; Phase B merges strip into hint/status so callers pass false. */ strip?: boolean },
 ): HudFit {
   const cap = rows - 1; // outputHeight must be <= rows - 1 to stay under Ink's wipe threshold
   const f: HudFit = {
@@ -916,10 +865,16 @@ export function fitHud(
   // this list first (cosmetic blank spacer goes first, then custom status, queued, pinned, …).
   // `liveWant` is the desired streaming-preview height (0 when there's nothing live to show).
   const add = (n: number, on: () => void): void => { if (f.height + n <= cap) { f.height += n; on(); } };
-  add(1, () => (f.strip = true));   // status strip: model / mode / context / tokens
+  // Separate strip is optional — Phase B merges model/mode/ctx into the composer hint (idle) or
+  // the working status line (running), reclaiming one permanent chrome row.
+  if (want.strip !== false) add(1, () => (f.strip = true));
   add(1, () => (f.status = true));  // 'working…' status line (liveness)
-  for (let i = 0; i < want.liveWant; i++) add(1, () => (f.liveRows += 1)); // streaming preview
-  add(1, () => (f.hint = true));    // composer hint (keybindings)
+  const addLive = (): void => { for (let i = 0; i < want.liveWant; i++) add(1, () => (f.liveRows += 1)); };
+  const addHint = (): void => add(1, () => (f.hint = true)); // composer hint — also carries merged strip when idle
+  // An idle live slot is BLANK reserve rows; the hint (which carries the merged model/mode/ctx/
+  // OFFLINE strip) must outrank blank rows on short terminals. While running, the streaming
+  // preview is real content and keeps its priority above the hint.
+  if (want.liveBlank) { addHint(); addLive(); } else { addLive(); addHint(); }
   if (want.pinned) add(1, () => (f.pinned = true));  // goal / task summary
   if (want.queued) add(1, () => (f.queued = true));
   if (want.custom) add(1, () => (f.custom = true));
@@ -1178,20 +1133,22 @@ export function Markdown({ source, color = C.fg, width = PROSE_MAX_COLS }: { sou
 }
 
 /** Large tool/diff output and reasoning are collapsible; everything else renders full.
- *  Collapsible items START collapsed; the `toggled` set flips them (Ctrl-O). */
-// Fold a tool/process output block to its `⌄ output N lines · ^O` summary once it's more than a
-// couple of lines — the reference client folds tool bodies by default (verbose off), so a run_shell / grep /
-// read doesn't dump a wall of output into the transcript. 1–3 line results still show inline.
-const COLLAPSE_THRESHOLD = 3;
-function transcriptLineCount(item: TranscriptItem): number {
-  if (item.lines) return item.lines.length;
-  if (typeof item.text === 'string' && item.text) return item.text.split('\n').length;
-  return 1;
-}
+ *  Collapsible items START collapsed; Ctrl-O expands ALL. Threshold lives in flatten.ts so the
+ *  renderer and the classifier never drift (was 3 here / 8 in flattenTranscript). */
 function isCollapsible(item: TranscriptItem): boolean {
-  if (item.kind === 'reasoning') return true;
-  if (item.kind === 'tool' || item.kind === 'blocked') return transcriptLineCount(item) > COLLAPSE_THRESHOLD;
-  return false;
+  return itemIsCollapsible(item);
+}
+
+/**
+ * Cap a multi-line tool body before it enters the transcript. Prefer the TAIL (shell logs,
+ * test runners) — the end is usually the signal. A head notice records how many lines were
+ * dropped so the fold count still reads honestly after expand.
+ */
+const MAX_TRANSCRIPT_BODY_LINES = 200;
+function capTranscriptBody(rawLines: string[]): string[] {
+  if (rawLines.length <= MAX_TRANSCRIPT_BODY_LINES) return rawLines;
+  const omitted = rawLines.length - MAX_TRANSCRIPT_BODY_LINES;
+  return [`… ${omitted} earlier lines omitted …`, ...rawLines.slice(-MAX_TRANSCRIPT_BODY_LINES)];
 }
 
 /** Pinned agent state — a light, full-width block above the composer: a dim top
@@ -1404,6 +1361,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // coalesce the re-render to ~30ms. setStreamNow/setThinkNow apply a value immediately AND drop
   // any pending flush, so a clear (turn end, /clear) can't be undone by a late timer.
   const thinkBufRef = useRef('');
+  /** Wall-clock start of the current reasoning stream (first thinking delta) — for `thought for Ns`. */
+  const thinkStartedAtRef = useRef<number | null>(null);
   const pendingStreamRef = useRef<string | null>(null);
   const pendingThinkRef = useRef<string | null>(null);
   const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1467,48 +1426,31 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     queuedTasksRef.current = next;
     setQueuedState(next);
   }, []);
-  const [todoCollapsed, setTodoCollapsed] = useState(false); // pinned task list folded to its header (Ctrl-T)
+  // Default COLLAPSED: one-line chrome summary; Ctrl-T expands the full list (redesign: accordion dies).
+  const [todoCollapsed, setTodoCollapsed] = useState(true);
   // The transcript is an Ink <Static> that owns the terminal's NATIVE scrollback
   // (mouse-wheel / scrollbar work, reference-client style). `staticEpoch` is bumped to
   // force a re-flush when committed items must repaint (Ctrl-O collapse, /clear).
   const [staticEpoch, setStaticEpoch] = useState(0);
-  // ── Hard reflow (user-initiated folds only) ──────────────────────────────────
-  // On an explicit fold toggle (Ctrl-O collapses/expands a committed item, Ctrl-T folds the
-  // task list) the committed transcript's rendered state must change, so we remount <Static>
-  // (via staticEpoch) to re-emit it. The visible SCREEN is wiped first (2J + home, deliberately
-  // NOT \x1b[3J — 3J would destroy the user's entire terminal scrollback, including everything
-  // from before shadow started). Known tradeoff: each fold pushes one re-emitted transcript copy
-  // into native scrollback — rare and user-initiated, far kinder than nuking history.
-  //
-  const hardReflow = useCallback(() => {
+  // ── Reflow (Static remount when committed rows must repaint) ─────────────────
+  // Ink <Static> paints each item once; toggling collapse needs a remount (epoch bump).
+  //   soft — clear the VISIBLE screen only (2J+H). Keeps native scrollback so PgUp history
+  //          survives Ctrl-O. May leave one stale pre-fold copy above the re-emit — rare and
+  //          user-initiated; far less of a flashbang than wiping the whole scrollback.
+  //   hard — also wipe scrollback (2J+3J+H). Used on resize /clear where a ghost composer or
+  //          stacked rewrap would otherwise stick around. Startup already cleared pre-launch history.
+  const reflow = useCallback((mode: 'soft' | 'hard' = 'hard') => {
     const out = process.stdout;
-    // Wipe screen AND scrollback (2J+3J) before the <Static> remount re-emits the FULL committed
-    // transcript. Previously this used 2J only (to preserve scrollback), but that left the pre-fold
-    // copy of the whole conversation stacked ABOVE the re-emitted one — every Ctrl-O/Ctrl-T pushed a
-    // duplicate into native scrollback. Since the transcript is fully re-emitted from `committed`,
-    // clearing scrollback loses nothing but the stale copies (and the pre-launch history we already
-    // clear at startup). The epoch bump is the functional part; the wipe just avoids visible stacking.
-    if (out.isTTY) out.write('\x1b[2J\x1b[3J\x1b[H');
+    if (out.isTTY) out.write(reflowSequence(mode));
     setStaticEpoch((n) => n + 1);
   }, []);
-  // Task-list collapse/expand (Ctrl-T) shrinks/grows the pinned block — reflow so the
-  // composer re-locks to the bottom instead of leaving (or jumping over) a blank gap.
-  // Skip the first run (mount) so startup doesn't wipe the freshly drawn banner.
-  const didMountReflowRef = useRef(false);
-  useEffect(() => {
-    if (!didMountReflowRef.current) {
-      didMountReflowRef.current = true;
-      return;
-    }
-    hardReflow();
-  }, [todoCollapsed, hardReflow]);
-  // RESIZE → debounced reflow. When cols/rows change, the terminal rewraps the already-printed
-  // <Static> lines, but Ink erases its live frame against its OWN tracked geometry (now stale) and
-  // leaves the previous composer/rules STRANDED on screen — the "ghost composer" a resize leaves
-  // behind. A hardReflow (2J+3J wipe + <Static> remount) repaints everything clean at the new width;
-  // the 3J clears scrollback so the re-emit can't duplicate (the reason resize-reflow was originally
-  // disabled — no longer true). Debounced so a click-drag (a burst of resize events) reflows ONCE,
-  // after it settles, not on every intermediate size. Mount is skipped (banner already drawn).
+  // Ctrl-T only mutates LIVE chrome (PinnedState / one-line summary) — never the committed
+  // Static transcript — so it must NOT reflow. A reflow on every task-list toggle was wiping
+  // the screen for a pure live-height change.
+  // RESIZE → debounced HARD reflow. When cols/rows change, the terminal rewraps already-printed
+  // <Static> lines, but Ink erases its live frame against stale geometry and leaves a ghost
+  // composer. Hard wipe + remount repaints clean at the new width. Debounced so a click-drag
+  // reflows once after it settles. Mount is skipped (banner already drawn).
   const didFirstSizeRef = useRef(false);
   const resizeReflowTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
@@ -1517,11 +1459,11 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       return;
     }
     if (resizeReflowTimer.current) clearTimeout(resizeReflowTimer.current);
-    resizeReflowTimer.current = setTimeout(() => hardReflow(), 120);
+    resizeReflowTimer.current = setTimeout(() => reflow('hard'), 120);
     return () => {
       if (resizeReflowTimer.current) clearTimeout(resizeReflowTimer.current);
     };
-  }, [terminalSize.cols, terminalSize.rows, hardReflow]);
+  }, [terminalSize.cols, terminalSize.rows, reflow]);
   const lastUsageRef = useRef<{ inputTokens: number; outputTokens: number; costUSD: number; contextPct: number } | null>(null);
   const costWarnedRef = useRef(false);
   // Session-level cost accumulation. The per-turn Budget resets each turn, so we
@@ -1750,9 +1692,18 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // single LATEST collapsible item, so every earlier fold was permanently unreachable.
   useEffect(() => kbRegister('transcript:toggleFoldLatest', () => {
     setShowAllExpanded((v) => !v);
-    hardReflow(); // <Static> caches committed rows; remount + clean re-emit reflects the new state
-  }), [kbRegister, hardReflow]);
-  useEffect(() => kbRegister('transcript:toggleTaskList', () => setTodoCollapsed((v) => !v)), [kbRegister]);
+    // Soft reflow: remount Static so folds repaint, keep scrollback (no 3J flashbang).
+    reflow('soft');
+  }), [kbRegister, reflow]);
+  useEffect(() => kbRegister('transcript:toggleTaskList', () => {
+    // Mid-turn the full block is suppressed (the summary glyph is pinned '▸'), so a toggle would
+    // be invisible now and pop the accordion open unprompted at turn end — drop the key instead.
+    if (runningRef.current) return;
+    setTodoCollapsed((v) => !v);
+    // The full block mounts/unmounts above <Static>; re-lock the composer to the bottom so the
+    // height change can't leave a blank gap or stale pinned rows (the old hardReflow invariant).
+    reflow('hard');
+  }), [kbRegister, reflow]);
 
   // Re-run the /statusline command (if any) and stash its output for the footer.
   const refreshStatusLine = useCallback(() => {
@@ -3162,6 +3113,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           break;
         case 'thinking':
           if (e.delta) {
+            if (thinkStartedAtRef.current == null) thinkStartedAtRef.current = Date.now();
             thinkBufRef.current += e.delta;
             pendingThinkRef.current = thinkBufRef.current;
             scheduleFlush();
@@ -3169,10 +3121,18 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           break;
         case 'reasoning_done': {
           // Through pushLine (the single choke point every transcript item flows through) so a
-          // future hook on commit sees reasoning items too.
-          pushLine({ kind: 'reasoning', text: e.text.trimEnd(), dimColor: true, meta: 'reasoning' });
+          // future hook on commit sees reasoning items too. durationMs drives `thought for Ns`.
+          const durationMs =
+            thinkStartedAtRef.current != null ? Math.max(0, Date.now() - thinkStartedAtRef.current) : 0;
+          thinkStartedAtRef.current = null;
+          pushLine({
+            kind: 'reasoning',
+            text: e.text.trimEnd(),
+            dimColor: true,
+            meta: 'reasoning',
+            durationMs,
+          });
           setThinkNow('');
-          // Keep open during stream; will auto-collapse on action (research collapse-when-done)
           break;
         }
         case 'assistant_done': {
@@ -3208,19 +3168,45 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           break;
         case 'tool_start':
           setThinkNow(''); // reasoning for this step is over once it acts (folded by default now)
+          // Live row (activeTool) already shows name(args) — don't also mirror it into toolLine
+          // (that used to double-print `↳ run_shell …` in the status tail under the same call).
           setActiveTool({ name: e.call.name, arg: previewOf(e.call.input) });
-          setToolLine(`↳ ${e.call.name} ${previewOf(e.call.input)}`);
+          setToolLine(null);
           break;
         case 'tool_end': {
           setToolLine(null);
           setActiveTool(null);
           setShellPid(null);
           setShellWarn(null);
+          // Nest shell stdout / edit diffs ON the tool header item so collapse is one unit:
+          //   ⏺ run_shell($ npm test) — exit 0 (1.2s)
+          //     ⌄ output 47 lines · ^O          ← default ( > TOOL_BODY_COLLAPSE_THRESHOLD )
+          // Short bodies (≤ threshold) stay inline under ⎿. Cap huge bodies before commit so
+          // React state + Static never hold multi-MB dumps.
+          const sd = e.result.data as { stdout?: string; stderr?: string } | undefined;
+          const shellOut = [sd?.stdout ?? '', sd?.stderr ?? ''].join('\n').replace(/^\n+|\n+$/g, '');
+          const diff = e.result.meta?.diff;
+          let bodyLines: BannerLine[] | undefined;
+          let bodyMeta: string | undefined;
+          if (shellOut.trim()) {
+            bodyMeta = 'output';
+            bodyLines = capTranscriptBody(shellOut.split('\n')).map((l) => ({ text: l, color: C.dim }));
+          } else if (diff && diff.length) {
+            bodyMeta = 'diff';
+            bodyLines = capTranscriptBody(diff.map((d) => `${d.tag} ${d.text}`)).map((text) => {
+              const tag = text.startsWith('+') ? '+' : text.startsWith('-') ? '-' : ' ';
+              return {
+                text,
+                color: tag === '+' ? C.green : tag === '-' ? C.red : undefined,
+                dimColor: tag === ' ' || text.startsWith('…'),
+              };
+            });
+          }
           pushLine({
             kind: 'tool',
             text: `${e.result.ok ? '✓' : '✗'} ${e.call.name} ${Math.max(0, Math.round(e.result.meta.durationMs))}ms — ${oneLine(e.result.summary)}`,
             color: e.result.ok ? C.green : C.red,
-            meta: e.call.name,
+            meta: bodyMeta ?? e.call.name,
             tool: {
               name: e.call.name,
               arg: previewOf(e.call.input) || undefined,
@@ -3228,33 +3214,23 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
               durationMs: Math.max(0, e.result.meta.durationMs),
               summary: oneLine(e.result.summary),
             },
+            lines: bodyLines,
           });
-          // Shell output (run_shell / bash_output) is shown as a COLLAPSIBLE block — visible but folded
-          // to "▸ output +N lines · Ctrl-O" once it passes the collapse threshold, so a noisy command
-          // (a big cat/print) can't flood the transcript. Short output shows inline. (the reference client parity.)
-          const sd = e.result.data as { stdout?: string; stderr?: string } | undefined;
-          const shellOut = [sd?.stdout ?? '', sd?.stderr ?? ''].join('\n').replace(/^\n+|\n+$/g, '');
-          if (shellOut.trim()) {
-            pushLine({
-              kind: 'tool',
-              text: shellOut,
-              meta: 'output',
-              lines: shellOut.split('\n').map((l) => ({ text: l, color: C.dim })),
-            });
-          }
-          // Edits/writes carry a UI-only diff on meta — render it as a collapsible
-          // +/- block in the transcript (collapsed by default; Ctrl-O expands).
-          const diff = e.result.meta?.diff;
-          if (diff && diff.length) {
+          // Rare: both shell capture AND a UI diff on the same call — nest shell above, keep
+          // the diff as its own foldable sibling so neither body is dropped.
+          if (shellOut.trim() && diff && diff.length) {
             pushLine({
               kind: 'tool',
               text: '',
               meta: 'diff',
-              lines: diff.map((d) => ({
-                text: `${d.tag} ${d.text}`,
-                color: d.tag === '+' ? C.green : d.tag === '-' ? C.red : undefined,
-                dimColor: d.tag === ' ',
-              })),
+              lines: capTranscriptBody(diff.map((d) => `${d.tag} ${d.text}`)).map((text) => {
+                const tag = text.startsWith('+') ? '+' : text.startsWith('-') ? '-' : ' ';
+                return {
+                  text,
+                  color: tag === '+' ? C.green : tag === '-' ? C.red : undefined,
+                  dimColor: tag === ' ' || text.startsWith('…'),
+                };
+              }),
             });
           }
           break;
@@ -3362,6 +3338,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           // the stream side; and stale buf/pending refs could leak a ghost flush into the next turn.
           streamBufRef.current = '';
           thinkBufRef.current = '';
+          thinkStartedAtRef.current = null;
           pendingStreamRef.current = null;
           pendingThinkRef.current = null;
           setStreamNow('');
@@ -3986,21 +3963,22 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // fallback (fires at outputHeight ≥ rows) stays strictly unreachable on terminals ≥ 17 rows.
   // Composer stationarity has exactly TWO one-time, turn-scoped +1 shifts (both inside the safety
   // rows): the todo pin line appearing, and the queued row appearing on the first type-ahead.
-  const streamTail = Math.max(3, Math.min(12, terminalSize.rows - 14));
-  const statusStrip = formatStatusStrip(
-    {
-      provider: current.provider,
-      model: current.model,
-      autonomy,
-      bypass: opts.bypass,
-      planStatus,
-      todoStatus,
-      effortStatus: ` · ${effortSymbol(effort)} ${effort}`,
-      sandboxStatus: opts.bypass ? ' · sandbox:off' : '',
-      status,
-    },
-    layout.cols,
-  );
+  // Constant live-slot budget (redesign: chrome never moves). fitHud may still drop these rows
+  // on a tiny terminal; when they fit they stay reserved idle AND running so the composer does
+  // not jump when a turn starts/ends or when thinking ↔ streaming swaps.
+  const LIVE_SLOT_ROWS = 2;
+  // Strip INPUT only — the string is formatted per host row (status line / composer hint), each
+  // with the width actually left beside it, so formatStatusStrip's shrink ladder can do its job.
+  const stripInput = {
+    provider: current.provider,
+    model: current.model,
+    autonomy,
+    bypass: opts.bypass,
+    planStatus,
+    todoStatus,
+    effortStatus: ` · ${effortSymbol(effort)} ${effort}`,
+    status,
+  };
   // The slash menu shows whenever "/word" has matches — including while a turn runs, so you can
   // still autocomplete a command to queue it (or run a live-safe one). Only an active overlay
   // (approval / model picker) suppresses it.
@@ -4022,54 +4000,67 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // box + composer + strip under the wipe threshold, the menu simply doesn't open (you can still type
   // the whole command); MENU_MAX+5 for the box, +5 for composer(4)+strip(1), +1 headroom.
   const menuOpen = menu.length > 0 && terminalSize.rows >= MENU_MAX + 5 + 5 + 1;
-  const hudStreamRows = menuOpen ? 0 : streamTail;
-  // Stock live-region cap: keep the preview short so the input bar below it barely moves as an answer
-  // streams (the "bar still jumps" tradeoff). The CONTENT tail and the Box height MUST use this same
-  // number — if the box is shorter than the clamped content, Ink clips the BOTTOM and the newest
-  // streamed line disappears (the CODE_199 regression). 6 rows is the sweet spot: enough to read, not
-  // enough to shove the composer around.
-  // PINNED live slot: a SMALL constant-height region above the composer (the latest LIVE_ROWS
-  // streaming lines, bottom-aligned, + the one 'working… Ns' status). Constant height ⇒ the composer
-  // never moves mid-turn — finished lines scroll up into <Static> as they commit. Capped at 2: each
-  // row here is one row the composer rises when the turn ends and the slot collapses (the answer has
-  // committed to scrollback by then, so the content stays visible — the jump is just the slot going
-  // away). Tighter = smaller turn-end settle. (the reference client pins its input the same way: content scrolls above.)
-  const liveWant = Math.min(hudStreamRows, 2);
+  // Constant live slot: always request LIVE_SLOT_ROWS (unless menu steals the rows). Content is
+  // bottom-aligned inside; idle leaves the slot blank. Same height idle ↔ running ⇒ no composer jump.
+  const liveWant = menuOpen ? 0 : LIVE_SLOT_ROWS;
+  // Pinned agent state: ONE line by default (redesign: accordion dies). Ctrl-T expands the full
+  // list only when idle on a tall enough terminal; running always stays one line so the composer
+  // never jumps.
+  const todoCurrent = todoItems.find((t) => t.status === 'in_progress')?.subject ?? '';
+  // Full multi-row PinnedState only on explicit Ctrl-T expand while idle (default is one-line).
+  // A GOAL alone never drives the full block — it always rides the one-line summary.
+  const idleFullBlock = !running && !todoCollapsed && !!(showPlan || showTodo);
+  const showFullPinned = idleFullBlock && terminalSize.rows >= 16;
+  const hudPinnedLine = [
+    goal ? `🎯 ${goal}` : '',
+    showPlan ? `${planMode.mode === 'planning' ? 'plan' : 'implement'}: ${planMode.title ?? ''}` : '',
+    showTodo
+      // The glyph mirrors what actually RENDERED: '▾' only when the full block is truly open —
+      // a short terminal keeps showFullPinned false even after Ctrl-T, so don't claim otherwise.
+      ? `${showFullPinned ? '▾' : '▸'} tasks ${todoDone}/${todoItems.length}${todoCurrent ? ` · ${todoCurrent}` : ''} · Ctrl-T`
+      : '',
+  ].filter(Boolean).join('   ·   ');
+  // Frame budget: keep the live (non-Static) frame strictly under the terminal height so Ink never
+  // trips its whole-screen wipe on a short/split-pane terminal. Drives which optional rows render.
+  const wantPinnedLine = hudPinnedLine !== '' && !menuOpen && (running || !showFullPinned);
+  const hudFit = fitHud(terminalSize.rows, {
+    liveWant,
+    liveBlank: !running, // idle slot = blank reserve; the hint outranks it on short terminals
+    pinned: wantPinnedLine,
+    queued: queued.length > 0 && !menuOpen,
+    custom: !!customStatus,
+    strip: false, // Phase B: strip merged into composer hint (idle) / status line (running)
+  });
   // reference-client style activity line: an orange pulsing sparkle (rendered separately, below) + a playful
   // per-turn verb + a quiet metric tail. No 'working… 0s · Esc to interrupt' clutter — the elapsed
   // only appears after a beat, and the interrupt hint already lives in the composer footer.
   const statusVerb = running ? `${DEFAULT_STATUS_VERB}…` : '';
-  const statusTail = running
-    ? `${elapsedSec >= 1 ? ` (${formatDuration(elapsedSec)})` : ''}${toolLine ? ` · ${toolLine.trim()}` : ''}${shellPid ? ` · shell ${shellPid}` : ''}${shellPid && shellWarn ? ' · ⚠ may survive Esc' : elapsedSec >= 25 && !toolLine ? ' · model slow to respond' : ''}`
+  // SAFETY MARKERS ride OUTSIDE the strip so its shrink ladder can never drop them: OFFLINE is the
+  // privacy contract's always-visible signal, sandbox:off is the "guardrails are OFF" warning.
+  const offlineTag = opts.offline ? 'OFFLINE · ' : '';
+  const sandboxTag = opts.bypass ? 'sandbox:off · ' : '';
+  // When the live slot can't render (tiny terminal / slash menu open) the activeTool row is
+  // invisible — surface the running tool here instead so a long tool call is never unindicated.
+  const toolTag = toolLine
+    ? ` · ${toolLine.trim()}`
+    : activeTool && hudFit.liveRows === 0
+      ? ` · ${activeTool.name}…`
+      : '';
+  // 'model slow to respond' means the MODEL is quiet — a tool executing (activeTool) is not the
+  // model being slow, so an in-flight tool suppresses the heuristic.
+  const statusPrefix = running
+    ? `${elapsedSec >= 1 ? ` (${formatDuration(elapsedSec)})` : ''}${toolTag}${shellPid ? ` · shell ${shellPid}` : ''}${shellPid && shellWarn ? ' · ⚠ may survive Esc' : elapsedSec >= 25 && !toolLine && !activeTool ? ' · model slow to respond' : ''}`
     : '';
-  // Pinned agent state collapses to ONE line while running (the full PinnedState block is a 3→14-row
-  // accordion that shoved the composer around mid-turn); the full list still renders between turns.
-  const todoCurrent = todoItems.find((t) => t.status === 'in_progress')?.subject ?? '';
-  const hudPinnedLine = [
-    goal ? `🎯 ${goal}` : '',
-    showPlan ? `${planMode.mode === 'planning' ? 'plan' : 'implement'}: ${planMode.title ?? ''}` : '',
-    showTodo ? `▸ tasks ${todoDone}/${todoItems.length}${todoCurrent ? ` · ${todoCurrent}` : ''} · Ctrl-T` : '',
-  ].filter(Boolean).join('   ·   ');
-  // Frame budget: keep the live (non-Static) frame strictly under the terminal height so Ink never
-  // trips its whole-screen wipe on a short/split-pane terminal. Drives which optional rows render.
-  const hasLive = running || stream !== '' || think !== '';
-  // Pinned zone: the full multi-row PinnedState block only renders IDLE on a comfortably tall terminal
-  // (it's ~5 rows of chrome + items); running, or idle on a short/split-pane terminal, it collapses to
-  // the single-row summary so it can't push the live frame past Ink's wipe threshold.
-  // A GOAL alone must NOT spawn the multi-row PinnedState block: that block (a full-width rule +
-  // marginTop sitting above <Static>) ghosts/DUPLICATES when it re-renders, and a standing goal is a
-  // one-line indicator, not an accordion. Only a plan or todo list — which genuinely needs several
-  // rows — drives the full block. The goal always rides the stable single-row summary line in the
-  // bottom info zone (hudPinnedLine already carries `🎯 <goal>`), so setting a goal never glitches.
-  const idleFullBlock = !running && !!(showPlan || showTodo);
-  const showFullPinned = idleFullBlock && terminalSize.rows >= 16;
-  const wantPinnedLine = hudPinnedLine !== '' && !menuOpen && (running || !showFullPinned);
-  const hudFit = fitHud(terminalSize.rows, {
-    liveWant: menuOpen || !hasLive ? 0 : liveWant,
-    pinned: wantPinnedLine,
-    queued: queued.length > 0 && !menuOpen,
-    custom: !!customStatus,
-  });
+  // Phase B: status strip is merged — while running, model/mode/ctx (and OFFLINE, the privacy
+  // contract's always-visible marker) ride this same status line. The strip is formatted against
+  // the width actually REMAINING beside the verb/elapsed/tool prefix, so its ctx/cost tail shrinks
+  // instead of being truncated off the row edge. Idle merge lives in the composer hint (below).
+  const statusTail = running
+    ? `${statusPrefix} · ${offlineTag}${sandboxTag}${formatStatusStrip(
+        stripInput,
+        Math.max(16, layout.cols - PAGE_MARGIN * 2 - statusVerb.length - statusPrefix.length - (offlineTag + sandboxTag).length - 6),
+      )}`
+    : '';
   const pickerRows = modelRows(opts.cfg);
   let pickerSel = Math.min(pickerIndex, Math.max(0, pickerRows.length - 1));
   if (pickerRows[pickerSel]?.kind !== 'model') pickerSel = firstSelectableRow(pickerRows);
@@ -4085,14 +4076,26 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     : [];
   const vimTag = vimEnabled ? (vimModeState === 'normal' ? '-- NORMAL -- · ' : '-- INSERT -- · ') : '';
   const attachTag = attachCount > 0 ? `📎 ${attachCount} · ` : '';
+  // Phase B status merge: idle composer hint carries model · mode · ctx (and OFFLINE); running keeps
+  // interrupt keys on the hint and rides usage on the status line above. No separate StatusStrip row.
+  // The strip shrinks against the width left after the hint's fixed text so the discoverability
+  // tail ('Shift+Tab mode · / commands') survives on ordinary 80-col terminals.
+  const HINT_TAIL = ' · Shift+Tab mode · / commands';
+  // The hint row renders flush-left at full width (wrap="truncate"), so the strip budget subtracts
+  // only the text actually sharing the row (+1 safety). The RUNNING branch carries the safety tags
+  // too: while a mid-turn approval/question overlay is up the HUD status row is suppressed and this
+  // hint is the only chrome left — OFFLINE/sandbox:off must not vanish exactly then.
   const composerHint =
     attachTag +
     vimTag +
     (menu.length > 0
-      ? `↑/↓ select · Tab complete · Enter ${running ? 'queues' : 'runs'} · Esc cancel`
+      ? `${offlineTag}${sandboxTag}↑/↓ select · Tab complete · Enter ${running ? 'queues' : 'runs'} · Esc cancel`
       : running
-        ? 'Type to queue · Enter queues for next · Esc interrupts · Ctrl-C ×2 quits'
-        : 'Shift+Tab mode · / commands');
+        ? `${offlineTag}${sandboxTag}Type to queue · Enter queues for next · Esc interrupts · Ctrl-C ×2 quits`
+        : `${offlineTag}${sandboxTag}${formatStatusStrip(
+            stripInput,
+            Math.max(16, layout.cols - (attachTag + vimTag + offlineTag + sandboxTag).length - HINT_TAIL.length - 1),
+          )}${HINT_TAIL}`);
 
   // Suppress the live stream PREVIEW when the model is re-typing an answer it already committed this
   // turn (weak models repeat the final block(s) verbatim in one generation) — that's the "answer
@@ -4135,31 +4138,17 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         )}
       </Static>
 
-      {/* ── Live stream (pinned, reference-client style) ── split into two parts so the composer NEVER snaps up
-          at turn end:
-          (1) a fixed-height TAIL slot (latest ~liveRows streaming lines, bottom-aligned) — mounted
-              only while a turn is active. Constant height ⇒ the composer holds still mid-turn.
-          (2) a one-row STATUS line ('working… Ns') that stays mounted across the turn boundary.
-          When the turn ends the tail slot unmounts, but its lines have committed to <Static>
-          (scrollback) in the same breath — so the status row + the grown <Static> keep the composer
-          at exactly the same row. The only cost is one row of space above the composer when idle.
-          An active overlay (question / approval / model picker) replaces both. */}
+      {/* ── Constant-height Turn HUD ──
+          (1) LIVE SLOT: always mounted at hudFit.liveRows (when the budget allows), idle or running.
+              Content is bottom-aligned; idle leaves blank rows. Composer never jumps at turn
+              boundaries or when thinking ↔ tool ↔ stream swaps (height is fixed).
+          (2) STATUS: one row — spinner while running, blank spacer when idle (keeps the band).
+          Overlays (question / approval / picker) replace both. Menu steals liveWant so the
+          dropdown can open without breaching Ink's wipe threshold. */}
       {!pending && !pickerOpen ? (
         <>
-          {/* Live region yields to the menu (its rows go to the command box); the status spacer below
-              stays so the composer never shifts up when the menu opens. hudFit.liveRows is 0 on a
-              terminal too short to afford it — then the preview is dropped so the frame stays under
-              the wipe threshold. */}
-          {!menuOpen && hudFit.liveRows > 0 && (running || stream !== '' || think !== '') ? (
-            // The live turn — rendered as the DIRECT CONTINUATION of the transcript, not a detached
-            // preview. The height is bounded to hudFit.liveRows ONLY while an answer is actively
-            // streaming (there, overflow:hidden clips any wrap/gap past the budget so a long open block
-            // can't trip Ink's wipe). A lone '∴ Thinking…' or tool row is exactly ONE line — no reserved
-            // rectangular slot with empty rows above it (that reserved space was the "tiny thinking
-            // port" — peephole scaffolding). The uncommitted answer tail flows through the SAME FlatItem
-            // path as committed blocks (identical ⏺/indent + markdown), growing out of the same column
-            // it will scroll away in. Finished lines commit to <Static> as they stream (native scrollback).
-            <Box flexDirection="column" height={previewStream ? hudFit.liveRows : 1} overflow="hidden" justifyContent="flex-end">
+          {!menuOpen && hudFit.liveRows > 0 ? (
+            <Box flexDirection="column" height={hudFit.liveRows} overflow="hidden" justifyContent="flex-end">
               {activeTool && !previewStream ? (
                 // Persistent live tool row: the ⏺ is orange while the call runs (matches the spinner),
                 // then tool_end commits the resolved green/red ⏺ row to <Static> in its place.
@@ -4174,7 +4163,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
               {think && !previewStream ? (
                 // While the model thinks, a single compact ∴ Thinking… indicator aligned under the
                 // gutter — NEVER the raw multi-line thought (that was the ugly split). The full thought
-                // still commits COLLAPSED to the transcript ('∴ Thinking · ^O') on reasoning_done.
+                // still commits COLLAPSED to the transcript on reasoning_done.
                 <Box paddingLeft={PAGE_MARGIN}>
                   <Text italic color={C.dim}>{'∴ Thinking…'}</Text>
                 </Box>
@@ -4229,153 +4218,33 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         </>
       ) : null}
 
-      {/* Overlays and active turn status. */}
+      {/* Overlays — extracted to tui/overlays.tsx (borderless shaded panels). */}
       {pending ? (
-        <Box flexDirection="column" borderStyle={pending.kind === 'user_question' ? 'round' : 'single'} borderColor={pending.kind === 'user_question' ? C.cyan : 'yellow'} paddingX={1} marginTop={1}>
-          <Text bold color={pending.kind === 'user_question' ? C.cyan : C.yellow}>
-            {pending.kind === 'user_question'
-              ? (activeQuestion?.header ? `◆ ${activeQuestion.header}` : '◆ A quick decision')
-              : pending.kind === 'plan_enter'
-                ? 'Enter plan mode?'
-                : pending.kind === 'plan_exit'
-                  ? 'Approve plan?'
-                  : 'Permission required'}
-          </Text>
-          <Text wrap="truncate">
-            <Text bold color={C.yellow}>
-              {pending.kind === 'user_question'
-                ? `question${pendingQuestions.length > 1 ? ` ${activeQuestionIndex + 1}/${pendingQuestions.length}` : ''}: `
-                : 'approve? '}
-            </Text>
-            <Text color={C.fg}>
-              {pending.kind === 'user_question'
-                ? (activeQuestion?.question ?? pending.preview)
-                : pending.preview}
-            </Text>
-          </Text>
-          {pending.kind === 'user_question' && activeQuestion ? (
-            // Window the option list around the cursor and force each row to ONE truncated line.
-            // Without this a long option list (or long descriptions) grows the live frame past the
-            // terminal height, re-triggering Ink's clearTerminal fallback — the whole transcript
-            // flickers and wipes every frame while the dialog is open. (audit P0 #3)
-            (() => {
-              // Cap the visible options by terminal height too: the dialog (borders/header/question/
-              // hint ≈ 6) + the composer + strip below must stay under the wipe threshold on a short
-              // terminal. rows-14 keeps ~8 on a normal screen and shrinks the window as it gets short.
-              const OPTION_MAX = Math.max(1, Math.min(8, terminalSize.rows - 14));
-              const opts_ = activeQuestion.options;
-              const cursor = questionCursor[activeQuestionIndex] ?? recommendedIndex(activeQuestion);
-              const rec = recommendedIndex(activeQuestion);
-              const start = Math.min(Math.max(0, cursor - OPTION_MAX + 1), Math.max(0, opts_.length - OPTION_MAX));
-              return (
-                <>
-                  {start > 0 ? <Text italic color={C.dim}>{`  ↑ ${start} more`}</Text> : null}
-                  {opts_.slice(start, start + OPTION_MAX).map((o, jj) => {
-                    const i = start + jj; // absolute index — selection/cursor compare against the full list
-                    const selected = activeQuestionSelection.includes(o.label);
-                    const isCursor = i === cursor;
-                    const isRec = i === rec;
-                    // ❯ points at the cursor row; a green ✓ marks a chosen option (multi-select only).
-                    // Single-select needs no glyph — the ❯ pointer IS the selection. No radio/checkbox.
-                    const mark = activeQuestion.multiSelect ? (selected ? '✓ ' : '  ') : '';
-                    return (
-                      <Text key={o.label} wrap="truncate" color={selected ? C.green : isCursor ? C.fg : C.dim} bold={isCursor}>
-                        {`${isCursor ? '❯' : ' '} ${i + 1}. ${mark}${o.label}`}
-                        {isRec ? <Text color={C.yellow}>{'  ★ recommended'}</Text> : ''}
-                        {o.description ? <Text color={C.dim}>{`  — ${o.description}`}</Text> : ''}
-                      </Text>
-                    );
-                  })}
-                  {start + OPTION_MAX < opts_.length ? (
-                    <Text italic color={C.dim}>{`  ↓ ${opts_.length - start - OPTION_MAX} more`}</Text>
-                  ) : null}
-                </>
-              );
-            })()
-          ) : (
-            <Text wrap="truncate" color={C.dim}>{`  [${pending.risk}] ${pending.reason}`}</Text>
-          )}
-          {pending.kind === 'user_question' && autoAnswerSecs != null ? (
-            <Text wrap="truncate" color={C.yellow}>
-              {`  ⏳ auto-picking the recommended answer in ${autoAnswerSecs}s · any key to take over`}
-            </Text>
-          ) : null}
-          <Text>
-            {pending.kind === 'user_question' ? (
-              <>
-                <Text color={C.green}>↑/↓</Text> move{' '}
-                {activeQuestion?.multiSelect ? (
-                  <>
-                    · <Text color={C.green}>Space</Text> toggle{' '}
-                  </>
-                ) : null}
-                · <Text color={C.green}>Enter</Text>{' '}
-                {pendingQuestions.length > 1 && activeQuestionIndex < pendingQuestions.length - 1
-                  ? 'next'
-                  : 'confirm'}{' '}
-                {pendingQuestions.length > 1 ? (
-                  <>
-                    · <Text color={C.cyan}>←/→</Text> question{' '}
-                  </>
-                ) : null}
-                · <Text color={C.red}>Esc</Text> skip
-              </>
-            ) : pending.kind === 'plan_enter' ? (
-              <>
-                <Text color={C.green}>(y)</Text>es{'  '}
-                <Text color={C.red}>(n)</Text>o
-              </>
-            ) : pending.kind === 'plan_exit' ? (
-              <>
-                <Text color={C.green}>(y)</Text>es{'  '}
-                <Text color={C.red}>(n)</Text>o{'  '}
-                <Text color={C.purple}>(a)</Text>lways
-              </>
-            ) : (
-              <>
-                <Text color={C.green}>(y)</Text>es{'  '}
-                <Text color={C.red}>(n)</Text>o{'  '}
-                <Text color={C.cyan}>(s)</Text>ession{'  '}
-                <Text color={C.cyan}>(f)</Text>prefix{'  '}
-                <Text color={C.purple}>(a)</Text>lways
-              </>
-            )}
-          </Text>
-        </Box>
+        <PendingOverlay
+          pending={pending}
+          cols={terminalSize.cols}
+          rows={terminalSize.rows}
+          pageMargin={PAGE_MARGIN}
+          colors={C}
+          activeQuestion={activeQuestion}
+          activeQuestionIndex={activeQuestionIndex}
+          pendingQuestionsLength={pendingQuestions.length}
+          activeQuestionSelection={activeQuestionSelection}
+          questionCursor={questionCursor}
+          autoAnswerSecs={autoAnswerSecs}
+        />
       ) : pickerOpen ? (
-        <Box flexDirection="column" borderStyle="single" borderColor="cyan" paddingX={1} marginTop={1}>
-          <Text bold color={C.cyan}>
-            Select a model
-          </Text>
-          {pickStart > 0 ? <Text italic color={C.dim}>{`  ↑ ${pickStart} more`}</Text> : null}
-          {pickerRows.slice(pickStart, pickStart + PICKER_MAX).map((r, j) => {
-            const i = pickStart + j; // absolute index — selection compares against the full list
-            if (r.kind === 'header') {
-              return (
-                <Text key={`h${i}`} wrap="truncate" bold color={C.yellow}>
-                  {r.label}
-                </Text>
-              );
-            }
-            const e = r.entry;
-            const active = e.provider === current.provider && e.model === current.model;
-            const cur = i === pickerSel;
-            // ❯ points at the cursor row (bright); a green ● marks the model in use. No reverse-video
-            // bar — the pointer + brightness carry the cursor, siblings recede into the dim gray.
-            return (
-              <Text key={`m${i}`} wrap="truncate">
-                <Text color={cur ? C.green : C.dim}>{cur ? '❯ ' : '  '}</Text>
-                <Text color={active ? C.green : C.dim}>{active ? '● ' : '  '}</Text>
-                <Text color={cur ? C.fg : C.dim} bold={cur}>{e.label.padEnd(14)} </Text>
-                <Text color={C.dim}>{`${e.provider}/${e.model}`}</Text>
-              </Text>
-            );
-          })}
-          {pickStart + PICKER_MAX < pickerRows.length ? (
-            <Text italic color={C.dim}>{`  ↓ ${pickerRows.length - pickStart - PICKER_MAX} more`}</Text>
-          ) : null}
-          <Text color={C.dim}>↑/↓ select · Enter switch · Esc cancel</Text>
-        </Box>
+        <ModelPickerOverlay
+          cols={terminalSize.cols}
+          pageMargin={PAGE_MARGIN}
+          colors={C}
+          pickerRows={pickerRows}
+          pickStart={pickStart}
+          pickerMax={PICKER_MAX}
+          pickerSel={pickerSel}
+          currentProvider={current.provider}
+          currentModel={current.model}
+        />
       ) : null}
       {/* (The running spinner/working line lives INSIDE the Turn HUD's status row now — one
           always-mounted line, not a fourth independently-appearing block.) */}
@@ -4470,13 +4339,11 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             );
           })()
         ) : null}
-        {hudFit.strip ? (
-          <Box paddingLeft={PAGE_MARGIN}>
-            <StatusStrip text={statusStrip} marker={opts.offline ? { text: 'OFFLINE', color: C.cyan } : undefined} />
-          </Box>
-        ) : null}
+        {/* Main status strip is Phase-B merged into the composer hint (idle) / working line
+            (running); the separate row is gone (the sole fitHud call passes strip:false, so a
+            hudFit.strip branch here would be permanently dead code). Only a user /statusline
+            custom row still renders in this slot. */}
         {customStatus && hudFit.custom ? (
-          // Same page-margin inset as the main strip above — a custom /statusline was flush-left in stock.
           <Box paddingLeft={PAGE_MARGIN}>
             <StatusStrip text={customStatus} />
           </Box>
@@ -4502,6 +4369,11 @@ export function startupSequence(isTTY: boolean, env: NodeJS.ProcessEnv = process
   let seq = '\x1b[22;2t\x1b]2;Shadow\x07'; // push prior title, set to "Shadow"
   if (env.SHADOW_KEEP_SCROLLBACK !== '1') seq += '\x1b[2J\x1b[3J\x1b[H'; // wipe screen + scrollback, home
   return seq;
+}
+
+/** Escape sequence for Static remount. Soft keeps scrollback; hard wipes it (resize/clear). */
+export function reflowSequence(mode: 'soft' | 'hard'): string {
+  return mode === 'hard' ? '\x1b[2J\x1b[3J\x1b[H' : '\x1b[2J\x1b[H';
 }
 
 export function runTui(opts: TuiOpts): Promise<void> {
@@ -4615,9 +4487,12 @@ interface UsageEvent {
   contextPct: number;
 }
 
+/** Usage chrome fragment. Hides `$0.0000` (local / free runs) so the strip stays calm. */
 function formatUsage(e: UsageEvent): string {
   const total = e.inputTokens + e.outputTokens;
-  return `${formatCount(total)} tokens · ctx ${Math.round(e.contextPct * 100)}% · $${e.costUSD.toFixed(4)}`;
+  const base = `${formatCount(total)} tokens · ctx ${Math.round(e.contextPct * 100)}%`;
+  if (!(e.costUSD > 0)) return base;
+  return `${base} · $${e.costUSD.toFixed(4)}`;
 }
 
 function formatCount(n: number): string {

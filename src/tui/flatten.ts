@@ -11,12 +11,83 @@ import { parseMarkdown, renderTableLines } from '../util/markdown.js';
 import { highlight } from '../util/highlight.js';
 import type { CodeRole } from '../util/highlight.js';
 import type { MdSpan, MdBlock } from '../util/markdown.js';
-import { renderBrand, renderToolResult, renderReasoning } from './rows.js';
+import { renderBrand, renderToolResult, renderToolChild, renderReasoning } from './rows.js';
 import type { BrandInfo, ToolInfo } from './rows.js';
 
 // the reference client vocabulary: the ⏺ turn bullet + the warm brand orange it's drawn in.
 const ASSISTANT_DOT = process.platform === 'darwin' ? '⏺' : '●';
 const CLAUDE_ORANGE = '#d97757';
+
+/** Tool/blocked bodies longer than this fold by default (Ctrl-O expands). 1–3 lines stay inline. */
+export const TOOL_BODY_COLLAPSE_THRESHOLD = 3;
+/**
+ * Hard cap on lines painted when a body is expanded. Scrollback stays usable even if a tool
+ * returned thousands of lines; a dim note reports how many were elided.
+ */
+export const TOOL_BODY_EXPAND_CAP = 80;
+
+type BodyLine = { text: string; color?: string; dimColor?: boolean; bold?: boolean };
+
+/** Label for the one-row fold (`⌄ output N lines · ^O` / `⌄ diff N lines · ^O`). */
+function toolBodyLabel(meta: string | undefined): string {
+  if (meta === 'diff') return 'diff';
+  if (meta === 'output') return 'output';
+  return 'output';
+}
+
+/**
+ * Append a tool/blocked child body under a ⏺ header (or as a standalone child item).
+ * Collapsed (default for >threshold lines): exactly ONE row via renderToolChild.
+ * Expanded / short: ⎿-branched content, hard-capped at TOOL_BODY_EXPAND_CAP.
+ */
+function appendToolBody(
+  out: ViewportLine[],
+  kp: string,
+  body: BodyLine[],
+  collapsed: boolean,
+  theme: ViewportTheme,
+  cols: number,
+  color: string | undefined,
+  meta: string | undefined,
+): void {
+  if (body.length === 0) return;
+  const collapsible = body.length > TOOL_BODY_COLLAPSE_THRESHOLD;
+  if (collapsible && collapsed) {
+    out.push({
+      key: `${kp}fold`,
+      spans: truncateSpans(renderToolChild(toolBodyLabel(meta), body.length, theme), cols),
+    });
+    return;
+  }
+  // Expanded (or short enough to stay inline): ⎿ branch, hard-capped so a huge body can't
+  // flood native scrollback even after Ctrl-O. Keep the TAIL — the ingest cap (capTranscriptBody)
+  // tail-prefers for the same reason: the end of a build/test run is usually the signal.
+  const over = body.length > TOOL_BODY_EXPAND_CAP;
+  const shown = over ? body.slice(-TOOL_BODY_EXPAND_CAP) : body;
+  if (over) {
+    const hidden = body.length - TOOL_BODY_EXPAND_CAP;
+    out.push({
+      key: `${kp}cap`,
+      spans: truncateSpans(
+        [
+          { text: '  ⎿ ', color: theme.dim },
+          { text: `… +${hidden} earlier ${hidden === 1 ? 'line' : 'lines'} elided`, color: theme.dim },
+        ],
+        cols,
+      ),
+    });
+  }
+  shown.forEach((l, i) => {
+    const gutter: StyledSpan = i === 0 && !over ? { text: '  ⎿ ', color: theme.dim } : { text: '    ' };
+    out.push({
+      key: `${kp}l${i}`,
+      spans: truncateSpans(
+        [gutter, { text: l.text ?? '', color: l.color ?? color, dim: l.dimColor, bold: l.bold }],
+        cols,
+      ),
+    });
+  });
+}
 
 // ── types ────────────────────────────────────────────────────────────────────
 
@@ -415,6 +486,8 @@ export interface FlattenItem {
    *  and `text`/`lines` are the plain fallback used only by the stock Ink components. */
   brand?: BrandInfo;
   tool?: ToolInfo;
+  /** Reasoning wall-clock (ms), when known — drives `thought for Ns` in the fold header. */
+  durationMs?: number;
 }
 
 /**
@@ -450,11 +523,15 @@ export function flattenItem(
     return out;
   }
 
-  // ── tool result (v2: one calm row, glyph carries status) ──
+  // ── tool result (v2: one calm row + optional nested body) ──
+  // Header is always exactly one truncated row. When `lines` are nested on the same item
+  // (shell stdout / edit diff from tool_end), they render as a child: folded to one
+  // `⌄ output N lines · ^O` row by default, or under a ⎿ branch when expanded / short.
   if (item.kind === 'tool' && item.tool) {
-    // ONE row, always: a tool line that wraps to 2-3 rows (long URLs) is the single biggest
-    // source of transcript noise. Truncate with an ellipsis; Ctrl-O children carry the detail.
     out.push({ key: `${kp}tool`, spans: truncateSpans(renderToolResult(item.tool, theme), cols) });
+    if (item.lines && item.lines.length > 0) {
+      appendToolBody(out, kp, item.lines, collapsed, theme, cols, color, item.meta);
+    }
     return out;
   }
 
@@ -470,11 +547,12 @@ export function flattenItem(
     return out;
   }
 
-  // ── reasoning (v2: ✻ summary row + expandable body) ──
+  // ── reasoning (v2: ∴ thought for Ns + fold child / expanded body) ──
   if (item.kind === 'reasoning') {
-    // Header: '∴ Thinking' (+ '(ctrl+o to expand)' when collapsed).
-    renderReasoning(item.text, collapsed, theme).forEach((spans, i) => out.push(...wrapLine(`${kp}rh${i}`, spans, cols)));
-    // Expanded: the thought body as DIM markdown, indented 2 — not raw italic (the reference client parity).
+    // Collapsed: header + `⌄ N lines · ^O`. Expanded: header only here; body is dim markdown below.
+    renderReasoning(item.text, collapsed, theme, item.durationMs ?? 0).forEach((spans, i) =>
+      out.push(...wrapLine(`${kp}rh${i}`, spans, cols)),
+    );
     if (!collapsed && item.text) {
       out.push({ key: `${kp}rgap`, spans: [{ text: '' }] });
       parseMarkdown(item.text).forEach((b, bi) => {
@@ -532,24 +610,10 @@ export function flattenItem(
   // ── tool / blocked / system / banner / user / error (line-array items) ──
   const body = item.lines ?? [{ text: item.text, color, dimColor: item.dimColor, bold: item.bold }];
 
-  // A tool/blocked CHILD block (shell output, diff) is threaded UNDER its ⏺ header with a ⎿ branch:
-  // the first content line carries the branch glyph, the rest align beneath it (indent 4). Collapsed
-  // shows a PREVIEW — the first PREVIEW_LINES lines then a dim '… +N lines · ^O' expander; Ctrl-O
-  // (showAllExpanded) reveals the whole block. Each line is truncated to one row so the indent holds.
+  // Standalone tool/blocked child (legacy sibling body, or a diff pushed without a ToolInfo
+  // header). Same fold rules as the nested path: one-row ⌄ summary when collapsed.
   if ((item.kind === 'tool' || item.kind === 'blocked') && item.meta) {
-    const PREVIEW_LINES = 10;
-    const shown = collapsed ? body.slice(0, PREVIEW_LINES) : body;
-    shown.forEach((l, i) => {
-      const gutter: StyledSpan = i === 0 ? { text: '  ⎿ ', color: theme.dim } : { text: '    ' };
-      out.push({
-        key: `${kp}l${i}`,
-        spans: truncateSpans([gutter, { text: l.text ?? '', color: l.color ?? color, dim: l.dimColor, bold: l.bold }], cols),
-      });
-    });
-    const hidden = body.length - shown.length;
-    if (hidden > 0) {
-      out.push({ key: `${kp}more`, spans: [{ text: `    … +${hidden} ${hidden === 1 ? 'line' : 'lines'} · ^O`, color: theme.dim }] });
-    }
+    appendToolBody(out, kp, body, collapsed, theme, cols, color, item.meta);
     return out;
   }
 
@@ -557,6 +621,24 @@ export function flattenItem(
     out.push(...wrapLine(`${kp}l${i}`, [{ text: l.text ?? '', color: l.color ?? color, dim: l.dimColor, bold: l.bold }], cols));
   });
   return out;
+}
+
+/** True when this item has a foldable body (reasoning always; tool bodies over the threshold). */
+export function itemIsCollapsible(item: {
+  kind: string;
+  lines?: unknown[];
+  text?: string;
+  tool?: unknown;
+}): boolean {
+  if (item.kind === 'reasoning') return true;
+  if (item.kind === 'tool' || item.kind === 'blocked') {
+    const n = item.lines?.length
+      ?? (typeof item.text === 'string' && item.text ? item.text.split('\n').length : 0);
+    // Header-only tool rows (tool info, no body) are never collapsible.
+    if (n === 0) return false;
+    return n > TOOL_BODY_COLLAPSE_THRESHOLD;
+  }
+  return false;
 }
 
 /**
@@ -571,11 +653,7 @@ export function flattenTranscript(
 ): ViewportLine[] {
   const all: ViewportLine[] = [];
   for (const item of items) {
-    const isCollapsible =
-      item.kind === 'reasoning' ||
-      ((item.kind === 'tool' || item.kind === 'blocked') &&
-        (item.lines?.length ?? (item.text?.split('\n').length ?? 1)) > 8);
-    const collapsed = isCollapsible && collapsedIds.has(item.id);
+    const collapsed = itemIsCollapsible(item) && collapsedIds.has(item.id);
     all.push(...flattenItem(item, cols, collapsed, theme));
   }
   return all;
