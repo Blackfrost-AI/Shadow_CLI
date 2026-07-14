@@ -11,8 +11,11 @@ import { parseMarkdown, renderTableLines } from '../util/markdown.js';
 import { highlight } from '../util/highlight.js';
 import type { CodeRole } from '../util/highlight.js';
 import type { MdSpan, MdBlock } from '../util/markdown.js';
+import { segmentTableLine, TABLE_COLLAPSE_THRESHOLD } from '../util/tableStyle.js';
 import { renderBrand, renderToolResult, renderToolChild, renderReasoning } from './rows.js';
 import type { BrandInfo, ToolInfo } from './rows.js';
+
+export { TABLE_COLLAPSE_THRESHOLD };
 
 // the reference client vocabulary: the ⏺ turn bullet + the warm brand orange it's drawn in.
 const ASSISTANT_DOT = process.platform === 'darwin' ? '⏺' : '●';
@@ -357,7 +360,31 @@ function mdSpanToStyled(s: MdSpan, theme: ViewportTheme): StyledSpan {
   return { text: s.text, color: theme.fg, italic: s.italic };
 }
 
-function blockToLines(block: MdBlock, cols: number, theme: ViewportTheme, keyPrefix: string): ViewportLine[] {
+/**
+ * Paint one rendered table line: box-drawing chrome in dim, header cell text bold+bright,
+ * body cell text in fg. Vertical-fallback lines stay plain fg (or dim for `— row N —`).
+ */
+function tableLineSpans(line: string, theme: ViewportTheme, isHeader: boolean): StyledSpan[] {
+  if (line.startsWith('—')) return [{ text: line, color: theme.dim }];
+  const segs = segmentTableLine(line);
+  return segs.map((seg) => {
+    if (seg.kind === 'border') return { text: seg.text, color: theme.dim };
+    return {
+      text: seg.text,
+      color: isHeader ? (theme.bright ?? theme.fg) : theme.fg,
+      bold: isHeader,
+    };
+  });
+}
+
+function blockToLines(
+  block: MdBlock,
+  cols: number,
+  theme: ViewportTheme,
+  keyPrefix: string,
+  /** When true, GFM tables with more than TABLE_COLLAPSE_THRESHOLD body rows fold to one line. */
+  foldLargeTables = false,
+): ViewportLine[] {
   const out: ViewportLine[] = [];
   switch (block.type) {
     case 'heading': {
@@ -432,18 +459,27 @@ function blockToLines(block: MdBlock, cols: number, theme: ViewportTheme, keyPre
       break;
     }
     case 'table': {
+      const bodyRows = block.rows.length;
+      // Large tables fold by default (same language as tool output). Ctrl-O / showAllExpanded
+      // sets foldLargeTables=false so the full grid paints.
+      if (foldLargeTables && bodyRows > TABLE_COLLAPSE_THRESHOLD) {
+        const colsN = block.align.length;
+        const n = `${bodyRows}×${colsN}`;
+        out.push({
+          key: `${keyPrefix}tfold`,
+          spans: [{ text: `  ⌄ table ${n} · ^O`, color: theme.dim }],
+        });
+        break;
+      }
       const lines = renderTableLines(block, cols);
-      // In the grid form, the HEADER TEXT is every line between the ┌─┐ top border and the first
-      // ├─┼─┤ separator (wrapped header cells span several lines) — bold those, never the borders.
-      // (The vertical fallback has no borders; nothing gets bolded there.)
+      // Grid form: HEADER TEXT is every line between the ┌─┐ top border and the first ├─┼─┤
+      // separator (wrapped header cells span several lines). Borders/│ stay dim; cells are fg.
       const isGrid = lines[0]?.startsWith('┌') ?? false;
       const sepIdx = isGrid ? lines.findIndex((l) => l.startsWith('├')) : -1;
       lines.forEach((l, j) => {
         const isHeader = isGrid && j > 0 && (sepIdx < 0 || j < sepIdx);
-        // Wrap each table line at cols — the wide-table vertical fallback ("key: <long value>") can
-        // exceed the width, and an unwrapped over-long line gets hard-char-wrapped by the terminal
-        // (the mid-word DOS look the redesign killed everywhere else).
-        out.push(...wrapLine(`${keyPrefix}t${j}`, [{ text: l, color: isHeader ? theme.bright ?? theme.fg : theme.fg, bold: isHeader }], cols, 'char'));
+        // Char-wrap: wide vertical-fallback lines must not terminal-hard-wrap mid-word.
+        out.push(...wrapLine(`${keyPrefix}t${j}`, tableLineSpans(l, theme, isHeader), cols, 'char'));
       });
       break;
     }
@@ -503,15 +539,26 @@ export function flattenItem(
   /** True when this assistant item CONTINUES the same turn (a previous assistant item precedes it):
    *  the ⏺ turn bullet is drawn ONCE per contiguous run, so continuations get the 2-col indent only. */
   continuation = false,
+  /**
+   * Fold GFM tables with more than TABLE_COLLAPSE_THRESHOLD body rows to one summary line.
+   * Callers pass true when global folds are collapsed (!showAllExpanded); Ctrl-O expands tables too.
+   */
+  foldLargeTables = false,
 ): ViewportLine[] {
   const kp = `i${item.id}`;
   const out: ViewportLine[] = [];
   const color = item.color ?? kindColor(item.kind, theme);
-  const gap = item.tight
-    ? 0
-    : item.kind === 'user' || item.kind === 'assistant' || item.kind === 'reasoning' || item.kind === 'finding'
+  // Spacing: user turns ALWAYS open with a blank line (new question = air), even if `tight` is set —
+  // that's what keeps the transcript from reading as one continuous gray column. Assistant /
+  // reasoning / finding respect `tight` so multi-block answers can still hug.
+  const gap =
+    item.kind === 'user'
       ? 1
-      : 0;
+      : item.tight
+        ? 0
+        : item.kind === 'assistant' || item.kind === 'reasoning' || item.kind === 'finding'
+          ? 1
+          : 0;
   // Gap blank line
   if (gap > 0) out.push({ key: `${kp}gap`, spans: [{ text: '' }] });
 
@@ -557,7 +604,7 @@ export function flattenItem(
       out.push({ key: `${kp}rgap`, spans: [{ text: '' }] });
       parseMarkdown(item.text).forEach((b, bi) => {
         if (bi > 0) out.push({ key: `${kp}rbgap${bi}`, spans: [{ text: '' }] });
-        for (const ln of blockToLines(b, cols - 2, theme, `${kp}rb${bi}`)) {
+        for (const ln of blockToLines(b, cols - 2, theme, `${kp}rb${bi}`, foldLargeTables)) {
           out.push({ key: ln.key, spans: [{ text: '  ' }, ...ln.spans.map((s) => ({ ...s, color: theme.dim, bold: false }))] });
         }
       });
@@ -565,12 +612,11 @@ export function flattenItem(
     return out;
   }
 
-  // ── user prompt (❯ gutter + quiet body) ──
-  // The typed prompt is CONTEXT, not output: a green ❯ in a 2-col gutter marks the turn (mirroring
-  // the assistant's ⏺) and the body renders in the quiet dim tier — not full-width bold green,
-  // which shouted over the answer it precedes. Text is verbatim (no markdown pass — rendering
-  // would rewrite what the user actually typed); each typed line keeps a hanging 2-col indent so
-  // wrapped rows align under the text, and the user's own leading whitespace survives inside it.
+  // ── user prompt (❯ gutter + bright body) ──
+  // Hierarchy: green ❯ marks the turn (mirrors the assistant's orange ⏺); body is theme.fg —
+  // the same readable tier as answer prose, NOT dim meta. Dim made user and model read as one
+  // gray column. Color stays on the glyph only (no full-width green shout). Text is verbatim
+  // (no markdown pass); hanging 2-col indent on wraps/typed lines.
   if (item.kind === 'user' && !item.lines) {
     // Both push sites bake '❯ ' into `text` (it must survive in the plain-text fallback);
     // strip it here so the styled gutter below is the only marker.
@@ -581,7 +627,7 @@ export function flattenItem(
           `${kp}u${i}`,
           i === 0 ? [{ text: '❯ ', color: theme.green, bold: true }] : [{ text: '  ' }],
           [{ text: '  ' }],
-          [{ text: ln, color: theme.dim }],
+          [{ text: ln, color: theme.fg }],
           cols,
         ),
       );
@@ -597,7 +643,7 @@ export function flattenItem(
     const bodyLines: ViewportLine[] = [];
     parseMarkdown(item.text).forEach((b, bi) => {
       if (bi > 0) bodyLines.push({ key: `${kp}bg${bi}`, spans: [{ text: '' }] }); // one blank between blocks
-      bodyLines.push(...blockToLines(b, cols - 2, theme, `${kp}b${bi}`));
+      bodyLines.push(...blockToLines(b, cols - 2, theme, `${kp}b${bi}`, foldLargeTables));
     });
     bodyLines.forEach((ln, i) => {
       // ⏺ on the first line of a NEW turn only; continuation items (same turn) align under it.
@@ -654,7 +700,9 @@ export function flattenTranscript(
   const all: ViewportLine[] = [];
   for (const item of items) {
     const collapsed = itemIsCollapsible(item) && collapsedIds.has(item.id);
-    all.push(...flattenItem(item, cols, collapsed, theme));
+    // Large tables fold by default in the calm transcript view (same as the stock FlatItem path
+    // with !showAllExpanded). Callers that want full grids pass foldLargeTables=false via flattenItem.
+    all.push(...flattenItem(item, cols, collapsed, theme, false, true));
   }
   return all;
 }

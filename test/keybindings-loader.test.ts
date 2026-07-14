@@ -69,6 +69,7 @@ test('template is valid JSON containing every default action', () => {
   for (const b of parsed.bindings) for (const a of Object.values(b.bindings)) actions.add(a);
   assert.ok(actions.has('chat:submit'));
   assert.ok(actions.has('transcript:toggleFoldLatest'));
+  assert.ok(actions.has('transcript:toggleFoldOne'));
 });
 
 test('merge: malformed entries degrade to warnings, never throw', () => {

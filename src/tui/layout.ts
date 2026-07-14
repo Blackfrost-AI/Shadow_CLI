@@ -118,3 +118,77 @@ export function formatStatusStrip(input: StatusStripInput, cols: number): string
   if (min.length <= cols) return min;
   return min.slice(0, Math.max(8, cols - 1)) + '…';
 }
+
+/** Which optional live-frame rows fit, and the composer hint. See fitHud. */
+export interface HudFit {
+  liveRows: number;   // height of the streaming preview region (0..liveWant)
+  status: boolean;    // the 'working… Ns' / spacer line above the composer
+  pinned: boolean;    // the 1-row pinned goal/task summary while running
+  queued: boolean;    // the type-ahead queue line
+  custom: boolean;    // the customStatus (/statusline) strip
+  hint: boolean;      // the composer's keybinding hint row
+  marginTop: boolean; // the blank spacer above the composer group
+  strip: boolean;     // the main status strip
+  height: number;     // total live-frame height this produces (always < rows for rows >= 4)
+}
+
+/**
+ * Bound the LIVE (non-<Static>) frame so its height stays STRICTLY below `rows`. Ink wipes the whole
+ * screen + scrollback and re-dumps the entire transcript on EVERY render when `outputHeight >= rows`
+ * (node_modules/ink/build/ink.js:121) — the flicker/duplication you get on a short or split-pane
+ * terminal. The composer's input + its two borders (3 rows) are mandatory; every other row is added
+ * only while it still fits under `rows - 1`, in priority order, so as the terminal shrinks the least
+ * important rows drop first (custom status → queued → pinned → margin → live preview → status line →
+ * strip → hint) and the frame never reaches the terminal height. Pure; the invariant is unit-tested.
+ */
+export function fitHud(
+  rows: number,
+  want: {
+    liveWant: number;
+    pinned: boolean;
+    queued: boolean;
+    custom: boolean;
+    /** The live slot is currently BLANK (idle reserve): rank it below the hint so short terminals keep real content over empty rows. */
+    liveBlank?: boolean;
+    /** Separate status strip row. Default true; Phase B merges strip into hint/status so callers pass false. */
+    strip?: boolean;
+    /**
+     * Visual rows of composer *input* (not counting the two border rules).
+     * Default 1 (single-line). Multi-line drafts raise this so the live frame budget stays honest.
+     */
+    composerInputRows?: number;
+  },
+): HudFit {
+  const cap = rows - 1; // outputHeight must be <= rows - 1 to stay under Ink's wipe threshold
+  // The composer's OWN chrome (2 rules + N input rows) is mandatory, but it must never by itself
+  // reach the terminal height or Ink wipes the screen on every keystroke. Clamp the input rows so
+  // the base (2 + input) stays <= cap even if the caller requests more — the documented invariant
+  // "height < rows for rows >= 4" then holds for any composerInputRows.
+  const inputRows = Math.max(1, Math.min(want.composerInputRows ?? 1, Math.max(1, rows - 3)));
+  const f: HudFit = {
+    liveRows: 0, status: false, pinned: false, queued: false, custom: false,
+    hint: false, marginTop: false, strip: false,
+    // Composer chrome: top rule + N (clamped) input rows + bottom rule.
+    height: 2 + inputRows,
+  };
+  // Added high-priority → low: whatever doesn't fit as the terminal shrinks drops from the bottom of
+  // this list first (cosmetic blank spacer goes first, then custom status, queued, pinned, …).
+  // `liveWant` is the desired streaming-preview height (0 when there's nothing live to show).
+  const add = (n: number, on: () => void): void => { if (f.height + n <= cap) { f.height += n; on(); } };
+  // Separate strip is optional — Phase B merges model/mode/ctx into the composer hint (idle) or
+  // the working status line (running), reclaiming one permanent chrome row.
+  if (want.strip !== false) add(1, () => (f.strip = true));
+  add(1, () => (f.status = true));  // 'working…' status line (liveness)
+  const addLive = (): void => { for (let i = 0; i < want.liveWant; i++) add(1, () => (f.liveRows += 1)); };
+  const addHint = (): void => add(1, () => (f.hint = true)); // composer hint — also carries merged strip when idle
+  // An idle live slot is BLANK reserve rows; the hint (which carries the merged model/mode/ctx/
+  // OFFLINE strip) must outrank blank rows on short terminals. While running, the streaming
+  // preview is real content and keeps its priority above the hint.
+  if (want.liveBlank) { addHint(); addLive(); } else { addLive(); addHint(); }
+  if (want.pinned) add(1, () => (f.pinned = true));  // goal / task summary
+  if (want.queued) add(1, () => (f.queued = true));
+  if (want.custom) add(1, () => (f.custom = true));
+  add(1, () => (f.marginTop = true)); // cosmetic blank above the composer — first to go
+  return f;
+}
+

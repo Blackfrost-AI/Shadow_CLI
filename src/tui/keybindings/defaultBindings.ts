@@ -62,7 +62,11 @@ const RAW_DEFAULTS: Record<ContextName, Record<string, string>> = {
     j: 'message:next',
   },
   Transcript: {
-    'ctrl+o': 'transcript:toggleFoldLatest',
+    'ctrl+o': 'transcript:toggleFoldLatest', // all folds (name is historical; behavior = all)
+    // NOT ctrl+shift+o: terminals send the same byte (0x0F) for Ctrl+O and Ctrl+Shift+O, so Ink
+    // reports both as ctrl+o (shift=false) and the shift binding can never match — it would just
+    // fire toggle-all. Alt/Option+O is a distinct sequence that actually reaches this action.
+    'meta+o': 'transcript:toggleFoldOne', // latest collapsible only (Alt/Option+O)
     'ctrl+t': 'transcript:toggleTaskList',
   },
 };

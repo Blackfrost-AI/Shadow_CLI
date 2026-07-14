@@ -96,3 +96,16 @@ test('fitHud liveBlank: the hint outranks BLANK idle live-slot rows on short ter
   const tallRun = fitHud(40, { liveWant: 2, liveBlank: false, pinned: true, queued: false, custom: false, strip: false });
   assert.equal(tallIdle.height, tallRun.height, 'idle and running frames match on tall terminals');
 });
+
+test('fitHud: a multi-row composer never pushes the live frame to terminal height (Ink wipe guard)', () => {
+  // The regression: a tall draft on a short terminal made base = 2 + inputRows reach `rows`,
+  // tripping Ink's whole-screen wipe on every keystroke. inputRows must be clamped to rows-3.
+  for (let rows = 4; rows <= 30; rows++) {
+    for (const req of [1, 2, 5, 8, 20]) {
+      const f = fitHud(rows, { liveWant: 2, pinned: true, queued: true, custom: true, strip: false, composerInputRows: req });
+      assert.ok(f.height < rows, `rows=${rows} composerInputRows=${req}: height ${f.height} must be < ${rows}`);
+    }
+  }
+  // The specific case from the finding: fitHud(8, {composerInputRows: 8}) must stay under 8.
+  assert.ok(fitHud(8, { liveWant: 0, pinned: false, queued: false, custom: false, strip: false, composerInputRows: 8 }).height <= 7);
+});

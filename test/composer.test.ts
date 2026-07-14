@@ -15,12 +15,16 @@ test('isPathLikeSlashToken: a bare command stays a command', () => {
   assert.equal(isPathLikeSlashToken('/modl'), false); // typo — still command-shaped (on-disk check at call site)
 });
 
-test('isBigPaste: multi-line or long condenses; short single-line stays inline', () => {
-  assert.equal(isBigPaste('a\nb\nc'), true); // 3 lines
-  assert.equal(isBigPaste('x'.repeat(400)), true); // long
+test('isBigPaste: only enormous blobs condense; multi-line drafts stay editable inline', () => {
+  // Threshold relaxed to 40 lines / 8000 chars so multi-paragraph drafts stay editable in the
+  // multi-row composer; only a huge blob chips. (Was 3 lines / 300 chars.)
+  assert.equal(isBigPaste('a\nb\nc'), false); // 3 lines — now editable, not a chip
+  assert.equal(isBigPaste('x'.repeat(400)), false); // 400 chars stays inline
+  assert.equal(isBigPaste('x'.repeat(9000)), true); // >8000 chars chips
+  assert.equal(isBigPaste(Array.from({ length: 50 }, () => 'line').join('\n')), true); // >40 lines chips
   assert.equal(isBigPaste('/Users/craigmac/foo'), false); // a pasted path stays inline (still typable)
   assert.equal(isBigPaste('one line'), false);
-  assert.equal(isBigPaste('two\nlines'), false); // only one newline — keep inline
+  assert.equal(isBigPaste('two\nlines'), false);
 });
 
 test('expandPastes: chips are restored to their stored content at submit', () => {

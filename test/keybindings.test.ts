@@ -138,7 +138,17 @@ test('defaults: parse cleanly and contain expected actions', () => {
   const actions = new Set(bindings.map((b) => b.action));
   assert.ok(actions.has('chat:submit'));
   assert.ok(actions.has('transcript:toggleFoldLatest'));
+  assert.ok(actions.has('transcript:toggleFoldOne'));
   assert.ok(actions.has('message:copy'));
+  // toggleFoldOne must bind to a key the terminal can actually distinguish from ctrl+o.
+  // ctrl+shift+o was dead (same 0x0F byte as ctrl+o); it binds to meta+o (Alt/Option+O).
+  const foldOne = bindings.find((b) => b.action === 'transcript:toggleFoldOne');
+  assert.ok(foldOne && foldOne.chord.length === 1, 'toggleFoldOne is a single-chord binding');
+  assert.deepEqual(
+    { key: foldOne!.chord[0]!.key, ctrl: foldOne!.chord[0]!.ctrl, shift: foldOne!.chord[0]!.shift, meta: foldOne!.chord[0]!.meta },
+    { key: 'o', ctrl: false, shift: false, meta: true },
+    'toggleFoldOne is meta+o (distinguishable), not the dead ctrl+shift+o',
+  );
   // app:redraw (ctrl+l) was intentionally REMOVED — it re-flushed the whole
   // transcript on every press (O(transcript) perf footgun). It must NOT be a default.
   assert.ok(!actions.has('app:redraw'));

@@ -85,20 +85,21 @@ test('assistant ⏺ turn bullet: on the first block, indent-only on continuation
   assert.ok(cont.every((r) => r.spans[0]!.text !== `${DOT} `), 'no ⏺ anywhere in a continuation block');
 });
 
-test('user prompt: ❯ gutter on line 0, dim body, hanging indent on wraps and typed lines', () => {
-  // The typed prompt must not render as a full-width bold-green blob: ❯ marks the turn (green,
-  // like the assistant's ⏺), the body is the quiet dim tier, and every wrapped or subsequent
-  // typed line aligns under the text via the 2-col gutter.
+test('user prompt: ❯ gutter on line 0, bright body (fg), hanging indent, leading blank', () => {
+  // Hierarchy A+C: green ❯ marks the turn (not full-width green body); body is theme.fg — the
+  // same readable tier as answer prose, not dim meta. A leading blank always opens the turn
+  // (new question = air), even if tight is set.
   const md = 'a prompt long enough to wrap at this narrow measure\n1. a typed list line';
-  const rows = flattenItem({ id: 3, kind: 'user', text: `❯ ${md}`, color: T.green, bold: true }, 30, false, T);
+  const rows = flattenItem({ id: 3, kind: 'user', text: `❯ ${md}`, color: T.green, bold: true, tight: true }, 30, false, T);
+  assert.equal(rows[0]!.spans.every((s) => s.text === ''), true, 'user turns always lead with a blank (tight ignored)');
   const nonBlank = rows.filter((r) => r.spans.some((s) => s.text.trim() !== ''));
   assert.equal(nonBlank[0]!.spans[0]!.text, '❯ ', '❯ gutter on the first content line');
   assert.equal(nonBlank[0]!.spans[0]!.color, T.green, 'the marker is green');
   assert.ok(nonBlank.slice(1).every((r) => r.spans[0]!.text === '  '), 'every other row aligns under the text');
   assert.equal(nonBlank.filter((r) => r.spans[0]!.text === '❯ ').length, 1, 'exactly one ❯');
   const body = nonBlank.flatMap((r) => r.spans.slice(1));
-  assert.ok(body.every((s) => s.color === T.dim), 'body is the quiet dim tier, not bold green');
-  assert.ok(body.every((s) => !s.bold), 'no bold body');
+  assert.ok(body.every((s) => s.color === T.fg), 'body is the bright fg tier, not dim meta');
+  assert.ok(body.every((s) => !s.bold), 'no bold body — color stays on the glyph only');
   const joined = nonBlank.map((r) => r.spans.map((s) => s.text).join('')).join('\n');
   assert.match(joined, /1\. a typed list line/, 'typed text is verbatim — no markdown rewrite');
   for (const r of rows) assert.ok(r.spans.map((s) => s.text).join('').length <= 30, 'fits the measure');

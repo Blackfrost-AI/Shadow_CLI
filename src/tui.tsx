@@ -1,6 +1,15 @@
 import React, { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react';
 import { render, Box, Text, Static, useApp, useInput, useStdout } from 'ink';
 import { flattenItem, itemIsCollapsible } from './tui/flatten.js';
+import {
+  extractCommittableUnits,
+  clampTail,
+  stripTrailingNewlines,
+  dupKey,
+  repeatStep,
+  leadsWithBlock,
+} from './tui/streamCommit.js';
+import { computeLayout, formatStatusStrip, pinnedMaxItems, fitHud } from './tui/layout.js';
 import { MENU_BG, MENU_SEL_BG, PendingOverlay, ModelPickerOverlay } from './tui/overlays.js';
 import { execFileSync, spawn } from 'node:child_process';
 import type { Message, Provider, ToolCall, ContentBlock, ImageBlock, Effort } from './provider/provider.js';
@@ -8,8 +17,22 @@ import type { ToolRegistry } from './tools/registry.js';
 import { EventBus } from './agent/events.js';
 import { Budget } from './agent/budget.js';
 import { maybeNotifyUpdate } from './update/checkUpdate.js';
-import { parseMarkdown, renderTableLines, wrapSpans, isTableSeparator, FENCE as MD_FENCE, LIST_ITEM as MD_LIST_ITEM, QUOTE as MD_QUOTE, type MdSpan } from './util/markdown.js';
-import { isBigPaste, expandPastes, isPathLikeSlashToken, pathExistsSafe } from './tui/composer.js';
+import { parseMarkdown, renderTableLines, wrapSpans, type MdSpan } from './util/markdown.js';
+import {
+  isBigPaste,
+  expandPastes,
+  isPathLikeSlashToken,
+  pathExistsSafe,
+  layoutComposer,
+  moveCursorVertical,
+  cursorOnFirstRow,
+  cursorOnLastRow,
+  visibleComposerWindow,
+  clickToCursor,
+  parseSgrMouse,
+  COMPOSER_MAX_VISIBLE_ROWS,
+  COMPOSER_GUTTER,
+} from './tui/composer.js';
 import { withSynchronizedOutput } from './tui/syncOutput.js';
 import type { BrandInfo, ToolInfo } from './tui/rows.js';
 import {
@@ -90,7 +113,6 @@ import { loadAgentDefs } from './agent/defs.js';
 import { existsSync, writeFileSync, statSync, readFileSync, readdirSync } from 'node:fs';
 import { join, resolve, isAbsolute } from 'node:path';
 import { friendlyDeniedReason } from './util/deniedReason.js';
-import { computeLayout, formatStatusStrip, pinnedMaxItems } from './tui/layout.js';
 import { vimNormalKey, type VimMode } from './tui/vim.js';
 import { runHookPhase } from './hooks/runner.js';
 import { discoverSkills } from './skills/loader.js';
@@ -709,310 +731,6 @@ function codeRoleColor(role: CodeRole): string | undefined {
   }
 }
 
-/**
- * The chat canvas: render a (possibly still-streaming) markdown string as flowing
- * blocks — headings, paragraphs, lists, blockquotes, fenced code, rules — so every
- * model's chat reads like the reference client's. Plain text round-trips unchanged.
- */
-/**
- * Split an accumulating markdown stream into completed top-level blocks plus the
- * still-incomplete trailing remainder.
- *
- * A block boundary is a blank line at the TOP level; blank lines inside an open
- * ``` code fence are ignored so a fenced block is never split. Completed blocks
- * are returned in order (to be committed to <Static> — the terminal's native
- * scrollback); the trailing partial block — an as-yet-unclosed fence, plus the
- * final line that has no newline after it — is returned as `rest` and kept in the
- * live region. Committing finished blocks as they land is what keeps the live
- * region (and the input composer pinned below it) from growing with the answer.
- */
-export function extractCompleteBlocks(buf: string): { blocks: string[]; rest: string } {
-  const parts = buf.split('\n');
-  const blocks: string[] = [];
-  let cur: string[] = [];
-  let inFence = false;
-  for (let i = 0; i < parts.length; i++) {
-    const line = parts[i];
-    // The final element has no trailing newline in `buf` — it is still streaming,
-    // so it always belongs to the live remainder, never to a committed block.
-    if (i === parts.length - 1) {
-      cur.push(line);
-      break;
-    }
-    if (/^\s*```/.test(line)) {
-      inFence = !inFence;
-      cur.push(line);
-      continue;
-    }
-    if (!inFence && line.trim() === '') {
-      // Top-level blank line → block boundary. Emit the block and drop the blank
-      // separator (TranscriptRow supplies spacing between committed blocks).
-      if (cur.length) {
-        blocks.push(cur.join('\n'));
-        cur = [];
-      }
-      continue;
-    }
-    cur.push(line);
-  }
-  return { blocks, rest: cur.join('\n') };
-}
-
-/**
- * Like {@link extractCompleteBlocks} but commits at LINE granularity for the smoothest, most stable
- * composer (the reference clients feel): a completed PROSE / heading / rule line is flushed to
- * native scrollback immediately, so the live region shrinks to just the line currently being typed
- * and the input barely moves. Multi-line constructs that MUST render as a unit — fenced code, lists,
- * blockquotes, and pipe/table runs — are kept grouped and flushed only when the construct ends (a
- * blank line, or a line that breaks the run), exactly as parseMarkdown gathers them, so nothing
- * misrenders. The still-typing final line (and any open construct) stays in `rest` (the live region).
- *
- * Each unit carries `pad` — whether it must render with a gap before it. The rule mirrors the
- * NON-streamed Markdown renderer exactly (which puts one blank between EVERY block pair): a unit is
- * padded when (a) a top-level blank line preceded it, (b) it is itself a distinct block (heading,
- * rule, list, quote, table, fence), or (c) the previous unit was one — only prose-after-prose hugs,
- * because consecutive prose source lines ARE one paragraph (parseMarkdown joins them). This keeps
- * streamed and non-streamed output byte-for-byte identical in rhythm, with no dependence on where
- * the stream happened to be cut. Dropping every separator used to glue ALL blocks into a wall of
- * text — the #1 "cluttered output" complaint.
- * `startPadded` seeds the state from the PREVIOUS delta batch (the caller persists `trailingBlank`
- * across calls in a ref — it covers both a consumed blank AND a committed block at a batch seam).
- * (Only edge case: an inline emphasis span that straddles a hard line break renders literally;
- * vanishingly rare in chat output.)
- */
-export interface CommitUnit {
-  text: string;
-  /** Render with a gap before this unit (blank line in source, or a block boundary). */
-  pad: boolean;
-}
-/** Is this unit a distinct markdown BLOCK (anything but a plain paragraph)? Classified by
- *  parseMarkdown ITSELF — the renderer's parser is the single source of truth, so the streamed
- *  gap rhythm can never drift from the non-streamed render (hand-rolled regex copies did drift:
- *  looser fence opens, trimmed list tests, pipe-prose misread as tables). */
-function isBlockUnit(text: string): boolean {
-  return parseMarkdown(text).some((b) => b.type !== 'paragraph');
-}
-/** Strip trailing NEWLINES only — never trimEnd() a committed unit. Trailing spaces are semantic
- *  in markdown ("- " is an empty list item; trimEnd turned it into a stray "-" paragraph). */
-export function stripTrailingNewlines(text: string): string {
-  return text.replace(/[\r\n]+$/, '');
-}
-/** Normalize an assistant block to letters+digits (lowercased) for duplicate detection — so a
- *  repeat that differs only by a trailing emoji, punctuation, or whitespace still matches. */
-export function dupKey(text: string): string {
-  return text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
-}
-/**
- * TURN-SCOPED verbatim-repeat detection for assistant blocks. Weak local models re-emit their whole
- * answer (which may be MULTIPLE blocks) verbatim in one generation. `run` is the ordered dupKeys of
- * assistant blocks committed THIS turn; `pos` is the position inside a detected repeat (0 = not in
- * one). Given the next block's dupKey, returns whether to SUPPRESS it and the new (run, pos).
- *
- * Only WHOLE-block exact (normalized) matches count — no prefix fuzz — so legitimate content is
- * never silently dropped, and the scope is the current turn only, so an identical short answer in a
- * LATER turn ("Done.") still commits. Blocks shorter than 12 normalized chars are never deduped.
- * This replaces isDuplicateBlock, which (a) compared only against the single most-recent block so a
- * multi-block repeat printed twice, and (b) matched across ALL turns + used an 0.8 prefix, dropping
- * legitimate content (a blank turn).
- */
-export function repeatStep(run: string[], pos: number, key: string): { suppress: boolean; run: string[]; pos: number } {
-  if (key.length < 12) return { suppress: false, run: [...run, key], pos: 0 };
-  if (pos > 0) {
-    if (run[pos] === key) {
-      const next = pos + 1;
-      return { suppress: true, run, pos: next >= run.length ? 0 : next };
-    }
-    return { suppress: false, run: [...run, key], pos: 0 }; // repeat broken → real new content
-  }
-  if (run.length > 0 && run[0] === key) {
-    return { suppress: true, run, pos: run.length > 1 ? 1 : 0 }; // the answer is restarting
-  }
-  return { suppress: false, run: [...run, key], pos: 0 };
-}
-
-/** Which optional live-frame rows fit, and the composer hint. See fitHud. */
-export interface HudFit {
-  liveRows: number;   // height of the streaming preview region (0..liveWant)
-  status: boolean;    // the 'working… Ns' / spacer line above the composer
-  pinned: boolean;    // the 1-row pinned goal/task summary while running
-  queued: boolean;    // the type-ahead queue line
-  custom: boolean;    // the customStatus (/statusline) strip
-  hint: boolean;      // the composer's keybinding hint row
-  marginTop: boolean; // the blank spacer above the composer group
-  strip: boolean;     // the main status strip
-  height: number;     // total live-frame height this produces (always < rows for rows >= 4)
-}
-
-/**
- * Bound the LIVE (non-<Static>) frame so its height stays STRICTLY below `rows`. Ink wipes the whole
- * screen + scrollback and re-dumps the entire transcript on EVERY render when `outputHeight >= rows`
- * (node_modules/ink/build/ink.js:121) — the flicker/duplication you get on a short or split-pane
- * terminal. The composer's input + its two borders (3 rows) are mandatory; every other row is added
- * only while it still fits under `rows - 1`, in priority order, so as the terminal shrinks the least
- * important rows drop first (custom status → queued → pinned → margin → live preview → status line →
- * strip → hint) and the frame never reaches the terminal height. Pure; the invariant is unit-tested.
- */
-export function fitHud(
-  rows: number,
-  want: { liveWant: number; pinned: boolean; queued: boolean; custom: boolean; /** The live slot is currently BLANK (idle reserve): rank it below the hint so short terminals keep real content over empty rows. */ liveBlank?: boolean; /** Separate status strip row. Default true; Phase B merges strip into hint/status so callers pass false. */ strip?: boolean },
-): HudFit {
-  const cap = rows - 1; // outputHeight must be <= rows - 1 to stay under Ink's wipe threshold
-  const f: HudFit = {
-    liveRows: 0, status: false, pinned: false, queued: false, custom: false,
-    hint: false, marginTop: false, strip: false, height: 3,
-  };
-  // Added high-priority → low: whatever doesn't fit as the terminal shrinks drops from the bottom of
-  // this list first (cosmetic blank spacer goes first, then custom status, queued, pinned, …).
-  // `liveWant` is the desired streaming-preview height (0 when there's nothing live to show).
-  const add = (n: number, on: () => void): void => { if (f.height + n <= cap) { f.height += n; on(); } };
-  // Separate strip is optional — Phase B merges model/mode/ctx into the composer hint (idle) or
-  // the working status line (running), reclaiming one permanent chrome row.
-  if (want.strip !== false) add(1, () => (f.strip = true));
-  add(1, () => (f.status = true));  // 'working…' status line (liveness)
-  const addLive = (): void => { for (let i = 0; i < want.liveWant; i++) add(1, () => (f.liveRows += 1)); };
-  const addHint = (): void => add(1, () => (f.hint = true)); // composer hint — also carries merged strip when idle
-  // An idle live slot is BLANK reserve rows; the hint (which carries the merged model/mode/ctx/
-  // OFFLINE strip) must outrank blank rows on short terminals. While running, the streaming
-  // preview is real content and keeps its priority above the hint.
-  if (want.liveBlank) { addHint(); addLive(); } else { addLive(); addHint(); }
-  if (want.pinned) add(1, () => (f.pinned = true));  // goal / task summary
-  if (want.queued) add(1, () => (f.queued = true));
-  if (want.custom) add(1, () => (f.custom = true));
-  add(1, () => (f.marginTop = true)); // cosmetic blank above the composer — first to go
-  return f;
-}
-
-/** Does this text START with a distinct markdown block? Used by the leftover-commit sites
- *  (assistant_done / stop / error teardown) to space a block leftover correctly. */
-export function leadsWithBlock(text: string): boolean {
-  const first = parseMarkdown(text)[0];
-  return first !== undefined && first.type !== 'paragraph';
-}
-export function extractCommittableUnits(
-  buf: string,
-  startPadded = false,
-): { units: CommitUnit[]; rest: string; trailingBlank: boolean } {
-  const lines = buf.split('\n');
-  const n = lines.length;
-  const units: CommitUnit[] = [];
-  let pending: string[] = []; // an open multi-line construct, held until it completes
-  let fenceChar: string | null = null; // the marker that OPENED the current fence (``` vs ~~~)
-  let padNext = startPadded; // gap owed to the next unit (blank line or block boundary behind us)
-  // Line-level grouping policy uses the PARSER'S OWN regexes (imported), so what we hold together
-  // is exactly what parseMarkdown renders together. Pipe lines are held so a real table commits
-  // whole; if the run turns out to be pipe-bearing PROSE, isBlockUnit classifies it back to a
-  // paragraph and it renders tight — no phantom gaps around shell pipelines or type unions.
-  const grouped = (line: string): boolean =>
-    MD_LIST_ITEM.test(line) || MD_QUOTE.test(line) || line.includes('|');
-  const push = (text: string): void => {
-    // A distinct block pads itself AND owes a pad to whatever follows it — exactly the
-    // marginTop-between-every-block-pair behavior of the non-streamed Markdown render.
-    const block = isBlockUnit(text);
-    units.push({ text, pad: padNext || block });
-    padNext = block;
-  };
-  const flush = (): void => {
-    if (!pending.length) return;
-    // A pipe RUN can be pipe-bearing PROSE followed by a real table ("see `a | b` output:" then a
-    // table) — one mixed unit would pad the prose half as if it were a block, diverging from the
-    // parser (which joins that prose into the surrounding paragraph). Split the run at each table
-    // START (a pipe line whose next line is a separator — parseMarkdown's own rule) so every piece
-    // classifies as exactly what the parser sees.
-    const held = pending;
-    pending = [];
-    // Split AT MOST ONCE, at the FIRST table start: once a table begins, parseMarkdown consumes
-    // every subsequent pipe line as a body row (even separator-looking ones), so splitting again
-    // inside the run would fabricate a second table the parser doesn't see.
-    let splitAt = -1;
-    for (let j = 0; j < held.length - 1; j++) {
-      if (held[j]!.includes('|') && isTableSeparator(held[j + 1]!)) {
-        splitAt = j;
-        break;
-      }
-    }
-    // splitAt === 0 → the run IS the table from its first line: no prose part, never split
-    // (later separator-shaped rows are body content of THIS table, not a second header).
-    if (splitAt > 0) {
-      push(held.slice(0, splitAt).join('\n')); // the pipe-bearing PROSE part → classifies paragraph
-      push(held.slice(splitAt).join('\n')); // the table (header + separator + all body rows)
-    } else {
-      push(held.join('\n'));
-    }
-  };
-
-  // Every element except the last had a trailing newline in `buf` (a COMPLETE line); the last element
-  // is still being typed and always stays live.
-  for (let i = 0; i < n - 1; i++) {
-    const line = lines[i]!;
-    if (fenceChar !== null) {
-      pending.push(line);
-      // Close ONLY on a full fence line of the SAME marker (parseMarkdown's exact rule): a ``` inside
-      // a ~~~ block is literal content, and `inline-code` at line start must not close anything.
-      if (MD_FENCE.test(line) && line.trim().startsWith(fenceChar)) {
-        fenceChar = null;
-        flush(); // fence closed → commit the whole block
-      }
-      continue;
-    }
-    const fence = MD_FENCE.exec(line);
-    if (fence) {
-      flush();
-      fenceChar = fence[1]![0]!;
-      pending.push(line);
-      continue;
-    }
-    if (line.trim() === '') {
-      flush(); // blank line ends a construct; remember it so the NEXT unit renders with a gap
-      padNext = true;
-      continue;
-    }
-    if (grouped(line)) {
-      pending.push(line);
-      continue;
-    }
-    flush();
-    // A standalone line commits right away; isBlockUnit (via parseMarkdown) decides whether it is
-    // a heading/rule (block → gaps) or plain prose (paragraph continuation → hugs).
-    push(line);
-  }
-
-  const tail = lines[n - 1] ?? '';
-  // The `pending` lines were COMPLETE (each had a trailing newline in `buf`), so keep that newline
-  // before the still-typing tail — otherwise carrying `rest` forward across deltas would glue the next
-  // line onto a held construct (merging list items, or breaking a fence's closing ``` onto the code).
-  const rest = pending.length ? pending.join('\n') + '\n' + tail : tail;
-  // padNext survives to the caller: it covers a consumed blank OR a just-committed block at the batch
-  // seam. A pending construct re-parses next call and owns its pad via this same seed.
-  return { units, rest, trailingBlank: padNext };
-}
-
-/**
- * Bound `src` to its last `maxLines` lines so a still-open block (e.g. a long
- * code fence mid-stream) cannot grow the live region without limit. If the kept
- * tail begins INSIDE an open code fence, re-open the fence (with its language) so
- * the renderer still applies code styling to the dangling lines.
- */
-export function clampTail(src: string, maxLines: number): string {
-  if (maxLines <= 0) return src;
-  const lines = src.split('\n');
-  if (lines.length <= maxLines) return src;
-  const tail = lines.slice(-maxLines);
-  // Only the DROPPED head lines determine whether the tail begins inside an open fence.
-  // Scanning the tail too would double-count an opener that is still present in the tail
-  // and prepend a spurious second ``` (an empty code block + plain-text code).
-  const head = lines.slice(0, lines.length - tail.length);
-  let open = false;
-  let lang = '';
-  for (const line of head) {
-    const m = /^\s*```(.*)$/.exec(line);
-    if (m) {
-      open = !open;
-      lang = open ? m[1].trim() : '';
-    }
-  }
-  return open ? '```' + lang + '\n' + tail.join('\n') : tail.join('\n');
-}
-
 /** Cap assistant prose to a readable measure so lines don't run edge-to-edge on wide terminals,
  *  and cap it IDENTICALLY for the streaming and committed renders so a finished turn never reflows.
  *  The `width` prop now constrains the whole block (previously it only reached table layout, so prose
@@ -1111,18 +829,43 @@ export function Markdown({ source, color = C.fg, width = PROSE_MAX_COLS }: { sou
               </Box>
             );
           case 'table': {
-            // Content-sized box-drawing table; collapses to a vertical key:value layout when it
-            // would exceed the terminal width (renderTableLines handles it). Border rules are
-            // dimmed so the data reads first; the header row is bold.
+            // Live preview: full grid with dim chrome (same as committed flatten path). Large-table
+            // folding is a committed-transcript concern (Ctrl-O); the live slot is already ≤2 rows.
             const lines = renderTableLines(b, width);
-            const bordered = lines[0]?.startsWith('┌') ?? false;
+            const isGrid = lines[0]?.startsWith('┌') ?? false;
+            const sepIdx = isGrid ? lines.findIndex((l) => l.startsWith('├')) : -1;
             return (
               <Box key={i} flexDirection="column" marginTop={i === 0 ? 0 : 1}>
-                {lines.map((l, j) => (
-                  <Text key={j} color={/^[┌├└]/.test(l) ? C.dim : color} bold={bordered && j === 1}>
-                    {l}
-                  </Text>
-                ))}
+                {lines.map((l, j) => {
+                  const isHeader = isGrid && j > 0 && (sepIdx < 0 || j < sepIdx);
+                  if (l.startsWith('—') || /^[┌├└]/.test(l)) {
+                    return <Text key={j} color={C.dim}>{l}</Text>;
+                  }
+                  if (!l.includes('│')) {
+                    return <Text key={j} color={color} bold={isHeader}>{l}</Text>;
+                  }
+                  // Dim │ pipes; bold+bright header cells, body in answer color.
+                  const parts: React.ReactNode[] = [];
+                  let k = 0;
+                  let pi = 0;
+                  while (k < l.length) {
+                    if (l[k] === '│') {
+                      parts.push(<Text key={pi++} color={C.dim}>│</Text>);
+                      k++;
+                    } else {
+                      let e = k;
+                      while (e < l.length && l[e] !== '│') e++;
+                      const cell = l.slice(k, e);
+                      parts.push(
+                        <Text key={pi++} color={isHeader ? C.fg : color} bold={isHeader}>
+                          {cell}
+                        </Text>,
+                      );
+                      k = e;
+                    }
+                  }
+                  return <Text key={j}>{parts}</Text>;
+                })}
               </Box>
             );
           }
@@ -1240,12 +983,18 @@ function StatusStrip({ text, marker }: { text: string; marker?: { text: string; 
 }
 
 /** Empty-composer placeholder — a dim prompt, not an example that could be mistaken for real input. */
-const COMPOSER_PLACEHOLDER = 'Send a message…  ( / for commands )';
+const COMPOSER_PLACEHOLDER = 'Send a message…  ( / for commands · Shift+Enter newline )';
 
+/**
+ * Multi-row composer: soft-wraps long lines, keeps a real caret on any row, scrolls a window when
+ * the draft is taller than COMPOSER_MAX_VISIBLE_ROWS. Open-sided rules (no L/R border).
+ */
 function Composer({
   input,
   cursor,
   hint,
+  cols,
+  maxRows = COMPOSER_MAX_VISIBLE_ROWS,
   showHint = true,
   borderColor = C.dim,
   placeholder = COMPOSER_PLACEHOLDER,
@@ -1253,38 +1002,66 @@ function Composer({
   input: string;
   cursor: number;
   hint: string;
-  /** Drop the hint row on a very short terminal to keep the composer at 3 rows (rule+input+rule). */
+  /** Terminal width — drives soft-wrap for caret math + paint. */
+  cols: number;
+  /** Max visible input rows — clamped by the caller to what the terminal height allows. */
+  maxRows?: number;
   showHint?: boolean;
-  /** Mode tint for the composer rules: dim at rest, cyan running, yellow in plan mode. */
   borderColor?: string;
   placeholder?: string;
 }) {
   const caret = Math.min(cursor, input.length);
   const empty = input.length === 0;
+  // Inner width after the `❯ ` gutter (also used as continuation indent).
+  const inner = Math.max(8, cols - COMPOSER_GUTTER - PAGE_MARGIN * 2);
+  const win = visibleComposerWindow(input, caret, inner, Math.max(1, maxRows));
+
   return (
-    <Box flexDirection="column" flexShrink={0}>
-      {/* Open-sided input: a top and bottom rule with NO left/right edges — the field reads as a
-          band in the flow, not a popped-up box. The chevron is a neutral dim gray (it brightens
-          only via the mode-tinted rules around it), so an idle prompt doesn't shout. */}
-      <Box borderStyle="single" borderColor={borderColor} borderLeft={false} borderRight={false} paddingX={0}>
-        <Text>
-          <Text color={C.dim}>{'❯ '}</Text>
-          {empty ? (
-            <>
-              <Text inverse> </Text>
-              <Text color={C.dim}>{placeholder}</Text>
-            </>
-          ) : (
-            <>
-              {input.slice(0, caret)}
-              <Text inverse>{input.slice(caret, caret + 1) || ' '}</Text>
-              {input.slice(caret + 1)}
-            </>
-          )}
-        </Text>
+    <Box flexDirection="column" flexShrink={0} width={cols}>
+      {/* Open-sided input: top + bottom rule only. Multi-line drafts grow up to
+          COMPOSER_MAX_VISIBLE_ROWS, then scroll around the caret. */}
+      <Box
+        flexDirection="column"
+        borderStyle="single"
+        borderColor={borderColor}
+        borderLeft={false}
+        borderRight={false}
+        paddingX={0}
+        width={cols}
+      >
+        {empty ? (
+          <Text>
+            <Text color={C.dim}>{'❯ '}</Text>
+            <Text inverse> </Text>
+            <Text color={C.dim}>{placeholder}</Text>
+          </Text>
+        ) : (
+          win.lines.map((line, ri) => {
+            const gutter = ri === 0 && win.offset === 0 ? '❯ ' : '  ';
+            const onCaretRow = ri === win.caretRow;
+            if (!onCaretRow) {
+              return (
+                <Text key={ri} wrap="truncate">
+                  <Text color={C.dim}>{gutter}</Text>
+                  {line || ' '}
+                </Text>
+              );
+            }
+            const col = Math.min(win.caretCol, line.length);
+            const before = line.slice(0, col);
+            const at = line.slice(col, col + 1) || ' ';
+            const after = line.slice(col + 1);
+            return (
+              <Text key={ri} wrap="truncate">
+                <Text color={C.dim}>{gutter}</Text>
+                {before}
+                <Text inverse>{at}</Text>
+                {after}
+              </Text>
+            );
+          })
+        )}
       </Box>
-      {/* Hint sits BELOW the bottom rule (outside the field). wrap="truncate": it is budgeted at ONE
-          row; at cols < ~74 the running-state hint wrapped to 2, eating the frame headroom. */}
       {showHint ? (
         <Text wrap="truncate" color={C.dim}>
           {hint}
@@ -1301,10 +1078,30 @@ function Composer({
  * whole scroll-region/absolute-paint bug class is structurally impossible — with the v2 look intact.
  * A left page margin (PAGE_MARGIN) insets content off the terminal edge.
  */
-function FlatItem({ item, cols, collapsed, continuation = false }: { item: TranscriptItem; cols: number; collapsed: boolean; continuation?: boolean }) {
+function FlatItem({
+  item,
+  cols,
+  collapsed,
+  continuation = false,
+  foldLargeTables = true,
+}: {
+  item: TranscriptItem;
+  cols: number;
+  collapsed: boolean;
+  continuation?: boolean;
+  /** When true (default), GFM tables with many body rows fold to `⌄ table N×M · ^O`. */
+  foldLargeTables?: boolean;
+}) {
   const inner = Math.max(20, cols - PAGE_MARGIN * 2);
   const w = item.kind === 'banner' ? inner : Math.min(inner, PROSE_MAX_COLS);
-  const lines = flattenItem(item as Parameters<typeof flattenItem>[0], w, collapsed, PIN_THEME, continuation);
+  const lines = flattenItem(
+    item as Parameters<typeof flattenItem>[0],
+    w,
+    collapsed,
+    PIN_THEME,
+    continuation,
+    foldLargeTables,
+  );
   return (
     <Box flexDirection="column" paddingLeft={PAGE_MARGIN}>
       {lines.map((ln) => {
@@ -1342,7 +1139,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const terminalSize = useTerminalSize();
   const [committed, setCommitted] = useState<TranscriptItem[]>([]);
   // (No live-banner state: the welcome card commits to <Static> once at startup — see showBanner.)
-  const [showAllExpanded, setShowAllExpanded] = useState(false); // Ctrl-O: reveal ALL collapsible blocks (global, not per-item)
+  const [showAllExpanded, setShowAllExpanded] = useState(false); // Ctrl-O: reveal ALL collapsible blocks
+  /** Per-item expands (Alt/Option+O on the latest). Cleared when Ctrl-O collapses/expands all. */
+  const [expandedIds, setExpandedIds] = useState<Set<number>>(() => new Set());
   const [stream, setStream] = useState('');
   const [think, setThink] = useState(''); // live extended-reasoning text (dim, cleared per step)
   // Uncommitted tail of the streaming answer: completed markdown blocks are flushed to
@@ -1505,6 +1304,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const histIdxRef = useRef(0);
   const menuIndexRef = useRef(0);
   const cursorRef = useRef(0);
+  // Rows rendered BELOW the composer input's last line (bottom rule + hint + custom-status),
+  // refreshed each render so the click-to-caret handler can map a screen Y to a draft row without
+  // guessing. -1 means "a menu/overlay is open below the composer" → don't place a caret from a click.
+  const belowComposerRef = useRef(1);
   // Big pastes are condensed to a `[Pasted text #N]` chip in the composer; the real content lives
   // here (session registry, kept for the whole session so a history re-run still resolves the chip)
   // and is spliced back in at submit via expandPastes.
@@ -1687,12 +1490,32 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const kbRegister = kb.register;
   const kbLoadedRef = useRef(kb.loaded);
   kbLoadedRef.current = kb.loaded;
-  // Ctrl-O now toggles ALL collapsible blocks (thoughts + tool output) at once — matching Claude
-  // Code's "reveal everything / hide everything" semantics. The old handler only ever toggled the
-  // single LATEST collapsible item, so every earlier fold was permanently unreachable.
+  // Ctrl-O: ALL collapsible blocks (thoughts + tool output) — matching Claude Code. Soft reflow
+  // remounts Static so folds repaint without nuking scrollback (no 3J flashbang).
   useEffect(() => kbRegister('transcript:toggleFoldLatest', () => {
+    setExpandedIds(new Set()); // per-item expands are superseded by the global toggle
     setShowAllExpanded((v) => !v);
-    // Soft reflow: remount Static so folds repaint, keep scrollback (no 3J flashbang).
+    reflow('soft');
+  }), [kbRegister, reflow]);
+  // Alt/Option+O: expand/collapse only the MOST RECENT collapsible block (inspect one shell dump
+  // without opening every earlier fold). Earlier folds stay reachable via Ctrl-O (all).
+  useEffect(() => kbRegister('transcript:toggleFoldOne', () => {
+    const items = committedRef.current;
+    let latest: TranscriptItem | undefined;
+    for (let i = items.length - 1; i >= 0; i--) {
+      if (isCollapsible(items[i]!)) {
+        latest = items[i];
+        break;
+      }
+    }
+    if (!latest) return;
+    setShowAllExpanded(false);
+    setExpandedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(latest!.id)) next.delete(latest!.id);
+      else next.add(latest!.id);
+      return next;
+    });
     reflow('soft');
   }), [kbRegister, reflow]);
   useEffect(() => kbRegister('transcript:toggleTaskList', () => {
@@ -1741,7 +1564,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
               { text: 'Commands:', bold: true },
               ...SLASH_COMMANDS.map((c) => ({ text: `  ${c.name.padEnd(SLASH_NAME_WIDTH)} ${c.desc}`, dimColor: true })),
               {
-                text: 'Keys: Shift+Tab mode · \\ + Enter newline · type while running to queue · Ctrl-O fold blocks · Ctrl-T fold tasks · scroll = native terminal scrollback · ↑/↓ history · Esc clear/interrupt · Ctrl-C quit',
+                text: 'Keys: Shift+Tab mode · Shift+Enter newline · ↑/↓ edit multi-line (history at edges) · click to place caret · Ctrl-O fold · Ctrl-T tasks · Esc interrupt · Ctrl-C quit',
                 dimColor: true,
               },
               { text: 'Approvals: y/n · s session · f prefix (shell) · a always', dimColor: true },
@@ -3202,9 +3025,16 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
               };
             });
           }
+          // Diff headers get a calm `+N −M` stats tail (redesign: ± edit path +12 −3) so you can
+          // scan churn without expanding the fold. Shell output keeps the model-facing summary.
+          let summary = oneLine(e.result.summary);
+          if (bodyMeta === 'diff' && bodyLines) {
+            const stats = formatDiffStats(bodyLines);
+            if (stats) summary = summary ? `${summary} · ${stats}` : stats;
+          }
           pushLine({
             kind: 'tool',
-            text: `${e.result.ok ? '✓' : '✗'} ${e.call.name} ${Math.max(0, Math.round(e.result.meta.durationMs))}ms — ${oneLine(e.result.summary)}`,
+            text: `${e.result.ok ? '✓' : '✗'} ${e.call.name} ${Math.max(0, Math.round(e.result.meta.durationMs))}ms — ${summary}`,
             color: e.result.ok ? C.green : C.red,
             meta: bodyMeta ?? e.call.name,
             tool: {
@@ -3212,25 +3042,35 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
               arg: previewOf(e.call.input) || undefined,
               ok: e.result.ok,
               durationMs: Math.max(0, e.result.meta.durationMs),
-              summary: oneLine(e.result.summary),
+              summary,
             },
             lines: bodyLines,
           });
           // Rare: both shell capture AND a UI diff on the same call — nest shell above, keep
           // the diff as its own foldable sibling so neither body is dropped.
           if (shellOut.trim() && diff && diff.length) {
+            const diffLines = capTranscriptBody(diff.map((d) => `${d.tag} ${d.text}`)).map((text) => {
+              const tag = text.startsWith('+') ? '+' : text.startsWith('-') ? '-' : ' ';
+              return {
+                text,
+                color: tag === '+' ? C.green : tag === '-' ? C.red : undefined,
+                dimColor: tag === ' ' || text.startsWith('…'),
+              };
+            });
+            const stats = formatDiffStats(diffLines);
             pushLine({
               kind: 'tool',
-              text: '',
+              text: stats ? `diff ${stats}` : '',
               meta: 'diff',
-              lines: capTranscriptBody(diff.map((d) => `${d.tag} ${d.text}`)).map((text) => {
-                const tag = text.startsWith('+') ? '+' : text.startsWith('-') ? '-' : ' ';
-                return {
-                  text,
-                  color: tag === '+' ? C.green : tag === '-' ? C.red : undefined,
-                  dimColor: tag === ' ' || text.startsWith('…'),
-                };
-              }),
+              lines: diffLines,
+              tool: stats
+                ? {
+                    name: 'diff',
+                    ok: e.result.ok,
+                    durationMs: 0,
+                    summary: stats,
+                  }
+                : undefined,
             });
           }
           break;
@@ -3812,7 +3652,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         return;
       }
 
-      // 5) Caret movement within the composer.
+      // 5) Caret movement within the (possibly multi-row) composer.
+      // Inner width must match Composer paint (cols − gutter − page margins).
+      const editInner = Math.max(8, (process.stdout.columns ?? 80) - COMPOSER_GUTTER - PAGE_MARGIN * 2);
       if (key.leftArrow) {
         const next = Math.max(0, cursorRef.current - 1);
         cursorRef.current = next;
@@ -3826,8 +3668,16 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         return;
       }
 
-      // 6) History (↑/↓) — replaces the whole line, caret to end.
+      // 6) ↑/↓ — multi-row drafts move the caret by visual row; history only at the edges
+      // (first row + ↑, last row + ↓) or when the draft is a single visual row.
       if (key.upArrow) {
+        const text = inputRef.current;
+        if (!cursorOnFirstRow(text, cursorRef.current, editInner)) {
+          const next = moveCursorVertical(text, cursorRef.current, -1, editInner);
+          cursorRef.current = next;
+          setCursor(next);
+          return;
+        }
         if (historyRef.current.length && histIdxRef.current > 0) {
           histIdxRef.current -= 1;
           setLine(historyRef.current[histIdxRef.current] ?? '');
@@ -3835,6 +3685,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         return;
       }
       if (key.downArrow) {
+        const text = inputRef.current;
+        if (!cursorOnLastRow(text, cursorRef.current, editInner)) {
+          const next = moveCursorVertical(text, cursorRef.current, 1, editInner);
+          cursorRef.current = next;
+          setCursor(next);
+          return;
+        }
         if (histIdxRef.current < historyRef.current.length) {
           histIdxRef.current += 1;
           setLine(historyRef.current[histIdxRef.current] ?? '');
@@ -3854,12 +3711,19 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         return;
       }
 
-      // 8) Submit.
+      // 8) Submit — or insert a newline (Shift+Enter / Alt+Enter / trailing `\`).
       if (key.return) {
-        // Multiline: a trailing backslash turns Enter into a newline instead of submit.
-        if (inputRef.current.endsWith('\\')) {
-          const next = inputRef.current.slice(0, -1) + '\n';
-          setComposer(next, next.length);
+        const wantNewline = key.shift || key.meta || inputRef.current.endsWith('\\');
+        if (wantNewline) {
+          const s = inputRef.current;
+          const c = cursorRef.current;
+          // Trailing `\` line-continuation: drop the backslash, insert `\n` at end.
+          if (s.endsWith('\\') && !key.shift && !key.meta) {
+            const next = s.slice(0, -1) + '\n';
+            setComposer(next, next.length);
+          } else {
+            setComposer(s.slice(0, c) + '\n' + s.slice(c), c + 1);
+          }
           return;
         }
         const task = inputRef.current.trim();
@@ -3908,20 +3772,56 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         return;
       }
 
-      // 9) Printable input — insert at the caret (Ink delivers pasted strings here too).
+      // 9) Mouse click (SGR) — place the caret when the user clicks inside the composer zone.
+      // Only left-button press (button 0). Wheel is ignored so we don't steal scrollback scrolling
+      // more than the terminal already does under mouse reporting. Only active under SHADOW_MOUSE=1.
+      if (ch && ch.includes('\x1b[<')) {
+        const ev = parseSgrMouse(ch);
+        if (ev && ev.press && (ev.button === 0 || ev.button === 32)) {
+          // Composer sits at the bottom of the frame. Approximate its top row from terminal height
+          // and the current multi-row draft height (same numbers Composer paints).
+          const rows = process.stdout.rows ?? 24;
+          const cols = process.stdout.columns ?? 80;
+          const inner = Math.max(8, cols - COMPOSER_GUTTER - PAGE_MARGIN * 2);
+          const below = belowComposerRef.current;
+          if (below < 0) return; // a menu/overlay is open below the composer — clicks aren't caret placement
+          const winMax = Math.max(1, Math.min(COMPOSER_MAX_VISIBLE_ROWS, rows - 3));
+          const win = visibleComposerWindow(inputRef.current, cursorRef.current, inner, winMax);
+          const inputRows = win.lines.length;
+          // Composer input's last line sits `below` rows above the terminal bottom (bottom rule +
+          // hint + custom status, counted live in belowComposerRef); its top is that minus the rows.
+          const composerTop = Math.max(0, rows - inputRows - below);
+          const y0 = ev.y - 1; // 0-based
+          const x0 = ev.x - 1;
+          if (y0 >= composerTop && y0 < composerTop + inputRows) {
+            const localRow = y0 - composerTop;
+            const localCol = Math.max(0, x0 - COMPOSER_GUTTER); // after `❯ `/`  `
+            const next = clickToCursor(inputRef.current, localRow, localCol, inner, win.offset);
+            cursorRef.current = next;
+            setCursor(next);
+          }
+          return;
+        }
+        // Swallow other mouse reports so they don't insert garbage.
+        if (ev) return;
+      }
+
+      // 10) Printable input — insert at the caret (Ink delivers pasted strings here too).
       if (!key.ctrl && !key.meta && ch) {
+        // Strip any accidental CSI mouse fragments that arrived glued to typed text.
+        const clean = ch.replace(/\x1b\[<\d+;\d+;\d+[Mm]/g, '');
+        if (!clean) return;
         const c = cursorRef.current;
         const s = inputRef.current;
-        if (isBigPaste(ch)) {
-          // Condense a big paste into a compact [Pasted text #N] chip (the reference clients feel) so
-          // the composer never balloons; the full text is restored at submit via expandPastes.
+        if (isBigPaste(clean)) {
+          // Only enormous blobs chip — multi-paragraph pastes stay fully editable in the multi-row field.
           const id = (pasteCounterRef.current += 1);
-          const lines = (ch.match(/\n/g)?.length ?? 0) + 1;
-          pastesRef.current.push({ id, content: ch, lines });
+          const lines = (clean.match(/\n/g)?.length ?? 0) + 1;
+          pastesRef.current.push({ id, content: clean, lines });
           const chip = `[Pasted text #${id} +${lines} lines]`;
           setComposer(s.slice(0, c) + chip + s.slice(c), c + chip.length);
         } else {
-          setComposer(s.slice(0, c) + ch + s.slice(c), c + ch.length);
+          setComposer(s.slice(0, c) + clean + s.slice(c), c + clean.length);
         }
         setMenuIndex(0);
       }
@@ -3930,6 +3830,19 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   );
 
   useInput(onKey);
+
+  // Mouse reporting for click-to-place caret is OPT-IN (SHADOW_MOUSE=1). Default OFF: enabling
+  // \x1b[?1000h routes wheel + click to the app, which breaks native scrollback scrolling and
+  // plain drag-to-select-copy — the whole premise of this stock-renderer branch. Off by default,
+  // the terminal keeps the mouse; a user who wants click-to-caret trades that away explicitly.
+  useEffect(() => {
+    if (!process.stdout.isTTY) return;
+    if (process.env.SHADOW_MOUSE !== '1') return;
+    process.stdout.write('\x1b[?1000h\x1b[?1006h'); // click + SGR coordinates
+    return () => {
+      process.stdout.write('\x1b[?1000l\x1b[?1006l');
+    };
+  }, []);
 
   const spinner = SPINNER[tick % SPINNER.length];
   // Elapsed seconds of the current turn — re-derived each spinner tick (~120ms) so a
@@ -4023,6 +3936,14 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // Frame budget: keep the live (non-Static) frame strictly under the terminal height so Ink never
   // trips its whole-screen wipe on a short/split-pane terminal. Drives which optional rows render.
   const wantPinnedLine = hudPinnedLine !== '' && !menuOpen && (running || !showFullPinned);
+  // Multi-row composer: budget real input height so the live frame stays under Ink's wipe line.
+  // The visible input is capped by BOTH the 8-row max AND what the terminal can hold: the mandatory
+  // composer chrome is 2 rules + N input rows, and that alone must stay < terminal height or Ink
+  // wipes the screen on every keystroke. terminalSize.rows - 3 keeps (2 + input) <= rows - 1.
+  const composerInnerW = Math.max(8, terminalSize.cols - COMPOSER_GUTTER - PAGE_MARGIN * 2);
+  const composerLineCount = layoutComposer(input, composerInnerW).lines.length;
+  const maxComposerRows = Math.max(1, Math.min(COMPOSER_MAX_VISIBLE_ROWS, terminalSize.rows - 3));
+  const composerInputRows = Math.min(maxComposerRows, Math.max(1, composerLineCount));
   const hudFit = fitHud(terminalSize.rows, {
     liveWant,
     liveBlank: !running, // idle slot = blank reserve; the hint outranks it on short terminals
@@ -4030,7 +3951,12 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     queued: queued.length > 0 && !menuOpen,
     custom: !!customStatus,
     strip: false, // Phase B: strip merged into composer hint (idle) / status line (running)
+    composerInputRows,
   });
+  // Rows below the composer input for click-to-caret: bottom rule (1) + hint (if shown) + custom
+  // status (if shown). When the slash menu is open below the composer, mark -1 so a click isn't
+  // misread as caret placement. Read live by the mouse handler via belowComposerRef.
+  belowComposerRef.current = menuOpen ? -1 : 1 + (hudFit.hint ? 1 : 0) + (customStatus && hudFit.custom ? 1 : 0);
   // reference-client style activity line: an orange pulsing sparkle (rendered separately, below) + a playful
   // per-turn verb + a quiet metric tail. No 'working… 0s · Esc to interrupt' clutter — the elapsed
   // only appears after a beat, and the interrupt hint already lives in the composer footer.
@@ -4078,24 +4004,27 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const attachTag = attachCount > 0 ? `📎 ${attachCount} · ` : '';
   // Phase B status merge: idle composer hint carries model · mode · ctx (and OFFLINE); running keeps
   // interrupt keys on the hint and rides usage on the status line above. No separate StatusStrip row.
-  // The strip shrinks against the width left after the hint's fixed text so the discoverability
-  // tail ('Shift+Tab mode · / commands') survives on ordinary 80-col terminals.
+  // The STRIP has priority over the discoverability tail: the strip (provider/model/mode/ctx — the
+  // state the user reads at a glance) is laid out first at its own budget, then the keybinding tail
+  // is appended ONLY if it still fits. So a narrow terminal drops the hints, never the strip — the
+  // v2.9.0 regression where a longer tail silently pushed provider+mode off the row. 'Shift+Enter
+  // newline' is not repeated here — it already lives in the empty-composer placeholder.
   const HINT_TAIL = ' · Shift+Tab mode · / commands';
-  // The hint row renders flush-left at full width (wrap="truncate"), so the strip budget subtracts
-  // only the text actually sharing the row (+1 safety). The RUNNING branch carries the safety tags
-  // too: while a mid-turn approval/question overlay is up the HUD status row is suppressed and this
-  // hint is the only chrome left — OFFLINE/sandbox:off must not vanish exactly then.
+  const idlePrefix = offlineTag + sandboxTag;
+  const idleFixed = (attachTag + vimTag + idlePrefix).length;
+  const idleStrip = formatStatusStrip(stripInput, Math.max(16, layout.cols - idleFixed - 1));
+  const idleTail = layout.cols - idleFixed - idleStrip.length - 1 >= HINT_TAIL.length ? HINT_TAIL : '';
+  // The RUNNING branch carries the safety tags too: while a mid-turn approval/question overlay is up
+  // the HUD status row is suppressed and this hint is the only chrome left — OFFLINE/sandbox:off must
+  // not vanish exactly then.
   const composerHint =
     attachTag +
     vimTag +
     (menu.length > 0
-      ? `${offlineTag}${sandboxTag}↑/↓ select · Tab complete · Enter ${running ? 'queues' : 'runs'} · Esc cancel`
+      ? `${idlePrefix}↑/↓ select · Tab complete · Enter ${running ? 'queues' : 'runs'} · Esc cancel`
       : running
-        ? `${offlineTag}${sandboxTag}Type to queue · Enter queues for next · Esc interrupts · Ctrl-C ×2 quits`
-        : `${offlineTag}${sandboxTag}${formatStatusStrip(
-            stripInput,
-            Math.max(16, layout.cols - (attachTag + vimTag + offlineTag + sandboxTag).length - HINT_TAIL.length - 1),
-          )}${HINT_TAIL}`);
+        ? `${idlePrefix}Type to queue · Enter queues · Shift+Enter newline · Esc interrupts · Ctrl-C ×2 quits`
+        : `${idlePrefix}${idleStrip}${idleTail}`);
 
   // Suppress the live stream PREVIEW when the model is re-typing an answer it already committed this
   // turn (weak models repeat the final block(s) verbatim in one generation) — that's the "answer
@@ -4130,10 +4059,12 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             key={String(item.id)}
             item={item}
             cols={terminalSize.cols}
-            collapsed={isCollapsible(item) && !showAllExpanded}
+            collapsed={isCollapsible(item) && !showAllExpanded && !expandedIds.has(item.id)}
             // ⏺ once per contiguous assistant run: continuation if the previous committed item was
             // also an assistant block — so a multi-line/multi-paragraph answer reads as ONE turn.
             continuation={item.kind === 'assistant' && index > 0 && committed[index - 1]?.kind === 'assistant'}
+            // Ctrl-O expands large GFM tables too (same global fold as tools/reasoning).
+            foldLargeTables={!showAllExpanded}
           />
         )}
       </Static>
@@ -4292,6 +4223,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             input={input}
             cursor={cursor}
             hint={composerHint}
+            cols={terminalSize.cols}
+            maxRows={maxComposerRows}
             showHint={hudFit.hint}
             borderColor={running ? C.cyan : planMode.mode === 'planning' ? C.yellow : C.dim}
           />
@@ -4375,6 +4308,19 @@ export function startupSequence(isTTY: boolean, env: NodeJS.ProcessEnv = process
 export function reflowSequence(mode: 'soft' | 'hard'): string {
   return mode === 'hard' ? '\x1b[2J\x1b[3J\x1b[H' : '\x1b[2J\x1b[H';
 }
+
+// Re-export pure helpers (moved to modules) so existing test imports from tui.js keep working.
+export {
+  extractCompleteBlocks,
+  extractCommittableUnits,
+  clampTail,
+  stripTrailingNewlines,
+  dupKey,
+  repeatStep,
+  leadsWithBlock,
+  type CommitUnit,
+} from './tui/streamCommit.js';
+export { fitHud, type HudFit } from './tui/layout.js';
 
 export function runTui(opts: TuiOpts): Promise<void> {
   // Launch-time privacy: title → "Shadow" (hide cwd) + wipe scrollback (hide pre-launch shell
@@ -4526,6 +4472,22 @@ function previewOf(input: unknown): string {
 function oneLine(s: string): string {
   const flat = s.replace(/\s+/g, ' ').trim();
   return flat.length > 140 ? `${flat.slice(0, 137)}…` : flat;
+}
+
+/** Count +/- lines in a UI diff body for the one-row tool summary (`+12 −3`). */
+export function formatDiffStats(lines: { text: string }[]): string {
+  let plus = 0;
+  let minus = 0;
+  for (const l of lines) {
+    const t = l.text;
+    if (t.startsWith('…')) continue; // elision notice from capTranscriptBody
+    if (t.startsWith('+') && !t.startsWith('+++')) plus++;
+    else if (t.startsWith('-') && !t.startsWith('---')) minus++;
+  }
+  if (!plus && !minus) return '';
+  if (plus && minus) return `+${plus} −${minus}`;
+  if (plus) return `+${plus}`;
+  return `−${minus}`;
 }
 
 function shortPath(path: string): string {

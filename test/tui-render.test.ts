@@ -42,6 +42,17 @@ test('TuiApp renders without throwing (regression guard for the Box/Text import 
   unmount();
 });
 
+test('idle footer: the FULL status strip survives beside the keybinding tail (strip-priority guard)', () => {
+  // Regressed twice: a longer hint tail (e.g. adding "Shift+Enter newline") silently pushed the
+  // strip down to its `slim` form, dropping provider+mode from a normal 100-col terminal. The strip
+  // now has priority — the tail is what drops on narrow widths, never the strip. This guards it.
+  const { lastFrame, unmount } = render(React.createElement(TuiApp, { opts: makeOpts() }));
+  const frame = lastFrame() ?? '';
+  assert.match(frame, /mock\/claude-opus-4-8/, 'provider/model stays visible (not shrunk away)');
+  assert.match(frame, /mode: auto-edit/, 'mode stays visible beside the hint tail');
+  unmount();
+});
+
 test('TuiApp reflects yolo + autonomy in the footer', () => {
   const { lastFrame, unmount } = render(
     React.createElement(TuiApp, { opts: makeOpts({ bypass: true, autonomy: 'full' }) }),

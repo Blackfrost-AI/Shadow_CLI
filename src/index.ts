@@ -230,6 +230,10 @@ function buildEnvBlock(
     // not a git repo, or git not installed — fine.
   }
   lines.push(`- paths: the cwd above is your filesystem scope (plus any "also readable/writable" path). Before reading or writing any path you have NOT seen this session, confirm it exists with glob or run_shell ls/find — never guess a path or invent a /tmp location.`);
+  // TUI renders GFM tables as a real grid and folds large ones; charts only look good as fenced ASCII.
+  lines.push(
+    `- Tables & charts (terminal): prefer GFM tables (\`| col | … |\` + separator) with ≤4 short columns; for trends use a fenced ASCII/Unicode bar chart (≤72 cols) or sparklines — not wide tab-separated walls or Mermaid/SVG.`,
+  );
 
   // Shadow harness capabilities — tell the model how to drive the full system
   lines.push(`- Shadow harness features: Use 'agent' tool with isolation:"worktree" for safe/parallel sub-work (auto-cleaned). Set run_in_background:true for long tasks; receive <task-notification> results. Externalize with todo_write (pinned fresh every turn in system) + plans/*.md + research/*.md. Call reviewer (agent type "reviewer") before major changes, when stuck, or before declaring done. Harness manages hooks (pre/post tool, compact, subagent_stop, notifications, session), permissions/classifier, compaction, and state. Follow disciplines in your profile to drive reliably.`);
