@@ -168,10 +168,14 @@ function shortSummary(summary: string, arg: string | undefined, max = 90): strin
 const TOOL_DOT = process.platform === 'darwin' ? '⏺' : '●';
 
 export function renderToolResult(t: ToolInfo, theme: ViewportTheme): StyledSpan[] {
-  // A single ⏺ dot whose COLOR carries state (green ok / red error) — not a ✓/✗ shape swap. Bold
-  // tool name, args in parens 'Name(args)', summary + elapsed as a dim tail. (the reference client vocabulary.)
+  // Success keeps the calm ⏺ dot; FAILURE swaps the shape to a bold ✗ (WCAG 1.4.1: green-vs-red
+  // on an identical glyph is invisible to red-green CVD and in mono — the state must survive
+  // with color removed). Failures are rare, so the shape change is signal, not noise. Bold tool
+  // name, args in parens 'Name(args)', summary + elapsed as a dim tail. (the reference client vocabulary.)
   const spans: StyledSpan[] = [
-    { text: `${TOOL_DOT} `, color: t.ok ? theme.green : theme.red },
+    t.ok
+      ? { text: `${TOOL_DOT} `, color: theme.green }
+      : { text: '✗ ', color: theme.red, bold: true },
     { text: t.name, color: theme.bright ?? theme.fg, bold: true },
   ];
   if (t.arg) spans.push({ text: `(${shortArg(t.arg)})`, color: theme.dim });

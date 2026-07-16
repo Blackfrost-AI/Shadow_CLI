@@ -30,7 +30,9 @@ export type MdBlock =
   | { type: 'table'; align: TableAlign[]; header: MdSpan[][]; rows: MdSpan[][][] }
   | { type: 'rule' };
 
-export type TableAlign = 'left' | 'center' | 'right';
+/** `auto` = bare `---` separator (no colons): resolved at render time — numeric columns
+ *  right-align like a ledger, text columns stay left. Explicit `:---`/`---:`/`:--:` win. */
+export type TableAlign = 'left' | 'center' | 'right' | 'auto';
 
 // Exported: the streaming committer (extractCommittableUnits in tui.tsx) must use the EXACT same
 // line classifications as this parser — re-implemented copies drifted (looser fence opens, trimmed
@@ -316,7 +318,8 @@ function alignOf(cell: string): TableAlign | null {
   if (!m) return null;
   if (m[1] && m[3]) return 'center';
   if (m[3]) return 'right';
-  return 'left'; // default (also `:---`)
+  if (m[1]) return 'left'; // explicit `:---`
+  return 'auto'; // bare `---` — numeric columns right-align at render time
 }
 
 export function isTableSeparator(line: string): boolean {
@@ -351,7 +354,7 @@ function tryParseTable(lines: string[], i: number): { block: MdBlock; next: numb
   const colCount = Math.max(headerCells.length, sepCells.length);
   const align: TableAlign[] = [];
   for (let c = 0; c < colCount; c++) {
-    align.push(alignOf(sepCells[c] ?? '') ?? 'left');
+    align.push(alignOf(sepCells[c] ?? '') ?? 'auto');
   }
   // Pad the header to colCount so a separator with more columns than the header
   // doesn't render a short header row misaligned with the body.
@@ -375,7 +378,8 @@ function tryParseTable(lines: string[], i: number): { block: MdBlock; next: numb
   };
 }
 
-/** Pad a cell string to `width`, applying column alignment. */
+/** Pad a cell string to `width`, applying column alignment ('auto' is resolved before here;
+ *  defensively treated as left). */
 function padCell(text: string, width: number, align: TableAlign): string {
   const gap = Math.max(0, width - visibleWidth(text));
   if (align === 'right') return ' '.repeat(gap) + text;
@@ -385,6 +389,11 @@ function padCell(text: string, width: number, align: TableAlign): string {
   }
   return text + ' '.repeat(gap);
 }
+
+/** A cell that reads as a number for auto-alignment: optional sign/currency, digits with
+ *  separators, optional decimal, optional trailing %. Conservative on purpose — "10.2s"
+ *  or "3 files" stay text (left). */
+const NUMERIC_CELL = /^[+\-−]?[$€£¥]?\d[\d,. ]*%?$/;
 
 /**
  * Render a parsed table to plain text lines (bordered ASCII). Falls back to a
@@ -440,6 +449,15 @@ export function renderTableLines(table: Extract<MdBlock, { type: 'table' }>, max
   const colCount = table.align.length;
   const headerText = table.header.map(spanText);
   const rowsText = table.rows.map((r) => r.map(spanText));
+
+  // Resolve 'auto' alignment (bare `---` separators): a column whose every non-empty BODY
+  // cell is numeric right-aligns like a ledger — 1,024 sits under 512, not ragged-left.
+  // Any explicit `:---`/`---:` marker was honored upstream and never reaches this branch.
+  const align: TableAlign[] = table.align.map((a, c) => {
+    if (a !== 'auto') return a;
+    const cells = rowsText.map((r) => (r[c] ?? '').trim()).filter((t) => t !== '');
+    return cells.length > 0 && cells.every((t) => NUMERIC_CELL.test(t)) ? 'right' : 'left';
+  });
 
   const natural: number[] = new Array(colCount).fill(0);
   for (let c = 0; c < colCount; c++) {
@@ -497,10 +515,12 @@ export function renderTableLines(table: Extract<MdBlock, { type: 'table' }>, max
     }
   }
 
-  // Box-drawing borders (┌─┬─┐ … │ … ├─┼─┤ … └─┴─┘) — the clean grid the reference client draws, not
-  // ASCII |/-. Each column segment is width+2 to match `' ' + paddedCell + ' '`, so every line is
-  // the same length and the verticals line up. Alignment is applied by padCell (no :---: markers).
-  // Cells WRAP within their column: a logical row renders as `height` terminal lines.
+  // Box-drawing borders (╭─┬─╮ … │ … ├─┼─┤ … ╰─┴─╯) — the clean grid the reference client draws, not
+  // ASCII |/-, with ROUNDED corners matching the code-block and finding-card chrome so every
+  // container in the transcript shares one visual family. Each column segment is width+2 to match
+  // `' ' + paddedCell + ' '`, so every line is the same length and the verticals line up.
+  // Alignment is applied by padCell (no :---: markers). Cells WRAP within their column: a logical
+  // row renders as `height` terminal lines.
   const rule = (l: string, m: string, r: string): string =>
     l + widths.map((w) => '─'.repeat(w + 2)).join(m) + r;
   const renderRow = (texts: string[]): string[] => {
@@ -508,7 +528,7 @@ export function renderTableLines(table: Extract<MdBlock, { type: 'table' }>, max
     const height = Math.max(1, ...cells.map((cl) => cl.length));
     const lines: string[] = [];
     for (let li = 0; li < height; li++) {
-      lines.push('│' + cells.map((cl, c) => ' ' + padCell(cl[li] ?? '', widths[c]!, table.align[c]!) + ' ').join('│') + '│');
+      lines.push('│' + cells.map((cl, c) => ' ' + padCell(cl[li] ?? '', widths[c]!, align[c]!) + ' ').join('│') + '│');
     }
     return lines;
   };
@@ -518,11 +538,11 @@ export function renderTableLines(table: Extract<MdBlock, { type: 'table' }>, max
   // When any row wraps to multiple lines, separate the body rows with rules so rows stay legible;
   // a fully single-line table keeps the tight border-free body it always had.
   const multiline = headerLines.length > 1 || bodyBlocks.some((b) => b.length > 1);
-  const out = [rule('┌', '┬', '┐'), ...headerLines, rule('├', '┼', '┤')];
+  const out = [rule('╭', '┬', '╮'), ...headerLines, rule('├', '┼', '┤')];
   bodyBlocks.forEach((b, i) => {
     if (i > 0 && multiline) out.push(rule('├', '┼', '┤'));
     out.push(...b);
   });
-  out.push(rule('└', '┴', '┘'));
+  out.push(rule('╰', '┴', '╯'));
   return out;
 }

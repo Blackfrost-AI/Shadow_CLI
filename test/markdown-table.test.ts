@@ -11,7 +11,8 @@ test('parses a simple GFM table into header + rows', () => {
     assert.deepEqual(t.header.map(spanText), ['Name', 'Age']);
     assert.equal(t.rows.length, 2);
     assert.deepEqual(t.rows[0]!.map(spanText), ['Ada', '36']);
-    assert.deepEqual(t.align, ['left', 'left']);
+    // Bare `---` separators parse as 'auto' — numeric columns right-align at render time.
+    assert.deepEqual(t.align, ['auto', 'auto']);
   }
 });
 
@@ -25,11 +26,28 @@ test('renders a horizontal box-drawing table that fits the width', () => {
   const md = ['| Name | Age |', '| --- | --- |', '| Ada | 36 |'].join('\n');
   const t = parseMarkdown(md).find((b) => b.type === 'table')!;
   const lines = renderTableLines(t as Extract<typeof t, { type: 'table' }>, 100);
-  assert.ok(lines.length >= 5); // top ┌, header, sep ├, body, bottom └
-  assert.equal(lines[0]![0], '┌'); // box-drawing top border
+  assert.ok(lines.length >= 5); // top ╭, header, sep ├, body, bottom ╰
+  assert.equal(lines[0]![0], '╭'); // rounded top border — same family as code blocks
   assert.match(lines[1]!, /Name/); // header on the row after the top border
   assert.ok(lines.some((l) => /Ada/.test(l))); // a body row
-  assert.equal(lines[lines.length - 1]![0], '└'); // bottom border
+  assert.equal(lines[lines.length - 1]![0], '╰'); // rounded bottom border
+});
+
+test('numeric columns auto-right-align under a bare --- separator; explicit :--- stays left', () => {
+  const md = ['| Region | Requests | Note |', '| --- | --- | :--- |', '| us-east | 42 | ok |', '| eu-west | 1,024 | ok |'].join('\n');
+  const t = parseMarkdown(md).find((b) => b.type === 'table')!;
+  const lines = renderTableLines(t as Extract<typeof t, { type: 'table' }>, 100);
+  const row = lines.find((l) => l.includes('42'))!;
+  const cells = row.split('│').slice(1, -1);
+  assert.match(cells[1]!, / 42 $/, 'numeric cell hugs the right edge of its column (ledger style)');
+  assert.match(cells[0]!, /^ us-east +$/, 'text column stays left');
+  assert.match(cells[2]!, /^ ok +$/, 'explicit :--- forces left even though cells look uniform');
+  // Mixed column (numbers + words) stays left — conservatism beats cleverness.
+  const md2 = ['| a | b |', '| --- | --- |', '| 1 | 2 files |'].join('\n');
+  const t2 = parseMarkdown(md2).find((b) => b.type === 'table')!;
+  const lines2 = renderTableLines(t2 as Extract<typeof t2, { type: 'table' }>, 100);
+  const row2 = lines2.find((l) => l.includes('files'))!;
+  assert.match(row2.split('│')[2]!, /^ 2 files +$/, '"2 files" is not numeric — column stays left');
 });
 
 test('collapses to vertical key:value layout when too wide', () => {
@@ -105,7 +123,7 @@ test('a WIDE table WRAPS ITS CELLS into a grid instead of collapsing to key:valu
   ].join('\n');
   const t = parseMarkdown(md).find((b) => b.type === 'table')!;
   const lines = renderTableLines(t as Extract<typeof t, { type: 'table' }>, 100);
-  assert.ok(lines[0]!.startsWith('┌'), 'renders a GRID, not the vertical fallback');
+  assert.ok(lines[0]!.startsWith('╭'), 'renders a GRID, not the vertical fallback');
   assert.ok(!lines.some((l) => l.startsWith('— row')), 'no "— row N —" labels');
   // Every line fits and all lines are the same width (verticals align).
   for (const l of lines) assert.ok(l.length <= 100, `line fits: ${l.length}`);
@@ -124,5 +142,5 @@ test('a table that fits at natural width keeps the tight single-line form (no in
   const t = parseMarkdown(md).find((b) => b.type === 'table')!;
   const lines = renderTableLines(t as Extract<typeof t, { type: 'table' }>, 80);
   assert.equal(lines.filter((l) => l.startsWith('├')).length, 1, 'only the header separator');
-  assert.equal(lines.length, 6, '┌ header ├ row row └');
+  assert.equal(lines.length, 6, '╭ header ├ row row ╰');
 });

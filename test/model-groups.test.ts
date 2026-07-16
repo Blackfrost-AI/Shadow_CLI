@@ -14,7 +14,7 @@ test('local endpoint groups under "Local" regardless of maker', () => {
   assert.equal(modelGroup(m('gemma4:12b', { baseUrl: 'http://localhost:11434/v1' })), 'Local');
   assert.equal(modelGroup(m('qwen3-coder', { baseUrl: 'http://127.0.0.1:1234/v1' })), 'Local');
   // LAN / WireGuard-served models are local too — locality beats the maker. A quad-served
-  // GLM is "Local", not "Zhipu"; a quad Local is "Local", not "Other".
+  // GLM is "Local", not "Zhipu"; a quad Ornith is "Local", not "Other".
   assert.equal(modelGroup(m('glm-local', { baseUrl: 'http://127.0.0.1:8002/v1' })), 'Local');
   assert.equal(modelGroup(m('local-reasoner', { baseUrl: 'http://127.0.0.1:8001/v1' })), 'Local');
   assert.equal(modelGroup(m('gemini-x', { baseUrl: 'http://192.168.1.50:8000/v1' })), 'Local');
@@ -38,12 +38,12 @@ test('groupedModelRows: header per category then its models', () => {
     m('claude-opus-4-8', { provider: 'anthropic' }),
     m('gemma4:12b', { baseUrl: 'http://localhost:11434/v1' }),
     m('grok-4'),
-    m('gemma-local', { baseUrl: 'http://localhost:11434/v1' }),
+    m('huihui-gemma4-12b', { baseUrl: 'http://localhost:11434/v1' }),
   ]);
   // Anthropic(h+1), Local(h+2 — both local models under one header), xAI(h+1)
   assert.deepEqual(
     rows.map((r) => (r.kind === 'header' ? `#${r.label}` : r.entry.model)),
-    ['#Anthropic', 'claude-opus-4-8', '#Local', 'gemma4:12b', 'gemma-local', '#xAI', 'grok-4'],
+    ['#Anthropic', 'claude-opus-4-8', '#Local', 'gemma4:12b', 'huihui-gemma4-12b', '#xAI', 'grok-4'],
   );
 });
 

@@ -10,9 +10,9 @@ export interface TableLineSeg {
   text: string;
 }
 
-/** True for full horizontal rule rows of a box-drawing grid. */
+/** True for full horizontal rule rows of a box-drawing grid (rounded ╭/╰ or legacy ┌/└ corners). */
 export function isTableRuleLine(line: string): boolean {
-  return /^[┌├└]/.test(line);
+  return /^[╭┌├╰└]/.test(line);
 }
 
 /**

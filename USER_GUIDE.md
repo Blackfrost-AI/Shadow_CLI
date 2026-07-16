@@ -162,6 +162,15 @@ sandbox you don't mind losing. Outside `--yolo`/`full`, file writes stay inside 
   **`/copy`**, **`/export`**, **`/resume`**, **`/mcp`** are the common ones.
 - **Ctrl-O** expands a collapsed reasoning / tool-output block; **PageUp/PageDown** or the mouse wheel
   scroll the transcript.
+- **Copy & paste**: paste multi-line text straight into the composer (it inserts atomically — newlines
+  never fire a send); **Ctrl-V** pastes from the system clipboard explicitly; **Alt-C** (or `/copy`)
+  copies the last answer, **`/copy code`** just its last fenced code block. Huge pastes condense to a
+  `[Pasted text #N]` chip and expand again on send.
+- **Accessibility**: `/theme colorblind` switches to an Okabe–Ito palette (safe under deuteranopia,
+  protanopia, and tritanopia); `/theme high-contrast` is a WCAG-AAA loud mode. Your turns carry a `▌`
+  bar on every line and failed tools a `✗` — state never rides on color alone.
+- **Tables & charts**: GFM tables render as rounded grids with numeric columns right-aligned; a fenced
+  ` ```chart ` block (`label: value` lines, `type: bar|line|spark`) renders as a real unicode chart.
 - **Ctrl-C twice** quits; **Esc** interrupts the current turn.
 - Pipe a one-shot task non-interactively: `shadow --task "summarize README.md"` (scriptable, plain output).
 

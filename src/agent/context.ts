@@ -157,6 +157,14 @@ export class Context {
     // that strict local (GLM/Lumix) chat templates reject. As a user turn it alternates cleanly with the
     // kept assistant turn across every adapter. The directive still prevents the post-compaction
     // "Hey! What can I help you with?" greeting: it tells the model to resume from NEXT STEP.
+    // The task must not depend on the summarizer faithfully copying it: preserve the human
+    // instruction turns verbatim, ABOVE the generated summary, so it survives even a lossy local
+    // summarizer. When there are none to harvest (task fully in the pinned prefix / all machine
+    // churn), the note is byte-identical to the pre-fix format.
+    const instructions = harvestInstructions(toSummarize);
+    const body = instructions.length
+      ? `${INSTR_HEADER}\n${renderInstructionBlock(instructions)}\n\n${SUMMARY_HEADER}\n${summary.trim()}`
+      : summary.trim();
     const note: Message = {
       role: 'user',
       content: [
@@ -166,7 +174,7 @@ export class Context {
             `[System note: earlier turns in this session were compacted to free up context. Below is the ` +
             `preserved state of the in-progress work. Continue the task directly from NEXT STEP — do NOT ` +
             `greet, ask what to help with, or recap; pick up exactly where you left off and keep working.]` +
-            `\n\n${summary.trim()}`,
+            `\n\n${body}`,
         },
       ],
     };
@@ -176,6 +184,75 @@ export class Context {
     this.lastActualTokens = 0;
     return true;
   }
+}
+
+// Stable markers delimiting the verbatim-instructions block inside a compaction note. The block is
+// the MODEL-INDEPENDENT carrier of the task: it survives compaction word-for-word even when the
+// summarizer model (often a small local one, for offline users) drops or softens its TASK line. The
+// markers must stay byte-stable — carry-forward across repeated compactions parses on them.
+const INSTR_HEADER =
+  '── TASK & INSTRUCTIONS (verbatim — the source of truth; follow these, the summary below is only a progress digest) ──';
+const SUMMARY_HEADER = '── PROGRESS SUMMARY ──';
+const INSTR_MAX_EACH = 1500; // per-instruction character cap
+const INSTR_MAX_TOTAL = 8000; // total verbatim budget (~2k tokens); earliest (task) instructions win
+
+/**
+ * Pull the load-bearing human instructions out of the turns about to be summarized, VERBATIM, so the
+ * original task survives compaction even when the summarizer model drops it. Only the first user
+ * message is pinned, so a task stated in any later turn would otherwise live only inside the lossy
+ * summary. Rules: a user turn carrying a tool_result is machine output, not an instruction (skip it);
+ * a prior compaction note contributes only its already-preserved instruction block (parsed between
+ * the markers), so instructions carry forward across repeated compactions without dragging the whole
+ * prior summary along.
+ */
+function harvestInstructions(turns: Message[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const add = (raw: string): void => {
+    const t = raw.trim();
+    if (!t) return;
+    const capped = t.length > INSTR_MAX_EACH ? `${t.slice(0, INSTR_MAX_EACH)} …[truncated]` : t;
+    const key = capped.slice(0, 200);
+    if (seen.has(key)) return; // dedupe repeated instructions / acks
+    seen.add(key);
+    out.push(capped);
+  };
+  for (const m of turns) {
+    if (m.role !== 'user') continue;
+    if (m.content.some((b) => b.type === 'tool_result')) continue; // machine output, not a human instruction
+    const text = m.content.map(blockText).join(' ').trim();
+    if (!text) continue;
+    const marker = text.indexOf(INSTR_HEADER);
+    if (marker !== -1) {
+      // A prior compaction note — carry forward ONLY its verbatim instruction lines.
+      const after = text.slice(marker + INSTR_HEADER.length);
+      const endIdx = after.indexOf(SUMMARY_HEADER);
+      const block = endIdx === -1 ? after : after.slice(0, endIdx);
+      for (const line of block.split('\n')) {
+        const l = line.replace(/^\s*•\s?/, '').trim();
+        if (l && !l.startsWith('…[')) add(l);
+      }
+      continue;
+    }
+    if (text.startsWith('[System note:')) continue; // a legacy/instruction-less note — don't re-preserve its summary
+    add(text);
+  }
+  return out;
+}
+
+/** Render harvested instructions as a bulleted block, earliest-first, bounded by the total budget. */
+function renderInstructionBlock(items: string[]): string {
+  const lines: string[] = [];
+  let total = 0;
+  for (const it of items) {
+    if (total + it.length > INSTR_MAX_TOTAL) {
+      lines.push('• …[further instructions elided to save space]');
+      break;
+    }
+    lines.push(`• ${it}`);
+    total += it.length;
+  }
+  return lines.join('\n');
 }
 
 function blockText(b: ContentBlock): string {

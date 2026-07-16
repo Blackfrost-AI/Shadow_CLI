@@ -108,6 +108,12 @@ const ModelEntrySchema = z.object({
   // Local MLX auto-serve (Apple Silicon): a model DIRECTORY or an mlx-community/... repo id;
   // shadow launches `mlx_lm.server` for it on activation (see src/gguf.ts ensureMlxServer).
   mlx: z.string().optional(),
+  // Local vLLM auto-serve (Linux + CUDA): a model DIRECTORY or a HuggingFace repo id — shadow launches
+  // vLLM (native `vllm serve`, else the vllm/vllm-openai Docker image) and talks to its OpenAI endpoint.
+  // The engine that covers the common GPU formats: safetensors, FP8, AWQ, GPTQ, and NVFP4 on Blackwell.
+  vllm: z.string().optional(),
+  vllmArgs: z.array(z.string()).optional(), // extra `vllm serve` args (--tensor-parallel-size, --quantization, …)
+  vllmImage: z.string().optional(), // docker image for the container path (default: vllm/vllm-openai:latest)
   ggufPort: z.number().optional(), // fixed port (default: deterministic per path)
   ggufArgs: z.array(z.string()).optional(), // extra llama-server args (overrides ctx/gpuLayers below when set)
   ggufServer: z.string().optional(), // llama-server binary path (default: PATH or $SHADOW_LLAMA_SERVER)
@@ -133,9 +139,33 @@ const ConfigSchema = z.object({
   permissionRules: z.array(PermissionRuleSchema).default([]),
   hooks: HooksSchema.default({ pre_tool_use: [], post_tool_use: [] }),
   mcpServers: z.record(McpServerSchema).default({}),
+  // Shadow's pluggable "eyes" — describe an image via a vision model YOU run, so any driving model
+  // (even a text-only one) can reason about pictures. The endpoint lives in ~/.shadow or env ONLY
+  // (both are in PROJECT_UNTRUSTED_KEYS), so a cloned repo can never redirect where your media uploads.
+  //
+  // `vision` (RECOMMENDED): any OpenAI-compatible vision endpoint — Ollama, vLLM, llama.cpp, etc.
+  // serving a VLM (Qwen-VL, LLaVA, …). This is the reproducible path; describe_media prefers it.
+  vision: z
+    .object({
+      baseUrl: z.string(), // your endpoint, e.g. http://<host>:8001/v1 — user-provided, never hardcoded
+      model: z.string(), // served model name, e.g. a qwen3-vl
+      prompt: z.string().default('Describe this image in detail. What is shown?'),
+    })
+    .optional(),
+  // `comfy` (alternative): a local ComfyUI, for describe via a caption node and (later) generation.
+  comfy: z
+    .object({
+      baseUrl: z.string(), // e.g. http://<your-comfyui-host>:8188 — user-provided, never hardcoded
+      visionModel: z.string().optional(),
+      visionType: z.string().default('qwen_image'),
+      describePrompt: z.string().default('Describe this image in detail. What is shown?'),
+    })
+    .optional(),
   parallelTools: z.boolean().default(true),
   lastStyle: z.enum(outputStyles).default('proactive'),
-  lastTheme: z.enum(['og', 'dark', 'light', 'matrix', 'mono', 'pipboy', 'cyberpunk', 'coder-chick']).default('og'),
+  lastTheme: z
+    .enum(['og', 'dark', 'light', 'matrix', 'mono', 'pipboy', 'cyberpunk', 'coder-chick', 'colorblind', 'high-contrast'])
+    .default('og'),
   statusLine: z.string().optional(), // shell command whose stdout renders in the footer (/statusline)
   vimMode: z.boolean().default(false), // modal (NORMAL/INSERT) editing in the composer (/vim)
   planMode: z.boolean().default(false),
@@ -233,7 +263,7 @@ const CONFIG_FILE = 'shadow.config.json';
  * drive-by-RCE vectors, so they are stripped too (preset fields below).
  * These come only from ~/.shadow (global), env, or CLI flags.
  */
-const PROJECT_UNTRUSTED_KEYS = ['baseUrl', 'shellEnvAllowlist', 'autonomy', 'denylistExtra', 'systemPromptPath', 'sandbox', 'sandboxNetwork', 'additionalDirectories', 'hooks', 'statusLine'];
+const PROJECT_UNTRUSTED_KEYS = ['baseUrl', 'shellEnvAllowlist', 'autonomy', 'denylistExtra', 'systemPromptPath', 'sandbox', 'sandboxNetwork', 'additionalDirectories', 'hooks', 'statusLine', 'comfy', 'vision'];
 
 /** Layered precedence: CLI flags > env > project config file (de-fanged) > global > defaults. */
 export function loadConfig(cwd: string, cliOverrides: Record<string, unknown> = {}): ShadowConfig {
@@ -279,7 +309,7 @@ export function loadConfig(cwd: string, cliOverrides: Record<string, unknown> = 
   // call — so a merely-cloned repo with a crafted preset would get ZERO-INTERACTION RCE. Drop all of
   // these from every project-file preset; only the benign label/model/group survive, so a repo can still
   // SUGGEST a model without hijacking your credentials or executing code.
-  const PRESET_UNTRUSTED_FIELDS = ['baseUrl', 'apiKey', 'authToken', 'gguf', 'ggufServer', 'ggufArgs', 'ggufPort', 'mlx'];
+  const PRESET_UNTRUSTED_FIELDS = ['baseUrl', 'apiKey', 'authToken', 'gguf', 'ggufServer', 'ggufArgs', 'ggufPort', 'mlx', 'vllm', 'vllmArgs', 'vllmImage'];
   if (Array.isArray(fromFile.models)) {
     let redacted = 0;
     for (const m of fromFile.models as Array<Record<string, unknown>>) {

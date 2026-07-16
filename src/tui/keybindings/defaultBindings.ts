@@ -21,6 +21,9 @@ const RAW_DEFAULTS: Record<ContextName, Record<string, string>> = {
     up: 'chat:historyPrevious',
     down: 'chat:historyNext',
     escape: 'chat:cancel',
+    // Paste from the SYSTEM clipboard (pbpaste / wl-paste / xclip). Terminal-native paste
+    // still works; this is the explicit in-app path (and the only one on odd terminals).
+    'ctrl+v': 'chat:pasteClipboard',
   },
   Autocomplete: {
     tab: 'menu:accept',
@@ -68,6 +71,9 @@ const RAW_DEFAULTS: Record<ContextName, Record<string, string>> = {
     // fire toggle-all. Alt/Option+O is a distinct sequence that actually reaches this action.
     'meta+o': 'transcript:toggleFoldOne', // latest collapsible only (Alt/Option+O)
     'ctrl+t': 'transcript:toggleTaskList',
+    // Alt/Option+C — copy the last assistant answer (same as /copy). NOT ctrl+c (reserved:
+    // interrupt/quit) and NOT ctrl+shift+c (indistinguishable from ctrl+c in most terminals).
+    'meta+c': 'transcript:copyLastAnswer',
   },
 };
 

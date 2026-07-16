@@ -40,6 +40,7 @@ import {
   makeScheduleWakeupTool,
   makeSkillTool,
   makeToolSearch,
+  makeDescribeMediaTool,
   registerBuiltinTools,
 } from './tools/index.js';
 import { registerMcpServers } from './mcp/client.js';
@@ -347,7 +348,7 @@ function needsOnboarding(cfg: ShadowConfig): boolean {
   // A local .gguf model is self-sufficient by definition — Shadow serves it itself; there is no
   // key or endpoint to configure. Without this, a pure-local user (no cloud key anywhere) got
   // bounced into the onboarding wizard on EVERY launch.
-  if (entry?.gguf || entry?.mlx) return false;
+  if (entry?.gguf || entry?.mlx || entry?.vllm) return false;
   if (entry?.apiKey || entry?.authToken || entry?.baseUrl) return false;
   if (resolveApiKey(cfg.provider) || resolveAuthToken(cfg.provider)) return false;
   if (resolveBaseUrl(cfg.provider, cfg.baseUrl)) return false;
@@ -569,7 +570,7 @@ async function runLocal(args: string[]): Promise<void> {
       return;
     }
     saveGlobalConfig(defaultModelPatch(entry));
-    stdout.write(lc.green(`✓ Active model → ${entry.label}`) + lc.gray(` (local: ${entry.gguf ?? entry.mlx})`) + '\n');
+    stdout.write(lc.green(`✓ Active model → ${entry.label}`) + lc.gray(` (local: ${entry.gguf ?? entry.mlx ?? entry.vllm})`) + '\n');
     stdout.write(lc.gray('  Run `shadow` to start a session with it.') + '\n');
     return;
   }
@@ -1019,6 +1020,13 @@ async function main(): Promise<void> {
     // absent from the registry — the model can't choose what it doesn't have.
     network: !offline,
   }); // M1 tools + M5 web tools (web tools gated off when offline)
+
+  // Shadow's "eyes": register describe_media only when the user configured a vision backend (~/.shadow) —
+  // an OpenAI-compatible vision endpoint (preferred) or a ComfyUI. Absent config → the tool isn't offered.
+  // Gated off when offline (it's a network call to the user's own endpoint).
+  if ((cfg.vision?.baseUrl || cfg.comfy?.baseUrl) && !offline) {
+    registry.register(makeDescribeMediaTool({ vision: cfg.vision, comfy: cfg.comfy }));
+  }
 
   // M4: project memory (known facts) — load, expose as a tool, inject into the prompt.
   const memory = ProjectMemory.load(workspaceRoot);

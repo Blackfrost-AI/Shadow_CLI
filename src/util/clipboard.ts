@@ -84,6 +84,101 @@ export function hasClipboard(): boolean {
   return resolveClipboardBin() !== null;
 }
 
+// ── read (paste) ──────────────────────────────────────────────────────────────
+
+type PasteSpec = { bin: string; args: string[] };
+
+/** Read-side helpers, mirroring the copy set: macOS pbpaste, Wayland wl-paste,
+ *  X11 xclip/xsel, Windows PowerShell Get-Clipboard (clip.exe is write-only). */
+function pastePrimary(platform: NodeJS.Platform): PasteSpec | null {
+  switch (platform) {
+    case 'darwin':
+      return { bin: 'pbpaste', args: [] };
+    case 'win32':
+      // -Raw preserves newlines as-is instead of returning a line array.
+      return { bin: 'powershell', args: ['-NoProfile', '-Command', 'Get-Clipboard', '-Raw'] };
+    case 'linux':
+    default:
+      return { bin: 'wl-paste', args: ['--no-newline'] };
+  }
+}
+
+const LINUX_PASTE_FALLBACKS: PasteSpec[] = [
+  { bin: 'xclip', args: ['-selection', 'clipboard', '-o'] },
+  { bin: 'xsel', args: ['--clipboard', '--output'] },
+];
+
+/** Resolve the first actually-installed paste helper for this platform. */
+export function resolvePasteBin(platform: NodeJS.Platform = process.platform): PasteSpec | null {
+  const primary = pastePrimary(platform);
+  const candidates = [primary, ...(platform === 'linux' || platform === 'freebsd' ? LINUX_PASTE_FALLBACKS : [])].filter(
+    Boolean,
+  ) as PasteSpec[];
+  return candidates.find((c) => onPath(c.bin)) ?? null;
+}
+
+/** Cap on clipboard reads — a runaway clipboard (screen recording buffer, huge log copy)
+ *  must not balloon the composer or the session. 2 MB of text is far beyond any real prompt. */
+const READ_CAP_BYTES = 2 * 1024 * 1024;
+
+/**
+ * Read the system clipboard as text. Resolves the text ('' for an empty clipboard),
+ * or null when no helper exists / the read failed / it exceeded the size cap.
+ * Never rejects, and a hung helper is killed after 2s — a paste miss must never
+ * wedge the composer.
+ */
+export function readClipboard(): Promise<string | null> {
+  const spec = resolvePasteBin();
+  if (!spec) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(spec.bin, spec.args, { stdio: ['ignore', 'pipe', 'ignore'] });
+    } catch {
+      resolve(null);
+      return;
+    }
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let done = false;
+    const finish = (val: string | null): void => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve(val);
+    };
+    const timer = setTimeout(() => {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        /* already gone */
+      }
+      finish(null);
+    }, 2000);
+    child.on('error', () => finish(null));
+    child.stdout?.on('data', (b: Buffer) => {
+      size += b.length;
+      if (size > READ_CAP_BYTES) {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          /* already gone */
+        }
+        finish(null);
+        return;
+      }
+      chunks.push(b);
+    });
+    child.on('close', (code) => {
+      if (code !== 0) {
+        finish(null);
+        return;
+      }
+      finish(Buffer.concat(chunks).toString('utf8'));
+    });
+  });
+}
+
 /**
  * Copy `text` to the system clipboard. Resolves true on success, false otherwise.
  * Never rejects — a clipboard miss is a soft failure, surfaced as a toast.

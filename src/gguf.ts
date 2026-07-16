@@ -3,12 +3,50 @@
 //   • `gguf: "/path/to/model.gguf"`      → llama.cpp (`llama-server`) — any platform
 //   • `mlx:  "<dir or mlx-community/…>"` → Apple MLX (`mlx_lm.server`) — Apple Silicon only
 // Activation (startup or /model) ensures the server is up and routes to http://127.0.0.1:<port>/v1.
-import { spawn, type ChildProcess } from 'node:child_process';
-import { existsSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { existsSync, readFileSync, statSync, accessSync, constants } from 'node:fs';
+import { join, resolve, dirname, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import type { ModelEntry } from './config.js';
+
+/**
+ * Resolve a server binary NAME (e.g. "llama-server") to a runnable path.
+ *
+ * When the name is bare (no path separator), a plain `spawn("llama-server")` relies entirely on the
+ * PATH the Shadow process inherited — and Shadow is often launched from a context (GUI, IDE, minimal
+ * login shell) whose PATH omits `~/.local/bin`, so the lookup ENOENTs even though the binary is right
+ * there. Shadow INSTALLS ITSELF to `~/.local/bin`, so a sibling `llama-server` is the common case; we
+ * check the Shadow executable's own directory first, then the usual local-bin locations, and only then
+ * fall back to the bare name (PATH lookup + the actionable install hint if that also fails).
+ *
+ * An explicit path (ggufServer / $SHADOW_LLAMA_SERVER) is returned untouched.
+ */
+export function resolveServerBin(
+  name: string,
+  // Candidate dirs, in order. Default = Shadow's own install dir + the usual local-bins. Injectable
+  // so the resolution + executability gate are unit-testable without planting files in real dirs.
+  dirs: string[] = [
+    dirname(process.execPath), // where the Shadow binary itself lives (the key case: ~/.local/bin)
+    join(homedir(), '.local', 'bin'),
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+  ],
+): string {
+  if (name.includes('/') || name.includes('\\') || isAbsolute(name)) return name; // already a path
+  const exe = process.platform === 'win32' ? `${name}.exe` : name;
+  for (const dir of dirs) {
+    const p = join(dir, exe);
+    try {
+      if (!existsSync(p) || !statSync(p).isFile()) continue;
+      if (process.platform !== 'win32') accessSync(p, constants.X_OK); // must be executable
+      return p;
+    } catch {
+      /* not executable / unreadable — keep looking */
+    }
+  }
+  return name; // fall back to PATH resolution (and the install hint if that fails too)
+}
 
 /** Actionable install guidance shown whenever llama-server can't be found OR fails to launch.
  *  Lives here (the lowest-level GGUF module) so both the setup-time check and the runtime spawn
@@ -43,7 +81,7 @@ export const MLX_INSTALL_HINT =
 /** Deterministic per-target port (8100–8999) so the same model reuses one server. */
 function portFor(entry: ModelEntry): number {
   if (entry.ggufPort) return entry.ggufPort;
-  const h = createHash('sha1').update(entry.gguf ?? entry.mlx ?? '').digest();
+  const h = createHash('sha1').update(entry.gguf ?? entry.mlx ?? entry.vllm ?? '').digest();
   return 8100 + (h.readUInt16BE(0) % 900);
 }
 
@@ -87,7 +125,7 @@ function installExitHook(): void {
 /** True when a server already answers on this entry's port (ours or the user's own) — used by the
  *  startup pre-flight to skip the install prompt when there is nothing to install FOR. */
 export async function ggufServerUp(entry: ModelEntry): Promise<boolean> {
-  if (!entry.gguf && !entry.mlx && !entry.ggufPort) return false;
+  if (!entry.gguf && !entry.mlx && !entry.vllm && !entry.ggufPort) return false;
   return serverReady(`http://127.0.0.1:${portFor(entry)}/v1`);
 }
 
@@ -186,7 +224,7 @@ export async function ensureGgufServer(
     return { baseUrl, started: false };
   }
 
-  const bin = entry.ggufServer || process.env.SHADOW_LLAMA_SERVER || 'llama-server';
+  const bin = entry.ggufServer || process.env.SHADOW_LLAMA_SERVER || resolveServerBin('llama-server');
   // Per-entry ctx (-c) and gpuLayers (-ngl) thread through from the Local Model Garage.
   // An explicit `ggufArgs` overrides everything (advanced/manual entries); otherwise we
   // build the args from ctx/gpuLayers, falling back to the historical defaults.
@@ -307,6 +345,22 @@ export function isMlxDir(target: string): boolean {
   return existsSync(abs) && existsSync(join(abs, 'config.json'));
 }
 
+/** True when an MLX model DIRECTORY is multimodal (its config.json has a vision_config) — those load
+ *  with mlx-vlm's server, not mlx_lm's text-only one. Repo ids can't be inspected pre-download → false. */
+export function isMultimodalMlx(dir: string): boolean {
+  try {
+    const cfg = JSON.parse(readFileSync(join(resolve(expandTilde(dir)), 'config.json'), 'utf8')) as Record<string, unknown>;
+    return Boolean(cfg.vision_config) || Boolean(cfg.image_token_id) || Boolean(cfg.image_token_index);
+  } catch {
+    return false;
+  }
+}
+
+export const MLX_VLM_INSTALL_HINT =
+  'mlx_vlm.server (mlx-vlm) is required to run MULTIMODAL MLX models, and was not found.\n' +
+  '  Install it:  uv tool install mlx-vlm   (or: pip install mlx-vlm)\n' +
+  '  Or point Shadow at an existing install: set $SHADOW_MLX_VLM_SERVER to the mlx_vlm.server path.';
+
 /**
  * --offline gate: is this MLX target servable with ZERO network? A directory target is (weights
  * on disk); a repo id only once its weights are already in the HuggingFace cache — otherwise the
@@ -401,10 +455,17 @@ export async function ensureMlxServer(
     );
   }
 
-  const bin = process.env.SHADOW_MLX_SERVER || 'mlx_lm.server';
+  // Multimodal MLX models (a vision_config in config.json — e.g. a Gemma-4 unified VLM) load with
+  // mlx-vlm's server, NOT mlx_lm's text-only one. Auto-detect for dir targets; both take --model/--host/
+  // --port so the rest of the launch is identical. No Docker — the Apple-Silicon path for local VLMs.
+  const multimodal = dirTarget && isMultimodalMlx(target);
+  const bin = multimodal
+    ? process.env.SHADOW_MLX_VLM_SERVER || resolveServerBin('mlx_vlm.server')
+    : process.env.SHADOW_MLX_SERVER || resolveServerBin('mlx_lm.server');
+  const installHint = multimodal ? MLX_VLM_INSTALL_HINT : MLX_INSTALL_HINT;
   const args = ['--model', target, '--host', '127.0.0.1', '--port', String(port)];
   const downloading = !dirTarget && !mlxOfflineReady(entry.mlx) ? ' (first run downloads the weights from HuggingFace)' : '';
-  log?.(`Starting local MLX server (${bin}, port ${port})${downloading} — first load can take a minute…`);
+  log?.(`Starting local ${multimodal ? 'MLX-VLM (multimodal)' : 'MLX'} server (${bin}, port ${port})${downloading} — first load can take a minute…`);
   installExitHook();
 
   let proc: ChildProcess;
@@ -416,7 +477,7 @@ export async function ensureMlxServer(
       env: opts.offline ? { ...process.env, HF_HUB_OFFLINE: '1' } : process.env,
     });
   } catch (e) {
-    throw new Error(`could not launch "${bin}": ${(e as Error).message}.\n${MLX_INSTALL_HINT}`);
+    throw new Error(`could not launch "${bin}": ${(e as Error).message}.\n${installHint}`);
   }
   await superviseUntilReady(proc, {
     bin,
@@ -424,7 +485,7 @@ export async function ensureMlxServer(
     baseUrl,
     log,
     target: entry.mlx,
-    installHint: MLX_INSTALL_HINT,
+    installHint,
     // Readiness = a real 1-token completion: /health lies (200 while — or after — the loader
     // thread dies), and this also confirms the WEIGHTS actually load, not just the HTTP server.
     ready: () => mlxProbe(baseUrl, target, 10_000),
@@ -437,6 +498,130 @@ export async function ensureMlxServer(
   return { baseUrl, started: true };
 }
 
+export const VLLM_INSTALL_HINT =
+  'vLLM needs Linux + a CUDA GPU. Install it so `vllm serve` is on PATH (pip install vllm), or ensure Docker + ' +
+  'the vllm/vllm-openai image are available (override the image with `vllmImage` or $SHADOW_VLLM_IMAGE).';
+
+/** A vLLM target is a local dir when it looks like a path or exists on disk; otherwise a HF repo id. */
+function isVllmDir(target: string): boolean {
+  return target.startsWith('/') || target.startsWith('~') || target.startsWith('./') || existsSync(target);
+}
+function hasNativeVllm(): boolean {
+  try {
+    return spawnSync('which', ['vllm'], { stdio: 'ignore', timeout: 3000 }).status === 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Ensure a vLLM server is serving `entry.vllm` locally and return its OpenAI-compatible base URL.
+ * Linux + CUDA only. Prefers native `vllm serve`; falls back to the vllm/vllm-openai Docker image.
+ * The engine that covers the common GPU formats (safetensors / FP8 / AWQ / GPTQ / NVFP4 on Blackwell) —
+ * exotic hand-tuned deployments keep their own launch scripts and are reached via `baseUrl` instead.
+ */
+export async function ensureVllmServer(
+  entry: ModelEntry,
+  log?: (msg: string) => void,
+  opts: { offline?: boolean } = {},
+): Promise<GgufStartResult> {
+  if (!entry.vllm) throw new Error('ensureVllmServer called on a non-vllm model entry');
+  if (process.platform !== 'linux') {
+    throw new Error(
+      `vLLM models run on Linux + CUDA only (this machine is ${process.platform}/${process.arch}). ` +
+        'Use a .gguf (portable) or an MLX model (Apple Silicon) here instead.',
+    );
+  }
+  const dirTarget = isVllmDir(entry.vllm);
+  const target = dirTarget ? resolve(entry.vllm.startsWith('~') ? join(homedir(), entry.vllm.slice(1)) : entry.vllm) : entry.vllm;
+  if (dirTarget && (!existsSync(target) || !existsSync(join(target, 'config.json')))) {
+    throw new Error(
+      `vLLM model folder not found (or missing config.json): ${target}\n` +
+        '  Check your models with `shadow local list`, then re-add it: `shadow local add <model-folder>`.',
+    );
+  }
+  if (opts.offline && !dirTarget) {
+    throw new Error(
+      `--offline: "${entry.vllm}" is a repo id whose weights would be fetched from huggingface.co.\n` +
+        '  Point the entry at a local model folder instead.',
+    );
+  }
+
+  const port = portFor(entry);
+  const baseUrl = `http://127.0.0.1:${port}/v1`;
+  const tracked = servers.get(baseUrl);
+  if (tracked) {
+    if (tracked.target === entry.vllm || tracked.target === target) return { baseUrl, started: false };
+    throw new Error(
+      `port ${port} is already used this session by a different local model (${tracked.target ?? 'unknown'}).\n` +
+        `  Give one of them its own port: set "ggufPort" on a model entry in ~/.shadow/config.json.`,
+    );
+  }
+  if (await serverReady(baseUrl)) {
+    log?.(`Reusing the vLLM server already running on port ${port}.`);
+    servers.set(baseUrl, { baseUrl, target: entry.vllm });
+    return { baseUrl, started: false };
+  }
+
+  const served = entry.model || 'model';
+  // Shadow is an agentic harness — every turn sends tools with tool_choice:"auto", which vLLM rejects
+  // ("auto tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set") unless
+  // tool calling is turned on. Default to the broadly-compatible `hermes` parser; a model that needs a
+  // different parser (qwen3_coder, llama3_json, mistral, …) overrides it via vllmArgs.
+  const userArgs = entry.vllmArgs ?? [];
+  const hasArg = (f: string) => userArgs.some((a) => a === f || a.startsWith(`${f}=`));
+  const toolArgs: string[] = [];
+  if (!hasArg('--enable-auto-tool-choice')) toolArgs.push('--enable-auto-tool-choice');
+  if (!hasArg('--tool-call-parser')) toolArgs.push('--tool-call-parser', 'hermes');
+  const serveArgs = [...toolArgs, ...userArgs];
+
+  const native = hasNativeVllm();
+  let bin: string;
+  let args: string[];
+  if (native) {
+    bin = 'vllm';
+    args = ['serve', target, '--host', '127.0.0.1', '--port', String(port), '--served-model-name', served, ...serveArgs];
+  } else {
+    const image = entry.vllmImage || process.env.SHADOW_VLLM_IMAGE || 'vllm/vllm-openai:latest';
+    bin = 'docker';
+    args = [
+      'run', '--rm', '--name', `shadow-vllm-${port}`, '--gpus', 'all', '--ipc=host', '--network', 'host',
+      '-v', `${homedir()}/.cache/huggingface:/root/.cache/huggingface`,
+      ...(dirTarget ? ['-v', `${target}:${target}:ro`] : []),
+      image, '--model', target, '--host', '127.0.0.1', '--port', String(port), '--served-model-name', served,
+      ...serveArgs,
+    ];
+  }
+  log?.(`Starting local vLLM server (${native ? 'native' : 'docker'}, port ${port}) — first load can take a few minutes…`);
+  installExitHook();
+
+  let proc: ChildProcess;
+  try {
+    proc = spawn(bin, args, {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      detached: false,
+      env: opts.offline ? { ...process.env, HF_HUB_OFFLINE: '1' } : process.env,
+    });
+  } catch (e) {
+    throw new Error(`could not launch vLLM via "${bin}": ${(e as Error).message}.\n${VLLM_INSTALL_HINT}`);
+  }
+  await superviseUntilReady(proc, {
+    bin,
+    port,
+    baseUrl,
+    log,
+    target: entry.vllm,
+    installHint: VLLM_INSTALL_HINT,
+    ready: () => serverReady(baseUrl),
+    // A large model (or a download) can take minutes on cold start; be generous.
+    deadlineMs: dirTarget ? 600_000 : 1_200_000,
+    timeoutHelp:
+      'A large model can take several minutes to load — re-run once it warms up, or lower --max-model-len / ' +
+      '--gpu-memory-utilization / --tensor-parallel-size via vllmArgs.',
+  });
+  return { baseUrl, started: true };
+}
+
 /** Route a local entry to its backend. The ONE entry point activation paths should use. */
 export async function ensureLocalServer(
   entry: ModelEntry,
@@ -444,10 +629,11 @@ export async function ensureLocalServer(
   opts: { offline?: boolean } = {},
 ): Promise<GgufStartResult> {
   if (entry.mlx) return ensureMlxServer(entry, log, opts);
+  if (entry.vllm) return ensureVllmServer(entry, log, opts);
   return ensureGgufServer(entry, log);
 }
 
-/** True when a model entry is a locally-served model (either backend). */
-export function isLocalServedEntry(entry: { gguf?: string; mlx?: string } | undefined): boolean {
-  return Boolean(entry?.gguf || entry?.mlx);
+/** True when a model entry is a locally-served model (gguf / mlx / vllm). */
+export function isLocalServedEntry(entry: { gguf?: string; mlx?: string; vllm?: string } | undefined): boolean {
+  return Boolean(entry?.gguf || entry?.mlx || entry?.vllm);
 }

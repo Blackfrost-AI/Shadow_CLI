@@ -86,8 +86,9 @@ test('renderToolResult: a single ⏺ dot carries status by COLOR, name bold, arg
   assert.ok(ok.every((s) => s.dim !== true), 'no faint attribute');
 
   const fail = renderToolResult({ name: 'web_fetch', arg: 'example.com', ok: false, durationMs: 400, summary: '404' }, T);
-  assert.equal(fail[0]!.text, '⏺ ', 'same dot on failure — shape does not change');
-  assert.equal(fail[0]!.color, T.red, 'red = error');
+  assert.equal(fail[0]!.text, '✗ ', 'failure swaps the SHAPE to ✗ — state must survive without color (WCAG 1.4.1)');
+  assert.equal(fail[0]!.color, T.red, 'red = error (color reinforces the shape)');
+  assert.equal(fail[0]!.bold, true, 'failure glyph is bold');
   assert.ok(fail.some((s) => s.text === ' (0.4s)'));
 });
 

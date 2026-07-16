@@ -71,7 +71,7 @@ test('mlx entries appear in the local list with an mlx tag', { skip: !APPLE }, (
   if (!added.ok) return;
   assert.equal(listLocalModels(added.value.models).length, 1);
   const row = formatLocalList(added.value.models)[0]!;
-  assert.match(row, /·  mlx  ·/);
+  assert.match(row, /· {2}mlx {2}·/);
   rmSync(dir, { recursive: true, force: true });
 });
 
@@ -110,4 +110,18 @@ test('mlxOfflineReady: dir targets ready; repo ids only when the HF cache has th
   assert.equal(mlxOfflineReady(dir, hub), true);
   rmSync(hub, { recursive: true, force: true });
   rmSync(dir, { recursive: true, force: true });
+});
+
+test('isMultimodalMlx: detects a vision_config (→ mlx-vlm), false for text-only or repo id', async () => {
+  const { isMultimodalMlx } = await import('../src/gguf.js');
+  const { mkdtempSync, writeFileSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const vdir = mkdtempSync(join(tmpdir(), 'mlxvlm-'));
+  writeFileSync(join(vdir, 'config.json'), JSON.stringify({ model_type: 'gemma4_unified', vision_config: { hidden_size: 1 }, image_token_id: 7 }));
+  assert.equal(isMultimodalMlx(vdir), true, 'vision_config → multimodal');
+  const tdir = mkdtempSync(join(tmpdir(), 'mlxtext-'));
+  writeFileSync(join(tdir, 'config.json'), JSON.stringify({ model_type: 'gemma4_text' }));
+  assert.equal(isMultimodalMlx(tdir), false, 'text-only → not multimodal');
+  assert.equal(isMultimodalMlx('mlx-community/some-repo'), false, 'repo id (no local config) → false');
 });

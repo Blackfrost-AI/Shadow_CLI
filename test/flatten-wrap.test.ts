@@ -85,23 +85,24 @@ test('assistant ⏺ turn bullet: on the first block, indent-only on continuation
   assert.ok(cont.every((r) => r.spans[0]!.text !== `${DOT} `), 'no ⏺ anywhere in a continuation block');
 });
 
-test('user prompt: ❯ gutter on line 0, bright body (fg), hanging indent, leading blank', () => {
-  // Hierarchy A+C: green ❯ marks the turn (not full-width green body); body is theme.fg — the
-  // same readable tier as answer prose, not dim meta. A leading blank always opens the turn
+test('user prompt: ▌ bar on EVERY line, bright body (fg), leading blank', () => {
+  // The ▌ bar runs down every row of the user turn (a SHAPE cue — survives mono/grayscale and
+  // any color-vision deficiency), tinted theme.user (falls back to green). The first-line-only
+  // ❯ left rows 2+ of a multi-line prompt indistinguishable from answer prose. Body is theme.fg —
+  // the same readable tier as answer prose, not dim meta. A leading blank always opens the turn
   // (new question = air), even if tight is set.
   const md = 'a prompt long enough to wrap at this narrow measure\n1. a typed list line';
   const rows = flattenItem({ id: 3, kind: 'user', text: `❯ ${md}`, color: T.green, bold: true, tight: true }, 30, false, T);
   assert.equal(rows[0]!.spans.every((s) => s.text === ''), true, 'user turns always lead with a blank (tight ignored)');
   const nonBlank = rows.filter((r) => r.spans.some((s) => s.text.trim() !== ''));
-  assert.equal(nonBlank[0]!.spans[0]!.text, '❯ ', '❯ gutter on the first content line');
-  assert.equal(nonBlank[0]!.spans[0]!.color, T.green, 'the marker is green');
-  assert.ok(nonBlank.slice(1).every((r) => r.spans[0]!.text === '  '), 'every other row aligns under the text');
-  assert.equal(nonBlank.filter((r) => r.spans[0]!.text === '❯ ').length, 1, 'exactly one ❯');
+  assert.ok(nonBlank.every((r) => r.spans[0]!.text === '▌ '), '▌ bar on every content row — wraps and typed lines alike');
+  assert.ok(nonBlank.every((r) => r.spans[0]!.color === T.green), 'bar takes theme.user (falls back to green)');
   const body = nonBlank.flatMap((r) => r.spans.slice(1));
   assert.ok(body.every((s) => s.color === T.fg), 'body is the bright fg tier, not dim meta');
-  assert.ok(body.every((s) => !s.bold), 'no bold body — color stays on the glyph only');
+  assert.ok(body.every((s) => !s.bold), 'no bold body — the bar is the marker');
   const joined = nonBlank.map((r) => r.spans.map((s) => s.text).join('')).join('\n');
   assert.match(joined, /1\. a typed list line/, 'typed text is verbatim — no markdown rewrite');
+  assert.ok(!joined.includes('❯'), 'the baked-in ❯ fallback marker is stripped from styled output');
   for (const r of rows) assert.ok(r.spans.map((s) => s.text).join('').length <= 30, 'fits the measure');
 });
 
@@ -255,11 +256,11 @@ test('blockquote: the │ bar repeats on EVERY wrapped row', () => {
   }
 });
 
-test('table: the HEADER TEXT row is bold, the top border is not (was bolding line 0 = ┌─┐)', () => {
+test('table: the HEADER TEXT row is bold, the top border is not (was bolding line 0 = ╭─╮)', () => {
   const md = ['| Name | State |', '| --- | --- |', '| alpha | ok |'].join('\n');
   const rows = flattenItem({ id: 1, kind: 'assistant', text: md }, 60, false, T);
   const tbl = rows.map((r) => ({ text: r.spans.map((s) => s.text).join(''), bold: r.spans.some((s) => s.bold) }));
-  const border = tbl.find((r) => r.text.includes('┌'))!;
+  const border = tbl.find((r) => r.text.includes('╭'))!;
   const header = tbl.find((r) => r.text.includes('Name'))!;
   assert.equal(border.bold, false, 'top border NOT bold');
   assert.equal(header.bold, true, 'header text row IS bold');
@@ -272,4 +273,21 @@ test('link label renders in the cyan link accent; the (url) tail stays dim', () 
   const url = spans.find((s) => s.text.includes('example.com'))!;
   assert.equal(label.color, T.cyan, 'label = link accent');
   assert.equal(url.color, T.dim, 'url tail = dim');
+});
+
+test('collaboration speaker: colored ⏺ handle header once per turn, body indents (no orange dot)', () => {
+  const spk = { handle: 'grok', color: '#38dbf5', model: 'openai/grok-4' };
+  // First block of the seat's turn (continuation=false) → header row + indented body.
+  // (Assistant items open with a leading gap blank line, so the header is the first NON-empty row.)
+  const first = flattenItem({ id: 1, kind: 'assistant', text: 'the KV cache is the OOM', speaker: spk } as never, 60, false, T, false);
+  const headRow = first.find((r) => r.spans.map((s) => s.text).join('').includes('⏺'))!;
+  const head = headRow.spans.map((s) => s.text).join('');
+  assert.match(head, /⏺ grok/, 'header shows the ⏺ + handle');
+  assert.match(head, /openai\/grok-4/, 'header shows the model');
+  assert.equal(headRow.spans[0]!.color, '#38dbf5', 'header is painted the seat color, not orange');
+  // No orange assistant bullet anywhere in a speaker turn (the header is the only bullet).
+  assert.ok(!first.slice(1).some((r) => (r.spans[0]?.color) === '#d97757'), 'body has no orange ⏺');
+  // A continuation block (same turn) draws neither a second header nor a bullet — just indent.
+  const cont = flattenItem({ id: 2, kind: 'assistant', text: 'add -ctk q8_0', speaker: spk } as never, 60, false, T, true);
+  assert.ok(!cont.some((r) => r.spans.map((s) => s.text).join('').includes('⏺')), 'continuation has no ⏺ header');
 });

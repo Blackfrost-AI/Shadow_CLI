@@ -270,7 +270,7 @@ test('/model list and /provider show provider/model management state', async () 
   await tick();
   out = strip(frames.join('\n'));
   assert.match(out, /openai\/local-reasoner/);
-  assert.match(out, /endpoint: http:\/\/127\.0\.0\.1:8001\/v1/);
+  assert.match(out, /endpoint: http:\/\/10\.80\.10\.24:8001\/v1/);
   assert.match(out, /presets: 2 configured · 1 disabled/);
   unmount();
 });
@@ -337,6 +337,132 @@ test('applyTheme swaps the active palette in place', () => {
   applyTheme('dark'); // legacy alias restores the OG default so other tests/snapshots are unaffected
   assert.equal(paletteSnapshot().fg, '#ffffff', 'dark alias restores the OG white (high contrast)');
   assert.equal(paletteSnapshot().dim, '#b6bcc3', 'dim is an explicit AA-compliant gray, not the faint attribute');
+});
+
+test('accessible themes: colorblind (Okabe–Ito) + high-contrast, with aliases; every theme carries every role token', () => {
+  // colorblind: user (sky) vs accent (orange) is the CVD-safe pairing — distinguishable under
+  // deuteranopia, protanopia, and tritanopia; the ▌ bar shape carries user turns regardless.
+  applyTheme('colorblind');
+  assert.equal(paletteSnapshot().user, '#56b4e9', 'colorblind user bar is Okabe–Ito sky blue');
+  assert.equal(paletteSnapshot().accent, '#e69f00', 'colorblind assistant bullet is Okabe–Ito orange');
+  applyTheme('cb');
+  assert.equal(paletteSnapshot().user, '#56b4e9', 'cb alias maps to colorblind');
+  applyTheme('high-contrast');
+  assert.equal(paletteSnapshot().fg, '#ffffff', 'high-contrast fg is pure white');
+  assert.equal(paletteSnapshot().dim, '#dcdcdc', 'high-contrast quiet tier stays bright (~15:1)');
+  applyTheme('hc');
+  assert.equal(paletteSnapshot().yellow, '#ffff00', 'hc alias maps to high-contrast');
+  // Role-token contract: every theme must define every token — a theme missing `user`/`accent`/
+  // `body`/`codeBg` would silently freeze part of the UI in the previous theme's colors.
+  const TOKENS = ['fg', 'body', 'bright', 'dim', 'cyan', 'green', 'red', 'yellow', 'purple', 'user', 'accent', 'codeBg'];
+  for (const name of ['og', 'pipboy', 'cyberpunk', 'coder-chick', 'matrix', 'mono', 'light', 'colorblind', 'high-contrast']) {
+    applyTheme(name);
+    const snap = paletteSnapshot();
+    for (const tok of TOKENS) {
+      assert.match(snap[tok] ?? '', /^#[0-9a-f]{6}$/i, `theme ${name} defines ${tok}`);
+    }
+  }
+  applyTheme('og'); // restore the default for the rest of the suite
+});
+
+test('fuzzy command matching: "/thm" finds /theme (prefix-only matching is gone)', async () => {
+  const { stdin, lastFrame, unmount } = render(React.createElement(TuiApp, { opts: makeOpts() }));
+  await tick();
+  stdin.write('/thm');
+  await tick();
+  assert.match(strip(lastFrame()), /\/theme/, 'subsequence match reaches /theme');
+  unmount();
+});
+
+test('argument menu: "/theme " lists themes with descriptions and a ✓ current marker', async () => {
+  const { stdin, lastFrame, unmount } = render(React.createElement(TuiApp, { opts: makeOpts() }));
+  await tick();
+  stdin.write('/theme ');
+  await tick();
+  const f = strip(lastFrame());
+  assert.match(f, /\/theme — pick an argument/, 'header names the command in argument mode');
+  assert.match(f, /colorblind/, 'theme names are offered');
+  assert.match(f, /Okabe/, 'argument rows carry their descriptions');
+  assert.match(f, /✓ current/, 'the active value is marked (og — no lastTheme in test cfg)');
+  unmount();
+});
+
+test('argument fuzzy + Enter: "/image cl" ⏎ runs /image clear', async () => {
+  const { stdin, frames, unmount } = render(React.createElement(TuiApp, { opts: makeOpts() }));
+  await tick();
+  stdin.write('/image cl');
+  await tick();
+  stdin.write('\r');
+  await tick();
+  assert.match(strip(frames.join('\n')), /Image attachments cleared\./, 'the completed argument executed');
+  unmount();
+});
+
+test('hint-only guard: "/goal " ⏎ submits the bare command — never auto-runs the first completion', async () => {
+  const { stdin, frames, unmount } = render(React.createElement(TuiApp, { opts: makeOpts() }));
+  await tick();
+  stdin.write('/goal ');
+  await tick();
+  stdin.write('\r'); // no partial typed, no navigation — the menu is only a hint here
+  await tick();
+  const out = strip(frames.join('\n'));
+  assert.match(out, /No goal set/, 'bare /goal ran (status readout)');
+  assert.doesNotMatch(out, /Goal cleared/, '"clear" did NOT fire itself');
+  unmount();
+});
+
+test('argument navigation + Enter: "/autonomy " ↓ ⏎ runs the selected level', async () => {
+  const { stdin, frames, unmount } = render(React.createElement(TuiApp, { opts: makeOpts() }));
+  await tick();
+  stdin.write('/autonomy ');
+  await tick();
+  stdin.write('\x1b[B'); // ↓ — explicit selection is intent, unlike the bare-space case above
+  await tick();
+  stdin.write('\r');
+  await tick();
+  assert.match(strip(frames.join('\n')), /Autonomy → auto-read/, 'second row (manual, auto-read, …) executed');
+  unmount();
+});
+
+test('/autonomy and /style accept a direct argument; invalid values error instead of silently cycling', async () => {
+  const { stdin, frames, unmount } = render(React.createElement(TuiApp, { opts: makeOpts() }));
+  await tick();
+  stdin.write('/autonomy full');
+  await tick();
+  stdin.write('\r');
+  await tick();
+  assert.match(strip(frames.join('\n')), /Autonomy → full/, 'valid arg jumps straight to the level');
+  // Invalid style: previously the arg was IGNORED and the style cycled — now it errors.
+  // (The valid-arg path persists lastStyle to the real ~/.shadow, so tests exercise only this branch.)
+  stdin.write('/style banana');
+  await tick();
+  stdin.write('\r');
+  await tick();
+  assert.match(strip(frames.join('\n')), /Unknown style "banana"/, 'bad style is rejected, not silently cycled');
+  unmount();
+});
+
+test('typo submits get a did-you-mean: "/modle" suggests /model', async () => {
+  const { stdin, frames, unmount } = render(React.createElement(TuiApp, { opts: makeOpts() }));
+  await tick();
+  stdin.write('/modle');
+  await tick();
+  stdin.write('\r');
+  await tick();
+  assert.match(strip(frames.join('\n')), /Did you mean \/model\?/, 'transposition typo gets a suggestion');
+  unmount();
+});
+
+test('alias rows fold out of the bare "/" browse list but still match when typed', async () => {
+  const { stdin, lastFrame, unmount } = render(React.createElement(TuiApp, { opts: makeOpts() }));
+  await tick();
+  stdin.write('/');
+  await tick();
+  assert.doesNotMatch(strip(lastFrame()), /alias for/i, 'no pure-alias rows in browse mode');
+  stdin.write('stats');
+  await tick();
+  assert.match(strip(lastFrame()), /\/stats/, 'typed alias still matches and is runnable');
+  unmount();
 });
 
 test('typing "/theme" surfaces it in the command menu', async () => {

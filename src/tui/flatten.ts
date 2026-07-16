@@ -12,6 +12,8 @@ import { highlight } from '../util/highlight.js';
 import type { CodeRole } from '../util/highlight.js';
 import type { MdSpan, MdBlock } from '../util/markdown.js';
 import { segmentTableLine, TABLE_COLLAPSE_THRESHOLD } from '../util/tableStyle.js';
+import { CHART_LANGS, parseChartSpec, renderChart } from '../util/chart.js';
+import type { ChartSpan } from '../util/chart.js';
 import { renderBrand, renderToolResult, renderToolChild, renderReasoning } from './rows.js';
 import type { BrandInfo, ToolInfo } from './rows.js';
 
@@ -128,6 +130,11 @@ export interface ViewportTheme {
   /** Bright white for BOLD text only. Body text uses the softer `fg`, so bold visibly pops —
    *  truecolor #ffffff body rendered heavy/bloomy in Terminal.app and blended with bold. */
   bright?: string;
+  /** The ▌ gutter bar on every line of a user turn. Optional — falls back to `green`. Paired with
+   *  `accent` per-theme so user vs assistant stays distinguishable under color-vision deficiency. */
+  user?: string;
+  /** The ⏺ assistant-turn bullet. Optional — falls back to the reference client's warm orange. */
+  accent?: string;
 }
 
 // ── wrapping ─────────────────────────────────────────────────────────────────
@@ -360,6 +367,21 @@ function mdSpanToStyled(s: MdSpan, theme: ViewportTheme): StyledSpan {
   return { text: s.text, color: theme.fg, italic: s.italic };
 }
 
+/** Map a chart span role to theme styling: title→bright bold, label→fg, bar→cyan
+ *  (the single series hue — labels/values never wear it), value/axis→dim. */
+function chartSpanToStyled(s: ChartSpan, theme: ViewportTheme): StyledSpan {
+  switch (s.role) {
+    case 'title':
+      return { text: s.text, color: theme.bright ?? theme.fg, bold: true };
+    case 'label':
+      return { text: s.text, color: theme.fg };
+    case 'bar':
+      return { text: s.text, color: theme.cyan };
+    default:
+      return { text: s.text, color: theme.dim };
+  }
+}
+
 /**
  * Paint one rendered table line: box-drawing chrome in dim, header cell text bold+bright,
  * body cell text in fg. Vertical-fallback lines stay plain fg (or dim for `— row N —`).
@@ -445,6 +467,25 @@ function blockToLines(
       break;
     }
     case 'code': {
+      // Fenced ```chart|graph|spark blocks render as REAL unicode charts (bars /
+      // braille lines / sparklines) once the fence closes; while still streaming —
+      // or when the spec doesn't parse — they stay an ordinary code block, so a
+      // sloppy model can never crash the canvas or paint half a chart.
+      if (block.closed && CHART_LANGS.has((block.lang || '').toLowerCase())) {
+        const spec = parseChartSpec(block.code);
+        if (spec) {
+          renderChart(spec, Math.min(cols, 72)).forEach((spans, ci) => {
+            out.push({
+              key: `${keyPrefix}ch${ci}`,
+              spans: truncateSpans(
+                spans.map((s) => chartSpanToStyled(s, theme)),
+                cols,
+              ),
+            });
+          });
+          break;
+        }
+      }
       const codeSpans = highlight(block.code || ' ', block.lang);
       // A contained code block: a labeled top rule, a dim left gutter on each line, and a closing
       // rule — so code is visually bounded (like the reference client's boxed blocks) instead of blending
@@ -472,9 +513,9 @@ function blockToLines(
         break;
       }
       const lines = renderTableLines(block, cols);
-      // Grid form: HEADER TEXT is every line between the ┌─┐ top border and the first ├─┼─┤
+      // Grid form: HEADER TEXT is every line between the ╭─╮ top border and the first ├─┼─┤
       // separator (wrapped header cells span several lines). Borders/│ stay dim; cells are fg.
-      const isGrid = lines[0]?.startsWith('┌') ?? false;
+      const isGrid = /^[╭┌]/.test(lines[0] ?? '');
       const sepIdx = isGrid ? lines.findIndex((l) => l.startsWith('├')) : -1;
       lines.forEach((l, j) => {
         const isHeader = isGrid && j > 0 && (sepIdx < 0 || j < sepIdx);
@@ -495,7 +536,7 @@ function blockToLines(
 
 function kindColor(kind: string, theme: ViewportTheme): string | undefined {
   switch (kind) {
-    case 'user': return theme.green;
+    case 'user': return theme.user ?? theme.green;
     case 'assistant': return theme.fg;
     case 'tool': return theme.cyan;
     case 'blocked': return theme.yellow;
@@ -524,6 +565,9 @@ export interface FlattenItem {
   tool?: ToolInfo;
   /** Reasoning wall-clock (ms), when known — drives `thought for Ns` in the fold header. */
   durationMs?: number;
+  /** Collaboration Mode: which model produced this assistant turn. When set, the ⏺ bullet becomes a
+   *  colored `⏺ handle  provider/model` header (drawn once per turn) and the body indents under it. */
+  speaker?: { handle: string; color: string; model: string };
 }
 
 /**
@@ -612,21 +656,24 @@ export function flattenItem(
     return out;
   }
 
-  // ── user prompt (❯ gutter + bright body) ──
-  // Hierarchy: green ❯ marks the turn (mirrors the assistant's orange ⏺); body is theme.fg —
-  // the same readable tier as answer prose, NOT dim meta. Dim made user and model read as one
-  // gray column. Color stays on the glyph only (no full-width green shout). Text is verbatim
-  // (no markdown pass); hanging 2-col indent on wraps/typed lines.
+  // ── user prompt (▌ bar gutter + bright body) ──
+  // Hierarchy: a ▌ bar runs down EVERY line of the user turn — the first-line-only ❯ left
+  // multi-line prompts indistinguishable from answer prose from row 2 on, which is exactly the
+  // "user entry and answers blend together" failure. The bar is a SHAPE cue (WCAG 1.4.1: works
+  // in mono/grayscale and under any color-vision deficiency), tinted theme.user so sighted users
+  // get the color reinforcement too. Body is theme.fg — the same readable tier as answers, NOT
+  // dim meta. Text is verbatim (no markdown pass); the bar repeats on soft-wrapped rows.
   if (item.kind === 'user' && !item.lines) {
     // Both push sites bake '❯ ' into `text` (it must survive in the plain-text fallback);
     // strip it here so the styled gutter below is the only marker.
+    const userC = theme.user ?? theme.green;
     const raw = item.text.startsWith('❯ ') ? item.text.slice(2) : item.text;
     raw.split('\n').forEach((ln, i) => {
       out.push(
         ...wrapHanging(
           `${kp}u${i}`,
-          i === 0 ? [{ text: '❯ ', color: theme.green, bold: true }] : [{ text: '  ' }],
-          [{ text: '  ' }],
+          [{ text: '▌ ', color: userC, bold: true }],
+          [{ text: '▌ ', color: userC, bold: true }],
           [{ text: ln, color: theme.fg }],
           cols,
         ),
@@ -645,9 +692,24 @@ export function flattenItem(
       if (bi > 0) bodyLines.push({ key: `${kp}bg${bi}`, spans: [{ text: '' }] }); // one blank between blocks
       bodyLines.push(...blockToLines(b, cols - 2, theme, `${kp}b${bi}`, foldLargeTables));
     });
+    // Collaboration Mode: a seat's turn opens with a colored `⏺ handle  provider/model` header row
+    // (once per turn — `!continuation`), then the body indents under it with no orange bullet, so a
+    // multi-model transcript reads as a legible group chat with unambiguous per-model attribution.
+    const spk = item.speaker;
+    if (spk && !continuation) {
+      out.push({
+        key: `${kp}spk`,
+        spans: [
+          { text: `${ASSISTANT_DOT} `, color: spk.color },
+          { text: spk.handle, color: spk.color, bold: true },
+          { text: `  ${spk.model}`, color: theme.dim },
+        ],
+      });
+    }
     bodyLines.forEach((ln, i) => {
-      // ⏺ on the first line of a NEW turn only; continuation items (same turn) align under it.
-      const gutter: StyledSpan = i === 0 && !continuation ? { text: `${ASSISTANT_DOT} `, color: CLAUDE_ORANGE } : { text: '  ' };
+      // ⏺ on the first line of a NEW turn only; continuation items (same turn) align under it. A
+      // speaker turn already drew its header, so its body always indents (no second bullet).
+      const gutter: StyledSpan = i === 0 && !continuation && !spk ? { text: `${ASSISTANT_DOT} `, color: theme.accent ?? CLAUDE_ORANGE } : { text: '  ' };
       out.push({ key: ln.key, spans: [gutter, ...ln.spans] });
     });
     return out;

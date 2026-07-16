@@ -6,7 +6,7 @@
 
 > **A true gift of freedom and privacy.**
 > Zero-telemetry · provider-neutral · phone home to no one.
-> Your models, your hardware, your rules.
+> Current build: **`v3.0.1`** — the biggest release Shadow has ever shipped.
 
 **Shadow is a zero-telemetry, provider-neutral coding agent that runs on your terms.** Point it at any model — Anthropic, any OpenAI-compatible endpoint, Gemini, or a local model on your own box — and it works as a coding / sysadmin agent over your workspace. **No Shadow account, no signup, no phone-home:** the only outbound traffic is the provider *you* chose and the web tools the agent explicitly invokes. Your config stays local and readable (`~/.shadow/config.json`), your keys never leave your machine, and you can switch models mid-session **without losing context**.
 
@@ -15,6 +15,19 @@ We're not competing for "coding-tool" mindshare — we're handing you back contr
 Under the hood it's a **tool-calling agentic runtime**: the model reasons, emits tool calls, Shadow executes them against the OS through a bounded, observable loop with a configurable permission model and enforced guardrails (workspace jail + OS sandbox), and loops until the task is done or a stop condition fires.
 
 This is **not a chat app** — it is a tool-calling runtime.
+
+## 🔥 What's new in v3.0.1
+
+V3 is the "make it beautiful and make it *see*" release. Highlights:
+
+- **👁 Give any model eyes.** Point Shadow at a vision model you host (Ollama / vLLM / llama.cpp) and *every* model you drive can see — even a text-only local coder. It delegates through the `describe_media` tool; the image goes only to *your* endpoint. → [Vision](#vision--give-any-model-eyes)
+- **🎭 Collaboration Mode — a live model round-table.** `/table gpt glm` seats 2–4 models in **one shared conversation**; you hold the baton and route each turn with `@handle`. Compare reasoning side by side, or let a strong model check a fast one.
+- **📊 Charts, tables & a genuinely beautiful TUI.** Fenced `chart` blocks render as real unicode **bar / line / sparkline** graphs; GFM tables get rounded grids with ledger-aligned numbers; markdown, code, and diffs are calm and readable.
+- **♿ Accessibility, first-class.** A `colorblind` (Okabe–Ito) palette and a `high-contrast` (WCAG-AAA) theme; your prompts carry a `▌` bar and failed tools a `✗` glyph, so meaning never rides on color alone.
+- **📋 Copy & paste that just works.** Multi-line paste is atomic (embedded newlines never fire a stray send), `Ctrl-V` pastes from the system clipboard, `Alt-C` copies the last answer, `/copy code` grabs the last code block.
+- **⌨ A slash menu that anticipates you.** Fuzzy matching (`/thm` → `/theme`), inline argument completion (`/theme ␣` lists every theme with a `✓ current` marker), and did-you-mean on typos.
+- **🖥 Three local backends, auto-served.** `.gguf` (llama.cpp), **MLX** (Apple Silicon — text *and* multimodal via mlx-vlm), and **vLLM** (Linux + CUDA) — point an entry at a model and Shadow launches the server for you.
+- **🧠 Never loses the plot.** Context compaction now pins your task verbatim, so a long session (or a weak local summarizer) can't make the model forget what it's doing.
 
 ## Status
 
@@ -353,6 +366,14 @@ Point a model entry at a local `.gguf` and Shadow starts a `llama.cpp` server fo
 ```
 
 Pick it from `/model` (or set it as the default) and Shadow serves it locally — first load shows a "loading the model into memory" note. An already-running server on the same port is reused. The context budget is capped under the server's `-c` automatically.
+
+## Vision — give any model eyes
+
+**Point Shadow at a vision model you run, and every model you drive can see — even a text-only one.** Vision in Shadow is a capability you plug in, not a property of your model: run any VLM behind an OpenAI-compatible endpoint (Ollama, vLLM, llama.cpp), add a `vision` block to `~/.shadow/config.json`, and the driving model gains eyes by *delegating*. Ask *"what's in this screenshot?"* and it calls the `describe_media` tool — Shadow sends the image to **your** endpoint, gets a text description back, and the model reasons over it. A small local coder with no native vision can now read a UI mockup, a diagram, or a chart. The image goes only to the vision model you chose and host — nothing to a coding-model provider. `vision` is a project-untrusted key (a cloned repo can't redirect your images), and the tool is off under `--offline`. See **[VISION.md](VISION.md)** for setup.
+
+## Collaboration Mode — the model round-table
+
+`/table <model> <model> …` seats **2–4 models in one shared conversation**. You hold the baton and route each turn with `@handle <question>`; `/pass @handle` forwards it, `/table done` restores your single model. Each seat's turn is drawn under a colored `⏺ handle  provider/model` header, so a multi-model thread reads as a legible group chat. Compare a fast local model against a frontier cloud one, or let a strong reasoner check a cheap coder — all in one context. (`@mention` routing is whitelist-only, so tool output can't hijack the baton.)
 
 ## Model compatibility — tested models
 

@@ -11,6 +11,7 @@ import {
 } from './tui/streamCommit.js';
 import { computeLayout, formatStatusStrip, pinnedMaxItems, fitHud } from './tui/layout.js';
 import { MENU_BG, MENU_SEL_BG, PendingOverlay, ModelPickerOverlay } from './tui/overlays.js';
+import { buildSeats, resolveTableEntries, parseTableInput, seatTag, MIN_SEATS, MAX_SEATS, type Seat, type SpeakerTag } from './tui/roundTable.js';
 import { execFileSync, spawn } from 'node:child_process';
 import type { Message, Provider, ToolCall, ContentBlock, ImageBlock, Effort } from './provider/provider.js';
 import type { ToolRegistry } from './tools/registry.js';
@@ -18,6 +19,8 @@ import { EventBus } from './agent/events.js';
 import { Budget } from './agent/budget.js';
 import { maybeNotifyUpdate } from './update/checkUpdate.js';
 import { parseMarkdown, renderTableLines, wrapSpans, type MdSpan } from './util/markdown.js';
+import { CHART_LANGS, parseChartSpec, renderChart } from './util/chart.js';
+import { fuzzyRank } from './util/fuzzy.js';
 import {
   isBigPaste,
   expandPastes,
@@ -59,7 +62,7 @@ import { applyPermissionCommand } from './safety/permissionCmd.js';
 import { isLocalModelTarget } from './safety/offline.js';
 import { familyProfile, resolveParallelTools } from './config/familyProfiles.js';
 import { SessionLog } from './state/session.js';
-import { createProvider } from './provider/index.js';
+import { createProvider, type ProviderName } from './provider/index.js';
 import {
   disableMcpServer,
   enableContextCooler,
@@ -124,7 +127,7 @@ import {
   normalizeEffort,
 } from './agent/effort.js';
 import { categorizeContext, contextSuggestions } from './tui/contextViz.js';
-import { copyToClipboard, hasClipboard } from './util/clipboard.js';
+import { copyToClipboard, hasClipboard, readClipboard } from './util/clipboard.js';
 import { redactString } from './util/redact.js';
 import { useKeybindings } from './tui/keybindings/useKeybinding.js';
 import { bindingsForDisplay, initKeybindingsFile } from './tui/keybindings/loader.js';
@@ -150,83 +153,166 @@ interface TuiStyleState {
 // EXPLICIT readable gray (NOT Ink's `dimColor` faint attribute, which terminals render unpredictably
 // and which routinely fails the 4.5:1 contrast floor). Every `fg`/`dim` here clears 4.5:1 on a black or
 // dark-gray terminal; accents (cyan/green/yellow/purple/red) are chosen to clear it too.
+//
+// Role tokens beyond the six accents:
+//   body   — transcript prose tier (softer than `bright` so bold/headers can pop above it)
+//   bright — the pop tier (bold text, header cells, tool names)
+//   user   — the ▌ gutter bar marking every line of a user turn (shape + color cue)
+//   accent — the ⏺ assistant-turn bullet
+//   codeBg — inline-code chip background (must contrast the theme's implied terminal bg)
+// `user` vs `accent` are chosen per-theme to stay distinguishable under color-vision
+// deficiency — and the cue is never color-alone: user turns carry the ▌ bar SHAPE.
 const THEMES = {
   og: {
     fg: '#ffffff', // white — high contrast
+    body: '#c9d2da', // transcript prose — soft, readable tier under bright
+    bright: '#ffffff',
     dim: '#b6bcc3', // ~9:1 on black — readable secondary text
     cyan: '#38dbf5',
     green: '#22d38f', // emerald, brightened for contrast
     red: '#ff6b6b', // red, brightened past AA
     yellow: '#f5b62e', // amber
     purple: '#b9a3ff', // violet, brightened
+    user: '#22d38f',
+    accent: '#d97757', // warm turn-bullet orange
+    codeBg: '#2d333b',
   },
   // Backward-compatible alias for configs saved before the OG name existed.
   dark: {
     fg: '#ffffff',
+    body: '#c9d2da',
+    bright: '#ffffff',
     dim: '#b6bcc3',
     cyan: '#38dbf5',
     green: '#22d38f',
     red: '#ff6b6b',
     yellow: '#f5b62e',
     purple: '#b9a3ff',
+    user: '#22d38f',
+    accent: '#d97757',
+    codeBg: '#2d333b',
   },
   pipboy: {
     fg: '#e6ffcf', // bright green-white
+    body: '#cde8ad',
+    bright: '#e6ffcf',
     dim: '#a9cf86',
     cyan: '#9be07a',
     green: '#b6f58a',
     red: '#ff8a7a',
     yellow: '#ecd977',
     purple: '#c8ea86',
+    user: '#b6f58a',
+    accent: '#ecd977',
+    codeBg: '#1e2a14',
   },
   cyberpunk: {
     fg: '#f7fbff',
+    body: '#d7deea',
+    bright: '#f7fbff',
     dim: '#b3bccb',
     cyan: '#4fe0ff',
     green: '#4ff0b3',
     red: '#ff6f93',
     yellow: '#ffdc80',
     purple: '#e08cff',
+    user: '#4fe0ff',
+    accent: '#e08cff',
+    codeBg: '#2a2438',
   },
   'coder-chick': {
     fg: '#fff7fb',
+    body: '#eedbe5',
+    bright: '#fff7fb',
     dim: '#dcc3cf',
     cyan: '#9fdcff',
     green: '#7fe0a0',
     red: '#ff7ba6',
     yellow: '#ffd485',
     purple: '#ff9fd4',
+    user: '#7fe0a0',
+    accent: '#ff9fd4',
+    codeBg: '#382631',
   },
   light: {
     fg: '#0a0a0a', // near-black (for light terminals)
+    body: '#1f2328',
+    bright: '#000000',
     dim: '#565656', // ~6:1 on a light background
     cyan: '#0369a1', // sky-700
     green: '#047857', // emerald-700
     red: '#b91c1c', // red-700
     yellow: '#b45309', // amber-700
     purple: '#6d28d9', // violet-700
+    user: '#047857',
+    accent: '#c2410c', // orange-700 — AA on white
+    codeBg: '#eaeef2',
   },
   matrix: {
     fg: '#5cff9f', // brighter phosphor green
+    body: '#54e893',
+    bright: '#c9ffdf',
     dim: '#3fbf7a',
     cyan: '#33ffd6',
     green: '#5cff9f',
     red: '#ff5f7d',
     yellow: '#d6ff33',
     purple: '#7fffbf',
+    user: '#33ffd6',
+    accent: '#d6ff33',
+    codeBg: '#06210f',
   },
   mono: {
     fg: '#f4f4f4', // bright grayscale — minimal color, terminal-default friendly
+    body: '#d6d6d6',
+    bright: '#ffffff',
     dim: '#b4b4b4', // ~8:1 on black
     cyan: '#cfd3d8',
     green: '#d6d6d6',
     red: '#ff8a8a',
     yellow: '#ededed',
     purple: '#c4c4c4',
+    user: '#ffffff', // mono relies on the ▌ bar shape — bar goes full bright
+    accent: '#e2e2e2',
+    codeBg: '#2e2e2e',
+  },
+  // Okabe–Ito palette: every accent pair stays distinguishable under deuteranopia,
+  // protanopia, AND tritanopia (the standard colorblind-safe set, lightness-tuned for
+  // dark terminals to clear WCAG AA). user (sky blue) vs accent (orange) is the
+  // strongest CVD-safe pairing — and the ▌ bar shape marks user turns regardless.
+  colorblind: {
+    fg: '#ffffff',
+    body: '#ccd4dc',
+    bright: '#ffffff',
+    dim: '#b6bcc3',
+    cyan: '#56b4e9', // OI sky blue
+    green: '#00c092', // OI bluish-green, brightened
+    red: '#e8763b', // OI vermillion, brightened
+    yellow: '#f0e442', // OI yellow
+    purple: '#d98cbb', // OI reddish-purple, brightened
+    user: '#56b4e9', // sky bar …
+    accent: '#e69f00', // … vs orange bullet: blue/orange survives all three CVD axes
+    codeBg: '#2d333b',
+  },
+  // Maximum-contrast mode: pure white text, loud accents, brighter "quiet" tier —
+  // for low vision, glare, or projector terminals. Everything clears AAA (7:1).
+  'high-contrast': {
+    fg: '#ffffff',
+    body: '#ffffff',
+    bright: '#ffffff',
+    dim: '#dcdcdc', // quiet tier stays ~15:1 — de-emphasis by role, never by illegibility
+    cyan: '#00ffff',
+    green: '#00ff7f',
+    red: '#ff5555',
+    yellow: '#ffff00',
+    purple: '#e0b0ff',
+    user: '#00ff7f',
+    accent: '#ffa347',
+    codeBg: '#262626',
   },
 } as const;
 export type ThemeName = keyof typeof THEMES;
-export const THEME_NAMES = ['og', 'pipboy', 'cyberpunk', 'coder-chick', 'matrix', 'mono', 'light'] as const;
+export const THEME_NAMES = ['og', 'pipboy', 'cyberpunk', 'coder-chick', 'matrix', 'mono', 'light', 'colorblind', 'high-contrast'] as const;
 type CanonicalThemeName = (typeof THEME_NAMES)[number];
 
 const THEME_DESCRIPTIONS: Record<CanonicalThemeName, string> = {
@@ -237,6 +323,8 @@ const THEME_DESCRIPTIONS: Record<CanonicalThemeName, string> = {
   matrix: 'Green phosphor mode with sharper signal colors.',
   mono: 'Minimal grayscale for plain terminal focus.',
   light: 'Near-black text and restrained color for light terminals.',
+  colorblind: 'Okabe–Ito accessible palette — accents stay distinct under deuteranopia, protanopia, and tritanopia.',
+  'high-contrast': 'Maximum contrast (WCAG AAA): pure white text, loud accents, brighter quiet tier.',
 };
 
 const THEME_ALIASES: Record<string, CanonicalThemeName> = {
@@ -245,6 +333,13 @@ const THEME_ALIASES: Record<string, CanonicalThemeName> = {
   coderchick: 'coder-chick',
   chick: 'coder-chick',
   pip: 'pipboy',
+  cb: 'colorblind',
+  a11y: 'colorblind',
+  accessible: 'colorblind',
+  'okabe-ito': 'colorblind',
+  hc: 'high-contrast',
+  contrast: 'high-contrast',
+  highcontrast: 'high-contrast',
 };
 
 const C = { ...THEMES.og };
@@ -346,18 +441,30 @@ const IS_DARWIN = process.platform === 'darwin';
 const SPINNER = ['◐', '◓', '◑', '◒']; // light/dark halves chase around the circle
 // The signature left-gutter dot on assistant turns; color (not shape) carries tool state.
 const BLACK_CIRCLE = IS_DARWIN ? '⏺' : '●';
-// Claude's warm brand orange — the spinner glyph + the ⏺ accent.
-const CLAUDE_ORANGE = '#d97757';
+// The spinner glyph + live-region ⏺ accent — reads the THEME token so the streaming
+// preview matches the committed transcript under /theme (incl. colorblind/high-contrast).
+// (Historically Claude's warm brand orange, now og's `accent` value.)
+const CLAUDE_ORANGE = '#d97757'; // fallback only — prefer C.accent at render time
 // The activity label shown beside the spinner while a turn runs. One brand-consistent word
 // ('Shadowing…') instead of a rotating grab-bag of generic verbs. A CUSTOM per-action label (a tool
 // or the app setting a contextual verb) can override it in future; there is no such source today.
 const DEFAULT_STATUS_VERB = 'Shadowing';
+// Bracketed-paste markers (DECSET 2004, enabled at mount). The terminal wraps every paste in
+// these, and Ink hands the raw CSI through in `ch` — the same transport the SGR mouse reports
+// ride on — so the key handler can treat the whole paste as ONE atomic insert.
+const PASTE_START = '\x1b[200~';
+const PASTE_END = '\x1b[201~';
 
 // ── Slash commands (the `/` dropdown) ────────────────────────────────────────
 interface SlashCommand {
   name: string;
   desc: string;
   dispatch?: string;
+}
+/** A dropdown row: a command, or (when `base` is set) a completed first ARGUMENT of one —
+ *  `name` then holds the full submission text ("/theme colorblind") and `base` the command. */
+interface SlashMenuItem extends SlashCommand {
+  base?: string;
 }
 const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/help', desc: 'Show keybindings and commands' },
@@ -366,6 +473,7 @@ const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/new', desc: 'Start a fresh conversation (alias for /clear)' },
   { name: '/goal', desc: 'Set a standing goal the model works toward (/goal clear to remove)' },
   { name: '/model', desc: 'Switch, list, add, remove, enable, disable, or test (capability check) model presets' },
+  { name: '/table', desc: 'Collaboration Mode (experimental): /table <model> <model> — a live round-table; @handle to route, /table done to end' },
   { name: '/provider', desc: 'Show active provider, endpoint, auth status, and model presets' },
   { name: '/local', desc: 'Add / test / switch a local model (.gguf or MLX)' },
   { name: '/onboard', desc: 'Show provider setup guidance' },
@@ -381,7 +489,7 @@ const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/stats', desc: 'Show session token usage and cost (alias for /cost)', dispatch: '/cost' },
   { name: '/context', desc: 'Show context-window usage' },
   { name: '/export', desc: 'Export session to markdown (optional path)' },
-  { name: '/copy', desc: 'Copy the last assistant answer to the clipboard' },
+  { name: '/copy', desc: 'Copy the last answer to the clipboard (/copy code → last code block); Alt+C' },
   { name: '/session', desc: 'Show current session id, log path, and message count' },
   { name: '/resume', desc: 'Resume a prior session (optional session id/path)' },
   { name: '/rewind', desc: 'Rewind to a turn index (e.g. /rewind 2)' },
@@ -415,11 +523,99 @@ const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/exit', desc: 'Exit Shadow (alias for /quit)' },
 ];
 const SLASH_NAME_WIDTH = Math.max(...SLASH_COMMANDS.map((c) => c.name.length)) + 1;
-/** Commands whose name starts with the typed prefix — non-empty only while typing a `/word`. */
-function slashMatches(input: string): SlashCommand[] {
-  if (!input.startsWith('/') || /\s/.test(input)) return [];
+
+// Enumerable FIRST arguments per command (keyed by dispatch name). Typing `/cmd ` opens a
+// second-level menu of these — users pick values instead of memorizing them. Only verified
+// vocabularies belong here (a completion that the command then rejects is worse than none).
+const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
+const AUTONOMY_LEVELS: AutonomyLevel[] = ['manual', 'auto-read', 'auto-edit', 'full'];
+const SLASH_ARG_COMPLETIONS: Record<string, { value: string; desc: string }[]> = {
+  '/theme': [
+    ...THEME_NAMES.map((n) => ({ value: n, desc: THEME_DESCRIPTIONS[n] })),
+    { value: 'preview', desc: 'Try a theme without saving it (/theme preview <name>)' },
+    { value: 'list', desc: 'List every theme with its description' },
+  ],
+  '/effort': EFFORT_LEVELS.map((l) => ({ value: l, desc: effortDescription(l) })),
+  '/autonomy': [
+    { value: 'manual', desc: 'Approve every tool call' },
+    { value: 'auto-read', desc: 'Reads are automatic; writes and commands ask' },
+    { value: 'auto-edit', desc: 'Reads and edits are automatic; commands ask' },
+    { value: 'full', desc: 'Everything runs without asking (inside the sandbox/jail)' },
+  ],
+  '/style': [
+    { value: 'proactive', desc: 'Lead with the result; act, then report' },
+    { value: 'explanatory', desc: 'Explain the reasoning alongside the work' },
+    { value: 'learning', desc: 'Teach while working — more context, more why' },
+    { value: 'procedural', desc: 'Terse step-by-step execution' },
+  ],
+  '/copy': [{ value: 'code', desc: 'Copy only the last fenced code block' }],
+  '/config': [
+    { value: 'fastMode', desc: 'on/off — Anthropic fast mode' },
+    { value: 'effort', desc: 'low | medium | high | xhigh | max' },
+    { value: 'cacheTtl', desc: '5m or 1h — prompt-cache TTL' },
+    { value: 'maxIterations', desc: 'agent loop cap (non-negative integer)' },
+    { value: 'maxOutputTokens', desc: 'per-call output cap (integer ≥ 256)' },
+    { value: 'autoClassifier', desc: 'on/off — automatic safety classifier' },
+    { value: 'parallelTools', desc: 'on/off — run independent tools in parallel' },
+    { value: 'costWarnUSD', desc: 'warn when session cost passes this (USD)' },
+  ],
+  '/model': [
+    { value: 'list', desc: 'Show configured model presets' },
+    { value: 'add', desc: 'Add a preset: /model add <name> …' },
+    { value: 'remove', desc: 'Remove a preset by name' },
+    { value: 'enable', desc: 'Enable a disabled preset' },
+    { value: 'disable', desc: 'Disable a preset (kept in config)' },
+    { value: 'test', desc: 'Capability-check a preset (tools, vision, context)' },
+  ],
+  '/mcp': [
+    { value: 'list', desc: 'List configured MCP servers' },
+    { value: 'get', desc: 'Inspect one server: /mcp get <name>' },
+    { value: 'enable', desc: 'Enable a server: /mcp enable <name>' },
+    { value: 'disable', desc: 'Disable a server: /mcp disable <name>' },
+  ],
+  '/local': [{ value: 'list', desc: 'Show local model presets (.gguf / MLX / vLLM)' }],
+  '/tasks': [{ value: 'clear', desc: 'Clear the live task list' }],
+  '/image': [{ value: 'clear', desc: 'Drop queued image attachments' }],
+  '/goal': [{ value: 'clear', desc: 'Remove the standing goal' }],
+  '/keybindings': [{ value: 'init', desc: 'Write a starter ~/.shadow/keybindings.json' }],
+  '/table': [{ value: 'done', desc: 'End the round-table and return to single-model chat' }],
+  '/statusline': [{ value: 'none', desc: 'Clear the custom footer line' }],
+};
+
+/**
+ * Build the dropdown for the current composer text.
+ *  - `/wor` → commands, FUZZY-ranked (`/thm` finds /theme; falls back to description search)
+ *  - bare `/` → the curated browse list, with pure-alias rows folded out (they still match typed)
+ *  - `/cmd part` → the command's known first arguments, fuzzy-filtered; `current` (dispatch →
+ *    active value) marks the live setting so pickers double as status readouts
+ */
+function slashMatches(input: string, current?: Record<string, string | undefined>): SlashMenuItem[] {
+  if (!input.startsWith('/')) return [];
   if (isPathLikeSlashToken(input)) return []; // a path (/Users/…, /x.y) is not a command — no menu
-  return SLASH_COMMANDS.filter((c) => c.name.startsWith(input));
+  const sp = input.indexOf(' ');
+  if (sp < 0) {
+    const q = input.slice(1);
+    if (!q) return SLASH_COMMANDS.filter((c) => !/\balias\b/i.test(c.desc));
+    // NAME-only fuzzy — deliberately no description search: Enter runs the selected row, and
+    // a desc match on a mistyped name ("/modle") would execute an unrelated command instead
+    // of falling through to the did-you-mean suggestion.
+    return fuzzyRank(SLASH_COMMANDS, q, (c) => c.name.slice(1)).map((r) => r.item);
+  }
+  const cmd = findSlashCommand(input.slice(0, sp));
+  if (!cmd) return [];
+  const completions = SLASH_ARG_COMPLETIONS[slashDispatchName(cmd)];
+  if (!completions) return [];
+  const partial = input.slice(sp + 1);
+  if (/\s/.test(partial)) return []; // only the FIRST argument completes
+  const active = current?.[slashDispatchName(cmd)];
+  const items: SlashMenuItem[] = completions.map((a) => ({
+    name: `${cmd.name} ${a.value}`,
+    desc: a.value === active ? `✓ current · ${a.desc}` : a.desc,
+    dispatch: cmd.dispatch,
+    base: cmd.name,
+  }));
+  if (!partial) return items;
+  return fuzzyRank(items, partial, (i) => i.name.slice(cmd.name.length + 1)).map((r) => r.item);
 }
 
 function slashDispatchName(cmd: SlashCommand): string {
@@ -430,13 +626,48 @@ function findSlashCommand(name: string): SlashCommand | undefined {
   return SLASH_COMMANDS.find((c) => c.name === name);
 }
 
+/** Levenshtein distance, early-exiting when it must exceed `max` — for did-you-mean on typos.
+ *  Fuzzy subsequence matching can't see TRANSPOSITIONS (/modle ⊄ /model), so this fills that gap. */
+function editDistance(a: string, b: string, max: number): number {
+  if (Math.abs(a.length - b.length) > max) return max + 1;
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i, ...new Array<number>(b.length).fill(0)];
+    let rowMin = i;
+    for (let j = 1; j <= b.length; j++) {
+      cur[j] = Math.min(prev[j]! + 1, cur[j - 1]! + 1, prev[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1));
+      rowMin = Math.min(rowMin, cur[j]!);
+    }
+    if (rowMin > max) return max + 1;
+    prev = cur;
+  }
+  return prev[b.length]!;
+}
+
+/** Best "did you mean" candidate for a mistyped command name, or undefined when nothing is close.
+ *  Fuzzy first (catches abbreviations: /thm), then edit-distance ≤ 2 (catches transpositions: /modle). */
+function suggestSlash(first: string): string | undefined {
+  const q = first.slice(1);
+  if (!q) return undefined;
+  const fuzzy = fuzzyRank(SLASH_COMMANDS, q, (c) => c.name.slice(1))[0];
+  if (fuzzy) return fuzzy.item.name;
+  let best: { name: string; d: number } | undefined;
+  for (const c of SLASH_COMMANDS) {
+    const d = editDistance(q.toLowerCase(), c.name.slice(1), 2);
+    if (d <= 2 && (!best || d < best.d)) best = { name: c.name, d };
+  }
+  return best?.name;
+}
+
 /** Classify a `/`-leading submission: a KNOWN command, a likely TYPO (/modl), or a PATH/message the
- *  user pasted or typed (/Users/…, /tmp). This is what stops a directory being rejected as a command. */
-function classifySlash(task: string): { cmd?: SlashCommand; kind: 'command' | 'typo' | 'message' } {
+ *  user pasted or typed (/Users/…, /tmp). This is what stops a directory being rejected as a command.
+ *  Typos carry a `suggestion` when a command is plausibly close. */
+function classifySlash(task: string): { cmd?: SlashCommand; kind: 'command' | 'typo' | 'message'; suggestion?: string } {
   const first = task.split(/\s+/)[0] ?? '';
   const cmd = findSlashCommand(first);
   if (cmd) return { cmd, kind: 'command' };
-  return { kind: isPathLikeSlashToken(first) || pathExistsSafe(first) ? 'message' : 'typo' };
+  if (isPathLikeSlashToken(first) || pathExistsSafe(first)) return { kind: 'message' };
+  return { kind: 'typo', suggestion: suggestSlash(first) };
 }
 
 const SAFE_CONFIG_KEYS = [
@@ -591,6 +822,8 @@ interface TranscriptBase {
   tool?: ToolInfo;
   /** Reasoning wall-clock (ms) when known — fold header shows `thought for Ns`. */
   durationMs?: number;
+  /** Collaboration Mode: which seat produced this assistant turn (attribution header). */
+  speaker?: SpeakerTag;
 }
 type TranscriptItem = TranscriptBase;
 // Idle-countdown config: when the model asks a question and the user is away, auto-pick the
@@ -739,11 +972,29 @@ const PROSE_MAX_COLS = 100;
 /** Left/right page margin for transcript content — floats content off the terminal edges
  *  like the reference client instead of running flush to column 1. */
 const PAGE_MARGIN = 4;
+/** Collaboration Mode: the baton is always this warm orange (Shadow's brand ⏺ color) — never a seat color. */
+const BATON_ORANGE = '#d97757';
 const MARGIN_PAD = ' '.repeat(PAGE_MARGIN);
 
 /** The single palette handed to flattenItem (the FlatItem stock renderer). `dim` is the
  *  EXPLICIT ADA gray — v2 rows use it for all de-emphasis instead of the banned faint attribute. */
-const PIN_THEME = { fg: '#c9d2da', bright: '#ffffff', dim: C.dim, green: C.green, cyan: C.cyan, yellow: C.yellow, red: C.red, purple: C.purple, codeBg: '#2d333b' };
+// LIVE theme view for the flattener. Getters (not a snapshot!) so `/theme` re-themes the
+// transcript: the old `{ fg: '#c9d2da', dim: C.dim, … }` literal froze the palette at module
+// load — switching to `light` left transcript prose painted in dark-theme gray, unreadable on
+// a white terminal. Every property now reads the mutable `C` singleton at render time.
+const PIN_THEME = {
+  get fg() { return C.body; },
+  get bright() { return C.bright; },
+  get dim() { return C.dim; },
+  get green() { return C.green; },
+  get cyan() { return C.cyan; },
+  get yellow() { return C.yellow; },
+  get red() { return C.red; },
+  get purple() { return C.purple; },
+  get user() { return C.user; },
+  get accent() { return C.accent; },
+  get codeBg() { return C.codeBg; },
+};
 
 export function Markdown({ source, color = C.fg, width = PROSE_MAX_COLS }: { source: string; color?: string; width?: number }) {
   const blocks = parseMarkdown(source);
@@ -808,6 +1059,31 @@ export function Markdown({ source, color = C.fg, width = PROSE_MAX_COLS }: { sou
               </Box>
             );
           case 'code': {
+            // Closed ```chart|graph|spark fences preview as the real chart (same renderer as
+            // the committed path); an open fence or unparseable spec stays a code block.
+            if (b.closed && CHART_LANGS.has((b.lang || '').toLowerCase())) {
+              const spec = parseChartSpec(b.code);
+              if (spec) {
+                const chartRows = renderChart(spec, Math.min(width, 72));
+                return (
+                  <Box key={i} flexDirection="column" marginTop={i === 0 ? 0 : 1}>
+                    {chartRows.map((spans, j) => (
+                      <Text key={j} wrap="truncate">
+                        {spans.map((s, k) => (
+                          <Text
+                            key={k}
+                            color={s.role === 'title' ? C.bright : s.role === 'label' ? C.fg : s.role === 'bar' ? C.cyan : C.dim}
+                            bold={s.role === 'title'}
+                          >
+                            {s.text}
+                          </Text>
+                        ))}
+                      </Text>
+                    ))}
+                  </Box>
+                );
+              }
+            }
             const spans = highlight(b.code || ' ', b.lang);
             return (
               <Box key={i} flexDirection="column" borderStyle="round" borderColor="gray" paddingX={1} marginTop={i === 0 ? 0 : 1}>
@@ -832,13 +1108,13 @@ export function Markdown({ source, color = C.fg, width = PROSE_MAX_COLS }: { sou
             // Live preview: full grid with dim chrome (same as committed flatten path). Large-table
             // folding is a committed-transcript concern (Ctrl-O); the live slot is already ≤2 rows.
             const lines = renderTableLines(b, width);
-            const isGrid = lines[0]?.startsWith('┌') ?? false;
+            const isGrid = /^[╭┌]/.test(lines[0] ?? '');
             const sepIdx = isGrid ? lines.findIndex((l) => l.startsWith('├')) : -1;
             return (
               <Box key={i} flexDirection="column" marginTop={i === 0 ? 0 : 1}>
                 {lines.map((l, j) => {
                   const isHeader = isGrid && j > 0 && (sepIdx < 0 || j < sepIdx);
-                  if (l.startsWith('—') || /^[┌├└]/.test(l)) {
+                  if (l.startsWith('—') || /^[╭┌├╰└]/.test(l)) {
                     return <Text key={j} color={C.dim}>{l}</Text>;
                   }
                   if (!l.includes('│')) {
@@ -1214,6 +1490,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const [menuIndex, setMenuIndex] = useState(0); // selected row in the slash-command menu
   const [cursor, setCursor] = useState(0); // caret position within the composer input
   const [current, setCurrent] = useState({ provider: opts.cfg.provider, model: opts.cfg.model }); // live model (for the footer + /model)
+  // Collaboration Mode (experimental): the active round-table (null = normal single-model session).
+  const [table, setTable] = useState<{ seats: Seat[] } | null>(null);
+  const tableRef = useRef<{ seats: Seat[] } | null>(null);
+  tableRef.current = table;
+  const speakerRef = useRef<SpeakerTag | null>(null); // seat that currently holds the baton (tags its turns)
+  const preTableRef = useRef<{ client: Provider; provider: ProviderName; model: string } | null>(null);
+  const routeInFlightRef = useRef(false); // a seat route is building/running — block a second concurrent route
   const [pickerOpen, setPickerOpen] = useState(false); // model-picker has focus
   const [pickerIndex, setPickerIndex] = useState(0); // selected row in the model picker
   // Type-ahead queue: messages/slash-commands submitted WHILE a turn is running are
@@ -1313,6 +1596,11 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // and is spliced back in at submit via expandPastes.
   const pastesRef = useRef<{ id: number; content: string; lines: number }[]>([]);
   const pasteCounterRef = useRef(0);
+  // Bracketed paste (mode 2004): between the \x1b[200~ … \x1b[201~ markers every input chunk
+  // is BUFFERED here and inserted atomically at the end — embedded newlines can't submit
+  // mid-paste and pasted Esc/Tab bytes can't fire their key handlers.
+  const pastingRef = useRef(false);
+  const pasteBufRef = useRef('');
   // Active model — `providerRef` is the live Provider OBJECT the next turn runs on;
   // `currentRef` mirrors the displayed {provider, model} NAMES for the key handler.
   const providerRef = useRef(opts.provider);
@@ -1325,6 +1613,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const styleRef = useRef(style);
   const runOneRef = useRef<((task: string) => void) | null>(null);
   const selectModelRef = useRef<((entry: ModelEntry) => Promise<void>) | null>(null);
+  const buildProviderRef = useRef<((entry: ModelEntry, opts?: { clampBudget?: boolean }) => Promise<{ ok: true; client: Provider; provider: ProviderName; model: string } | { ok: false; error: string; fatal?: boolean }>) | null>(null);
+  const handleTableInputRef = useRef<((raw: string) => void) | null>(null);
+  const startTableRef = useRef<((arg: string) => void) | null>(null);
   const flushQueueRef = useRef<(() => void) | null>(null);
   const goalRef = useRef<string | null>(null);
   // Extra granted roots, mutable at runtime via /add-dir (seeded from startup config/--add-dir).
@@ -1384,6 +1675,27 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     setCursor(nextCursor);
   }, []);
 
+  // Insert text into the composer at the caret. Enormous blobs condense to a
+  // `[Pasted text #N +M lines]` chip (content parked in pastesRef, spliced back at submit);
+  // anything smaller inserts verbatim and stays editable. Newlines are already normalized
+  // (\r\n and bare \r → \n) by every caller — macOS terminals paste line ends as \r, which
+  // used to defeat the chip's line count and render as invisible garbage in the composer.
+  const insertPastable = useCallback((text: string) => {
+    const c = cursorRef.current;
+    const s = inputRef.current;
+    if (isBigPaste(text)) {
+      const id = (pasteCounterRef.current += 1);
+      const lines = (text.match(/\n/g)?.length ?? 0) + 1;
+      pastesRef.current.push({ id, content: text, lines });
+      const chip = `[Pasted text #${id} +${lines} lines]`;
+      setComposer(s.slice(0, c) + chip + s.slice(c), c + chip.length);
+    } else {
+      setComposer(s.slice(0, c) + text + s.slice(c), c + text.length);
+    }
+    setMenuIndex(0);
+  }, [setComposer]);
+
+
   const setQuestionIndex = useCallback((next: number) => {
     questionIndexRef.current = Math.max(0, next);
     setQuestionIndexState(questionIndexRef.current);
@@ -1424,7 +1736,11 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   }
 
   const pushLine = useCallback((l: Omit<TranscriptItem, 'id' | 'kind'> & { kind?: TranscriptItem['kind'] }) => {
-    const entry = { id: lineId.current++, kind: l.kind ?? 'system', ...l } as TranscriptItem;
+    const kind = l.kind ?? 'system';
+    // Collaboration Mode: while a seat holds the baton, tag its assistant turns with the active
+    // speaker so the flattener draws the colored attribution header. Explicit speaker on the call wins.
+    const speaker = l.speaker ?? (kind === 'assistant' ? speakerRef.current ?? undefined : undefined);
+    const entry = { id: lineId.current++, kind, ...l, speaker } as TranscriptItem;
     setCommitted((c) => {
       const next = [...c, entry];
       committedRef.current = next;
@@ -1548,6 +1864,65 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     if (!running) refreshStatusLine();
   }, [running, current.model, current.provider, autonomy, refreshStatusLine]);
 
+  // Copy the last assistant answer — or just its last fenced code block — to the OS
+  // clipboard. Shared by `/copy [code]` and the Alt+C keybinding. Secrets are redacted
+  // first: the clipboard is a broader sink than the screen (macOS Universal Clipboard /
+  // iCloud sync, clipboard managers, polling apps). Best-effort, but never copy raw.
+  const copyLast = useCallback((what: 'answer' | 'code') => {
+    if (!hasClipboard()) {
+      pushLine({ text: 'No clipboard helper found — install pbcopy (macOS), xclip/wl-copy (Linux), or run on Windows.', color: C.yellow });
+      return;
+    }
+    const last = [...committedRef.current].reverse().find((it) => it.kind === 'assistant' && it.text);
+    if (!last) {
+      pushLine({ text: 'No assistant answer to copy yet.', dimColor: true });
+      return;
+    }
+    let raw = last.text!;
+    let label = 'answer';
+    if (what === 'code') {
+      // Last fenced block wins — "copy the code you just gave me" is the ask 95% of the
+      // time, and the last block is the final/complete version when a model iterates.
+      const blocks = [...raw.matchAll(/```[^\n]*\n([\s\S]*?)```/g)].map((m) => m[1] ?? '');
+      if (blocks.length === 0) {
+        pushLine({ text: 'No fenced code block in the last answer — plain /copy takes the whole text.', dimColor: true });
+        return;
+      }
+      raw = blocks[blocks.length - 1]!.replace(/\n$/, '');
+      label = 'code block';
+    }
+    const safe = redactString(raw);
+    const redacted = safe !== raw;
+    void (async () => {
+      const ok = await copyToClipboard(safe);
+      pushLine(
+        ok
+          ? { text: `Copied last ${label} — ${safe.length} chars${redacted ? ' (secrets redacted)' : ''}.`, color: C.cyan }
+          : { text: 'Clipboard copy failed.', color: C.red },
+      );
+    })();
+  }, [pushLine]);
+
+  // Alt/Option+C — copy the last answer without reaching for /copy.
+  useEffect(() => kbRegister('transcript:copyLastAnswer', () => copyLast('answer')), [kbRegister, copyLast]);
+
+  // Ctrl+V — paste from the SYSTEM clipboard. Terminal-native paste (Cmd+V / Ctrl+Shift+V)
+  // still works and now arrives bracketed; this covers terminals/keyboards where that is
+  // awkward and guarantees a paste path that never depends on terminal support. Async and
+  // soft-failing: a clipboard miss is a dim note, never a crash or a hang.
+  const pasteFromClipboard = useCallback(() => {
+    void (async () => {
+      const text = await readClipboard();
+      if (text === null) {
+        pushLine({ text: 'Paste failed — no clipboard helper (pbpaste / wl-paste / xclip) or read error.', dimColor: true });
+        return;
+      }
+      if (!text) return; // empty clipboard — nothing to do
+      insertPastable(text.replace(/\r\n?/g, '\n'));
+    })();
+  }, [insertPastable, pushLine]);
+  useEffect(() => kbRegister('chat:pasteClipboard', pasteFromClipboard), [kbRegister, pasteFromClipboard]);
+
   // Execute a slash command (not sent to the agent).
   const runSlash = useCallback(
     (cmd: SlashCommand, rawLine?: string) => {
@@ -1564,7 +1939,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
               { text: 'Commands:', bold: true },
               ...SLASH_COMMANDS.map((c) => ({ text: `  ${c.name.padEnd(SLASH_NAME_WIDTH)} ${c.desc}`, dimColor: true })),
               {
-                text: 'Keys: Shift+Tab mode · Shift+Enter newline · ↑/↓ edit multi-line (history at edges) · click to place caret · Ctrl-O fold · Ctrl-T tasks · Esc interrupt · Ctrl-C quit',
+                text: 'Keys: Shift+Tab mode · Shift+Enter newline · ↑/↓ edit multi-line (history at edges) · click to place caret · Ctrl-O fold · Ctrl-T tasks · Ctrl-V paste · Alt-C copy answer · Esc interrupt · Ctrl-C quit',
                 dimColor: true,
               },
               { text: 'Approvals: y/n · s session · f prefix (shell) · a always', dimColor: true },
@@ -1637,6 +2012,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           }
           break;
         }
+        case '/table':
+          startTableRef.current?.(arg);
+          break;
         case '/model': {
           const parsed = splitPresetArgs(arg);
           if (!parsed.ok) {
@@ -1852,7 +2230,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
               text: 'local',
               lines: [
                 { text: `Added local model: ${e.label}`, color: C.cyan },
-                { text: e.mlx ? `  ${e.mlx}  ·  mlx` : `  ${e.gguf}  ·  ctx ${e.ctx}  ·  gpu-layers ${e.gpuLayers}`, dimColor: true },
+                { text: e.mlx ? `  ${e.mlx}  ·  mlx` : e.vllm ? `  ${e.vllm}  ·  vllm` : `  ${e.gguf}  ·  ctx ${e.ctx}  ·  gpu-layers ${e.gpuLayers}`, dimColor: true },
                 { text: `  Switch to it now: /local use ${e.label}`, dimColor: true },
               ],
             });
@@ -1928,8 +2306,17 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           break;
         }
         case '/style': {
+          // No arg: cycle (original behavior). With arg: set directly — the arg was silently
+          // IGNORED before, so "/style learning" cycled to whatever came next. Menu-completable.
           const styles: OutputStyle[] = ['proactive', 'explanatory', 'learning', 'procedural'];
-          const next = styles[(styles.indexOf(styleRef.current) + 1) % styles.length] ?? 'proactive';
+          const req = arg.toLowerCase();
+          if (req && !(styles as readonly string[]).includes(req)) {
+            pushLine({ text: `Unknown style "${arg}". Styles: ${styles.join(', ')}.`, color: C.red });
+            break;
+          }
+          const next = req
+            ? (req as OutputStyle)
+            : styles[(styles.indexOf(styleRef.current) + 1) % styles.length] ?? 'proactive';
           styleRef.current = next;
           setStyle(next);
           opts.styleState?.setStyle(next);
@@ -1938,7 +2325,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           break;
         }
         case '/autonomy': {
-          const next = cycleAutonomy(autonomyRef.current);
+          // No arg: cycle (original behavior). With arg: jump straight to a level.
+          const req = arg.toLowerCase();
+          if (req && !(AUTONOMY_LEVELS as readonly string[]).includes(req)) {
+            pushLine({ text: `Unknown autonomy "${arg}". Levels: ${AUTONOMY_LEVELS.join(', ')}.`, color: C.red });
+            break;
+          }
+          const next = req ? (req as AutonomyLevel) : cycleAutonomy(autonomyRef.current);
           setAutonomy(next);
           loopRef.current?.setAutonomy(next);
           pushLine({ text: `Autonomy → ${next}`, color: C.purple });
@@ -1997,7 +2390,11 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             text: 'cost',
             lines: [
               { text: `Tokens: ${u.inputTokens.toLocaleString()} in · ${u.outputTokens.toLocaleString()} out (session)` },
-              { text: `Cost:   $${u.costUSD.toFixed(4)}`, color: C.cyan },
+              // Local / unpriced models never accrue cost — say so instead of a fake-precision
+              // $0.0000 (founder decision 2026-07-16: no dollar readouts on local models).
+              u.costUSD > 0
+                ? { text: `Cost:   $${u.costUSD.toFixed(4)}`, color: C.cyan }
+                : { text: 'Cost:   none — local/unpriced model', dimColor: true },
             ],
           });
           break;
@@ -2256,32 +2653,11 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           break;
         }
         case '/copy': {
-          // Copy the last assistant answer to the system clipboard. Read-only and
-          // safe mid-turn. (Per-message keyboard nav + selection needs the owned
-          // viewport — see reports; this delivers the 80% copy value without it.)
-          if (!hasClipboard()) {
-            pushLine({ text: 'No clipboard helper found — install pbcopy (macOS), xclip/wl-copy (Linux), or run on Windows.', color: C.yellow });
-            break;
-          }
-          const last = [...committedRef.current].reverse().find((it) => it.kind === 'assistant' && it.text);
-          if (!last) {
-            pushLine({ text: 'No assistant answer to copy yet.', dimColor: true });
-            break;
-          }
-          // Redact secrets before they reach the OS clipboard — a broader sink than
-          // the screen (macOS Universal Clipboard/iCloud sync, clipboard managers,
-          // polling apps). Best-effort like all redaction, but never copy raw.
-          const raw = last.text!;
-          const safe = redactString(raw);
-          const redacted = safe !== raw;
-          void (async () => {
-            const ok = await copyToClipboard(safe);
-            pushLine(
-              ok
-                ? { text: `Copied ${safe.length} chars to clipboard${redacted ? ' (secrets redacted)' : ''}.`, color: C.cyan }
-                : { text: 'Clipboard copy failed.', color: C.red },
-            );
-          })();
+          // Copy the last assistant answer (or `/copy code` → its last fenced code
+          // block) to the system clipboard. Read-only and safe mid-turn. Also on
+          // Alt+C. (Per-message keyboard nav + selection needs the owned viewport —
+          // see reports; this delivers the 80% copy value without it.)
+          copyLast(arg.toLowerCase() === 'code' ? 'code' : 'answer');
           break;
         }
         case '/session': {
@@ -2318,7 +2694,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             text: 'status',
             lines: [
               { text: `${currentRef.current.provider}/${currentRef.current.model} · ${autonomyRef.current}${opts.bypass ? ' (yolo)' : ''} · style ${styleRef.current}`, color: C.cyan },
-              { text: `context ${pct}% of ${opts.cfg.contextBudget.toLocaleString()} · ${u ? (u.inputTokens + u.outputTokens).toLocaleString() : 0} tokens · $${u ? u.costUSD.toFixed(4) : '0.0000'}`, dimColor: true },
+              // The `· $…` tail only when real cost accrued — local/unpriced sessions stay clean
+              // (same rule as formatUsage in the status strip).
+              { text: `context ${pct}% of ${opts.cfg.contextBudget.toLocaleString()} · ${u ? (u.inputTokens + u.outputTokens).toLocaleString() : 0} tokens${u && u.costUSD > 0 ? ` · $${u.costUSD.toFixed(4)}` : ''}`, dimColor: true },
               { text: `workspace ${opts.workspaceRoot}`, dimColor: true },
               ...(goalRef.current ? [{ text: `goal: ${goalRef.current}`, color: C.purple }] : []),
             ],
@@ -2757,29 +3135,29 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           break;
       }
     },
-    [pushLine, showBanner, setAutonomy, exit, context, opts, setLine, sessionLog, refreshStatusLine],
+    [pushLine, showBanner, setAutonomy, exit, context, opts, setLine, sessionLog, refreshStatusLine, copyLast],
   );
 
   // Apply a picked model: rebuild the provider, hot-swap it into the running loop
   // (there is none mid-pick — the picker can't open while a turn runs), point the
   // next turn's deps at it, mirror the change into the UI, and remember the choice.
-  const selectModel = useCallback(
-    async (entry: ModelEntry) => {
-      setPickerOpen(false);
+  // PURE provider construction for a model entry: offline guard → local-server spawn → budget clamp →
+  // createProvider. Returns the built client + resolved provider/model, or an {error} to show. It does
+  // NOT touch providerRef/currentRef/saveGlobalConfig — so both the persistent /model switch AND the
+  // (non-persistent) Collaboration Mode per-seat routing can build a provider through the same path.
+  const buildProvider = useCallback(
+    async (
+      entry: ModelEntry,
+      opts2: { clampBudget?: boolean } = {},
+    ): Promise<{ ok: true; client: Provider; provider: ProviderName; model: string } | { ok: false; error: string; fatal?: boolean }> => {
       let provider = entry.provider;
       let baseUrl = resolveBaseUrl(entry.provider, entry.baseUrl);
       let apiKey = entry.apiKey ?? resolveApiKey(entry.provider);
-      // Offline Shadow Mode: a mid-session /model switch must not silently break the no-egress
-      // contract — refuse anything that isn't a local target (gguf or loopback/LAN base URL).
       const mlxReadyOffline = entry.mlx ? mlxOfflineReady(entry.mlx) : false;
-      if (opts.offline && !isLocalModelTarget({ gguf: entry.gguf, mlx: mlxReadyOffline ? entry.mlx : undefined, baseUrl })) {
-        pushLine({
-          text: `Offline mode: "${entry.label}" is a cloud endpoint — switch refused. Local models only (see /local list, then /local use <name>).`,
-          color: C.yellow,
-        });
-        return;
+      if (opts.offline && !isLocalModelTarget({ gguf: entry.gguf, mlx: mlxReadyOffline ? entry.mlx : undefined, vllm: entry.vllm, baseUrl })) {
+        // A soft refusal (yellow), with the actionable local-model hint preserved verbatim.
+        return { ok: false, error: `Offline mode: "${entry.label}" is a cloud endpoint — switch refused. Local models only (see /local list, then /local use <name>).` };
       }
-      // Local .gguf model: ensure a llama.cpp server is up and route to it (ollama-style).
       if (isLocalServedEntry(entry)) {
         try {
           const r = await ensureLocalServer(entry, (m) => pushLine({ text: m, dimColor: true }), { offline: opts.offline });
@@ -2787,45 +3165,64 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           baseUrl = r.baseUrl;
           apiKey = entry.apiKey ?? 'sk-local';
         } catch (e) {
-          pushLine({ text: `Local model failed: ${(e as Error).message}`, color: C.red });
-          return;
+          // A hard failure (red) — the local server couldn't start, so nothing can route here.
+          return { ok: false, error: `Local model failed: ${(e as Error).message}`, fatal: true };
         }
       }
-      // Context budget must track the ACTIVE model's window across mid-session switches: a session
-      // started on a 128k cloud model that switches to a 32k llama-server would otherwise compact
-      // at ~109k — long past the server window — and die on a 400. Switching back to a cloud model
-      // restores the session's original budget. (Mirrors the startup clamp in index.ts.)
-      if (baseBudgetRef.current == null) baseBudgetRef.current = opts.cfg.contextBudget;
-      const nextBudget = entry.gguf || entry.mlx
-        ? Math.min(baseBudgetRef.current, 30_000, Math.max(2_048, (entry.ctx ?? 32_768) - 2_048))
-        : baseBudgetRef.current;
-      if (nextBudget !== opts.cfg.contextBudget) {
-        opts.cfg.contextBudget = nextBudget;
-        pushLine({ text: `  context budget → ${nextBudget.toLocaleString()} tokens (fits the model's window)`, dimColor: true });
+      // Context budget tracks the ACTIVE model's window (cosmetic — the live Context snapshots its
+      // budget at construction; this drives the HUD/status readout). The round-table passes
+      // clampBudget:false so a mixed-window table doesn't bounce/print this line every route.
+      if (opts2.clampBudget !== false) {
+        if (baseBudgetRef.current == null) baseBudgetRef.current = opts.cfg.contextBudget;
+        const nextBudget = entry.gguf || entry.mlx || entry.vllm
+          ? Math.min(baseBudgetRef.current, 30_000, Math.max(2_048, (entry.ctx ?? 32_768) - 2_048))
+          : baseBudgetRef.current;
+        if (nextBudget !== opts.cfg.contextBudget) {
+          opts.cfg.contextBudget = nextBudget;
+          pushLine({ text: `  context budget → ${nextBudget.toLocaleString()} tokens (fits the model's window)`, dimColor: true });
+        }
       }
-      const newProvider = createProvider({
+      const client = createProvider({
         provider,
         model: entry.model,
         apiKey,
         authToken: entry.authToken ?? resolveAuthToken(entry.provider),
         baseUrl,
       });
-      providerRef.current = newProvider;
-      loopRef.current?.setProvider(newProvider, entry.model);
-      opts.onModelSwitch?.(newProvider, entry.model); // keep the agent tool's sub-agents on the live model
-      setCurrent({ provider, model: entry.model });
+      return { ok: true, client, provider, model: entry.model };
+    },
+    [pushLine, opts],
+  );
+  buildProviderRef.current = buildProvider;
+
+  const selectModel = useCallback(
+    async (entry: ModelEntry) => {
+      setPickerOpen(false);
+      // Context budget must track the ACTIVE model's window across mid-session switches: a session
+      // started on a 128k cloud model that switches to a 32k llama-server would otherwise compact
+      // at ~109k — long past the server window — and die on a 400. Switching back to a cloud model
+      // restores the session's original budget. (Mirrors the startup clamp in index.ts.)
+      const built = await buildProvider(entry);
+      if (!built.ok) {
+        pushLine({ text: built.error, color: built.fatal ? C.red : C.yellow });
+        return;
+      }
+      providerRef.current = built.client;
+      loopRef.current?.setProvider(built.client, built.model);
+      opts.onModelSwitch?.(built.client, built.model); // keep the agent tool's sub-agents on the live model
+      setCurrent({ provider: built.provider, model: built.model });
       try {
         saveGlobalConfig({ lastModel: entry.label });
       } catch {
         // best-effort persistence; the live switch already applies this session
       }
-      pushLine({ text: `Model → ${entry.label} (${provider}/${entry.model})`, color: C.cyan });
+      pushLine({ text: `Model → ${entry.label} (${built.provider}/${built.model})`, color: C.cyan });
       // Family-profile knowledge surfaces at the moment of selection — matrix verdicts and
       // adapter floors are useless in a README table nobody reads mid-session.
       const prof = familyProfile(entry.model);
       if (prof?.note) pushLine({ text: `  ${prof.family}: ${prof.note}`, dimColor: true });
     },
-    [pushLine],
+    [pushLine, buildProvider, opts],
   );
   selectModelRef.current = selectModel;
 
@@ -3350,6 +3747,149 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     [pushLine, runOne],
   );
 
+  // ── Collaboration Mode (experimental round-table) ─────────────────────────────
+  // A hand-off is a scoped, non-persistent selectModel: point the live provider at the seat, tag its
+  // turns, run ONE turn against the shared Context, then clear the tag (baton returns to the human).
+  // No saveGlobalConfig, no picker — the whole feature rides buildProvider + runOne + the shared Context.
+  const routeToSeat = useCallback(
+    async (seat: Seat, question: string) => {
+      // Guard the whole route, including the buildProvider await (a local seat's server spawn does real
+      // I/O): routeInFlightRef blocks a second Enter from starting a concurrent turn on the shared
+      // Context before runOne flips `running`. Cleared in the finally so the baton always frees up.
+      routeInFlightRef.current = true;
+      try {
+        const build = buildProviderRef.current;
+        if (!build) return;
+        const built = await build(seat.entry, { clampBudget: false }); // no per-route budget bounce/noise
+        if (!built.ok) {
+          pushLine({ text: `  @${seat.handle}: ${built.error}`, color: built.fatal ? C.red : C.yellow });
+          return;
+        }
+        providerRef.current = built.client;
+        currentRef.current = { provider: built.provider, model: built.model }; // set imperatively BEFORE runOne captures it
+        setCurrent({ provider: built.provider, model: built.model }); // footer follows the active seat
+        speakerRef.current = seatTag(seat);
+        await runOne(question);
+      } finally {
+        speakerRef.current = null; // baton returns to the human
+        routeInFlightRef.current = false;
+      }
+    },
+    [pushLine, runOne],
+  );
+
+  const endTable = useCallback(() => {
+    const pre = preTableRef.current;
+    if (pre) {
+      providerRef.current = pre.client;
+      currentRef.current = { provider: pre.provider, model: pre.model };
+      loopRef.current?.setProvider(pre.client, pre.model);
+      setCurrent({ provider: pre.provider, model: pre.model });
+      preTableRef.current = null;
+    }
+    speakerRef.current = null;
+    setTable(null);
+    pushLine({ text: 'Round-table ended — back to your single model.', color: C.cyan });
+  }, [pushLine]);
+
+  const startTable = useCallback(
+    (arg: string) => {
+      if (tableRef.current) {
+        pushLine({ text: 'A round-table is already active — /table done to end it first.', color: C.yellow });
+        return;
+      }
+      const names = arg.split(/\s+/).filter(Boolean);
+      const listModels = () =>
+        pushLine({
+          kind: 'system',
+          text: 'table-help',
+          lines: [
+            { text: `Collaboration Mode (experimental) — a live round-table you steer.`, bold: true },
+            { text: `  /table <model> <model> [model…]   — pick ${MIN_SEATS}–${MAX_SEATS} models, e.g. /table grok glm`, dimColor: true },
+            { text: `  Then: @handle <question> routes a turn · /pass @handle forwards · /table done ends.`, dimColor: true },
+            { text: `  Configured models:`, dimColor: true },
+            ...opts.cfg.models
+              .filter((m) => !m.disabled)
+              .slice(0, 12)
+              .map((m) => ({ text: `    ${m.label}  (${m.provider}/${m.model})`, dimColor: true })),
+          ],
+        });
+      if (names.length < MIN_SEATS) {
+        listModels();
+        return;
+      }
+      const { entries, errors } = resolveTableEntries(names, opts.cfg.models);
+      if (errors.length) {
+        pushLine({ text: `No model matches: ${errors.join(', ')} — see /model list.`, color: C.yellow });
+        return;
+      }
+      if (entries.length < MIN_SEATS) {
+        pushLine({ text: `Pick at least ${MIN_SEATS} distinct models.`, color: C.yellow });
+        return;
+      }
+      const seats = buildSeats(entries.slice(0, MAX_SEATS), [C.cyan, C.purple, C.yellow, C.red]);
+      preTableRef.current = {
+        client: providerRef.current,
+        provider: currentRef.current.provider as ProviderName,
+        model: currentRef.current.model,
+      };
+      setTable({ seats });
+      pushLine({
+        kind: 'system',
+        text: 'table-open',
+        lines: [
+          { text: `◆ round-table · ${seats.length} seats · you hold the baton`, color: BATON_ORANGE, bold: true },
+          ...seats.map((s) => ({ text: `  ⏺ @${s.handle}  ${s.provider}/${s.model}`, color: s.color })),
+          { text: `  @${seats[0]!.handle} <question> to route · /pass @handle forwards · /table done ends`, dimColor: true },
+        ],
+      });
+      // Honest M1 caveat: the seats share ONE context bounded by the session budget, which is NOT
+      // clamped to the smallest seat. A long mixed cloud+local conversation can exceed a small local
+      // window and 400 that seat. Surface it rather than fail silently (proper clamp is a later step).
+      const hasLocal = seats.some((s) => s.entry.gguf || s.entry.mlx);
+      const hasCloud = seats.some((s) => !s.entry.gguf && !s.entry.mlx);
+      if (hasLocal && hasCloud) {
+        pushLine({ text: `  note: mixed cloud + local seats share one context — a long session may exceed a small local window.`, dimColor: true });
+      }
+    },
+    [pushLine, opts],
+  );
+
+  startTableRef.current = startTable;
+
+  const handleTableInput = useCallback(
+    (raw: string) => {
+      const t = tableRef.current;
+      if (!t) return;
+      const cmd = parseTableInput(raw, t.seats.map((s) => s.handle));
+      switch (cmd.kind) {
+        case 'done':
+          endTable();
+          break;
+        case 'note':
+          pushLine({ text: `Address a model with @${t.seats[0]!.handle} <question>, or /table done to end.`, dimColor: true });
+          break;
+        case 'unknownHandle':
+          pushLine({ text: `No seat "@${cmd.handle}". Seats: ${t.seats.map((s) => '@' + s.handle).join(' ')}.`, color: C.yellow });
+          break;
+        case 'route': {
+          const seat = t.seats.find((s) => s.handle === cmd.handle)!;
+          pushLine({ kind: 'user', text: `❯ @${seat.handle} ${cmd.question || '(your take?)'}`, color: C.green, bold: true, meta: 'you' });
+          void routeToSeat(seat, cmd.question || 'Please weigh in on the discussion above.');
+          break;
+        }
+        case 'pass': {
+          const seat = t.seats.find((s) => s.handle === cmd.handle)!;
+          pushLine({ text: `↳ passed the floor to @${seat.handle}`, dimColor: true });
+          void routeToSeat(seat, 'Please continue from the discussion above — your take?');
+          break;
+        }
+      }
+    },
+    [pushLine, endTable, routeToSeat],
+  );
+  handleTableInputRef.current = handleTableInput;
+
   // Flush the type-ahead queue in FIFO order. Slash commands run synchronously (same
   // dispatch path as a typed one) and we keep draining; a plain message starts a turn
   // and we stop — that turn's completion re-invokes flushQueue for the remainder.
@@ -3519,6 +4059,56 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         return;
       }
 
+      // 2.8) Bracketed paste (mode 2004, enabled at mount). Everything between the
+      // \x1b[200~ … \x1b[201~ markers is buffered and inserted as ONE atomic paste:
+      // embedded newlines can't submit mid-paste, a pasted Tab can't drive the menu, a
+      // pasted Esc can't interrupt the running turn, and vim-NORMAL can't eat pasted
+      // chars as motions. Multi-chunk pastes (large buffers arrive in several stdin
+      // reads) keep buffering until the end marker shows up.
+      //
+      // Ink mangles the raw stream two ways this block must undo (see use-input.js):
+      //  - a chunk-LEADING \x1b is stripped, so the start marker arrives as '[200~'
+      //    (inner markers keep their ESC) — restore it before matching;
+      //  - a chunk that IS a named key ('\r' → return, '\t' → tab) arrives with input ''
+      //    and only the flag set — mid-paste those are literal bytes, re-materialize them.
+      const chp = ch && (ch.startsWith('[200~') || ch.startsWith('[201~')) ? `\x1b${ch}` : ch;
+      if (pastingRef.current) {
+        const piece = chp || (key.return ? '\n' : key.tab ? '\t' : '');
+        if (!piece) return; // unrepresentable key mid-paste (arrows etc.) — drop
+        const endIdx = piece.indexOf(PASTE_END);
+        if (endIdx < 0) {
+          pasteBufRef.current += piece;
+          // Runaway guard: no end marker after 8 MB means the marker was lost (or a
+          // hostile stream) — bail out of paste mode rather than buffer forever.
+          if (pasteBufRef.current.length > 8 * 1024 * 1024) {
+            pastingRef.current = false;
+            pasteBufRef.current = '';
+          }
+          return;
+        }
+        const content = pasteBufRef.current + piece.slice(0, endIdx);
+        pastingRef.current = false;
+        pasteBufRef.current = '';
+        insertPastable(content.replace(/\r\n?/g, '\n'));
+        return;
+      }
+      if (chp && chp.includes(PASTE_START)) {
+        const startIdx = chp.indexOf(PASTE_START);
+        // Text typed in the same stdin read BEFORE the paste began inserts normally first.
+        const prefix = chp.slice(0, startIdx);
+        if (prefix) insertPastable(prefix.replace(/\r\n?/g, '\n'));
+        const after = chp.slice(startIdx + PASTE_START.length);
+        const endIdx = after.indexOf(PASTE_END);
+        if (endIdx >= 0) {
+          // Whole paste in one chunk — the common case.
+          insertPastable(after.slice(0, endIdx).replace(/\r\n?/g, '\n'));
+        } else {
+          pastingRef.current = true;
+          pasteBufRef.current = after;
+        }
+        return;
+      }
+
       // 2.9) Vim modal editing (when enabled via /vim). ESC enters NORMAL mode; in
       // NORMAL, keys are motions/operators (never text). INSERT is the default composer.
       if (vimEnabledRef.current && !runningRef.current) {
@@ -3618,17 +4208,30 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           return;
         }
         if (key.return) {
-          const cmd = menu[sel]!;
-          // Mid-turn, a command that isn't live-safe is QUEUED (runs when the turn ends); a
-          // live-safe one (/help, /cost, …) and any command when idle runs immediately.
-          if (runningRef.current && !SLASH_WHILE_RUNNING.has(slashDispatchName(cmd))) {
-            setQueued([...queuedTasksRef.current, cmd.name]);
-            setLine('');
-            setMenuIndex(0);
-          } else {
-            runSlash(cmd);
+          const item = menu[sel]!;
+          // Argument rows are HINTS until the user commits to one: right after "/cmd " (no
+          // partial typed, no ↑/↓ navigation) Enter must submit the text as typed — never
+          // auto-run the first completion ("/tasks " + Enter firing "clear" would be a
+          // destructive surprise). A typed partial or an arrow press = explicit intent.
+          const spIdx = inputRef.current.indexOf(' ');
+          const argPartial = item.base && spIdx >= 0 ? inputRef.current.slice(spIdx + 1) : '';
+          const argHintOnly = !!item.base && argPartial === '' && sel === 0 && menuIndexRef.current === 0;
+          if (!argHintOnly) {
+            // An argument row ("/theme colorblind") resolves to its BASE command; runSlash slices
+            // the arg off item.name by the base's name length, so the completed value flows through.
+            const cmd = (item.base ? findSlashCommand(item.base) : item) ?? item;
+            // Mid-turn, a command that isn't live-safe is QUEUED (runs when the turn ends); a
+            // live-safe one (/help, /cost, …) and any command when idle runs immediately.
+            if (runningRef.current && !SLASH_WHILE_RUNNING.has(slashDispatchName(cmd))) {
+              setQueued([...queuedTasksRef.current, item.name]);
+              setLine('');
+              setMenuIndex(0);
+            } else {
+              runSlash(cmd, item.name);
+            }
+            return;
           }
-          return;
+          // fall through: submit the composer text verbatim (section 8 below)
         }
         // typing / backspace fall through below to re-filter the menu
       }
@@ -3728,6 +4331,22 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         }
         const task = inputRef.current.trim();
         if (!task && !attachmentsRef.current.length) return; // allow an image-only message
+        // Collaboration Mode: while a round-table is active, the composer routes to seats instead of
+        // starting a normal turn. `/table` START (no table yet) falls through to the slash dispatch below.
+        if (tableRef.current) {
+          if (!task) { setLine(''); return; }
+          if (runningRef.current || routeInFlightRef.current) {
+            pushLine({ text: 'A model is answering — wait for the baton to return, or Esc to interrupt.', dimColor: true });
+            setLine('');
+            return;
+          }
+          historyRef.current.push(task);
+          histIdxRef.current = historyRef.current.length;
+          setLine('');
+          if (vimEnabledRef.current) setVimMode('insert');
+          handleTableInputRef.current?.(task);
+          return;
+        }
         if (runningRef.current) {
           // Type-ahead: a turn is in flight. Informational slash commands run live;
           // everything else is QUEUED (FIFO) and flushed when the turn ends — the turn
@@ -3754,7 +4373,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             return;
           }
           if (s.kind === 'typo') {
-            pushLine({ text: `Unknown command: ${task.split(/\s+/)[0]} — type / for the list.`, color: C.red });
+            const hint = s.suggestion ? ` Did you mean ${s.suggestion}?` : '';
+            pushLine({ text: `Unknown command: ${task.split(/\s+/)[0]} —${hint} (type / for the list)`, color: C.red });
             setLine('');
             return;
           }
@@ -3806,30 +4426,33 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         if (ev) return;
       }
 
-      // 10) Printable input — insert at the caret (Ink delivers pasted strings here too).
+      // 10) Printable input — insert at the caret (unbracketed pastes land here too).
       if (!key.ctrl && !key.meta && ch) {
-        // Strip any accidental CSI mouse fragments that arrived glued to typed text.
-        const clean = ch.replace(/\x1b\[<\d+;\d+;\d+[Mm]/g, '');
+        // Strip any accidental CSI mouse fragments glued to typed text, then normalize
+        // carriage returns: terminals paste line ends as \r (not \n), which defeated the
+        // paste-chip line count and rendered as invisible garbage in the composer. A lone
+        // typed Enter arrives as key.return (handled above), so any \r here IS a paste.
+        const clean = ch.replace(/\x1b\[<\d+;\d+;\d+[Mm]/g, '').replace(/\r\n?/g, '\n');
         if (!clean) return;
-        const c = cursorRef.current;
-        const s = inputRef.current;
-        if (isBigPaste(clean)) {
-          // Only enormous blobs chip — multi-paragraph pastes stay fully editable in the multi-row field.
-          const id = (pasteCounterRef.current += 1);
-          const lines = (clean.match(/\n/g)?.length ?? 0) + 1;
-          pastesRef.current.push({ id, content: clean, lines });
-          const chip = `[Pasted text #${id} +${lines} lines]`;
-          setComposer(s.slice(0, c) + chip + s.slice(c), c + chip.length);
-        } else {
-          setComposer(s.slice(0, c) + clean + s.slice(c), c + clean.length);
-        }
-        setMenuIndex(0);
+        insertPastable(clean);
       }
     },
-    [exit, pushLine, runOne, runSlash, selectModel, setAutonomy, setComposer, setLine, setQuestionIndex, setQuestionSelection, opts, startTurn, setQueued, kbConsume],
+    [exit, pushLine, runOne, runSlash, selectModel, setAutonomy, setComposer, setLine, setQuestionIndex, setQuestionSelection, opts, startTurn, setQueued, kbConsume, insertPastable],
   );
 
   useInput(onKey);
+
+  // Bracketed paste (DECSET 2004) — default ON. Terminals that support it wrap every paste
+  // in \x1b[200~ … \x1b[201~ so the key handler can insert it atomically (see step 2.8);
+  // terminals that don't simply ignore the mode and pastes take the legacy per-chunk path.
+  // Unlike mouse reporting this takes nothing away from the terminal, so it needs no opt-in.
+  useEffect(() => {
+    if (!process.stdout.isTTY) return;
+    process.stdout.write('\x1b[?2004h');
+    return () => {
+      process.stdout.write('\x1b[?2004l');
+    };
+  }, []);
 
   // Mouse reporting for click-to-place caret is OPT-IN (SHADOW_MOUSE=1). Default OFF: enabling
   // \x1b[?1000h routes wheel + click to the app, which breaks native scrollback scrolling and
@@ -3895,7 +4518,16 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // The slash menu shows whenever "/word" has matches — including while a turn runs, so you can
   // still autocomplete a command to queue it (or run a live-safe one). Only an active overlay
   // (approval / model picker) suppresses it.
-  const menu = !pending && !pickerOpen ? slashMatches(input) : [];
+  // Live settings surfaced inside argument menus (the "✓ current" row) — a picker that shows
+  // where you ARE doubles as a status readout.
+  const menu = !pending && !pickerOpen
+    ? slashMatches(input, {
+        '/theme': normalizeThemeName(opts.cfg.lastTheme as string | undefined) ?? 'og',
+        '/effort': effortRef.current,
+        '/autonomy': autonomy,
+        '/style': style,
+      })
+    : [];
   const selIndex = Math.min(menuIndex, Math.max(0, menu.length - 1));
   // Slash menu is windowed (10 rows) and scrolls with the selection so ↑/↓ can reach
   // every command — not capped at the first 10 (which hid the highlight past row 10).
@@ -4017,6 +4649,11 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // The RUNNING branch carries the safety tags too: while a mid-turn approval/question overlay is up
   // the HUD status row is suppressed and this hint is the only chrome left — OFFLINE/sandbox:off must
   // not vanish exactly then.
+  // Collaboration Mode legend replaces the model strip on the idle hint: the baton + seat roster + how
+  // to route. (Running keeps the interrupt hint; the working status line shows the active seat's model.)
+  const tableLegend = table
+    ? `◆ baton: you · ${table.seats.map((s) => '@' + s.handle).join(' ')} · @handle to route · /table done`
+    : '';
   const composerHint =
     attachTag +
     vimTag +
@@ -4024,7 +4661,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       ? `${idlePrefix}↑/↓ select · Tab complete · Enter ${running ? 'queues' : 'runs'} · Esc cancel`
       : running
         ? `${idlePrefix}Type to queue · Enter queues · Shift+Enter newline · Esc interrupts · Ctrl-C ×2 quits`
-        : `${idlePrefix}${idleStrip}${idleTail}`);
+        : table
+          ? `${idlePrefix}${tableLegend}`
+          : `${idlePrefix}${idleStrip}${idleTail}`);
 
   // Suppress the live stream PREVIEW when the model is re-typing an answer it already committed this
   // turn (weak models repeat the final block(s) verbatim in one generation) — that's the "answer
@@ -4085,7 +4724,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
                 // then tool_end commits the resolved green/red ⏺ row to <Static> in its place.
                 <Box paddingLeft={PAGE_MARGIN}>
                   <Text wrap="truncate">
-                    <Text color={CLAUDE_ORANGE}>{BLACK_CIRCLE} </Text>
+                    <Text color={C.accent ?? CLAUDE_ORANGE}>{BLACK_CIRCLE} </Text>
                     <Text bold>{activeTool.name}</Text>
                     {activeTool.arg ? <Text color={C.dim}>{`(${activeTool.arg})`}</Text> : null}
                   </Text>
@@ -4137,7 +4776,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             <Box paddingLeft={PAGE_MARGIN}>
               {running ? (
                 <Text wrap="truncate">
-                  <Text color={CLAUDE_ORANGE}>{spinner}</Text>
+                  <Text color={C.accent ?? CLAUDE_ORANGE}>{spinner}</Text>
                   <Text> {statusVerb}</Text>
                   {statusTail ? <Text color={C.dim}>{statusTail}</Text> : null}
                 </Text>
@@ -4243,7 +4882,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             return (
               <Box flexDirection="column" paddingLeft={PAGE_MARGIN}>
                 <Text wrap="truncate" backgroundColor={MENU_BG} color={C.cyan} bold>
-                  {bar(` Commands (${selIndex + 1}/${menu.length})`)}
+                  {bar(` ${menu[0]?.base ? `${menu[0].base} — pick an argument` : 'Commands'} (${selIndex + 1}/${menu.length})`)}
                 </Text>
                 {menuStart > 0 ? (
                   <Text wrap="truncate" backgroundColor={MENU_BG} color={C.dim} italic>{bar(`   ↑ ${menuStart} more`)}</Text>

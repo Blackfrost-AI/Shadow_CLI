@@ -110,47 +110,52 @@ export function buildLocalEntry(opts: LocalAddOptions): PresetResult<ModelEntry>
   // string reaches us without a shell to expand it, and "~/models/x.gguf" is how humans type it.
   const expanded = raw === '~' || raw.startsWith('~/') ? join(homedir(), raw.slice(1)) : raw;
 
-  // MLX targets (Apple Silicon): a model FOLDER (config.json + safetensors) or a HuggingFace
-  // repo id like mlx-community/Qwen2.5-0.5B-Instruct-4bit. Detected before the .gguf rule so
-  // `local add` is one verb for both backends.
+  // A HuggingFace-format model — a FOLDER (config.json + safetensors) or a repo id — is served by
+  // MLX on Apple Silicon and by vLLM on Linux+CUDA. Detected before the .gguf rule so `local add`
+  // is one verb for every backend; the platform picks the engine.
   const absMaybe = resolve(expanded);
-  const looksMlxDir = existsSync(absMaybe) && statSync(absMaybe).isDirectory();
+  const looksModelDir = existsSync(absMaybe) && statSync(absMaybe).isDirectory();
   const looksRepoId = !existsSync(absMaybe) && /^[\w.-]+\/[\w.-]+$/.test(raw) && !/\.gguf$/i.test(raw);
-  if (looksMlxDir || looksRepoId) {
-    if (process.platform !== 'darwin' || process.arch !== 'arm64') {
-      return { ok: false, message: 'MLX models run on Apple Silicon Macs only — use a .gguf file here instead.' };
-    }
-    if (looksMlxDir && !existsSync(join(absMaybe, 'config.json'))) {
+  if (looksModelDir || looksRepoId) {
+    if (looksModelDir && !existsSync(join(absMaybe, 'config.json'))) {
       return {
         ok: false,
-        message: `Not an MLX model folder (no config.json inside): ${absMaybe}\n  Expected a folder like one from mlx-community (config.json + *.safetensors), or a .gguf file.`,
+        message: `Not a model folder (no config.json inside): ${absMaybe}\n  Expected a HuggingFace-format folder (config.json + *.safetensors), or a .gguf file.`,
       };
     }
-    if (opts.gpuLayers !== undefined) {
-      return { ok: false, message: '--gpu-layers is a llama.cpp (.gguf) option — mlx_lm.server manages its own memory.' };
-    }
-    // --ctx for MLX is a BUDGET HINT: mlx_lm.server has no -c flag, but Shadow still needs to
-    // know the model's window to compact before it overflows (default assumption: 32k).
+    // --ctx is a BUDGET HINT for these backends (the server window is set its own way — mlx has no
+    // -c flag; vLLM uses --max-model-len via vllmArgs). It bounds Shadow's compaction, not the server.
     if (opts.ctx !== undefined && (!Number.isInteger(opts.ctx) || opts.ctx < 2048)) {
-      return { ok: false, message: `--ctx ${opts.ctx} is not usable (minimum 2048) — for MLX it bounds Shadow's context budget, not the server.` };
+      return { ok: false, message: `--ctx ${opts.ctx} is not usable (minimum 2048) — here it bounds Shadow's context budget, not the server.` };
     }
-    const target = looksMlxDir ? absMaybe : raw;
+    const target = looksModelDir ? absMaybe : raw;
     const name = opts.name ? sanitizeLocalName(opts.name) : sanitizeLocalName(basename(target));
     if (!name) return { ok: false, message: 'Could not derive a model name; pass --name <name>.' };
-    const entry: ModelEntry = {
-      label: name,
-      provider: 'openai', // mlx_lm.server speaks the OpenAI wire
-      // Unlike llama-server, mlx_lm.server HONORS the request's model field (it can hot-load
-      // repos by id) — so the wire model MUST be the real target, not the friendly label, or
-      // the server tries to resolve the label as a HuggingFace repo and 404s.
-      model: target,
-      mlx: target,
-      ...(opts.ctx !== undefined ? { ctx: opts.ctx } : {}),
-      group: 'Local',
-    };
-    return looksRepoId
-      ? { ok: true, value: entry, note: `repo id — the weights download from HuggingFace on first use (cached after).` }
-      : { ok: true, value: entry };
+    const ctxHint = opts.ctx !== undefined ? { ctx: opts.ctx } : {};
+
+    // Apple Silicon → MLX (mlx_lm.server HONORS the request's model field — it hot-loads repos by
+    // id — so the wire model MUST be the real target, not the friendly label, or it 404s).
+    if (process.platform === 'darwin' && process.arch === 'arm64') {
+      if (opts.gpuLayers !== undefined) {
+        return { ok: false, message: '--gpu-layers is a llama.cpp (.gguf) option — mlx_lm.server manages its own memory.' };
+      }
+      const entry: ModelEntry = { label: name, provider: 'openai', model: target, mlx: target, ...ctxHint, group: 'Local' };
+      return looksRepoId
+        ? { ok: true, value: entry, note: `repo id — the weights download from HuggingFace on first use (cached after).` }
+        : { ok: true, value: entry };
+    }
+    // Linux → vLLM (served under --served-model-name = the friendly label, so requests use the label;
+    // multi-GPU / quantization knobs go in `vllmArgs`, e.g. ["--tensor-parallel-size","8"]).
+    if (process.platform === 'linux') {
+      if (opts.gpuLayers !== undefined) {
+        return { ok: false, message: '--gpu-layers is a llama.cpp (.gguf) option — vLLM manages its own GPU memory; use vllmArgs for --tensor-parallel-size etc.' };
+      }
+      const entry: ModelEntry = { label: name, provider: 'openai', model: name, vllm: target, ...ctxHint, group: 'Local' };
+      return looksRepoId
+        ? { ok: true, value: entry, note: `repo id — vLLM downloads the weights from HuggingFace on first use (cached after).` }
+        : { ok: true, value: entry };
+    }
+    return { ok: false, message: `Model folders are served via MLX (Apple Silicon) or vLLM (Linux+CUDA) — this platform (${process.platform}) supports neither. Use a .gguf file.` };
   }
 
   if (!/\.gguf$/i.test(raw)) {
@@ -212,9 +217,9 @@ export function addLocalModel(
   return { ok: true, value: { models: next.value, entry: built.value }, ...(built.note ? { note: built.note } : {}) };
 }
 
-/** Every registered local (gguf) preset, in config order. */
+/** Every registered local preset (gguf / mlx / vllm), in config order. */
 export function listLocalModels(models: ModelEntry[]): ModelEntry[] {
-  return models.filter((m) => Boolean(m.gguf) || Boolean(m.mlx));
+  return models.filter((m) => Boolean(m.gguf) || Boolean(m.mlx) || Boolean(m.vllm));
 }
 
 /** Remove a local preset by name (rejects unknown / non-local names). */
@@ -222,7 +227,7 @@ export function removeLocalModel(models: ModelEntry[], name: string): PresetResu
   if (!name) return { ok: false, message: 'Usage: local remove <name>' };
   const target = models.find((m) => m.label.trim().toLowerCase() === name.trim().toLowerCase());
   if (!target) return { ok: false, message: `No local model named "${name}".` };
-  if (!target.gguf && !target.mlx)
+  if (!target.gguf && !target.mlx && !target.vllm)
     return { ok: false, message: `"${name}" is not a locally-served model; use /model remove.` };
   return removeModelPreset(models, name);
 }
@@ -237,6 +242,10 @@ export function formatLocalList(models: ModelEntry[]): string[] {
     if (m.mlx) {
       const target = m.mlx.includes('/') && !m.mlx.startsWith('/') ? m.mlx : basename(m.mlx);
       return `${m.label}  ·  ${target}  ·  mlx  ·  ${state}`;
+    }
+    if (m.vllm) {
+      const target = m.vllm.startsWith('/') ? basename(m.vllm) : m.vllm;
+      return `${m.label}  ·  ${target}  ·  vllm  ·  ${state}`;
     }
     const file = m.gguf ? basename(m.gguf) : '(unknown)';
     const ctx = m.ctx ?? DEFAULT_LOCAL_CTX;
@@ -263,7 +272,7 @@ export async function testLocalModel(
   entry: ModelEntry,
   log?: (msg: string) => void,
 ): Promise<LocalTestResult> {
-  if (!entry.gguf && !entry.mlx) return { ok: false, error: `"${entry.label}" is not a locally-served model.` };
+  if (!entry.gguf && !entry.mlx && !entry.vllm) return { ok: false, error: `"${entry.label}" is not a locally-served model.` };
   let baseUrl: string;
   try {
     ({ baseUrl } = await ensureLocalServer(entry, log));
