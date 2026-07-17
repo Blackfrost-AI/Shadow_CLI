@@ -61,7 +61,19 @@ const ITEMS: { item: FlattenItem; collapsed?: boolean }[] = [
   { item: { id: 2, kind: 'reasoning', text: 'Check per-region metrics first.\nThen correlate with the deploy window.', durationMs: 9400 }, collapsed: true },
   { item: { id: 3, kind: 'tool', text: '', tool: { name: 'run_shell', arg: 'shadow-metrics --by-region', ok: true, durationMs: 2300, summary: '3 regions' } } },
   { item: { id: 4, kind: 'tool', text: '', tool: { name: 'web_fetch', arg: 'status.internal/api', ok: false, durationMs: 400, summary: '404 Not Found' } } },
+  // A delegated sub-agent renders distinctly (▸ type · description) instead of anonymous agent(…),
+  // and its full answer is a foldable body (⌄ answer N lines · ^O) — no longer truncated away.
+  { item: { id: 6, kind: 'tool', text: '', meta: 'answer', tool: { name: 'agent', arg: 'Correlate the deploy window with per-region error logs', ok: true, durationMs: 18400, summary: 'ap-south deploy lines up with the spike', agent: { subagentType: 'explore', description: 'Trace the deploy→error correlation' } }, lines: [
+    { text: 'Correlated the 14:02 UTC deploy against per-region error logs:', dimColor: true },
+    { text: '• us-east: errors flat (12 → 11) — deploy not causal.', dimColor: true },
+    { text: '• eu-west: errors flat (3 → 3) — deploy not causal.', dimColor: true },
+    { text: '• ap-south: errors 3 → 122 within 90s of the deploy.', dimColor: true },
+    { text: '  Spike is bounded to ap-south and time-correlated to the rollout.', dimColor: true },
+    { text: 'Recommend holding the rollout in ap-south; safe to continue elsewhere.', dimColor: true },
+  ] } },
   { item: { id: 5, kind: 'assistant', text: ANSWER } },
+  // Per-task timer: total wall-clock the agent worked on this turn.
+  { item: { id: 7, kind: 'system', text: '⏺ done · 47s', dimColor: true } },
 ];
 
 const SHOW: string[] = ['og', 'colorblind', 'high-contrast', 'mono'];

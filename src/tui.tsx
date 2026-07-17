@@ -1469,7 +1469,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const [toolLine, setToolLine] = useState<string | null>(null);
   // The tool currently executing — rendered as a persistent live ⏺ Name(args) row that appears the
   // instant the call starts and resolves in place (into the committed green/red ⏺ row) on tool_end.
-  const [activeTool, setActiveTool] = useState<{ name: string; arg: string } | null>(null);
+  const [activeTool, setActiveTool] = useState<{ name: string; arg: string; agent?: { subagentType?: string; description?: string } } | null>(null);
   const [shellPid, setShellPid] = useState<number | null>(null); // active run_shell child, for the HUD
   const [shellWarn, setShellWarn] = useState<string | null>(null); // set when that child may survive ESC
   const [running, setRunning] = useState(false);
@@ -1722,6 +1722,40 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     setQuestionCursorState({});
   }, []);
 
+  // Shared question-dialog actions — used by BOTH the keybinding resolver handlers (question:*)
+  // and the legacy inline key path below, so the two cannot drift. They read live state from refs
+  // so a handler registered once always acts on the current dialog (gate, questions, selections).
+  const chooseAtQuestion = useCallback((idx: number, pos: number) => {
+    const q = pendingRef.current?.questions?.[idx];
+    if (!q) return;
+    const label = q.options[pos]?.label;
+    if (label === undefined) return;
+    const current = questionSelectionsRef.current[idx] ?? [];
+    const selected = q.multiSelect
+      ? current.includes(label)
+        ? current.filter((v) => v !== label)
+        : [...current, label]
+      : [label];
+    setQuestionSelection(idx, selected);
+  }, [setQuestionSelection]);
+
+  const confirmQuestion = useCallback(() => {
+    const g = igateRef.current;
+    const qs = pendingRef.current?.questions;
+    if (!g || !qs?.length || pendingRef.current?.kind !== 'user_question') return;
+    const idx = Math.min(questionIndexRef.current, qs.length - 1);
+    const q = qs[idx];
+    if (!q) return;
+    const cursor = questionCursorRef.current[idx] ?? recommendedIndex(q);
+    // Single-select: commit the highlighted option if nothing is chosen yet.
+    if (!q.multiSelect && !questionSelectionsRef.current[idx]?.length) chooseAtQuestion(idx, cursor);
+    if (idx < qs.length - 1) {
+      setQuestionIndex(idx + 1);
+      return;
+    }
+    g.respond({ answers: buildQuestionAnswers(qs, questionSelectionsRef.current) });
+  }, [chooseAtQuestion, setQuestionIndex]);
+
   // One stable gate instance for the whole session.
   const gateRef = useRef<ApprovalGate | null>(null);
   const igateRef = useRef<InteractiveGate | null>(null);
@@ -1922,6 +1956,44 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     })();
   }, [insertPastable, pushLine]);
   useEffect(() => kbRegister('chat:pasteClipboard', pasteFromClipboard), [kbRegister, pasteFromClipboard]);
+
+  // ── Approval (Confirmation) + question-dialog (QuestionDialog) actions ──────────
+  // Migrated onto the resolver so a user can rebind y/n/s/f/a and the question-dialog nav in
+  // ~/.shadow/keybindings.json. Each handler reads live state from refs (the gate, the pending
+  // request, autonomy, question cursor/selections) so a handler registered once always acts on
+  // the current dialog. The legacy default keys remain as a fall-through (consume() returns false
+  // for unbound/unregistered), so rebinding ADDS chords without ever stranding the defaults.
+  useEffect(() => kbRegister('confirm:yes', () => { igateRef.current?.respond('approve'); }), [kbRegister]);
+  useEffect(() => kbRegister('confirm:no', () => { igateRef.current?.respond('deny'); }), [kbRegister]);
+  useEffect(() => kbRegister('confirm:session', () => {
+    if (pendingRef.current?.kind === 'permission') igateRef.current?.respond({ approveForSession: true });
+  }), [kbRegister]);
+  useEffect(() => kbRegister('confirm:prefix', () => {
+    const p = pendingRef.current;
+    if (p?.kind === 'permission' && p.call.name === 'run_shell') {
+      const cmd = shellCommandOf(p.call.input) ?? '';
+      const prefix = cmd.split(/\s+/).slice(0, 2).join(' ');
+      igateRef.current?.respond({ approveForPrefix: prefix || cmd.slice(0, 24) });
+    }
+  }), [kbRegister]);
+  useEffect(() => kbRegister('confirm:always', () => {
+    const p = pendingRef.current;
+    if (p && p.kind !== 'plan_enter') {
+      const next = cycleAutonomy(autonomyRef.current);
+      setAutonomy(next);
+      igateRef.current?.respond({ setAutonomy: next });
+    }
+  }), [kbRegister, setAutonomy]);
+  useEffect(() => kbRegister('question:skip', () => { igateRef.current?.respond('deny'); }), [kbRegister]);
+  useEffect(() => kbRegister('question:confirm', confirmQuestion), [kbRegister, confirmQuestion]);
+  useEffect(() => kbRegister('question:prev', () => {
+    const qs = pendingRef.current?.questions;
+    if (qs?.length) setQuestionIndex(Math.max(0, Math.min(questionIndexRef.current, qs.length - 1) - 1));
+  }), [kbRegister, setQuestionIndex]);
+  useEffect(() => kbRegister('question:next', () => {
+    const qs = pendingRef.current?.questions;
+    if (qs?.length) setQuestionIndex(Math.min(qs.length - 1, Math.min(questionIndexRef.current, qs.length - 1) + 1));
+  }), [kbRegister, setQuestionIndex]);
 
   // Execute a slash command (not sent to the agent).
   const runSlash = useCallback(
@@ -3390,7 +3462,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           setThinkNow(''); // reasoning for this step is over once it acts (folded by default now)
           // Live row (activeTool) already shows name(args) — don't also mirror it into toolLine
           // (that used to double-print `↳ run_shell …` in the status tail under the same call).
-          setActiveTool({ name: e.call.name, arg: previewOf(e.call.input) });
+          setActiveTool({ name: e.call.name, arg: previewOf(e.call.input), agent: e.call.name === 'agent' ? agentAttr(e.call.input) : undefined });
           setToolLine(null);
           break;
         case 'tool_end': {
@@ -3421,6 +3493,16 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
                 dimColor: tag === ' ' || text.startsWith('…'),
               };
             });
+          } else if (e.call.name === 'agent') {
+            // The sub-agent's full answer IS its result. Surface it as a foldable body so the
+            // delegated work is VISIBLE — the header's one-line preview is only a gist, and without
+            // this a long exploration answer is truncated to ~90 chars with no way to read the rest.
+            // Same cap+collapse rules as shell output, so a huge answer can't flood the transcript.
+            const ans = (e.result.data as { answer?: string } | undefined)?.answer;
+            if (ans && ans.trim()) {
+              bodyMeta = 'answer';
+              bodyLines = capTranscriptBody(ans.split('\n')).map((l) => ({ text: l, color: C.dim }));
+            }
           }
           // Diff headers get a calm `+N −M` stats tail (redesign: ± edit path +12 −3) so you can
           // scan churn without expanding the fold. Shell output keeps the model-facing summary.
@@ -3440,6 +3522,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
               ok: e.result.ok,
               durationMs: Math.max(0, e.result.meta.durationMs),
               summary,
+              agent: e.call.name === 'agent' ? agentAttr(e.call.input) : undefined,
             },
             lines: bodyLines,
           });
@@ -3715,6 +3798,14 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         setThinkNow('');
         setToolLine(null);
         setRunning(false);
+        // Per-task timer: total wall-clock the agent worked on this turn — paralleling the
+        // per-tool `(2.3s)` and per-thought `thought for 9s`, but for the whole task. Only when
+        // it took ≥1s; a sub-second turn is noise. Emitted here (the single turn-end choke
+        // point) so success, error, and abort all report how long the agent spent.
+        const turnSec = Math.max(0, Math.round((Date.now() - runStartRef.current) / 1000));
+        if (turnSec >= 1) {
+          pushLine({ text: `⏺ done · ${formatDuration(turnSec)}`, dimColor: true });
+        }
         // Turn ended — drain any type-ahead the user queued while it ran. flushQueue
         // either starts the next queued turn (which re-enters this finally on its own
         // completion) or runs queued slash commands in order.
@@ -3931,39 +4022,36 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         const g = igateRef.current;
         if (!g) return;
         const kind = pendingRef.current.kind;
+        // Any key during a question dialog means the user is present → restart the idle auto-answer
+        // countdown. Done BEFORE the resolver routing so bound keys (enter/arrows/escape) reset it
+        // too — the old inline handler reset it on every keypress unconditionally.
+        if (kind === 'user_question' && AUTO_ANSWER_ENABLED) {
+          autoAnswerSecsRef.current = AUTO_ANSWER_SECS;
+          setAutoAnswerSecs(AUTO_ANSWER_SECS);
+        }
+        // Route bound approval/question keys through the keybinding resolver FIRST, so
+        // ~/.shadow/keybindings.json can rebind y/n/s/f/a (Confirmation) and question-dialog
+        // nav (QuestionDialog). Unbound keys (number-jump, space-toggle, Tab) and any key the
+        // user has unbound fall through to the legacy handling below — defaults never strand you.
+        const dialogCtx: ContextName[] = kind === 'user_question' ? ['QuestionDialog', 'Global'] : ['Confirmation', 'Global'];
+        if (kbConsume(ch, key, dialogCtx)) return;
         if (kind === 'user_question' && pendingRef.current.questions?.length) {
           const qs = pendingRef.current.questions;
           const idx = Math.min(questionIndexRef.current, qs.length - 1);
           const q = qs[idx];
           if (!q) return;
-          // Any key means the user is present → restart the idle auto-answer countdown.
-          if (AUTO_ANSWER_ENABLED) {
-            autoAnswerSecsRef.current = AUTO_ANSWER_SECS;
-            setAutoAnswerSecs(AUTO_ANSWER_SECS);
-          }
           const cursor = questionCursorRef.current[idx] ?? recommendedIndex(q);
-          const chooseAt = (pos: number) => {
-            const label = q.options[pos]?.label;
-            if (label === undefined) return;
-            const current = questionSelectionsRef.current[idx] ?? [];
-            const selected = q.multiSelect
-              ? current.includes(label)
-                ? current.filter((v) => v !== label)
-                : [...current, label]
-              : [label];
-            setQuestionSelection(idx, selected);
-          };
           // ↑/↓ move the option cursor. Single-select follows it (radio); multi just moves.
           if (key.upArrow) {
             const pos = Math.max(0, cursor - 1);
             setQuestionCursor(idx, pos);
-            if (!q.multiSelect) chooseAt(pos);
+            if (!q.multiSelect) chooseAtQuestion(idx, pos);
             return;
           }
           if (key.downArrow) {
             const pos = Math.min(q.options.length - 1, cursor + 1);
             setQuestionCursor(idx, pos);
-            if (!q.multiSelect) chooseAt(pos);
+            if (!q.multiSelect) chooseAtQuestion(idx, pos);
             return;
           }
           // ←/→ (and Tab) switch between questions in a multi-question dialog.
@@ -3977,7 +4065,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           }
           // Space toggles the highlighted option (multi-select).
           if (ch === ' ' && q.multiSelect) {
-            chooseAt(cursor);
+            chooseAtQuestion(idx, cursor);
             return;
           }
           // Number keys jump straight to an option.
@@ -3985,18 +4073,12 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             const pos = Number(ch) - 1;
             if (q.options[pos]) {
               setQuestionCursor(idx, pos);
-              chooseAt(pos);
+              chooseAtQuestion(idx, pos);
             }
             return;
           }
           if (key.return) {
-            // Single-select: commit the highlighted option if nothing is chosen yet.
-            if (!q.multiSelect && !questionSelectionsRef.current[idx]?.length) chooseAt(cursor);
-            if (idx < qs.length - 1) {
-              setQuestionIndex(idx + 1);
-              return;
-            }
-            g.respond({ answers: buildQuestionAnswers(qs, questionSelectionsRef.current) });
+            confirmQuestion();
             return;
           }
           if (key.escape) g.respond('deny');
@@ -4725,8 +4807,21 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
                 <Box paddingLeft={PAGE_MARGIN}>
                   <Text wrap="truncate">
                     <Text color={C.accent ?? CLAUDE_ORANGE}>{BLACK_CIRCLE} </Text>
-                    <Text bold>{activeTool.name}</Text>
-                    {activeTool.arg ? <Text color={C.dim}>{`(${activeTool.arg})`}</Text> : null}
+                    {activeTool.name === 'agent' && activeTool.agent ? (
+                      // A running sub-agent shows `▸ <type> · <description>` (orange ▸ while it
+                      // runs, like the spinner dot) so delegated work is visible in the live row,
+                      // not an anonymous `agent(…)`.
+                      <>
+                        <Text color={C.cyan}>▸ </Text>
+                        <Text bold>{activeTool.agent.subagentType ?? 'subagent'}</Text>
+                        <Text color={C.dim}>{` · ${activeTool.agent.description ?? activeTool.arg}`}</Text>
+                      </>
+                    ) : (
+                      <>
+                        <Text bold>{activeTool.name}</Text>
+                        {activeTool.arg ? <Text color={C.dim}>{`(${activeTool.arg})`}</Text> : null}
+                      </>
+                    )}
                   </Text>
                 </Box>
               ) : null}
@@ -5090,6 +5185,16 @@ function shellCommandOf(input: unknown): string | null {
   const o = input as Record<string, unknown> | undefined;
   if (o && typeof o.command === 'string') return o.command;
   return null;
+}
+
+/** Pull subagent attribution (type + description) from an `agent` tool call's parsed input, so the
+ *  TUI can render a sub-agent distinctly (`▸ type · description`) instead of an anonymous row. */
+function agentAttr(input: unknown): { subagentType?: string; description?: string } | undefined {
+  const o = input as Record<string, unknown> | undefined;
+  if (!o) return undefined;
+  const description = typeof o.description === 'string' ? o.description : undefined;
+  const subagentType = typeof o.subagent_type === 'string' ? o.subagent_type : undefined;
+  return description || subagentType ? { description, subagentType } : undefined;
 }
 
 function previewOf(input: unknown): string {

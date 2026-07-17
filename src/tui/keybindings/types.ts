@@ -74,7 +74,6 @@ export type ContextName =
   | 'Confirmation'
   | 'ModelPicker'
   | 'QuestionDialog'
-  | 'MessageActions'
   | 'Transcript';
 
 export const KEYBINDING_CONTEXTS: readonly ContextName[] = [
@@ -84,7 +83,6 @@ export const KEYBINDING_CONTEXTS: readonly ContextName[] = [
   'Confirmation',
   'ModelPicker',
   'QuestionDialog',
-  'MessageActions',
   'Transcript',
 ] as const;
 

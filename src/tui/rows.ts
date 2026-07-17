@@ -118,6 +118,9 @@ export interface ToolInfo {
   durationMs: number;
   /** One-line result summary, e.g. "630 pass". */
   summary: string;
+  /** Subagent (`agent` tool) attribution — rendered distinctly (▸ type · description) so a
+   *  delegated sub-agent is visible at a glance instead of an anonymous `agent(prompt)` row. */
+  agent?: { subagentType?: string; description?: string };
 }
 
 /** Elapsed as "(10.2s)"; sub-100ms calls omit it (noise, and rounds to 0.0s). */
@@ -176,9 +179,23 @@ export function renderToolResult(t: ToolInfo, theme: ViewportTheme): StyledSpan[
     t.ok
       ? { text: `${TOOL_DOT} `, color: theme.green }
       : { text: '✗ ', color: theme.red, bold: true },
-    { text: t.name, color: theme.bright ?? theme.fg, bold: true },
   ];
-  if (t.arg) spans.push({ text: `(${shortArg(t.arg)})`, color: theme.dim });
+  // Subagent calls render distinctly: `▸ <type> · <description>` instead of the anonymous
+  // `agent(prompt)`, so a delegated sub-agent is visible at a glance. The ▸ marker signals
+  // delegation; the type (explore / reviewer / …) and the caller-supplied description name the
+  // work. Falls back to the generic `name(arg)` form when agent attribution is absent.
+  if (t.name === 'agent' && t.agent) {
+    const type = t.agent.subagentType ?? 'subagent';
+    const desc = t.agent.description ?? (t.arg ? shortArg(t.arg) : '');
+    spans.push(
+      { text: '▸ ', color: theme.cyan },
+      { text: type, color: theme.bright ?? theme.fg, bold: true },
+    );
+    if (desc) spans.push({ text: ` · ${desc}`, color: theme.dim });
+  } else {
+    spans.push({ text: t.name, color: theme.bright ?? theme.fg, bold: true });
+    if (t.arg) spans.push({ text: `(${shortArg(t.arg)})`, color: theme.dim });
+  }
   const s = t.summary ? shortSummary(t.summary, t.arg) : '';
   if (s) spans.push({ text: ` — ${s}`, color: theme.dim });
   const e = elapsed(t.durationMs);

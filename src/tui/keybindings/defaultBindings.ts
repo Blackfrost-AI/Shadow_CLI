@@ -40,8 +40,6 @@ const RAW_DEFAULTS: Record<ContextName, Record<string, string>> = {
     f: 'confirm:prefix',
     enter: 'confirm:yes',
     escape: 'confirm:no',
-    up: 'confirm:previous',
-    down: 'confirm:next',
   },
   ModelPicker: {
     up: 'picker:previous',
@@ -54,15 +52,6 @@ const RAW_DEFAULTS: Record<ContextName, Record<string, string>> = {
     enter: 'question:confirm',
     left: 'question:prev',
     right: 'question:next',
-  },
-  MessageActions: {
-    c: 'message:copy',
-    p: 'message:copyInput',
-    enter: 'message:expand',
-    up: 'message:previous',
-    down: 'message:next',
-    k: 'message:previous',
-    j: 'message:next',
   },
   Transcript: {
     'ctrl+o': 'transcript:toggleFoldLatest', // all folds (name is historical; behavior = all)

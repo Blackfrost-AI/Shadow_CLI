@@ -100,6 +100,38 @@ test('renderToolResult: sub-100ms calls omit the (0.0s) noise; minutes format as
   assert.ok(slow.some((s) => s.text === ' (1m 35s)'), 'minute formatting');
 });
 
+test('renderToolResult: subagent (agent tool) renders as ▸ type · description, not anonymous agent(…)', () => {
+  const r = renderToolResult(
+    { name: 'agent', arg: 'Explore the auth module', ok: true, durationMs: 8400, summary: '3 files use the old token helper', agent: { subagentType: 'explore', description: 'Map the auth call sites' } },
+    T,
+  );
+  const text = r.map((s) => s.text).join('');
+  assert.equal(r[0]!.text, '⏺ ', 'status dot first');
+  assert.equal(r[1]!.text, '▸ ', '▸ delegation marker');
+  assert.equal(r[1]!.color, T.cyan);
+  assert.equal(r[2]!.text, 'explore');
+  assert.equal(r[2]!.bold, true, 'subagent type is bold — it replaces the tool name');
+  assert.ok(text.includes(' · Map the auth call sites'), 'caller description shown');
+  assert.ok(!text.includes('agent('), 'no anonymous agent(arg) form');
+  assert.ok(!text.includes('Explore the auth module'), 'raw prompt arg suppressed when a description exists');
+  assert.ok(text.includes(' — 3 files use the old token helper'), 'subagent answer summary still shown');
+  assert.ok(text.includes(' (8.4s)'), 'elapsed still shown');
+  assert.ok(r.every((s) => s.dim !== true), 'no faint attribute');
+
+  // No description → falls back to the (truncated) prompt arg so the row is never blank.
+  const noDesc = renderToolResult(
+    { name: 'agent', arg: 'Review the diff for races', ok: true, durationMs: 1000, summary: 'ok', agent: { subagentType: 'reviewer' } },
+    T,
+  );
+  assert.ok(noDesc.some((s) => s.text === 'reviewer'));
+  assert.ok(noDesc.some((s) => s.text === ' · Review the diff for races'), 'falls back to the prompt arg when no description');
+
+  // No agent attribution → generic name(arg) form (back-compat for older/odd items).
+  const generic = renderToolResult({ name: 'agent', arg: 'do thing', ok: true, durationMs: 12, summary: '' }, T);
+  assert.ok(generic.some((s) => s.text === 'agent'), 'generic form keeps the literal tool name');
+  assert.ok(generic.some((s) => s.text === '(do thing)'), 'generic form keeps args in parens');
+});
+
 test('renderToolChild: collapsed output/diff — ⌄ glyph, +2 indent, dim, ^O hint', () => {
   const c = renderToolChild('output', 29, T);
   assert.equal(c[0]!.text, '  ⌄ output 29 lines · ^O');

@@ -33,9 +33,10 @@ export const TOOL_BODY_EXPAND_CAP = 80;
 
 type BodyLine = { text: string; color?: string; dimColor?: boolean; bold?: boolean };
 
-/** Label for the one-row fold (`⌄ output N lines · ^O` / `⌄ diff N lines · ^O`). */
+/** Label for the one-row fold (`⌄ output N lines · ^O` / `⌄ diff N lines · ^O` / `⌄ answer N lines · ^O`). */
 function toolBodyLabel(meta: string | undefined): string {
   if (meta === 'diff') return 'diff';
+  if (meta === 'answer') return 'answer'; // a sub-agent's answer body (agent tool) reads as "answer", not "output"
   if (meta === 'output') return 'output';
   return 'output';
 }
@@ -472,18 +473,24 @@ function blockToLines(
       // or when the spec doesn't parse — they stay an ordinary code block, so a
       // sloppy model can never crash the canvas or paint half a chart.
       if (block.closed && CHART_LANGS.has((block.lang || '').toLowerCase())) {
-        const spec = parseChartSpec(block.code);
-        if (spec) {
-          renderChart(spec, Math.min(cols, 72)).forEach((spans, ci) => {
-            out.push({
-              key: `${keyPrefix}ch${ci}`,
-              spans: truncateSpans(
-                spans.map((s) => chartSpanToStyled(s, theme)),
-                cols,
-              ),
+        try {
+          const spec = parseChartSpec(block.code);
+          if (spec) {
+            renderChart(spec, Math.min(cols, 72)).forEach((spans, ci) => {
+              out.push({
+                key: `${keyPrefix}ch${ci}`,
+                spans: truncateSpans(
+                  spans.map((s) => chartSpanToStyled(s, theme)),
+                  cols,
+                ),
+              });
             });
-          });
-          break;
+            break;
+          }
+        } catch {
+          // parseChartSpec is strict (ambiguous specs return null and render as a code block), so a
+          // throw here means a pathological VALID spec hit an edge in the geometry math. A model's
+          // chart must never crash the whole canvas — fall through to the plain code block below.
         }
       }
       const codeSpans = highlight(block.code || ' ', block.lang);

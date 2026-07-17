@@ -139,7 +139,16 @@ test('defaults: parse cleanly and contain expected actions', () => {
   assert.ok(actions.has('chat:submit'));
   assert.ok(actions.has('transcript:toggleFoldLatest'));
   assert.ok(actions.has('transcript:toggleFoldOne'));
-  assert.ok(actions.has('message:copy'));
+  // Confirmation + QuestionDialog ship defaults and are now wired into the live handler.
+  assert.ok(actions.has('confirm:yes'));
+  assert.ok(actions.has('question:confirm'));
+  // MessageActions was removed — per-message nav needed the owned viewport that collapse-to-stock
+  // dropped — so none of its actions may linger in the defaults.
+  assert.ok(!actions.has('message:copy'));
+  assert.ok(!actions.has('message:next'));
+  // confirm:previous/confirm:next were dead (plain approval has no list to navigate): removed.
+  assert.ok(!actions.has('confirm:previous'));
+  assert.ok(!actions.has('confirm:next'));
   // toggleFoldOne must bind to a key the terminal can actually distinguish from ctrl+o.
   // ctrl+shift+o was dead (same 0x0F byte as ctrl+o); it binds to meta+o (Alt/Option+O).
   const foldOne = bindings.find((b) => b.action === 'transcript:toggleFoldOne');
