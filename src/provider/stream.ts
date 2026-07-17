@@ -15,7 +15,8 @@ import type { ProviderEvent } from './provider.js';
 
 const MAX_ATTEMPTS = 4;
 /** Max times we shrink an over-budget output cap and retry a 400 that says the request is too long. */
-const MAX_TOKEN_SHRINKS = 3;
+// Enough halvings to walk a large cap down to the floor: 16000 → 8000 → 4096 → 2048 → 1024.
+const MAX_TOKEN_SHRINKS = 5;
 /** Abort a request that produces no bytes for this long (initial wait or mid-stream stall). */
 const IDLE_MS = 120_000;
 
@@ -300,9 +301,16 @@ export function looksLikeTokenOverflow(msg: string): boolean {
 
 /**
  * Halve any output-token cap on a request body (`max_tokens` / `max_completion_tokens`), flooring
- * at 4096. Returns true if it reduced anything, so the caller knows a retry is worth attempting.
- * Mutates the body in place — safe because each send() builds a fresh body object.
+ * at TOKEN_SHRINK_FLOOR. Returns true if it reduced anything, so the caller knows a retry is worth
+ * attempting. Mutates the body in place — safe because each send() builds a fresh body object.
+ *
+ * The floor is deliberately low (1024): a model whose ENTIRE window is 8192 can't fit a 4096 output
+ * cap alongside any real input, so a 4096 floor left tiny-window models (small local reasoners,
+ * some vLLM serves) dead on `max_tokens=… > max_model_len=8192` with no self-recovery. 1024 output
+ * still yields a usable (if short) answer, and this only ever kicks in AFTER the endpoint has
+ * rejected larger requests — a normal big-window request stops shrinking the moment it fits.
  */
+export const TOKEN_SHRINK_FLOOR = 1024;
 export function shrinkMaxTokens(body: unknown): boolean {
   if (!body || typeof body !== 'object') return false;
   const b = body as Record<string, unknown>;
@@ -311,8 +319,8 @@ export function shrinkMaxTokens(body: unknown): boolean {
     // 'max_output_tokens' is the Responses API (/v1/responses) field — without it the token-overflow
     // 400 → shrink-and-retry self-correction was a no-op on that wire and the run died on turn 1.
     const v = b[field];
-    if (typeof v === 'number' && v > 4096) {
-      b[field] = Math.max(4096, Math.floor(v / 2));
+    if (typeof v === 'number' && v > TOKEN_SHRINK_FLOOR) {
+      b[field] = Math.max(TOKEN_SHRINK_FLOOR, Math.floor(v / 2));
       changed = true;
     }
   }

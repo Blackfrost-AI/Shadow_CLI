@@ -21,6 +21,7 @@ import { maybeNotifyUpdate } from './update/checkUpdate.js';
 import { parseMarkdown, renderTableLines, wrapSpans, type MdSpan } from './util/markdown.js';
 import { CHART_LANGS, parseChartSpec, renderChart } from './util/chart.js';
 import { fuzzyRank } from './util/fuzzy.js';
+import { providerErrorHint } from './util/errorHints.js';
 import {
   isBigPaste,
   expandPastes,
@@ -3566,9 +3567,14 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             dimColor: true,
           });
           break;
-        case 'error':
+        case 'error': {
           pushLine({ kind: 'error', text: `  ! ${e.message}`, color: C.red });
+          // Actionable recovery hint under the raw error (dim ↳ line) — tells the user WHAT TO DO
+          // (lower tokens / re-auth / check the endpoint / /model), not just what failed.
+          const hint = providerErrorHint(e.message);
+          if (hint) pushLine({ text: `  ↳ ${hint}`, dimColor: true });
           break;
+        }
         case 'autonomy':
           setAutonomy(e.level);
           break;
