@@ -203,6 +203,25 @@ test('an unrepairable tool-call JSON is fed back and the model retries (no silen
   assert.ok(events.some((e) => e.type === 'retry'), 'a retry event was emitted for the bad JSON');
 });
 
+test('a recoverable provider error is surfaced EXACTLY ONCE (regression: it printed twice)', async () => {
+  // The double-print bug: the loop emitted a provider error at the stream-event site (case
+  // 'error') AND again at turn cleanup (the `turn.providerError && !finalAnswer` branch), so the
+  // HUD showed every provider error twice. The cleanup branch must STOP without re-emitting.
+  const provider = new MockProvider([
+    [
+      { type: 'error', recoverable: true, code: 'http_400', message: 'max_tokens=16000 cannot be greater than max_model_len=8192' },
+      { type: 'done', stopReason: 'end_turn' }, // empty turn → the providerError cleanup branch fires
+    ],
+  ]);
+  const { loop, events } = buildLoop(provider, [], new AutoApproveGate());
+  const res = await loop.run();
+
+  const errs = events.filter((e) => e.type === 'error');
+  assert.equal(errs.length, 1, 'the provider error is emitted ONCE, not twice');
+  assert.match((errs[0] as { message: string }).message, /http_400/, 'it is the provider error');
+  assert.equal(res.stopReason, 'provider_error', 'the turn still stops with the provider_error reason');
+});
+
 test('repeated unrepairable tool JSON terminates (bounded repair attempts, no infinite loop)', async () => {
   const alwaysBad: Provider = {
     name: 'badjson',

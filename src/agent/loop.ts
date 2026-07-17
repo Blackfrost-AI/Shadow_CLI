@@ -308,9 +308,11 @@ export class AgentLoop {
         }
 
         // A recoverable provider error mid-stream (e.g. an OpenAI 200 error frame) that
-        // left the turn empty — surface it instead of a silent end_turn.
+        // left the turn empty — stop with the provider_error reason. The error was ALREADY
+        // emitted to the bus at the stream-event site (the `case 'error'` handler emits the
+        // moment the event arrives, then records it as `providerError`), so emitting again here
+        // printed every provider error TWICE on the HUD. Stop only; do not re-emit.
         if (turn.providerError && !finalAnswer) {
-          bus.emit({ type: 'error', message: redactString(`${turn.providerError.code}: ${turn.providerError.message}`) });
           return this.stop('provider_error', finalAnswer);
         }
 
