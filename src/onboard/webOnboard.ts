@@ -23,7 +23,7 @@ import {
   type VaultData,
 } from '../auth/vault.js';
 import { storeKey, retrieveKey, available as keychainAvailable } from '../auth/keychain.js';
-import { saveGlobalConfig } from '../state/globalStore.js';
+import { saveGlobalConfig, shredLegacyCredentials } from '../state/globalStore.js';
 
 export interface PersistResult {
   /** true = added to an existing vault; false = a new vault was created. */
@@ -71,12 +71,16 @@ export function persistOnboardSecret(input: {
     data[input.provider] = entry;
     saveSecrets(data, key);
     const cached = keychainAvailable() ? storeKey(key.toString('base64')) : Boolean(cachedB64);
+    // The key is sealed — drop any plaintext copy. Without this a vault and a live
+    // credentials.json coexist, and the plaintext is still served whenever nothing is unlocked.
+    shredLegacyCredentials();
     return { merged: true, cached };
   }
   // Fresh vault — the password sets the master password.
   if (!input.password || input.password.length < 8) throw new Error('weak-password');
   const key = createVault(input.password, { [input.provider]: entry });
   const cached = keychainAvailable() ? storeKey(key.toString('base64')) : false;
+  shredLegacyCredentials(); // same reason as above
   return { merged: false, cached };
 }
 

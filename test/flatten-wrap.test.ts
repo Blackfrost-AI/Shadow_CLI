@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { wrapSpansWord, truncateSpans, flattenItem, TOOL_BODY_EXPAND_CAP, itemIsCollapsible } from '../src/tui/flatten.js';
+import { wrapSpansWord, truncateSpans, flattenItem, TOOL_BODY_EXPAND_CAP, itemIsCollapsible, computeToolRuns } from '../src/tui/flatten.js';
 import { renderToolResult } from '../src/tui/rows.js';
 import type { ViewportTheme } from '../src/tui/flatten.js';
 
@@ -290,4 +290,30 @@ test('collaboration speaker: colored ⏺ handle header once per turn, body inden
   // A continuation block (same turn) draws neither a second header nor a bullet — just indent.
   const cont = flattenItem({ id: 2, kind: 'assistant', text: 'add -ctk q8_0', speaker: spk } as never, 60, false, T, true);
   assert.ok(!cont.some((r) => r.spans.map((s) => s.text).join('').includes('⏺')), 'continuation has no ⏺ header');
+});
+
+test('computeToolRuns: groups runs of ≥2 consecutive tools; lone tools + non-tools stay ungrouped', () => {
+  const tool = (id: number, name: string, ok: boolean, ms: number) => ({
+    id, kind: 'tool', text: '', tool: { name, ok, durationMs: ms, summary: '' },
+  });
+  const items: object[] = [
+    { id: 1, kind: 'user', text: 'q' },
+    tool(2, 'a', true, 100),
+    tool(3, 'b', false, 200),
+    tool(4, 'c', true, 300),
+    { id: 5, kind: 'assistant', text: 'ans' },
+    tool(6, 'd', true, 50), // lone tool — not grouped
+  ];
+  const runs = computeToolRuns(items as never, false);
+  assert.equal(runs.size, 3, 'only the 3-item run (indices 1,2,3) is grouped');
+  assert.equal(runs.get(1)!.len, 3);
+  assert.equal(runs.get(1)!.pos, 0);
+  assert.equal(runs.get(2)!.pos, 1);
+  assert.equal(runs.get(3)!.pos, 2);
+  assert.equal(runs.get(1)!.okCount, 2);
+  assert.equal(runs.get(1)!.failCount, 1);
+  assert.equal(runs.get(1)!.totalMs, 600);
+  assert.equal(runs.get(1)!.collapsed, true, 'collapsed when not all-expanded');
+  assert.ok(!runs.has(5), 'the lone tool is not in any run');
+  assert.equal(computeToolRuns(items as never, true).get(1)!.collapsed, false, 'Ctrl-O flips collapsed off');
 });

@@ -19,6 +19,9 @@ export interface MdSpan {
   link?: boolean;
   /** The [label] of a link — rendered in the link accent so it reads as a link, not prose. */
   linkLabel?: boolean;
+  /** The link target URL (on the label span). Lets the renderer wrap the label as an OSC 8
+   *  hyperlink when the terminal supports it — the URL is then the click target, not shown text. */
+  url?: string;
 }
 
 export type MdBlock =
@@ -76,7 +79,7 @@ export function parseInline(text: string): MdSpan[] {
     else if (m[3]) push(m[4]!, { bold: true });
     else if (m[5]) push(m[6]!, { italic: true });
     else {
-      push(m[7]!, { linkLabel: true }); // link label — link accent
+      push(m[7]!, { linkLabel: true, url: m[8] }); // link label — link accent; url carried for OSC 8
       push(` (${m[8]})`, { link: true }); // dim URL tail
     }
     rest = rest.slice(m.index + m[0].length);

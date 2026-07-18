@@ -15,7 +15,7 @@ export function providerErrorHint(raw: string): string | null {
   if (!raw) return null;
   const msg = raw.toLowerCase();
   // Leading token: `http_400`, `network_error`, `idle_timeout`, … (before the first ':' or '-').
-  const code = /^\s*(http_\d{3}|[a-z]+(?:_[a-z0-9]+)+)\s*[:\-]/.exec(msg)?.[1] ?? '';
+  const code = /^\s*(http_\d{3}|[a-z]+(?:_[a-z0-9]+)+)\s*[:-]/.exec(msg)?.[1] ?? '';
   const has = (re: RegExp): boolean => re.test(msg);
 
   // Context / token overflow — check FIRST: it often arrives as a generic http_400 whose message

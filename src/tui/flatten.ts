@@ -14,14 +14,21 @@ import type { MdSpan, MdBlock } from '../util/markdown.js';
 import { segmentTableLine, TABLE_COLLAPSE_THRESHOLD } from '../util/tableStyle.js';
 import { CHART_LANGS, parseChartSpec, renderChart } from '../util/chart.js';
 import type { ChartSpan } from '../util/chart.js';
-import { renderBrand, renderToolResult, renderToolChild, renderReasoning } from './rows.js';
-import type { BrandInfo, ToolInfo } from './rows.js';
+import { hyperlink, supportsHyperlinks } from '../util/hyperlinks.js';
+import { inlineImageEsc, formatBytes, supportsInlineImages } from '../util/termImage.js';
+import { renderBrand, renderToolResult, renderToolChild, renderReasoning, renderToolStack } from './rows.js';
+import type { BrandInfo, ToolInfo, ToolRun } from './rows.js';
 
 export { TABLE_COLLAPSE_THRESHOLD };
 
 // the reference client vocabulary: the ⏺ turn bullet + the warm brand orange it's drawn in.
 const ASSISTANT_DOT = process.platform === 'darwin' ? '⏺' : '●';
 const CLAUDE_ORANGE = '#d97757';
+// OSC 8 hyperlinks: stable for the process (env-derived), so resolve once at module load.
+const LINKS = supportsHyperlinks();
+// Inline images: likewise TTY+terminal-derived and stable. Gated so image escapes never leak into
+// piped/redirected output (only emit when stdout is a real TTY on a capable terminal).
+const IMG = supportsInlineImages();
 
 /** Tool/blocked bodies longer than this fold by default (Ctrl-O expands). 1–3 lines stay inline. */
 export const TOOL_BODY_COLLAPSE_THRESHOLD = 3;
@@ -362,8 +369,21 @@ function mdSpanToStyled(s: MdSpan, theme: ViewportTheme): StyledSpan {
   // read as a link, not blend into prose); the " (url)" tail → dim so the address recedes.
   // Bold gets the BRIGHT tier so it pops against the softer body gray (weight + brightness).
   if (s.code) return { text: s.text, color: theme.cyan, bg: theme.codeBg, italic: s.italic };
-  if (s.linkLabel) return { text: s.text, color: theme.cyan, italic: s.italic };
-  if (s.link) return { text: s.text, color: theme.dim, italic: s.italic };
+  if (s.linkLabel) {
+    // When the terminal renders OSC 8 hyperlinks, wrap the label as a real clickable link (the URL
+    // becomes the click target / hover) and DROP the dim " (url)" tail below — no duplication.
+    // Ink passes the raw escape through <Text> unsanitized (see syncOutput's DEC-2026 wrapping), so
+    // embedding it in span text reaches the terminal. The click modifier is the terminal's binding
+    // (⌘ on macOS iTerm2/Terminal, Ctrl on Linux).
+    if (LINKS && s.url) return { text: hyperlink(s.text, s.url), color: theme.cyan, italic: s.italic };
+    return { text: s.text, color: theme.cyan, italic: s.italic };
+  }
+  if (s.link) {
+    // The dim URL tail is only shown when we are NOT hyperlinking the label (fallback for terminals
+    // without OSC 8, or a link that somehow lost its url). Otherwise it's empty — the label carries it.
+    if (LINKS) return { text: '', color: theme.dim };
+    return { text: s.text, color: theme.dim, italic: s.italic };
+  }
   if (s.bold) return { text: s.text, color: theme.bright ?? theme.fg, bold: true, italic: s.italic };
   return { text: s.text, color: theme.fg, italic: s.italic };
 }
@@ -570,6 +590,9 @@ export interface FlattenItem {
    *  and `text`/`lines` are the plain fallback used only by the stock Ink components. */
   brand?: BrandInfo;
   tool?: ToolInfo;
+  /** Inline image (a `/image` echo, a `view_image` result, or a fetched markdown `![](url)`).
+   *  Rendered as a durable text placeholder + the terminal's inline-image escape when supported. */
+  image?: { bytes: string; mediaType: string; alt?: string; source?: string };
   /** Reasoning wall-clock (ms), when known — drives `thought for Ns` in the fold header. */
   durationMs?: number;
   /** Collaboration Mode: which model produced this assistant turn. When set, the ⏺ bullet becomes a
@@ -595,6 +618,9 @@ export function flattenItem(
    * Callers pass true when global folds are collapsed (!showAllExpanded); Ctrl-O expands tables too.
    */
   foldLargeTables = false,
+  /** Tool-call stacking: when this tool item is part of a run of ≥2 consecutive tools, the run
+   *  collapses to one header row (pos 0 draws it; pos>0 is absorbed). Undefined = render normally. */
+  toolRun?: ToolRun,
 ): ViewportLine[] {
   const kp = `i${item.id}`;
   const out: ViewportLine[] = [];
@@ -621,11 +647,40 @@ export function flattenItem(
     return out;
   }
 
+  // ── inline image (durable placeholder + terminal-native pixels when supported) ──
+  // Models can't emit images; these come from /image echoes, view_image results, or fetched
+  // markdown ![](url). The placeholder is text — it survives scroll-up (inline pixels usually
+  // DON'T on iTerm2/Kitty), so the image is never truly lost. When the terminal supports inline
+  // images, the escape paints the real pixels on the row below the placeholder.
+  if (item.kind === 'image' && item.image) {
+    const bytes = Buffer.from(item.image.bytes, 'base64');
+    const alt = item.image.alt || 'image';
+    const type = (item.image.mediaType || 'image').replace(/^image\//, '');
+    out.push({
+      key: `${kp}imglabel`,
+      spans: truncateSpans([{ text: `🖼 ${alt} · ${type} ${formatBytes(bytes.length)}`, color: theme.dim }], cols),
+    });
+    const esc = IMG ? inlineImageEsc(bytes, { cols: Math.max(8, cols - 4), name: alt }) : null;
+    if (esc) out.push({ key: `${kp}imgpix`, spans: [{ text: esc, color: theme.dim }] });
+    return out;
+  }
+
   // ── tool result (v2: one calm row + optional nested body) ──
   // Header is always exactly one truncated row. When `lines` are nested on the same item
   // (shell stdout / edit diff from tool_end), they render as a child: folded to one
   // `⌄ output N lines · ^O` row by default, or under a ⎿ branch when expanded / short.
   if (item.kind === 'tool' && item.tool) {
+    // Tool-call stacking: a run of ≥2 consecutive tools collapses to ONE summary header so a long
+    // tool-heavy turn can't flood scrollback. pos 0 draws the header; pos>0 is absorbed (no rows)
+    // when collapsed. Expanded (Ctrl-O) draws the header as a summary, then every tool's own row.
+    if (toolRun) {
+      if (toolRun.pos > 0) {
+        if (toolRun.collapsed) return out; // absorbed into the run header — emits zero rows
+      } else {
+        out.push({ key: `${kp}stack`, spans: truncateSpans(renderToolStack(toolRun, theme), cols) });
+        if (toolRun.collapsed) return out; // collapsed: the header is the whole run
+      }
+    }
     out.push({ key: `${kp}tool`, spans: truncateSpans(renderToolResult(item.tool, theme), cols) });
     if (item.lines && item.lines.length > 0) {
       appendToolBody(out, kp, item.lines, collapsed, theme, cols, color, item.meta);
@@ -736,6 +791,43 @@ export function flattenItem(
     out.push(...wrapLine(`${kp}l${i}`, [{ text: l.text ?? '', color: l.color ?? color, dim: l.dimColor, bold: l.bold }], cols));
   });
   return out;
+}
+
+/**
+ * Group consecutive `kind:'tool'` items into runs for tool-call stacking. Returns a map keyed by
+ * item index → the run descriptor, but ONLY for items in a run of ≥2 (single tools render normally).
+ * `allExpanded` (Ctrl-O) flips every run's `collapsed` false at once. One pass, O(n).
+ */
+export function computeToolRuns(items: FlattenItem[], allExpanded: boolean): Map<number, ToolRun> {
+  const runs = new Map<number, ToolRun>();
+  let i = 0;
+  while (i < items.length) {
+    if (items[i]!.kind !== 'tool') {
+      i++;
+      continue;
+    }
+    let j = i;
+    while (j < items.length && items[j]!.kind === 'tool') j++;
+    const len = j - i;
+    if (len >= 2) {
+      let okCount = 0;
+      let failCount = 0;
+      let totalMs = 0;
+      for (let k = i; k < j; k++) {
+        const t = items[k]!.tool;
+        if (t) {
+          if (t.ok) okCount++;
+          else failCount++;
+          totalMs += t.durationMs;
+        }
+      }
+      for (let k = i; k < j; k++) {
+        runs.set(k, { pos: k - i, len, okCount, failCount, totalMs, collapsed: !allExpanded });
+      }
+    }
+    i = j;
+  }
+  return runs;
 }
 
 /** True when this item has a foldable body (reasoning always; tool bodies over the threshold). */

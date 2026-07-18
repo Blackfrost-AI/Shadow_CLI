@@ -123,6 +123,19 @@ export interface ToolInfo {
   agent?: { subagentType?: string; description?: string };
 }
 
+/** A run of consecutive tool items collapsed into ONE row (tool-call stacking). `collapsed` is the
+ *  run-level state — Ctrl-O (show-all-expanded) flips it for every run at once. */
+export interface ToolRun {
+  /** This item's 0-based position within the run. */
+  pos: number;
+  /** Run length (≥ 2; single tools never stack). */
+  len: number;
+  okCount: number;
+  failCount: number;
+  totalMs: number;
+  collapsed: boolean;
+}
+
 /** Elapsed as "(10.2s)"; sub-100ms calls omit it (noise, and rounds to 0.0s). */
 function elapsed(durationMs: number): string {
   if (durationMs < 100) return '';
@@ -200,6 +213,27 @@ export function renderToolResult(t: ToolInfo, theme: ViewportTheme): StyledSpan[
   if (s) spans.push({ text: ` — ${s}`, color: theme.dim });
   const e = elapsed(t.durationMs);
   if (e) spans.push({ text: e, color: theme.dim });
+  return spans;
+}
+
+/**
+ * Collapsed header for a run of consecutive tool calls — the "tool-call stacking" that keeps a
+ * 15-tool turn from scrolling the transcript forever: `⏺ 5 tools · ✓4 ✗1 · (12.3s) · ⌄ ^O`.
+ * The dot is green when every call succeeded, red as soon as one failed (shape+color, WCAG 1.4.1).
+ * Ctrl-O expands the run to the full per-tool ledger (each tool then renders via renderToolResult).
+ */
+export function renderToolStack(run: ToolRun, theme: ViewportTheme): StyledSpan[] {
+  const spans: StyledSpan[] = [
+    { text: `${TOOL_DOT} `, color: run.failCount > 0 ? theme.red : theme.green },
+    { text: `${run.len} tool${run.len === 1 ? '' : 's'}`, color: theme.bright ?? theme.fg, bold: true },
+  ];
+  const tally: string[] = [];
+  if (run.okCount) tally.push(`✓${run.okCount}`);
+  if (run.failCount) tally.push(`✗${run.failCount}`);
+  if (tally.length) spans.push({ text: ` · ${tally.join(' ')}`, color: theme.dim });
+  const e = elapsed(run.totalMs);
+  if (e) spans.push({ text: e, color: theme.dim });
+  if (run.collapsed) spans.push({ text: ' · ⌄ ^O', color: theme.dim }); // expand hint
   return spans;
 }
 

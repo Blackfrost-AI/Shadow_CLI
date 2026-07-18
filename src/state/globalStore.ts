@@ -78,6 +78,23 @@ export function setUnlockedVault(v: Credentials | null): void {
   _unlockedVault = v;
 }
 
+/** True when a decrypted vault is installed for this session. */
+export function vaultUnlocked(): boolean {
+  return _unlockedVault !== null;
+}
+
+/**
+ * Re-seal hook, registered by the unlock flow. Without it `saveCredential` mutated only the
+ * in-memory vault and the change was lost at exit — a rotation appeared to work all session
+ * and silently vanished. The store must not import the vault module (cycle), so the writer
+ * is injected instead.
+ */
+let _vaultWriter: ((d: Credentials) => void) | null = null;
+
+export function setVaultWriter(fn: ((d: Credentials) => void) | null): void {
+  _vaultWriter = fn;
+}
+
 export function loadCredentials(): Credentials {
   // Prefer the encrypted vault once unlocked; fall back to the legacy plaintext file (unmigrated users).
   if (_unlockedVault) return _unlockedVault;
@@ -91,10 +108,13 @@ export function getCredential(provider: string): CredentialEntry | undefined {
 export function saveCredential(provider: string, entry: CredentialEntry): void {
   const all = loadCredentials();
   all[provider] = { ...all[provider], ...entry };
-  // Note: when a vault is unlocked, this only mutates the in-memory copy; persisting a rotation into
-  // the vault is a vault-write (see auth/unlock.ts saveIntoVault). Legacy path writes the plaintext.
+  // With a vault unlocked the plaintext file is never written; the change is re-sealed into
+  // the vault through the injected writer (registered by auth/unlock.ts installUnlocked).
+  // If no writer is registered the change stays in memory only — the pre-existing behaviour
+  // that tests without an unlock flow rely on.
   if (_unlockedVault) {
     _unlockedVault = all;
+    _vaultWriter?.(all);
     return;
   }
   writeJsonAtomic(CREDS_PATH, all, 0o600);

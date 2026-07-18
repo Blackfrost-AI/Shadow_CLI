@@ -260,7 +260,7 @@ test('loop guard: identical repeated calls stop executing after the limit', asyn
 });
 
 test('recovers a tool call emitted ONLY in the thinking/reasoning stream (qwen-class strand)', async () => {
-  // The "stops mid-thinking" bug: a thinking model (a local reasoning model) emits the
+  // The "stops mid-thinking" bug: a thinking model (a local reasoning model / RED-APEX-class) emits the
   // Hermes/Qwen <tool_call> XML inside its REASONING stream, with no content and no native
   // tool call. The old recovery only sniffed turn.text, so the call was stranded.
   let ranWith = '';

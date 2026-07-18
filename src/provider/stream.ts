@@ -333,6 +333,9 @@ export function looksLikeVisionUnsupported(msg: string): boolean {
   // Text-only OpenAI-compatible servers reject non-text parts, e.g.
   // "messages.content.type is invalid, allowed values: ['text']".
   if (m.includes('allowed values') && m.includes("'text'")) return true;
+  // vLLM / custom gateways: "BLACK-LM is not a multimodal model"
+  if (m.includes('multimodal') && /not a |is not |non-/.test(m)) return true;
+  if (/not a multimodal|non-multimodal|text-only model|does not support (multi-?modal|vision|images?)/.test(m)) return true;
   // Generic "image(s) unsupported / invalid content type" variants across servers.
   if ((m.includes('image_url') || m.includes('image')) && /not support|unsupported|invalid|cannot|does not|no vision|only text/.test(m)) return true;
   return false;
@@ -366,7 +369,9 @@ export function stripImagesFromBody(body: unknown): boolean {
     const texts = (msg.content as { type?: string; text?: string }[])
       .filter((p) => p && isTxt(p.type) && typeof p.text === 'string')
       .map((p) => p.text as string);
-    texts.push('[image omitted — the current model has no vision support]');
+    texts.push(
+      '[image omitted — the current model has no vision support; use the describe_media tool to see it]',
+    );
     msg.content = texts.join('\n');
     stripped = true;
   }

@@ -14,6 +14,9 @@ import { vaultExists, unlockWithKey, unlockWithPassword, createVault, saveSecret
 import { retrieveKey, storeKey, clearKey, available as keychainAvailable } from './keychain.js';
 import {
   setUnlockedVault,
+  setVaultWriter,
+  vaultUnlocked,
+  loadCredentials,
   loadLegacyCredentials,
   legacyCredentialsExist,
   shredLegacyCredentials,
@@ -89,11 +92,26 @@ async function promptLine(question: string): Promise<string> {
 function installUnlocked(data: VaultData, key: Buffer): void {
   setUnlockedVault(data as unknown as Record<string, CredentialEntry>);
   sessionKey = key;
+  // Make saveCredential durable: without this a rotation lives only in memory and is lost
+  // at exit (the vault file would keep the superseded key indefinitely).
+  setVaultWriter((d) => persistToVault(d as unknown as VaultData));
+}
+
+/** Drop the session's secrets and stop re-sealing (used by `/lock`). */
+export function lockVault(): void {
+  setUnlockedVault(null);
+  setVaultWriter(null);
+  sessionKey = null;
 }
 
 /** Persist a credential change back into the vault (re-seal). No-op if the vault isn't the source. */
 export function persistToVault(data: VaultData): void {
   if (sessionKey) saveSecrets(data, sessionKey);
+}
+
+/** The session's derived key, for flows that must verify a re-seal opens (credRef migration). */
+export function getSessionKey(): Buffer | null {
+  return sessionKey;
 }
 
 /** One-time migration: plaintext credentials.json → encrypted vault, then shred. Returns true if it
@@ -129,6 +147,48 @@ async function maybeMigrateLegacy(write: (s: string) => void): Promise<boolean> 
   shredLegacyCredentials();
   write('✓ Credentials encrypted into ~/.shadow/vault.enc; the plaintext file was removed.\n\n');
   return true;
+}
+
+/**
+ * Adopt a plaintext credentials.json that outlived the vault's creation.
+ *
+ * `maybeMigrateLegacy` bails the moment a vault exists, and `persistOnboardSecret` creates a
+ * vault without shredding — so a vault and a live plaintext file could coexist forever, with
+ * the plaintext still served by `loadCredentials()` whenever nothing is unlocked. This closes
+ * that hole: merge whatever the vault does not already hold, re-seal, verify, then shred.
+ *
+ * Vault values win on conflict — the vault is the newer, deliberate store.
+ */
+export function adoptLegacyIntoUnlockedVault(write: (s: string) => void = () => {}): number {
+  if (!vaultUnlocked() || !sessionKey || !legacyCredentialsExist()) return 0;
+  const legacy = loadLegacyCredentials();
+  const slots = Object.keys(legacy ?? {});
+  if (slots.length === 0) {
+    shredLegacyCredentials(); // empty file, nothing to keep
+    return 0;
+  }
+  const current = loadCredentials();
+  const merged: Record<string, CredentialEntry> = { ...current };
+  let adopted = 0;
+  for (const slot of slots) {
+    if (merged[slot]) continue; // vault wins
+    merged[slot] = legacy[slot];
+    adopted++;
+  }
+  // Seal FIRST and prove it opens before destroying the only other copy.
+  setUnlockedVault(merged);
+  persistToVault(merged as unknown as VaultData);
+  try {
+    unlockWithKey(sessionKey);
+  } catch {
+    write('⚠ Could not verify the vault after merging legacy credentials — plaintext left in place.\n');
+    return 0;
+  }
+  shredLegacyCredentials();
+  if (adopted > 0) {
+    write(`✓ Adopted ${adopted} credential(s) from the plaintext credentials.json into your vault; the file was removed.\n`);
+  }
+  return adopted;
 }
 
 /** Unlock the vault for this session: keychain (silent) → env → masked prompt. */
@@ -186,7 +246,18 @@ export async function ensureVaultReady(write: (s: string) => void = (s) => proce
   try {
     await maybeMigrateLegacy(write);
     if (!vaultExists()) return true; // no vault (fresh install / declined migration) — env/onboarding path
-    return (await unlockExisting(write)) === 'ok';
+    if ((await unlockExisting(write)) !== 'ok') return false;
+    // A vault created by `onboard --web` may have left the old plaintext file behind.
+    adoptLegacyIntoUnlockedVault(write);
+    // Plaintext keys hand-written into config.json presets move into the vault too. Imported
+    // lazily to keep the module graph acyclic (credRefMigrate imports from here).
+    try {
+      const { migratePresetKeysIntoVault } = await import('./credRefMigrate.js');
+      migratePresetKeysIntoVault(write);
+    } catch {
+      /* migration is best-effort; a failure must never block startup */
+    }
+    return true;
   } catch {
     return true; // never block startup on an unexpected error — env vars may still carry the key
   }

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { renderBrand, renderToolResult, renderToolChild, renderReasoning } from '../src/tui/rows.js';
+import { renderBrand, renderToolResult, renderToolChild, renderReasoning, renderToolStack } from '../src/tui/rows.js';
 import type { ViewportTheme } from '../src/tui/flatten.js';
 
 // The v2 palette (matches PIN_THEME): dim is the EXPLICIT ADA gray, never a faint attribute.
@@ -130,6 +130,25 @@ test('renderToolResult: subagent (agent tool) renders as ▸ type · description
   const generic = renderToolResult({ name: 'agent', arg: 'do thing', ok: true, durationMs: 12, summary: '' }, T);
   assert.ok(generic.some((s) => s.text === 'agent'), 'generic form keeps the literal tool name');
   assert.ok(generic.some((s) => s.text === '(do thing)'), 'generic form keeps args in parens');
+});
+
+test('renderToolStack: collapsed run = ⏺ N tools · ✓a ✗b · (total) · ⌄ ^O', () => {
+  const r = renderToolStack({ pos: 0, len: 5, okCount: 4, failCount: 1, totalMs: 12300, collapsed: true }, T);
+  const text = r.map((s) => s.text).join('');
+  assert.equal(r[0]!.text, '⏺ ', 'status dot');
+  assert.equal(r[0]!.color, T.red, 'red as soon as one call failed');
+  assert.ok(text.includes('5 tools'), 'run length');
+  assert.ok(text.includes('✓4'), 'ok tally');
+  assert.ok(text.includes('✗1'), 'fail tally');
+  assert.ok(text.includes(' (12.3s)'), 'total elapsed');
+  assert.ok(text.includes('⌄ ^O'), 'expand hint when collapsed');
+});
+
+test('renderToolStack: all-ok run is green; expanded drops the expand hint', () => {
+  const ok = renderToolStack({ pos: 0, len: 3, okCount: 3, failCount: 0, totalMs: 500, collapsed: false }, T);
+  assert.equal(ok[0]!.color, T.green, 'green when no failures');
+  assert.ok(!ok.some((s) => s.text.includes('⌄ ^O')), 'no expand hint when expanded');
+  assert.ok(ok.some((s) => s.text.includes('✓3')), 'ok tally shown');
 });
 
 test('renderToolChild: collapsed output/diff — ⌄ glyph, +2 indent, dim, ^O hint', () => {

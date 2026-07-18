@@ -1,21 +1,21 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { rmSync } from 'node:fs';
+import { isolateHome, assertStoreIsolated } from './helpers/isolateHome.js';
 
 // Isolate ~/.shadow AND disable the keychain (empty PATH → the backend probe ENOENTs) so the merge
 // path exercises the master-password branch and never touches the real login keychain. GLOBAL_DIR is
 // frozen at import from this HOME, so tests run in order: no-vault cases FIRST, then create, then merge.
-const HOME = mkdtempSync(join(tmpdir(), 'shadow-home-'));
-process.env.HOME = HOME;
-process.env.USERPROFILE = HOME;
+// isolateHome() PROVES the redirect took effect — this file writes a real vault, and a runner that
+// ignores process.env.HOME would write it over the user's own. Run with `npm test`, never `bun test`.
+const { home: HOME } = isolateHome('merge');
 process.env.PATH = '';
 delete process.env.SHADOW_VAULT_PASSWORD;
-mkdirSync(join(HOME, '.shadow'), { recursive: true });
 
 const { persistOnboardSecret } = await import('../src/onboard/webOnboard.js');
 const { unlockWithPassword, vaultExists } = await import('../src/auth/vault.js');
+const { GLOBAL_DIR } = await import('../src/state/globalStore.js');
+assertStoreIsolated(GLOBAL_DIR, HOME);
 
 const PW = 'correct horse battery';
 

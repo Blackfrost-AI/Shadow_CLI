@@ -249,7 +249,7 @@ test('/model list and /provider show provider/model management state', async () 
     model: 'local-reasoner',
     baseUrl: 'http://127.0.0.1:8001/v1',
     models: [
-      { label: 'Local Reasoner', provider: 'openai', model: 'local-reasoner', baseUrl: 'http://127.0.0.1:8001/v1' },
+      { label: 'Local RED-APEX', provider: 'openai', model: 'local-reasoner', baseUrl: 'http://127.0.0.1:8001/v1' },
       { label: 'Gemini Flash', provider: 'openai', model: 'gemini-2.5-flash', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', disabled: true },
     ],
   } as unknown as TuiOpts['cfg'];
@@ -261,7 +261,7 @@ test('/model list and /provider show provider/model management state', async () 
   stdin.write('\r');
   await tick();
   let out = strip(frames.join('\n'));
-  assert.match(out, /\* Local Reasoner/);
+  assert.match(out, /\* Local RED-APEX/);
   assert.match(out, /Gemini Flash \[disabled\]/);
 
   stdin.write('/provider');
@@ -270,7 +270,7 @@ test('/model list and /provider show provider/model management state', async () 
   await tick();
   out = strip(frames.join('\n'));
   assert.match(out, /openai\/local-reasoner/);
-  assert.match(out, /endpoint: http:\/\/10\.80\.10\.24:8001\/v1/);
+  assert.match(out, /endpoint: http:\/\/127\.0\.0\.1:8001\/v1/);
   assert.match(out, /presets: 2 configured · 1 disabled/);
   unmount();
 });

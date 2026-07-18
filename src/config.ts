@@ -97,6 +97,16 @@ const ModelEntrySchema = z.object({
     .transform((v) => normalizeBaseUrl(v)),
   apiKey: z.string().optional(),
   authToken: z.string().optional(),
+  /**
+   * Pointer into the encrypted vault: the slot id holding this preset's secret. Opaque and
+   * non-secret, so a migrated config.json is safe to sync or paste. Takes precedence over a
+   * co-present `apiKey` (which is then legacy residue). `apiKey`/`authToken` stay in the
+   * schema permanently — that is the backward-compatibility contract for unmigrated configs.
+   */
+  credRef: z
+    .string()
+    .regex(/^[a-z0-9][a-z0-9._-]{0,63}$/)
+    .optional(),
   fallback: z.string().optional(),
   disabled: z.boolean().optional(),
   // Optional /model-picker category override. When unset, the group is derived:
@@ -309,7 +319,10 @@ export function loadConfig(cwd: string, cliOverrides: Record<string, unknown> = 
   // call — so a merely-cloned repo with a crafted preset would get ZERO-INTERACTION RCE. Drop all of
   // these from every project-file preset; only the benign label/model/group survive, so a repo can still
   // SUGGEST a model without hijacking your credentials or executing code.
-  const PRESET_UNTRUSTED_FIELDS = ['baseUrl', 'apiKey', 'authToken', 'gguf', 'ggufServer', 'ggufArgs', 'ggufPort', 'mlx', 'vllm', 'vllmArgs', 'vllmImage'];
+  // `credRef` is in this list for the same reason as `apiKey`: a project file that could name a
+  // vault slot would let a cloned repo aim YOUR sealed credential at ITS `baseUrl`. The pointer is
+  // not secret, but the ability to choose which secret gets sent is exactly the capability we deny.
+  const PRESET_UNTRUSTED_FIELDS = ['baseUrl', 'apiKey', 'authToken', 'credRef', 'gguf', 'ggufServer', 'ggufArgs', 'ggufPort', 'mlx', 'vllm', 'vllmArgs', 'vllmImage'];
   if (Array.isArray(fromFile.models)) {
     let redacted = 0;
     for (const m of fromFile.models as Array<Record<string, unknown>>) {
@@ -423,10 +436,19 @@ function readEnvOverrides(): Record<string, unknown> {
 export interface ResolveKeyOpts {
   model?: string;
   allowImport?: boolean;
+  /**
+   * An explicit vault slot (a preset's `credRef`). When set, the lookup is vault-ONLY: no env
+   * fallback, no adapter-slot fallback. See `resolveEntryCredential` for why.
+   */
+  slot?: string;
 }
 
 /** API key: env first, then store; with allowImport, subscription/OAuth import may supply a bearer. */
 export function resolveApiKey(provider: string, opts: ResolveKeyOpts = {}): string | undefined {
+  // Slot lookups never fall back. Every custom preset (z.ai, Gemini, Together, local vLLM) shares
+  // the single 'openai' adapter, so a fallback here would hand OPENAI_API_KEY to whatever host the
+  // preset's baseUrl names — disclosing the key to a third party. A miss must stay a miss.
+  if (opts.slot) return getCredential(opts.slot)?.apiKey;
   const envKey =
     provider === 'anthropic'
       ? process.env.ANTHROPIC_API_KEY || getCredential('anthropic')?.apiKey
@@ -450,11 +472,55 @@ export function resolveApiKey(provider: string, opts: ResolveKeyOpts = {}): stri
 }
 
 /** Bearer token: env (ANTHROPIC_AUTH_TOKEN), then the credentials store. */
-export function resolveAuthToken(provider: string): string | undefined {
+export function resolveAuthToken(provider: string, slot?: string): string | undefined {
+  if (slot) return getCredential(slot)?.authToken; // vault-only, same no-fallback rule as above
   if (provider === 'anthropic') {
     return process.env.ANTHROPIC_AUTH_TOKEN || getCredential('anthropic')?.authToken;
   }
   return undefined;
+}
+
+/** Where a resolved model credential came from — useful for `/provider` and doctor output. */
+export type CredSource = 'credRef' | 'inline' | 'provider';
+
+export type EntryCredential =
+  | { ok: true; apiKey?: string; authToken?: string; source: CredSource }
+  | { ok: false; reason: 'locked' | 'missing'; slot: string };
+
+/**
+ * Resolve the credential for one model preset. This is the single place the precedence lives,
+ * replacing four copies of `entry?.apiKey ?? resolveApiKey(...)`.
+ *
+ * Order:
+ *  1. `credRef` → the vault slot, and NOTHING else. If the vault is locked or the slot is empty
+ *     this FAILS rather than falling through — a fall-through would send the generic adapter key
+ *     (or `OPENAI_API_KEY`) to the preset's own `baseUrl`, i.e. disclose your OpenAI key to
+ *     api.z.ai or a LAN box. A visible failure is strictly better than a silent leak.
+ *  2. Inline `apiKey`/`authToken` on the entry — the legacy, pre-migration path. Still honoured
+ *     so an unmigrated config keeps working.
+ *  3. The provider-level resolution (env, then adapter slot) for presets that carry no key.
+ */
+export function resolveEntryCredential(
+  entry: { provider?: string; apiKey?: string; authToken?: string; credRef?: string } | undefined,
+  opts: { vaultIsLocked?: boolean } = {},
+): EntryCredential {
+  const provider = entry?.provider ?? 'openai';
+  if (entry?.credRef) {
+    const slot = entry.credRef;
+    const apiKey = resolveApiKey(provider, { slot });
+    const authToken = resolveAuthToken(provider, slot);
+    if (apiKey || authToken) return { ok: true, apiKey, authToken, source: 'credRef' };
+    return { ok: false, reason: opts.vaultIsLocked ? 'locked' : 'missing', slot };
+  }
+  if (entry?.apiKey || entry?.authToken) {
+    return { ok: true, apiKey: entry.apiKey, authToken: entry.authToken, source: 'inline' };
+  }
+  return {
+    ok: true,
+    apiKey: resolveApiKey(provider),
+    authToken: resolveAuthToken(provider),
+    source: 'provider',
+  };
 }
 
 /** Base URL precedence: explicit (flag/config/global) > env > credentials store. */

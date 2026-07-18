@@ -1,19 +1,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, readFileSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { writeFileSync, existsSync, readFileSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { isolateHome, assertStoreIsolated } from './helpers/isolateHome.js';
 
-// Redirect ~/.shadow to a throwaway HOME BEFORE importing the store (GLOBAL_DIR is derived from
-// homedir() at module load). node --test runs each file in its own process, so this is isolated.
-const HOME = mkdtempSync(join(tmpdir(), 'shadow-home-'));
-process.env.HOME = HOME;
-process.env.USERPROFILE = HOME; // Windows
-const SHADOW = join(HOME, '.shadow');
-mkdirSync(SHADOW, { recursive: true });
+// Redirect ~/.shadow to a throwaway HOME BEFORE importing the store (GLOBAL_DIR is derived
+// from homedir() at module load), and PROVE the redirect took — these tests shred credential
+// files, so a runner that ignores process.env.HOME would destroy a real ~/.shadow.
+// See test/helpers/isolateHome.ts. Run with `npm test`, never `bun test`.
+const { home: HOME, shadowDir: SHADOW } = isolateHome('wire');
 const CREDS = join(SHADOW, 'credentials.json');
 
 const store = await import('../src/state/globalStore.js');
+assertStoreIsolated(store.GLOBAL_DIR, HOME);
 
 test('getCredential prefers the unlocked vault over the plaintext credentials.json', () => {
   writeFileSync(CREDS, JSON.stringify({ anthropic: { apiKey: 'plaintext-key' } }));

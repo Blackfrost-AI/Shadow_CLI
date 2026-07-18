@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react';
 import { render, Box, Text, Static, useApp, useInput, useStdout } from 'ink';
-import { flattenItem, itemIsCollapsible } from './tui/flatten.js';
+import { flattenItem, itemIsCollapsible, computeToolRuns } from './tui/flatten.js';
+import type { ToolRun } from './tui/rows.js';
+import { supportsInlineImages, saveAndOpen } from './util/termImage.js';
 import {
   extractCommittableUnits,
   clampTail,
@@ -51,7 +53,8 @@ import { highlight, type CodeRole } from './util/highlight.js';
 import { Context } from './agent/context.js';
 import type { TodoItem, TodoList } from './agent/todo.js';
 import type { PlanModeState, PlanSnapshot } from './agent/planMode.js';
-import { AgentLoop, type LoopDeps } from './agent/loop.js';
+import { AgentLoop } from './agent/loop.js';
+import { buildLoopDeps } from './agent/loopDeps.js';
 import {
   type ApprovalDecision,
   type ApprovalGate,
@@ -61,7 +64,7 @@ import {
 import { cycleAutonomy, type AutonomyLevel } from './safety/permissions.js';
 import { applyPermissionCommand } from './safety/permissionCmd.js';
 import { isLocalModelTarget } from './safety/offline.js';
-import { familyProfile, resolveParallelTools } from './config/familyProfiles.js';
+import { familyProfile } from './config/familyProfiles.js';
 import { SessionLog } from './state/session.js';
 import { createProvider, type ProviderName } from './provider/index.js';
 import {
@@ -79,9 +82,11 @@ import {
   resolveApiKey,
   resolveAuthToken,
   resolveBaseUrl,
+  resolveEntryCredential,
   type ShadowConfig,
   type ModelEntry,
 } from './config.js';
+import { vaultExists } from './auth/vault.js';
 import {
   addModelPreset,
   defaultModelPatch,
@@ -107,7 +112,7 @@ import {
   type PickerRow,
 } from './util/modelGroups.js';
 import { persistPermissionRules } from './config.js';
-import { GLOBAL_DIR, saveGlobalConfig } from './state/globalStore.js';
+import { GLOBAL_DIR, saveGlobalConfig, vaultUnlocked } from './state/globalStore.js';
 import { exportSession } from './state/chatExport.js';
 import { listResumableSessions, resumeSession } from './state/resume.js';
 import { rewindToTurn } from './state/rewind.js';
@@ -803,7 +808,7 @@ interface BannerLine {
 }
 interface TranscriptBase {
   id: number;
-  kind: 'user' | 'assistant' | 'tool' | 'system' | 'blocked' | 'error' | 'banner' | 'reasoning' | 'finding';
+  kind: 'user' | 'assistant' | 'tool' | 'system' | 'blocked' | 'error' | 'banner' | 'reasoning' | 'finding' | 'image';
   text: string;
   color?: string;
   dimColor?: boolean;
@@ -821,6 +826,9 @@ interface TranscriptBase {
    *  fallback the stock Ink components read, so both paths stay in sync. */
   brand?: BrandInfo;
   tool?: ToolInfo;
+  /** Inline image (/image echo, view_image result, fetched markdown ![](url)). Rendered as a
+   *  durable placeholder + terminal-native pixels when supported (see flatten.ts). */
+  image?: { bytes: string; mediaType: string; alt?: string; source?: string };
   /** Reasoning wall-clock (ms) when known — fold header shows `thought for Ns`. */
   durationMs?: number;
   /** Collaboration Mode: which seat produced this assistant turn (attribution header). */
@@ -1361,6 +1369,7 @@ function FlatItem({
   collapsed,
   continuation = false,
   foldLargeTables = true,
+  toolRun,
 }: {
   item: TranscriptItem;
   cols: number;
@@ -1368,6 +1377,8 @@ function FlatItem({
   continuation?: boolean;
   /** When true (default), GFM tables with many body rows fold to `⌄ table N×M · ^O`. */
   foldLargeTables?: boolean;
+  /** Tool-call stacking descriptor (set only for items in a run of ≥2 consecutive tools). */
+  toolRun?: ToolRun;
 }) {
   const inner = Math.max(20, cols - PAGE_MARGIN * 2);
   const w = item.kind === 'banner' ? inner : Math.min(inner, PROSE_MAX_COLS);
@@ -1378,6 +1389,7 @@ function FlatItem({
     PIN_THEME,
     continuation,
     foldLargeTables,
+    toolRun,
   );
   return (
     <Box flexDirection="column" paddingLeft={PAGE_MARGIN}>
@@ -1770,6 +1782,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     }
   }
 
+  // Ref so pushLine (stable, no deps) can trigger markdown-image scanning without a hook cycle
+  // (scan → pushImage → pushLine). Assigned below where enqueueMdImages is defined.
+  const enqueueMdImagesRef = useRef<(text: string) => void>(() => {});
   const pushLine = useCallback((l: Omit<TranscriptItem, 'id' | 'kind'> & { kind?: TranscriptItem['kind'] }) => {
     const kind = l.kind ?? 'system';
     // Collaboration Mode: while a seat holds the baton, tag its assistant turns with the active
@@ -1781,7 +1796,65 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       committedRef.current = next;
       return next;
     });
+    // Markdown ![](url) in a committed assistant answer → enqueue an inline render. Remote http(s)
+    // is opt-in (SHADOW_FETCH_REMOTE_IMAGES=1); local paths + data: URIs always load. Fire-and-forget.
+    if (kind === 'assistant' && typeof l.text === 'string') enqueueMdImagesRef.current(l.text);
   }, []);
+
+  /** Push an inline-image item to the transcript and handle the display fallback. On a terminal
+   *  that renders inline images, flatten paints the pixels + a durable placeholder. On any other
+   *  terminal, the placeholder still shows AND we auto-open the OS viewer (Preview.app / xdg-open)
+   *  — the grok-cli approach — so the image is always seen. */
+  const pushImage = useCallback((bytes: string, mediaType: string, alt: string, source: string) => {
+    // `text` is the plain-text fallback (export / headless / stock Ink path); the styled flatten
+    // render uses `image` for the placeholder + inline pixels.
+    pushLine({ kind: 'image', text: `🖼 ${alt}`, image: { bytes, mediaType, alt, source } });
+    if (!supportsInlineImages()) void saveAndOpen(Buffer.from(bytes, 'base64'), mediaType, alt);
+  }, [pushLine]);
+
+  // Scan a committed assistant text for markdown images and render each. data: URIs decode locally
+  // (no network); local paths read from disk; remote http(s) fetches ONLY when opted in — Shadow is
+  // privacy-first and must not silently call out to arbitrary URLs a model emits.
+  const enqueueMdImages = useCallback((text: string) => {
+    const re = /!\[([^\]]*)\]\(([^)\s]+)\)/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+      const alt = m[1] || 'image';
+      const url = m[2]!;
+      const dataUri = url.match(/^data:(image\/[a-z+]+);base64,(.*)$/i);
+      if (dataUri) {
+        pushImage(dataUri[2]!, dataUri[1]!, alt, 'markdown');
+        continue;
+      }
+      if (/^https?:\/\//i.test(url)) {
+        if (process.env.SHADOW_FETCH_REMOTE_IMAGES !== '1') continue; // opt-in privacy gate
+        void (async () => {
+          try {
+            const res = await fetch(url);
+            if (!res.ok) return;
+            const buf = Buffer.from(await res.arrayBuffer());
+            const mt = (res.headers.get('content-type') ?? 'image/png').split(';')[0]!.trim();
+            pushImage(buf.toString('base64'), mt, alt, 'markdown');
+          } catch {
+            /* network failure — skip silently */
+          }
+        })();
+        continue;
+      }
+      // Local path (workspace-relative or absolute).
+      void (async () => {
+        try {
+          const abs = isAbsolute(url) ? url : resolve(opts.workspaceRoot, url);
+          const mt = imageMediaType(abs);
+          if (!mt) return;
+          pushImage(readFileSync(abs).toString('base64'), mt, alt, 'markdown');
+        } catch {
+          /* not found / unreadable — skip */
+        }
+      })();
+    }
+  }, [pushImage, opts.workspaceRoot]);
+  enqueueMdImagesRef.current = enqueueMdImages;
 
   /** Print the welcome card ONCE to <Static> (native scrollback), exactly like every other transcript
    *  item — it is deliberately NOT kept as a live, reflowing block. A tall live block sitting above
@@ -2195,7 +2268,16 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
                 isLocal = isLocalServedEntry(entry);
                 let p = entry.provider;
                 let baseUrl = resolveBaseUrl(entry.provider, entry.baseUrl);
-                let apiKey = entry.apiKey ?? resolveApiKey(entry.provider, { model: entry.model });
+                const testCred = resolveEntryCredential(entry, {
+                  vaultIsLocked: vaultExists() && !vaultUnlocked(),
+                });
+                let apiKey = testCred.ok ? testCred.apiKey : undefined;
+                if (!testCred.ok) {
+                  pushLine({
+                    text: `${entry.label}: vault slot "${testCred.slot}" is ${testCred.reason === 'locked' ? 'locked' : 'empty'} — cannot test.`,
+                    color: C.red,
+                  });
+                }
                 if (isLocalServedEntry(entry)) {
                   try {
                     const r = await ensureLocalServer(entry, (m) => pushLine({ text: m, dimColor: true }));
@@ -3157,6 +3239,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             attachmentsRef.current = [...attachmentsRef.current, { type: 'image', mediaType, data }];
             setAttachCount(attachmentsRef.current.length);
             pushLine({ text: `Attached ${arg} — sent with your next message (${attachmentsRef.current.length} queued).`, color: C.green });
+            // Echo the attached image inline so the user sees what they're sending.
+            pushImage(data, mediaType, arg, 'attach');
           } catch (e) {
             pushLine({ text: `Cannot read ${abs}: ${(e as Error).message.split('\n')[0]}`, color: C.red });
           }
@@ -3225,7 +3309,19 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     ): Promise<{ ok: true; client: Provider; provider: ProviderName; model: string } | { ok: false; error: string; fatal?: boolean }> => {
       let provider = entry.provider;
       let baseUrl = resolveBaseUrl(entry.provider, entry.baseUrl);
-      let apiKey = entry.apiKey ?? resolveApiKey(entry.provider);
+      const cred = resolveEntryCredential(entry, { vaultIsLocked: vaultExists() && !vaultUnlocked() });
+      if (!cred.ok) {
+        // Soft failure: the session survives on the current model rather than dying. Falling
+        // through to the adapter key here would send it to this preset's baseUrl.
+        return {
+          ok: false,
+          error: `"${entry.label}" needs the vault slot "${cred.slot}", which is ${
+            cred.reason === 'locked' ? 'locked — unlock the vault to use it.' : 'empty — re-add its key.'
+          }`,
+          fatal: false,
+        };
+      }
+      let apiKey = cred.apiKey;
       const mlxReadyOffline = entry.mlx ? mlxOfflineReady(entry.mlx) : false;
       if (opts.offline && !isLocalModelTarget({ gguf: entry.gguf, mlx: mlxReadyOffline ? entry.mlx : undefined, vllm: entry.vllm, baseUrl })) {
         // A soft refusal (yellow), with the actionable local-model hint preserved verbatim.
@@ -3527,6 +3623,12 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             },
             lines: bodyLines,
           });
+          // view_image returns the image it loaded into model context — echo it inline so the user
+          // can see what the model is looking at (the tool result alone is just a path string).
+          if (e.call.name === 'view_image') {
+            const im = (e.result as { images?: { mediaType: string; data: string }[] }).images?.[0];
+            if (im) pushImage(im.data, im.mediaType, previewOf(e.call.input) || 'view_image', 'view_image');
+          }
           // Rare: both shell capture AND a UI diff on the same call — nest shell above, keep
           // the diff as its own foldable sibling so neither body is dropped.
           if (shellOut.trim() && diff && diff.length) {
@@ -3740,7 +3842,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         opts.cfg.priceTable,
         Date.now(),
       );
-      const deps: LoopDeps = {
+      const deps = buildLoopDeps({
+        cfg: opts.cfg,
         provider: providerRef.current,
         registry: opts.registry,
         gate: gateRef.current!,
@@ -3748,35 +3851,22 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         budget,
         context,
         signal: controller.signal,
+        // LIVE model, resolved per turn — a /model switch changes the family mid-session
+        // and parallelTools is derived from whatever is passed here.
         model: currentRef.current.model,
         system:
           (opts.styleState?.systemForStyle?.(styleRef.current) ?? opts.system) +
           (goalRef.current
             ? `\n\n## Standing goal\nThe user set a standing goal for this session. Keep working toward it until it is met or explicitly cleared; do not consider the task done while it is unmet:\n${goalRef.current}\n`
             : ''),
-        maxOutputTokens: opts.cfg.maxOutputTokens,
-        effort: opts.cfg.effort,
-        cacheTtl: opts.cfg.cacheTtl,
-        fastMode: opts.cfg.fastMode,
         workspaceRoot: opts.workspaceRoot,
         additionalRoots: additionalRootsRef.current,
-        dryRun: opts.cfg.dryRun,
-        maxToolResultChars: opts.cfg.maxToolResultChars,
-        contextBudget: opts.cfg.contextBudget,
         forceConfirm: opts.forceConfirm,
         todoList: opts.todoList,
         planMode: opts.planMode,
-        permissionRules: opts.cfg.permissionRules,
-        autoClassifier: opts.cfg.autoClassifier,
-        hooks: opts.cfg.hooks,
-        models: opts.cfg.models,
-        fallbackModel: opts.cfg.fallbackModel,
-        // Resolved per turn on the LIVE model (a /model switch changes the family mid-session):
-        // explicit config > family profile > global default.
-        parallelTools: resolveParallelTools(opts.cfg, currentRef.current.model),
         streamShell: true,
         sessionLog,
-      };
+      });
       const loop = new AgentLoop(deps, autonomyRef.current);
       loopRef.current = loop;
       try {
@@ -4572,6 +4662,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // is an Ink <Static> that owns the terminal's native scrollback, so the vertical
   // chrome math never clips it; todo/plan render as a pinned block above the composer.
   const layout = computeLayout(terminalSize.cols, terminalSize.rows);
+  // Tool-call stacking: group consecutive committed tools into runs so a tool-heavy turn collapses
+  // to one summary row instead of flooding scrollback. One O(n) pass per render; Ctrl-O expands all.
+  const toolRuns = computeToolRuns(committed, showAllExpanded);
   // ── Turn-HUD frame budget ─────────────────────────────────────────────────────
   // While a turn runs, the live region is a CONSTANT-HEIGHT HUD (fixed stream window + exactly one
   // status line + at most one pinned-tasks line) so the composer never moves mid-turn — the Claude
@@ -4792,6 +4885,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             continuation={item.kind === 'assistant' && index > 0 && committed[index - 1]?.kind === 'assistant'}
             // Ctrl-O expands large GFM tables too (same global fold as tools/reasoning).
             foldLargeTables={!showAllExpanded}
+            // Tool-call stacking: the run descriptor for this item (undefined for lone tools).
+            toolRun={toolRuns.get(index)}
           />
         )}
       </Static>

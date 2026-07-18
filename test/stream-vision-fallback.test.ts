@@ -8,6 +8,9 @@ test('looksLikeVisionUnsupported detects text-only-endpoint image rejections', (
   assert.ok(looksLikeVisionUnsupported('image_url is not supported by this model'));
   assert.ok(looksLikeVisionUnsupported('this model does not support image input'));
   assert.ok(looksLikeVisionUnsupported('invalid content type: image'));
+  // vLLM gateways on text-only custom models
+  assert.ok(looksLikeVisionUnsupported('BLACK-LM is not a multimodal model'));
+  assert.ok(looksLikeVisionUnsupported('Error: model is not a multimodal model'));
 });
 
 test('looksLikeVisionUnsupported does NOT match unrelated 400s (incl. token overflow)', () => {
@@ -38,6 +41,7 @@ test('stripImagesFromBody drops image parts, keeps text, collapses to a string (
   assert.equal(typeof userContent, 'string'); // collapsed
   assert.match(userContent as string, /Loaded image standings\.png/); // text preserved
   assert.match(userContent as string, /image omitted/); // note appended
+  assert.match(userContent as string, /describe_media/); // steer text-only agents to eyes tool
   assert.doesNotMatch(userContent as string, /base64|image_url/); // image gone
 });
 

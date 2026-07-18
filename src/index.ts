@@ -9,9 +9,12 @@ import {
   resolveApiKey,
   resolveAuthToken,
   resolveBaseUrl,
+  resolveEntryCredential,
   type ShadowConfig,
   type ModelEntry,
 } from './config.js';
+import { vaultExists } from './auth/vault.js';
+import { vaultUnlocked } from './state/globalStore.js';
 import { createProvider } from './provider/index.js';
 import { ensureLocalServer, stopGgufServers, ggufServerUp, isLocalServedEntry, MLX_INSTALL_HINT, mlxOfflineReady } from './gguf.js';
 import {
@@ -24,11 +27,11 @@ import {
   LLAMA_INSTALL_HINT,
 } from './local/garage.js';
 import { defaultModelPatch, findModelPreset } from './config/modelPresets.js';
-import { resolveParallelTools } from './config/familyProfiles.js';
 import type { Message } from './provider/provider.js';
 import { ToolRegistry } from './tools/registry.js';
 import { BgRegistry } from './tools/bgShell.js';
 import { runWebOnboard } from './onboard/webOnboard.js';
+import { runWeb, parseWebArgs } from './web/cli.js';
 import { windowsPowerShell } from './update/winShell.js';
 import { ensureVaultReady } from './auth/unlock.js';
 import {
@@ -58,7 +61,8 @@ import { exportSessionFile } from './state/chatExport.js';
 import { EventBus } from './agent/events.js';
 import { Budget } from './agent/budget.js';
 import { Context } from './agent/context.js';
-import { AgentLoop, type LoopDeps } from './agent/loop.js';
+import { AgentLoop } from './agent/loop.js';
+import { buildLoopDeps } from './agent/loopDeps.js';
 import { raiseAutonomy, type AutonomyLevel } from './safety/permissions.js';
 import { makeDenylist } from './safety/denylist.js';
 import { osSandboxStatus } from './safety/sandbox.js';
@@ -646,8 +650,20 @@ async function runDoctorModel(name: string | undefined, cwd: string): Promise<vo
 
   let startProvider = provider;
   let baseUrl = resolveBaseUrl(provider, entry?.baseUrl ?? (provider === cfg.provider ? cfg.baseUrl : undefined));
-  let apiKey = entry?.apiKey ?? resolveApiKey(provider, { model, allowImport });
-  const authToken = entry?.authToken ?? resolveAuthToken(provider);
+  const cred = resolveEntryCredential(entry, { vaultIsLocked: vaultExists() && !vaultUnlocked() });
+  if (!cred.ok) {
+    process.stderr.write(
+      lc.red(
+        `✗ "${entry?.label ?? model}" needs the vault slot "${cred.slot}", which is ` +
+          (cred.reason === 'locked' ? 'locked. Unlock it, or set SHADOW_VAULT_PASSWORD.' : 'empty. Re-add the key.'),
+      ) + '\n',
+    );
+    process.exit(1);
+  }
+  // Slot resolution never falls back to the adapter key, so a miss above cannot leak your
+  // OpenAI key to this preset's baseUrl. allowImport only applies to the provider-level path.
+  let apiKey = cred.source === 'provider' ? resolveApiKey(provider, { model, allowImport }) : cred.apiKey;
+  const authToken = cred.authToken;
 
   if (entry && isLocalServedEntry(entry)) {
     if (entry.gguf && !entry.ggufServer) await ensureLlamaServer(stdout); // offer `brew install llama.cpp` before we try to spawn it
@@ -760,6 +776,11 @@ async function main(): Promise<void> {
       return;
     }
     await runOnboard();
+    return;
+  }
+  if (argv[0] === 'web') {
+    const { port, open } = parseWebArgs(argv.slice(1));
+    await runWeb({ write: (s) => stdout.write(s), port, open });
     return;
   }
   if (argv[0] === 'update') {
@@ -924,8 +945,23 @@ async function main(): Promise<void> {
   // cloud model in the picker uses its OWN key; fall back to provider-level resolution.
   const activeModelEntry =
     lastPicked ?? cfg.models.find((m) => m.provider === cfg.provider && m.model === cfg.model);
-  const apiKey = activeModelEntry?.apiKey ?? resolveApiKey(cfg.provider, { model: cfg.model, allowImport });
-  const authToken = activeModelEntry?.authToken ?? resolveAuthToken(cfg.provider);
+  const activeCred = resolveEntryCredential(activeModelEntry, {
+    vaultIsLocked: vaultExists() && !vaultUnlocked(),
+  });
+  if (!activeCred.ok) {
+    process.stderr.write(
+      lc.red(
+        `✗ "${activeModelEntry?.label ?? cfg.model}" needs the vault slot "${activeCred.slot}", which is ` +
+          (activeCred.reason === 'locked'
+            ? 'locked. Unlock it, or set SHADOW_VAULT_PASSWORD.'
+            : 'empty. Re-add the key with `shadow onboard --web`.'),
+      ) + '\n',
+    );
+    process.exit(1);
+  }
+  const apiKey =
+    activeCred.source === 'provider' ? resolveApiKey(cfg.provider, { model: cfg.model, allowImport }) : activeCred.apiKey;
+  const authToken = activeCred.authToken;
   registerSecret(apiKey); // mask the resolved key/token in all logs + surfaced errors
   registerSecret(authToken);
   const resolvedBaseUrl = resolveBaseUrl(cfg.provider, flags.baseUrl ?? cfg.baseUrl);
@@ -1213,41 +1249,30 @@ async function main(): Promise<void> {
 
   registry.register(
     makeAgentTool({
-      makeLoopDeps: () => ({
-        provider: activeAgentProvider,
-        registry,
-        gate: currentGate,
-        bus,
-        budget: new Budget({ maxIterations: Math.min(cfg.maxIterations, 15) }, activeAgentModel, cfg.priceTable, Date.now()),
-        context: new Context({
-          contextBudget: cfg.contextBudget,
-          triggerRatio: cfg.summarizeTriggerRatio,
-          keepLastTurns: cfg.keepLastTurns,
+      makeLoopDeps: () =>
+        buildLoopDeps({
+          cfg,
+          provider: activeAgentProvider,
+          registry,
+          gate: currentGate,
+          bus,
+          budget: new Budget({ maxIterations: Math.min(cfg.maxIterations, 15) }, activeAgentModel, cfg.priceTable, Date.now()),
+          context: new Context({
+            contextBudget: cfg.contextBudget,
+            triggerRatio: cfg.summarizeTriggerRatio,
+            keepLastTurns: cfg.keepLastTurns,
+          }),
+          signal: new AbortController().signal,
+          // LIVE sub-agent model — parallelTools resolves against this, not cfg.model
+          model: activeAgentModel,
+          system: fullSystem,
+          workspaceRoot,
+          additionalRoots,
+          forceConfirm,
+          todoList,
+          planMode,
+          streamShell: false,
         }),
-        signal: new AbortController().signal,
-        model: activeAgentModel,
-        system: fullSystem,
-        maxOutputTokens: cfg.maxOutputTokens,
-        effort: cfg.effort,
-        cacheTtl: cfg.cacheTtl,
-        fastMode: cfg.fastMode,
-        workspaceRoot,
-        additionalRoots,
-        dryRun: cfg.dryRun,
-        maxToolResultChars: cfg.maxToolResultChars,
-        contextBudget: cfg.contextBudget,
-        forceConfirm,
-        todoList,
-        planMode,
-        permissionRules: cfg.permissionRules,
-        autoClassifier: cfg.autoClassifier,
-        hooks: cfg.hooks,
-        models: cfg.models,
-        fallbackModel: cfg.fallbackModel,
-        // explicit config > family profile > global default (resolved on the LIVE sub-agent model)
-        parallelTools: resolveParallelTools(cfg, activeAgentModel),
-        streamShell: false,
-      }),
       getAutonomy: () => autonomy,
       contextBudget: cfg.contextBudget,
       triggerRatio: cfg.summarizeTriggerRatio,
@@ -1303,7 +1328,8 @@ async function main(): Promise<void> {
       cfg.priceTable,
       Date.now(),
     );
-    const deps: LoopDeps = {
+    const deps = buildLoopDeps({
+      cfg,
       provider,
       registry,
       gate,
@@ -1313,28 +1339,14 @@ async function main(): Promise<void> {
       signal,
       model: cfg.model,
       system: fullSystem,
-      maxOutputTokens: cfg.maxOutputTokens,
-      effort: cfg.effort,
-      cacheTtl: cfg.cacheTtl,
-      fastMode: cfg.fastMode,
       workspaceRoot,
       additionalRoots,
-      dryRun: cfg.dryRun,
-      maxToolResultChars: cfg.maxToolResultChars,
-      contextBudget: cfg.contextBudget,
       forceConfirm,
       todoList,
       planMode,
-      permissionRules: cfg.permissionRules,
-      autoClassifier: cfg.autoClassifier,
-      hooks: cfg.hooks,
-      models: cfg.models,
-      fallbackModel: cfg.fallbackModel,
-      // explicit config > family profile > global default
-      parallelTools: resolveParallelTools(cfg, cfg.model),
       streamShell: !headless,
       sessionLog,
-    };
+    });
     const { stopReason, finalAnswer } = await new AgentLoop(deps, autonomy).run();
     // Headless: an error-class stop — OR a reasoning run that hit the output cap before
     // producing any answer — must exit non-zero so CI/scripts can't mistake a silent failure
