@@ -53,7 +53,10 @@ function writeJsonAtomic(path: string, data: unknown, mode = 0o600): void {
   } catch {
     /* not fatal */
   }
-  const tmp = `${path}.tmp`;
+  // Unique per-process temp path: two processes sharing one `.tmp` interleave writes and
+  // rename spliced JSON into place; readJson's catch then silently returns {} — every model
+  // preset and credRef pointer reads as empty, no error. There is no backup of ~/.shadow.
+  const tmp = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
   writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', { mode });
   chmodSync(tmp, mode); // force perms even if umask widened the create mode
   renameSync(tmp, path);
@@ -66,7 +69,38 @@ export function loadGlobalConfig(): Record<string, unknown> {
 }
 
 export function saveGlobalConfig(patch: Record<string, unknown>): void {
-  writeJsonAtomic(CONFIG_PATH, { ...loadGlobalConfig(), ...patch });
+  ensureShadowLayout();
+  // Merge onto the CURRENT on-disk config — but NEVER onto an accidental {}. If config.json exists
+  // and is non-empty yet fails to parse (a stray comma, a half-written file, an interleaved write),
+  // loadGlobalConfig's readJson catch returns {}, and writing { ...{}, ...patch } is exactly how
+  // every model preset and credRef pointer silently vanishes with no error and no backup. Preserve
+  // the unparseable bytes and REFUSE the save rather than annihilate the user's endpoints.
+  let base: Record<string, unknown> = {};
+  if (existsSync(CONFIG_PATH)) {
+    let raw = '';
+    try {
+      raw = readFileSync(CONFIG_PATH, 'utf8');
+    } catch {
+      /* unreadable — treat as absent and fall through to a fresh write */
+    }
+    if (raw.trim()) {
+      try {
+        base = JSON.parse(raw) as Record<string, unknown>;
+      } catch {
+        const rescue = `${CONFIG_PATH}.corrupt-${Date.now()}`;
+        try {
+          writeFileSync(rescue, raw, { mode: 0o600 });
+        } catch {
+          /* best effort — refuse below regardless */
+        }
+        throw new Error(
+          `refusing to overwrite a corrupt ${CONFIG_PATH} — that would delete every model preset. ` +
+            `Preserved the unparseable file at ${rescue}; fix its JSON, then retry.`,
+        );
+      }
+    }
+  }
+  writeJsonAtomic(CONFIG_PATH, { ...base, ...patch });
 }
 
 /** Secrets decrypted from the vault for THIS session (set by the unlock flow at startup). When set,

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync, writeFileSync, unlinkSync, renameSync, chmodSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -144,4 +144,91 @@ export function resolveAgentDef(type: string, workspaceRoot: string): AgentDef |
     if (def.name.toLowerCase() === key) return def;
   }
   return null;
+}
+
+// ── write side (web UI / future `shadow agent` CLI) ──────────────────────────
+
+/**
+ * Names that may never be written or deleted — they are hardcoded built-ins. A user can still
+ * shadow `explore` by dropping a file in the agents dir (the loader prefers user files), but
+ * the write API refuses to touch the reserved names so the built-ins always remain restorable.
+ */
+const BUILTIN_NAMES = new Set(['explore', 'reviewer']);
+
+/** Validate an agent name. Matches the credRef slug rule so filenames stay filesystem-safe. */
+export function isValidAgentName(name: string): boolean {
+  return /^[a-z0-9][a-z0-9._-]{0,63}$/.test(name);
+}
+
+/** Light tool-name validation: lowercase snake_case. Existence is enforced later by the registry. */
+export function isValidToolName(name: string): boolean {
+  return /^[a-z][a-z0-9_]*$/.test(name) && name.length <= 64;
+}
+
+/**
+ * Serialize an AgentDef back to the markdown-with-frontmatter form `parseFrontmatter` reads.
+ * Round-trips: save → load yields the same def. The body is the systemPrompt; scalar fields
+ * go in YAML frontmatter; tools is a YAML list.
+ */
+export function serializeAgentDef(def: AgentDef): string {
+  const lines: string[] = ['---'];
+  lines.push(`name: ${def.name}`);
+  lines.push(`description: ${def.description}`);
+  if (def.model) lines.push(`model: ${def.model}`);
+  if (def.maxIterations !== undefined) lines.push(`maxIterations: ${def.maxIterations}`);
+  if (def.tools.length > 0) {
+    lines.push('tools:');
+    for (const t of def.tools) lines.push(`  - ${t}`);
+  } else {
+    // An empty tools list would make coerceDef reject it on reload; emit a sentinel that
+    // rounds back to []. We don't write such files in practice (the API requires ≥1 tool).
+    lines.push('tools: []');
+  }
+  lines.push('---');
+  lines.push('');
+  lines.push(def.systemPrompt);
+  return `${lines.join('\n')}\n`;
+}
+
+/** The user-global agents dir. Writes go here (workspace-local is read-only for now). */
+function globalAgentsDir(): string {
+  return join(homedir(), '.shadow', 'agents');
+}
+
+/**
+ * Persist an agent definition to `~/.shadow/agents/<name>.md`. Atomic: temp file + chmod 0600
+ * + rename, mirroring `writeJsonAtomic` in globalStore. Refuses builtin names. Returns the
+ * path written, or throws on invalid input.
+ */
+export function saveAgentDef(def: AgentDef): string {
+  if (!isValidAgentName(def.name)) {
+    throw new Error(`Invalid agent name "${def.name}". Use lowercase letters, digits, . _ -, max 64 chars.`);
+  }
+  if (BUILTIN_NAMES.has(def.name)) {
+    throw new Error(`"${def.name}" is a built-in agent and cannot be overwritten.`);
+  }
+  if (!def.description.trim()) throw new Error('description is required');
+  if (!def.systemPrompt.trim()) throw new Error('systemPrompt is required');
+  if (!def.tools.every(isValidToolName)) {
+    throw new Error('tools must be snake_case names (e.g. read_file, grep, run_shell)');
+  }
+
+  const dir = globalAgentsDir();
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const path = join(dir, `${def.name}.md`);
+  const tmp = `${path}.tmp`;
+  writeFileSync(tmp, serializeAgentDef(def), { mode: 0o600 });
+  chmodSync(tmp, 0o600);
+  renameSync(tmp, path);
+  return path;
+}
+
+/** Delete `~/.shadow/agents/<name>.md`. Returns true if a file was removed. Refuses builtins. */
+export function deleteAgentDef(name: string): boolean {
+  if (!isValidAgentName(name)) throw new Error(`Invalid agent name "${name}".`);
+  if (BUILTIN_NAMES.has(name)) throw new Error(`"${name}" is a built-in agent and cannot be deleted.`);
+  const path = join(globalAgentsDir(), `${name}.md`);
+  if (!existsSync(path)) return false;
+  unlinkSync(path);
+  return true;
 }

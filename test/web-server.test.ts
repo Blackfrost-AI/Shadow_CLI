@@ -37,10 +37,16 @@ async function collect(res: Response, want: number, timeoutMs = 3000): Promise<s
     const { value, done } = await reader.read();
     if (done) break;
     buf += dec.decode(value, { stream: true });
-    for (const line of buf.split('\n')) {
+    // Consume only COMPLETE lines. The previous version split the whole buffer each read and
+    // pushed the trailing element too — which is the partial tail of a frame still arriving,
+    // so any frame larger than one read arrived truncated and failed to JSON.parse. It also
+    // re-split a growing buffer on every read, which is quadratic on large frames.
+    let idx: number;
+    while ((idx = buf.indexOf('\n')) !== -1) {
+      const line = buf.slice(0, idx);
+      buf = buf.slice(idx + 1);
       if (line.startsWith('data: ')) out.push(line.slice(6));
     }
-    buf = buf.slice(buf.lastIndexOf('\n') + 1);
   }
   await reader.cancel().catch(() => {});
   return out;
@@ -162,4 +168,194 @@ test('close() ends the stream and drops subscribers', async () => {
   await h.close();
   assert.equal(h.clients(), 0);
   await res.body?.cancel().catch(() => {});
+});
+
+// ── W8: redaction, transcript snapshot, token hygiene ────────────────────────────────────
+
+test('SSE redacts secrets — the live stream must not leak more than the session log', async () => {
+  // redact() ran only in SessionLog, so the wire carried tool args, shell output and file
+  // contents unscrubbed while the file on disk was clean. Redaction now happens at the
+  // bus→wire boundary, which covers every consumer of the stream.
+  await withServer(async (h, bus) => {
+    const res = await fetch(`http://127.0.0.1:${h.port}/events?t=${h.token}`);
+    const deadline = Date.now() + 2000;
+    while (h.clients() === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+
+    bus.emit({ type: 'shell_output', callId: 'c1', stream: 'stdout', chunk: 'export KEY=sk-abcdef0123456789abcdef' });
+    bus.emit({ type: 'error', message: 'auth failed for Bearer abcdef0123456789abcdef' });
+
+    const frames = await collect(res, 2);
+    const blob = frames.join('\n');
+    assert.ok(!blob.includes('sk-abcdef0123456789abcdef'), 'an sk- key must not reach the browser');
+    assert.ok(!blob.includes('Bearer abcdef0123456789abcdef'), 'a bearer token must not reach the browser');
+  });
+});
+
+test('the session token itself is redacted from event payloads', async () => {
+  // registerSecret(token) at mint time: the agent runs on the same host and can read its own
+  // output back, so an unregistered token would be a self-disclosure path.
+  await withServer(async (h, bus) => {
+    const res = await fetch(`http://127.0.0.1:${h.port}/events?t=${h.token}`);
+    const deadline = Date.now() + 2000;
+    while (h.clients() === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+
+    bus.emit({ type: 'error', message: `leaked the session token: ${h.token}` });
+    const frames = await collect(res, 1);
+    assert.ok(!frames.join('').includes(h.token), 'the session token must be scrubbed from events');
+  });
+});
+
+test('GET /api/transcript returns buffered history so a refresh is not a blank page', async () => {
+  await withServer(async (h, bus) => {
+    bus.emit({ type: 'text', delta: 'first' });
+    bus.emit({ type: 'text', delta: 'second' });
+    // Let the (non-shell) events flush through synchronously.
+    const r = await fetch(`http://127.0.0.1:${h.port}/api/transcript?t=${h.token}`);
+    assert.equal(r.status, 200);
+    const body = (await r.json()) as { events: { id: number; event: { type: string; delta?: string } }[]; lastEventId: number };
+    const deltas = body.events.filter((e) => e.event.type === 'text').map((e) => e.event.delta);
+    assert.deepEqual(deltas, ['first', 'second']);
+    assert.ok(body.lastEventId >= 2, 'reports the highest event id');
+  });
+});
+
+test('the coalescer flushes early instead of growing one unbounded frame', async () => {
+  // Without a size cap, `yes`-style output accumulates the whole 50ms window into a single
+  // frame that is stringified once and retained 500 deep in the replay ring.
+  await withServer(async (h, bus) => {
+    const res = await fetch(`http://127.0.0.1:${h.port}/events?t=${h.token}`);
+    const deadline = Date.now() + 2000;
+    while (h.clients() === 0 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+
+    // 128KB in one tick = exactly two 64KB early flushes. Sized so the reader below consumes
+    // the stream completely — cancelling mid-body leaves the server writing into a dead socket
+    // and close() then waits on it.
+    const chunk = 'x'.repeat(16 * 1024);
+    for (let i = 0; i < 8; i++) bus.emit({ type: 'shell_output', callId: 'c1', stream: 'stdout', chunk });
+
+    const frames = await collect(res, 2);
+    assert.ok(frames.length >= 2, 'a large burst produces multiple frames, not one giant one');
+    for (const f of frames) {
+      const ev = JSON.parse(f) as { chunk?: string };
+      if (ev.chunk) assert.ok(ev.chunk.length <= 128 * 1024, `frame stayed bounded (${ev.chunk.length})`);
+    }
+  });
+});
+
+test('the launch URL uses fragment handoff so the token never reaches the server', async () => {
+  await withServer(async (h) => {
+    assert.ok(h.url.includes('#t='), h.url);
+    assert.ok(!h.url.includes('?t='), 'no query-string token in the advertised URL');
+  });
+});
+
+// ── W13: per-server router context + readJsonBody ────────────────────────────────────────
+
+test('an empty POST body is handled, not a post-resolution rejection', async () => {
+  // readJsonBody used to resolve(null) on an empty body and then fall through to
+  // JSON.parse('') and call reject() on an already-settled promise. Settled promises ignore
+  // that, so the bug was invisible — until a route that legitimately accepts an empty body
+  // starts being hit. The route must simply see null and answer 400.
+  await withServer(async (h) => {
+    const r = await fetch(`http://127.0.0.1:${h.port}/api/agents`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${h.token}`, 'content-type': 'application/json' },
+      body: '',
+    });
+    assert.equal(r.status, 400, 'empty body is a clean 400');
+    assert.match(await r.text(), /invalid body/);
+  });
+});
+
+test('two servers in one process have independent routers', async () => {
+  // Routes used to live in a module-level array populated at import time, so a second server
+  // shared (and re-registered into) the first one's table, and route state leaked between
+  // tests depending on import order.
+  const busA = new EventBus();
+  const busB = new EventBus();
+  const a = await startWebServer({ bus: busA });
+  const b = await startWebServer({ bus: busB });
+  try {
+    assert.notEqual(a.port, b.port);
+    assert.notEqual(a.token, b.token, 'each server mints its own token');
+
+    // Each answers on its own port with its OWN token, and rejects the other's.
+    const okA = await rawGet(a.port, '/api/state', { host: `127.0.0.1:${a.port}`, authorization: `Bearer ${a.token}` });
+    const okB = await rawGet(b.port, '/api/state', { host: `127.0.0.1:${b.port}`, authorization: `Bearer ${b.token}` });
+    assert.equal(okA.status, 200);
+    assert.equal(okB.status, 200);
+
+    const crossed = await rawGet(b.port, '/api/state', { host: `127.0.0.1:${b.port}`, authorization: `Bearer ${a.token}` });
+    assert.equal(crossed.status, 401, "server B rejects server A's token");
+  } finally {
+    await a.close();
+    await b.close();
+  }
+});
+
+test('the API acts on the workspace it was given, not process.cwd()', async () => {
+  // The workspace is now server context rather than a global read at call time, which is what
+  // makes a per-session workspace possible later.
+  const bus = new EventBus();
+  const h = await startWebServer({ bus, workspaceRoot: '/tmp' });
+  try {
+    const r = await rawGet(h.port, '/api/state', { host: `127.0.0.1:${h.port}`, authorization: `Bearer ${h.token}` });
+    assert.equal(r.status, 200);
+    // Built-ins are always present regardless of workspace; the point is it did not throw and
+    // resolved agents against the supplied root.
+    const snap = JSON.parse(r.body) as { agents: { name: string }[] };
+    assert.ok(snap.agents.some((a) => a.name === 'explore'));
+  } finally {
+    await h.close();
+  }
+});
+
+// ── C3: session registry, ?session=, normalized path ─────────────────────────────────────
+
+test('GET /api/sessions lists the reserved cli session (origin local when there is no mirror)', async () => {
+  await withServer(async (h) => {
+    const r = await rawGet(h.port, `/api/sessions?t=${h.token}`, { host: `127.0.0.1:${h.port}` });
+    assert.equal(r.status, 200);
+    const body = JSON.parse(r.body) as {
+      sessions: Array<{ id: string; origin: string; canPrompt: boolean; canInterrupt: boolean }>;
+    };
+    assert.equal(body.sessions.length, 1, 'exactly the reserved session');
+    assert.equal(body.sessions[0]!.id, 'cli');
+    assert.equal(body.sessions[0]!.origin, 'local', 'no mirror opts → inert local placeholder');
+    assert.equal(body.sessions[0]!.canPrompt, false, 'the mirror is observed, never driven');
+  });
+});
+
+test('/events and /api/transcript 404 an unknown ?session= id', async () => {
+  await withServer(async (h) => {
+    const ev = await rawGet(h.port, `/events?session=nope&t=${h.token}`, { host: `127.0.0.1:${h.port}` });
+    assert.equal(ev.status, 404, 'unknown session → 404 before the SSE head is written');
+    const tr = await rawGet(h.port, `/api/transcript?session=nope&t=${h.token}`, { host: `127.0.0.1:${h.port}` });
+    assert.equal(tr.status, 404);
+  });
+});
+
+test('a duplicated ?session= takes the first value (split-parse hardening)', async () => {
+  await withServer(async (h) => {
+    const first = await rawGet(h.port, `/api/transcript?session=cli&session=nope&t=${h.token}`, {
+      host: `127.0.0.1:${h.port}`,
+    });
+    assert.equal(first.status, 200, 'first value cli wins');
+    const second = await rawGet(h.port, `/api/transcript?session=nope&session=cli&t=${h.token}`, {
+      host: `127.0.0.1:${h.port}`,
+    });
+    assert.equal(second.status, 404, 'first value nope wins → unknown');
+  });
+});
+
+test('isPublicPath is computed on the same NORMALIZED path the router dispatches on', async () => {
+  // %2e%2e is '..'; new URL collapses /assets/../api/state → /api/state, which is NOT a public
+  // asset, so the token is required and the request dispatches to /api/state (not a 404 asset).
+  // This equality — auth and dispatch reading one normalized string — is the whole safety property.
+  await withServer(async (h) => {
+    const noTok = await rawGet(h.port, `/assets/%2e%2e/api/state`, { host: `127.0.0.1:${h.port}` });
+    assert.equal(noTok.status, 401, 'traversal normalized to /api/state → token required, not served ungated');
+    const withTok = await rawGet(h.port, `/assets/%2e%2e/api/state?t=${h.token}`, { host: `127.0.0.1:${h.port}` });
+    assert.equal(withTok.status, 200, 'and with a token it dispatches to /api/state');
+  });
 });

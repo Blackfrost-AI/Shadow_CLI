@@ -16,7 +16,7 @@ import type { ApprovalRequest } from '../src/agent/approval.js';
 function fakeRl(answer: string): ReadlineInterface {
   return { question: async () => answer } as unknown as ReadlineInterface;
 }
-const REQ: ApprovalRequest = { kind: 'permission', call: { id: '1', name: 'run_shell', input: {} }, risk: 'exec', reason: 'r', preview: '$ ls' };
+const REQ: ApprovalRequest = { id: 'ap_test_1', kind: 'permission', call: { id: '1', name: 'run_shell', input: {} }, risk: 'exec', reason: 'r', preview: '$ ls' };
 
 test('ReplGate maps y/n/a to approve/deny/raise-autonomy', async () => {
   assert.equal(await new ReplGate(fakeRl('y'), () => 'full').request(REQ), 'approve');

@@ -10,6 +10,11 @@ import type { PlanSnapshot } from './planMode.js';
  */
 export type LoopEvent =
   | { type: 'mode'; mode: 'thinking' | 'acting' | 'idle' }
+  // The user's own turn. Emitted by the SUBMIT sites (tui.tsx, index.ts), not by the loop —
+  // the loop receives a Message, not a keystroke, and by then the text is already history.
+  // Exists so a non-terminal renderer (the `--web` mirror) can show the question as well as
+  // the answer; the TUI and headless renderers ignore it because they echo input locally.
+  | { type: 'user'; text: string }
   | { type: 'text'; delta: string } // streamed assistant answer
   | { type: 'thinking'; delta: string } // streamed extended-reasoning text
   | { type: 'reasoning_done'; text: string } // committed collapsible reasoning block

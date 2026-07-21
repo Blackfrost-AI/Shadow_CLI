@@ -11,7 +11,8 @@ import { isFallbackEligible, resolveFallbackModel } from '../provider/fallback.j
 import type { UserQuestion } from './approval.js';
 import { askUserInputSchema } from '../tools/askUser.js';
 import type { ModelEntry } from '../config.js';
-import type { ApprovalGate } from './approval.js';
+import type { ApprovalGate, ApprovalRequest, ApprovalDecision } from './approval.js';
+import { settleWithAbort, nextApprovalId } from './approval.js';
 import type { EventBus, StopReasonExt } from './events.js';
 import type { Budget } from './budget.js';
 import type { Context } from './context.js';
@@ -108,6 +109,16 @@ export class AgentLoop {
     this.effort = deps.effort ?? DEFAULT_EFFORT;
     this.now = deps.now ?? Date.now;
   }
+
+  /**
+   * Every approval goes through here so all four call sites get an id and an abort race for
+   * free. See settleWithAbort in approval.ts for why the race is not optional.
+   */
+  private requestApproval(req: Omit<ApprovalRequest, 'id' | 'signal'>): Promise<ApprovalDecision> {
+    const full: ApprovalRequest = { ...req, id: nextApprovalId(), signal: this.deps.signal };
+    return settleWithAbort(this.deps.gate.request(full), this.deps.signal);
+  }
+
 
   setAutonomy(level: AutonomyLevel): void {
     this.autonomy = level;
@@ -647,7 +658,7 @@ export class AgentLoop {
         this.emitToolEnd(call, result);
         return { block: this.resultBlock(call.id, true, this.serialize(result)), isFatal: false };
       }
-      const decision = await this.deps.gate.request({
+      const decision = await this.requestApproval({
         kind: 'plan_enter',
         call,
         risk: tool.risk,
@@ -677,7 +688,7 @@ export class AgentLoop {
     if (call.name === 'ask_user_question') {
       const parsed = askUserInputSchema.safeParse(call.input);
       if (!parsed.success) return this.invalidInput(call, tool.risk, formatZodError(call.name, parsed.error));
-      const decision = await this.deps.gate.request({
+      const decision = await this.requestApproval({
         kind: 'user_question',
         call,
         risk: tool.risk,
@@ -793,7 +804,7 @@ export class AgentLoop {
         !bashReadOnlyAllow &&
         (ruleAsk || classifierAsk || needsApproval(tool.risk, this.autonomy)))
     ) {
-      const decision = await this.deps.gate.request({
+      const decision = await this.requestApproval({
         kind: 'permission',
         call,
         risk: tool.risk,
@@ -923,7 +934,7 @@ export class AgentLoop {
     if (call.name === 'plan_write' || isPlanModeReadLikeCall(call)) return null;
 
     if (call.name === 'exit_plan_mode') {
-      const decision = await this.deps.gate.request({
+      const decision = await this.requestApproval({
         kind: 'plan_exit',
         call,
         risk: 'write',

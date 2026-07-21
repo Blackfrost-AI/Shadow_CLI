@@ -35,6 +35,14 @@ export type ApprovalDecision =
   | { approveForPrefix: string };
 
 export interface ApprovalRequest {
+  /**
+   * Identifies THIS pending request. Terminal gates never needed one — there is exactly one
+   * prompt on screen and the human answering it is the human who was asked. Over HTTP neither
+   * holds: two tabs can be open, and a decision arrives as a separate request that must name
+   * what it is deciding. Without an id a handler can only resolve "whatever is pending", which
+   * becomes an authorization hole the moment the decision is `approveForPrefix`.
+   */
+  id: string;
   kind: ApprovalKind;
   call: ToolCall;
   risk: ToolRisk;
@@ -42,10 +50,48 @@ export interface ApprovalRequest {
   preview: string;
   /** Populated when kind === 'user_question'. */
   questions?: UserQuestion[];
+  /**
+   * Aborts when the turn is interrupted. A gate that can wait indefinitely (a browser tab, a
+   * terminal prompt) should stop waiting when this fires. The loop also races it — see
+   * `settleWithAbort` — so a gate that ignores it still cannot hang the turn.
+   */
+  signal?: AbortSignal;
 }
 
 export interface ApprovalGate {
   request(req: ApprovalRequest): Promise<ApprovalDecision>;
+}
+
+/**
+ * Resolve `p`, or 'deny' if `signal` aborts first.
+ *
+ * Every `gate.request(...)` in the loop used to be a bare await racing nothing, which meant
+ * interrupt did not work during an approval AT ALL. In the TUI this is visible today: while a
+ * prompt is pending the key handler intercepts every key and never reaches the ESC/Ctrl-C abort
+ * path, so the only way out of a stuck approval is killing the process. A browser console makes
+ * it worse, because pending-approval is its DEFAULT state at manual autonomy — a closed tab
+ * would park the turn forever.
+ *
+ * Denying on abort (rather than rejecting) keeps the loop's existing control flow: every call
+ * site already handles a denial, and an interrupted turn should not run the tool.
+ */
+export function settleWithAbort(p: Promise<ApprovalDecision>, signal?: AbortSignal): Promise<ApprovalDecision> {
+  if (!signal) return p;
+  if (signal.aborted) return Promise.resolve('deny');
+  return new Promise<ApprovalDecision>((resolve) => {
+    const onAbort = (): void => resolve('deny');
+    signal.addEventListener('abort', onAbort, { once: true });
+    void p
+      .then(resolve, () => resolve('deny'))
+      .finally(() => signal.removeEventListener('abort', onAbort));
+  });
+}
+
+/** Mint an approval id. Unique per process; the browser only needs to match it back. */
+let approvalSeq = 0;
+export function nextApprovalId(): string {
+  approvalSeq += 1;
+  return `ap_${approvalSeq.toString(36)}_${Math.trunc(performance.now()).toString(36)}`;
 }
 
 /** Test/M0 gate: returns scripted decisions in order; defaults to a fallback. */

@@ -36,6 +36,30 @@ export interface AuthFailure {
 }
 export type AuthResult = { ok: true } | AuthFailure;
 
+export interface AuthOptions {
+  /**
+   * When false, Host and Origin are still enforced but the session token is not required.
+   *
+   * This exists for one narrow case: the static `/assets/*` tree. An external ES module
+   * cannot send an `Authorization` header, and — the part that bit us — a module's relative
+   * import resolves against the *module URL* and drops its query string, so stamping `?t=`
+   * onto the entry point does not carry to `import './api.js'`. Every such import arrived
+   * tokenless, 401'd, and killed the module graph on the first line, stranding the page on
+   * "Loading…" forever.
+   *
+   * Serving those files without a token is safe because they are inert, non-secret UI source
+   * — the same bytes published in the public repo. The token's job is protecting `/api/*` and
+   * `/events`, which carry configuration, credentials-by-reference and live agent output;
+   * those still require it. Host and Origin validation (the DNS-rebinding defense) applies to
+   * assets exactly as before.
+   *
+   * Deliberately NOT solved with a session cookie: cookies ignore port, so a `127.0.0.1`
+   * cookie is sent to every other local service the browser visits, handing the token to any
+   * of them. Ungated inert assets leak nothing.
+   */
+  requireToken?: boolean;
+}
+
 /** Split a `Host`/`Origin` authority into name + port, tolerating IPv6 brackets. */
 function splitAuthority(authority: string): { name: string; port?: string } {
   if (authority.startsWith('[')) {
@@ -114,6 +138,7 @@ export function extractToken(headers: Record<string, string | string[] | undefin
 export function authorizeRequest(
   req: { headers: Record<string, string | string[] | undefined>; url?: string },
   ctx: AuthContext,
+  opts: AuthOptions = {},
 ): AuthResult {
   const host = req.headers['host'];
   if (!isAllowedHost(Array.isArray(host) ? host[0] : host, ctx.port)) {
@@ -123,10 +148,30 @@ export function authorizeRequest(
   if (!isAllowedOrigin(Array.isArray(origin) ? origin[0] : origin, ctx.port)) {
     return { ok: false, status: 403, error: 'bad origin' };
   }
+  if (opts.requireToken === false) return { ok: true };
   if (!tokenMatches(extractToken(req.headers, req.url), ctx.token)) {
     return { ok: false, status: 401, error: 'unauthorized' };
   }
   return { ok: true };
+}
+
+/**
+ * Paths served without a session token (Host/Origin still enforced): the inert static asset
+ * tree, and the shell document itself.
+ *
+ * The shell is public because the launch URL now hands the token over as a URL *fragment*
+ * (`#t=…`), which browsers never transmit — that is the point, it keeps the token out of
+ * request logs and out of anything that records URLs. A gated `/` is therefore impossible to
+ * combine with fragment handoff: the server cannot see the credential it would be checking.
+ *
+ * Nothing is given away by this. Since the shell stopped being per-session (no token is
+ * stamped into it), every session is served byte-identical HTML that names two asset paths.
+ * The data — config, credentials-by-reference, live agent output — lives behind `/api/*` and
+ * `/events`, which still require the token.
+ */
+export function isPublicPath(method: string | undefined, path: string): boolean {
+  if (method !== 'GET') return false;
+  return path === '/' || path.startsWith('/assets/');
 }
 
 /** Response headers for every reply: no framing, no sniffing, no referrer, no outbound anything. */
@@ -137,6 +182,10 @@ export const SEC_HEADERS: Record<string, string> = {
   'Cache-Control': 'no-store',
   // No remote origins of any kind — the page is fully self-contained, which is also what
   // makes "watch it phone home to no one" checkable rather than a claim.
+  //
+  // `script-src 'self' 'unsafe-inline'`: 'self' allows the external ES module graph served
+  // from /assets/* (the shell loads via <script type="module" src="/assets/app.js">); 'unsafe-inline'
+  // is retained for any inline fallback. Neither permits a remote origin.
   'Content-Security-Policy':
-    "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src data:; connect-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'",
+    "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src data:; connect-src 'self'; form-action 'none'; base-uri 'none'; frame-ancestors 'none'",
 };

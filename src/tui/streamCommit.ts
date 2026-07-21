@@ -3,6 +3,9 @@
 // without booting React.
 
 import { parseMarkdown, isTableSeparator, FENCE as MD_FENCE, LIST_ITEM as MD_LIST_ITEM, QUOTE as MD_QUOTE } from '../util/markdown.js';
+// dupKey/repeatStep moved to src/util/repeat.ts so the web console can share them
+// (src/util is the only tree tsconfig.web.json transpiles to browser ESM).
+export { dupKey, repeatStep } from '../util/repeat.js';
 
 /**
  * Split an accumulating markdown stream into completed top-level blocks plus the
@@ -87,39 +90,6 @@ function isBlockUnit(text: string): boolean {
 export function stripTrailingNewlines(text: string): string {
   return text.replace(/[\r\n]+$/, '');
 }
-/** Normalize an assistant block to letters+digits (lowercased) for duplicate detection — so a
- *  repeat that differs only by a trailing emoji, punctuation, or whitespace still matches. */
-export function dupKey(text: string): string {
-  return text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
-}
-/**
- * TURN-SCOPED verbatim-repeat detection for assistant blocks. Weak local models re-emit their whole
- * answer (which may be MULTIPLE blocks) verbatim in one generation. `run` is the ordered dupKeys of
- * assistant blocks committed THIS turn; `pos` is the position inside a detected repeat (0 = not in
- * one). Given the next block's dupKey, returns whether to SUPPRESS it and the new (run, pos).
- *
- * Only WHOLE-block exact (normalized) matches count — no prefix fuzz — so legitimate content is
- * never silently dropped, and the scope is the current turn only, so an identical short answer in a
- * LATER turn ("Done.") still commits. Blocks shorter than 12 normalized chars are never deduped.
- * This replaces isDuplicateBlock, which (a) compared only against the single most-recent block so a
- * multi-block repeat printed twice, and (b) matched across ALL turns + used an 0.8 prefix, dropping
- * legitimate content (a blank turn).
- */
-export function repeatStep(run: string[], pos: number, key: string): { suppress: boolean; run: string[]; pos: number } {
-  if (key.length < 12) return { suppress: false, run: [...run, key], pos: 0 };
-  if (pos > 0) {
-    if (run[pos] === key) {
-      const next = pos + 1;
-      return { suppress: true, run, pos: next >= run.length ? 0 : next };
-    }
-    return { suppress: false, run: [...run, key], pos: 0 }; // repeat broken → real new content
-  }
-  if (run.length > 0 && run[0] === key) {
-    return { suppress: true, run, pos: run.length > 1 ? 1 : 0 }; // the answer is restarting
-  }
-  return { suppress: false, run: [...run, key], pos: 0 };
-}
-
 /** Does this text START with a distinct markdown block? Used by the leftover-commit sites
  *  (assistant_done / stop / error teardown) to space a block leftover correctly. */
 export function leadsWithBlock(text: string): boolean {

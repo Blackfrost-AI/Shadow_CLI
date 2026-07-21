@@ -32,6 +32,7 @@ import { ToolRegistry } from './tools/registry.js';
 import { BgRegistry } from './tools/bgShell.js';
 import { runWebOnboard } from './onboard/webOnboard.js';
 import { runWeb, parseWebArgs } from './web/cli.js';
+import { runLock, CLI_HOLDER } from './web/runLock.js';
 import { windowsPowerShell } from './update/winShell.js';
 import { ensureVaultReady } from './auth/unlock.js';
 import {
@@ -63,6 +64,7 @@ import { Budget } from './agent/budget.js';
 import { Context } from './agent/context.js';
 import { AgentLoop } from './agent/loop.js';
 import { buildLoopDeps } from './agent/loopDeps.js';
+import { createAgentSession } from './agent/bootstrap.js';
 import { raiseAutonomy, type AutonomyLevel } from './safety/permissions.js';
 import { makeDenylist } from './safety/denylist.js';
 import { osSandboxStatus } from './safety/sandbox.js';
@@ -70,6 +72,7 @@ import { evaluateOffline, isLocalBaseUrl, OFFLINE_BANNER } from './safety/offlin
 import type { ToolCall } from './provider/provider.js';
 import { Logger } from './util/logger.js';
 import { registerSecret } from './util/redact.js';
+import { lc } from './util/lc.js';
 import { createInterface } from 'node:readline/promises';
 import { AutoApproveGate, AutoDenyGate, type ApprovalGate } from './agent/approval.js';
 import { ReplGate } from './replGate.js';
@@ -90,13 +93,13 @@ import { buildPrivacyReport, gatherPrivacyEnv, formatPrivacyReport, type Privacy
 import { DEV_UNRESTRICTED, resolveUnrestricted } from './buildProfile.js';
 import { runTui, attachRenderer } from './tui.js';
 import { runOnboard } from './onboard/onboard.js';
-import { fileURLToPath } from 'node:url';
+import { INSTALL_DIR } from './installDir.js';
 import { resolveSystem } from './system/resolveSystem.js';
 import { runHookPhase } from './hooks/runner.js';
 import { parseArgs } from './cli/flags.js';
 
-/** The install dir (package root) — works whether running from dist/ or tsx on src/. */
-const INSTALL_DIR = fileURLToPath(new URL('..', import.meta.url));
+// INSTALL_DIR (package root) is imported from ./installDir.js at the top — its own module so
+// src/web/* can share it without pulling in this file's top-level main().
 /** Single source of truth: the version comes from package.json, never hard-coded.
  * The compiled single-file binary has no package.json on disk, so the build injects
  * the version via `--define process.env.SHADOW_BUILD_VERSION=...` (see scripts/build-binary.sh). */
@@ -203,68 +206,6 @@ function helpText(): string {
   ].join('\n');
 }
 
-/**
- * The environment block injected into the system prompt each session. The model
- * is amnesiac — it knows nothing about the machine unless the harness tells it.
- * cwd/OS/shell/date (+ git branch, best-effort) so it acts with context.
- */
-function buildEnvBlock(
-  workspaceRoot: string,
-  additionalRoots: string[] = [],
-  guard: { yolo?: boolean; noSandbox?: boolean; unrestricted?: boolean; offline?: boolean } = {},
-): string {
-  const lines = [
-    `- **working directory (cwd): ${workspaceRoot}** — run_shell runs here, relative paths resolve here, and scratch/output files belong here (NOT /tmp).`,
-    `- os: ${process.platform} (${process.arch})`,
-    process.platform === 'win32'
-      ? `- shell: PowerShell — use PowerShell syntax.`
-      : `- shell: ${process.env.SHELL ?? '/bin/sh'} — a POSIX shell. Use bash/sh syntax (ls, cat, grep), NOT PowerShell/pwsh or cmdlets. Quote any path that contains spaces.`,
-    `- date: ${new Date().toISOString()}`,
-  ];
-  if (additionalRoots.length) lines.push(`- also readable/writable (outside cwd): ${additionalRoots.join(', ')}`);
-  try {
-    const branch = execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
-      cwd: workspaceRoot,
-      timeout: 1000,
-      stdio: ['ignore', 'pipe', 'ignore'],
-    })
-      .toString()
-      .trim();
-    if (branch) lines.push(`- git branch: ${branch}`);
-  } catch {
-    // not a git repo, or git not installed — fine.
-  }
-  lines.push(`- paths: the cwd above is your filesystem scope (plus any "also readable/writable" path). Before reading or writing any path you have NOT seen this session, confirm it exists with glob or run_shell ls/find — never guess a path or invent a /tmp location.`);
-  // TUI renders GFM tables as a real grid and folds large ones; charts only look good as fenced ASCII.
-  lines.push(
-    `- Tables & charts (terminal): prefer GFM tables (\`| col | … |\` + separator) with ≤4 short columns; for trends use a fenced ASCII/Unicode bar chart (≤72 cols) or sparklines — not wide tab-separated walls or Mermaid/SVG.`,
-  );
-
-  // Shadow harness capabilities — tell the model how to drive the full system
-  lines.push(`- Shadow harness features: Use 'agent' tool with isolation:"worktree" for safe/parallel sub-work (auto-cleaned). Set run_in_background:true for long tasks; receive <task-notification> results. Externalize with todo_write (pinned fresh every turn in system) + plans/*.md + research/*.md. Call reviewer (agent type "reviewer") before major changes, when stuck, or before declaring done. Harness manages hooks (pre/post tool, compact, subagent_stop, notifications, session), permissions/classifier, compaction, and state. Follow disciplines in your profile to drive reliably.`);
-
-  // Guardrails / sandbox status — model must know the boundaries. The filesystem jail + OS
-  // sandbox are dropped under --yolo (and aliases) OR full autonomy; --yolo additionally bypasses
-  // the catastrophic-command denylist + all permission gating.
-  const yoloOn = !!guard.yolo;
-  const sandboxOff = !!guard.noSandbox || yoloOn || !!guard.unrestricted;
-  const jailOff = !!guard.unrestricted;
-  lines.push(
-    `- Guardrails: filesystem jail ${jailOff ? 'OFF (root granted via --yolo or full autonomy)' : 'ON'}. ` +
-    `OS sandbox for run_shell: ${osSandboxStatus(!sandboxOff)}. ` +
-    `Classifier and permission gates apply per autonomy level; the catastrophic-command denylist is active unless --yolo. The filesystem jail + OS sandbox are dropped under --yolo or full autonomy — outside either, writes stay inside the workspace.`
-  );
-
-  if (guard.offline) {
-    lines.push(
-      `- Offline Shadow Mode: ACTIVE. No provider network beyond the local model server. ` +
-      `web_fetch, web_search, and MCP tools are NOT registered this session, and run_shell network egress is denied. ` +
-      `Do not attempt to reach the internet — those tools do not exist here. Work entirely from local files and the local model.`
-    );
-  }
-
-  return `## Environment\n${lines.join('\n')}`;
-}
 
 /**
  * Binary install (`curl install.sh`): no .git, and the repo may be private (so a git
@@ -397,13 +338,7 @@ function runMcp(args: string[]): void {
 }
 
 // Minimal ANSI helpers for `shadow local` output (matches the onboarding tone).
-const lc = {
-  bold: (s: string) => `\x1b[1m${s}\x1b[0m`,
-  green: (s: string) => `\x1b[32m${s}\x1b[0m`,
-  red: (s: string) => `\x1b[31m${s}\x1b[0m`,
-  yellow: (s: string) => `\x1b[33m${s}\x1b[0m`,
-  gray: (s: string) => `\x1b[90m${s}\x1b[0m`,
-};
+
 
 /** Locate the llama-server binary: explicit override, then PATH (command -v / where). */
 /** Locate mlx_lm.server: $SHADOW_MLX_SERVER, else PATH. (Apple Silicon backend.) */
@@ -915,183 +850,125 @@ async function main(): Promise<void> {
   const activeStyle = flags.style ?? cfg.lastStyle;
   if (flags.style) saveGlobalConfig({ lastStyle: activeStyle });
   if (flags.planMode) saveGlobalConfig({ planMode: true });
-  const skills = discoverSkills(workspaceRoot);
-  const skillsBlock = skillsIndexBlock(skills);
-  const baseSystem = [
-    resolveSystem(cwd, {
-      installDir: INSTALL_DIR,
-      homedir: homedir(),
-      systemPromptPath: cfg.systemPromptPath,
-      model: cfg.model,
-    }),
-    buildEnvBlock(workspaceRoot, additionalRoots, {
-      yolo: !!flags.yolo,
-      noSandbox: !!flags.noSandbox,
-      unrestricted,
-      offline: !!flags.offline,
-    }),
-    skillsBlock,
-  ]
-    .filter(Boolean)
-    .join('\n\n');
-
-  // session_start hook (init)
-  if (cfg.hooks?.session_start?.length) {
-    runHookPhase('session_start', cfg.hooks.session_start, { workspaceRoot, sessionId: 'main' });
-  }
-
-  const allowImport = process.env.SHADOW_ALLOW_IMPORT === '1';
-  // Per-model credentials: a model entry may carry its own apiKey/authToken so each
-  // cloud model in the picker uses its OWN key; fall back to provider-level resolution.
-  const activeModelEntry =
-    lastPicked ?? cfg.models.find((m) => m.provider === cfg.provider && m.model === cfg.model);
-  const activeCred = resolveEntryCredential(activeModelEntry, {
-    vaultIsLocked: vaultExists() && !vaultUnlocked(),
-  });
-  if (!activeCred.ok) {
-    process.stderr.write(
-      lc.red(
-        `✗ "${activeModelEntry?.label ?? cfg.model}" needs the vault slot "${activeCred.slot}", which is ` +
-          (activeCred.reason === 'locked'
-            ? 'locked. Unlock it, or set SHADOW_VAULT_PASSWORD.'
-            : 'empty. Re-add the key with `shadow onboard --web`.'),
-      ) + '\n',
-    );
-    process.exit(1);
-  }
-  const apiKey =
-    activeCred.source === 'provider' ? resolveApiKey(cfg.provider, { model: cfg.model, allowImport }) : activeCred.apiKey;
-  const authToken = activeCred.authToken;
-  registerSecret(apiKey); // mask the resolved key/token in all logs + surfaced errors
-  registerSecret(authToken);
-  const resolvedBaseUrl = resolveBaseUrl(cfg.provider, flags.baseUrl ?? cfg.baseUrl);
-  // ── Offline Shadow Mode: hard no-cloud, no-web. Requires a LOCAL model (a gguf
-  // preset, or a baseUrl whose host is localhost/LAN). Fail fast + friendly when the
-  // active model is a cloud provider — before we spin up anything or touch the network.
-  const offline = flags.offline ?? false;
-  if (offline) {
-    const decision = evaluateOffline({
-      label: activeModelEntry?.label ?? `${cfg.provider}/${cfg.model}`,
-      gguf: activeModelEntry?.gguf,
-      // A repo-id MLX target only counts as local once its weights are CACHED — otherwise the
-      // first serve would download from huggingface.co mid-"offline" session.
-      mlx: activeModelEntry?.mlx && mlxOfflineReady(activeModelEntry.mlx) ? activeModelEntry.mlx : undefined,
-      baseUrl: resolvedBaseUrl,
-    });
-    if (!decision.ok) {
-      process.stderr.write(lc.red(decision.error!) + '\n');
+  const session = await createAgentSession({
+    cfg,
+    flags,
+    installDir: INSTALL_DIR,
+    cwd,
+    workspaceRoot,
+    additionalRoots,
+    activeStyle,
+    unrestricted,
+    lastPicked,
+    resumeSessionPath,
+    write: (s) => stdout.write(s),
+    fail: (message) => {
+      process.stderr.write(message);
       process.exit(1);
-    }
-    stdout.write(lc.bold(OFFLINE_BANNER) + '\n');
-  }
-  // Local/open-weights models (private LAN/localhost endpoint) degrade on long context
-  // far sooner than a frontier API, so compact them earlier — summarize before they rot.
-  // Frontier APIs keep the configured budget; an explicit --context-budget always wins.
-  if (flags.contextBudget === undefined && isLocalBaseUrl(resolvedBaseUrl)) {
-    cfg = { ...cfg, contextBudget: Math.min(cfg.contextBudget, 48_000) };
-  }
-  let startProvider = cfg.provider;
-  let startBaseUrl = resolvedBaseUrl;
-  let startApiKey = apiKey;
-  // Local .gguf model: launch a llama.cpp server before connecting (ollama-style).
-  if (isLocalServedEntry(activeModelEntry)) {
-    // Session pre-flight: on an interactive TTY, a missing llama-server gets the one-keypress
-    // brew offer HERE — previously only `local add`/`local test`/`doctor model` offered it, and a
-    // fresh user launching `shadow` with a gguf active hit a raw spawn error instead.
-    // Guards (reviewed): never in --task runs (they are non-interactive by design, even under a
-    // PTY wrapper); never when the entry names its OWN binary or $SHADOW_LLAMA_SERVER is set
-    // (PATH lookup would false-nag); never when a server is ALREADY answering on the entry's
-    // port (nothing to install for).
-    if (
-      !flags.task &&
-      process.stdin.isTTY &&
-      process.stdout.isTTY &&
-      activeModelEntry!.gguf &&
-      !activeModelEntry!.ggufServer &&
-      !process.env.SHADOW_LLAMA_SERVER &&
-      !(await ggufServerUp(activeModelEntry!))
-    ) {
-      await ensureLlamaServer(process.stdout as NodeJS.WriteStream);
-    }
-    if (activeModelEntry?.mlx && !findMlxServer() && !(await ggufServerUp(activeModelEntry))) {
-      process.stderr.write(lc.yellow('  ⚠ ' + MLX_INSTALL_HINT.split('\n').join('\n    ')) + '\n');
-    }
-    try {
-      const r = await ensureLocalServer(activeModelEntry!, (m) => console.error(`  ${m}`), { offline });
-      startProvider = 'openai';
-      startBaseUrl = r.baseUrl;
-      startApiKey = activeModelEntry!.apiKey ?? 'sk-local';
-      // A local llama.cpp server is bounded by its -c: keep the context budget under BOTH the
-      // historical 30k gguf clamp AND this entry's actual window MINUS real headroom (a --ctx
-      // 8192 model must compact well before 8192, or long sessions die on a provider 400 instead
-      // of compacting). The 2048 floor keeps a degenerate window functional rather than zero.
-      const window = activeModelEntry!.ctx ?? 32_768;
-      cfg = { ...cfg, contextBudget: Math.min(cfg.contextBudget, 30_000, Math.max(2_048, window - 2_048)) };
-    } catch (e) {
-      console.error(`local model failed: ${(e as Error).message}`);
-      process.exit(1);
-    }
-  }
-  const provider = createProvider({
-    provider: startProvider,
-    model: cfg.model,
-    apiKey: startApiKey,
-    authToken,
-    baseUrl: startBaseUrl,
+    },
+    // The gguf/MLX launch stays here: it offers an interactive `brew install` and its helpers
+    // (ensureLlamaServer, findMlxServer) have call sites elsewhere in this file.
+    launchLocalServer: async (activeModelEntry, offline) => {
+      if (!isLocalServedEntry(activeModelEntry)) return null;
+      // Session pre-flight: on an interactive TTY, a missing llama-server gets the one-keypress
+      // brew offer HERE — previously only `local add`/`local test`/`doctor model` offered it, and a
+      // fresh user launching `shadow` with a gguf active hit a raw spawn error instead.
+      // Guards (reviewed): never in --task runs (they are non-interactive by design, even under a
+      // PTY wrapper); never when the entry names its OWN binary or $SHADOW_LLAMA_SERVER is set
+      // (PATH lookup would false-nag); never when a server is ALREADY answering on the entry's
+      // port (nothing to install for).
+      if (
+        !flags.task &&
+        process.stdin.isTTY &&
+        process.stdout.isTTY &&
+        activeModelEntry!.gguf &&
+        !activeModelEntry!.ggufServer &&
+        !process.env.SHADOW_LLAMA_SERVER &&
+        !(await ggufServerUp(activeModelEntry!))
+      ) {
+        await ensureLlamaServer(process.stdout as NodeJS.WriteStream);
+      }
+      if (activeModelEntry?.mlx && !findMlxServer() && !(await ggufServerUp(activeModelEntry))) {
+        process.stderr.write(lc.yellow('  ⚠ ' + MLX_INSTALL_HINT.split('\n').join('\n    ')) + '\n');
+      }
+      try {
+        const r = await ensureLocalServer(activeModelEntry!, (m) => console.error(`  ${m}`), { offline });
+        return {
+          provider: 'openai',
+          baseUrl: r.baseUrl,
+          apiKey: activeModelEntry!.apiKey ?? 'sk-local',
+          ctxWindow: activeModelEntry!.ctx ?? 32_768,
+        };
+      } catch (e) {
+        console.error(`local model failed: ${(e as Error).message}`);
+        process.exit(1);
+      }
+    },
   });
 
-  const registry = new ToolRegistry();
-  // Own the background-shell registry so we can kill orphaned children on shutdown (killAll had no
-  // call site — quitting left dev servers holding their ports across sessions).
-  const bg = new BgRegistry();
-  registerBuiltinTools(registry, {
-    bg,
-    shellEnvAllowlist: cfg.shellEnvAllowlist,
-    shellTimeoutMs: cfg.shellTimeoutMs,
-    sandbox: cfg.sandbox,
-    // Offline mode: deny run_shell network egress (when the OS sandbox is active) so the
-    // only outbound traffic is to the local model server.
-    sandboxNetwork: offline ? false : cfg.sandboxNetwork,
-    // Offline mode: do NOT register the web tools (web_fetch / web_search). They are simply
-    // absent from the registry — the model can't choose what it doesn't have.
-    network: !offline,
-  }); // M1 tools + M5 web tools (web tools gated off when offline)
-
-  // Shadow's "eyes": register describe_media only when the user configured a vision backend (~/.shadow) —
-  // an OpenAI-compatible vision endpoint (preferred) or a ComfyUI. Absent config → the tool isn't offered.
-  // Gated off when offline (it's a network call to the user's own endpoint).
-  if ((cfg.vision?.baseUrl || cfg.comfy?.baseUrl) && !offline) {
-    registry.register(makeDescribeMediaTool({ vision: cfg.vision, comfy: cfg.comfy }));
-  }
-
-  // M4: project memory (known facts) — load, expose as a tool, inject into the prompt.
-  const memory = ProjectMemory.load(workspaceRoot);
-  registry.register(makeMemoryTool(memory));
-  const facts = memory.asContext();
-
-  // Agent-maintained todo list — externalizes "what's done / what's next" into a
-  // tool. The loop renders the live list into the system prompt each turn (pinned,
-  // summarization-proof) so a weak model never loses the plot. The bus event lets
-  // the TUI render live progress.
-  const todoList = new TodoList();
-  registry.register(makeTodoTool(todoList));
-  const planMode = new PlanModeState(flags.planMode || cfg.planMode || activeStyle === 'procedural');
-  registry.register(makePlanWriteTool(planMode));
-  registry.register(makeExitPlanModeTool(planMode));
-  registry.register(makeEnterPlanModeTool(planMode));
-  registry.register(makeAskUserQuestionTool());
-  if (skills.length) registry.register(makeSkillTool(skills));
-  registry.register(makeToolSearch(registry));
-
-  const wakeup = new WakeupScheduler();
-  const fullSystemForStyle = (style: OutputStyle): string => buildStyledSystem(baseSystem, style, facts);
-  const fullSystem = fullSystemForStyle(activeStyle);
-
-  // M4: append-only, redacted session log for this process.
-  const sessionLog = SessionLog.open(workspaceRoot);
+  // Destructured so the rest of main() reads exactly as it did before the extraction.
+  cfg = session.cfg;
+  const { provider, registry, bg, memory, todoList, planMode, wakeup, skills, facts, sessionLog, offline, context } =
+    session;
+  const fullSystemForStyle = session.systemForStyle;
+  const fullSystem = session.system;
+  void memory;
+  void skills;
+  void facts;
+  void wakeup;
 
   const bus = new EventBus();
   bus.on((e) => sessionLog.record({ kind: 'event', ...e }));
+
+  // Hoisted above the --web mirror below: its model()/autonomy() getters close over these live
+  // bindings, and a GET /api/sessions can call them while main() is still awaiting MCP startup
+  // (openBrowser fires first) — a TDZ ReferenceError otherwise. Reassignments stay at their
+  // original sites (autonomy: raiseAutonomy at the "always" approval; model: onModelSwitch).
+  let autonomy: AutonomyLevel = (flags.yolo ?? false) ? 'full' : cfg.autonomy;
+  let activeAgentModel = cfg.model;
+
+  // --web: mirror this session to a loopback browser console. The bus is already
+  // multi-subscriber, so this is additive — the TUI/headless renderer still gets every event
+  // and the loop is unaware. Strictly READ-ONLY: approvals are still answered in the
+  // terminal, so there is no window where a browser can drive a privileged session without
+  // an approval gate. Attached here, before the plan_mode emit below, so the mirror does not
+  // miss the initial snapshot.
+  let webMirror: { url: string; close: () => Promise<void> } | null = null;
+  // Shared box the TUI populates at mount (runTui.setAbortGetter, below) with a getter for its live
+  // turn controller. Created here — before startWebServer — so the mirror's getAbort can close over
+  // it; until the TUI mounts it returns null (no turn is running yet anyway). This is what lets the
+  // browser interrupt the terminal's turn (canInterrupt) without being able to drive it.
+  const cliAbort: { get: () => AbortController | null } = { get: () => null };
+  if (flags.web) {
+    try {
+      const { startWebServer } = await import('./web/server.js');
+      const handle = await startWebServer({
+        bus,
+        port: flags.webPort,
+        // Pass the workspace so the mirror reports the right path under `--workspace sub/`
+        // (it was defaulting to process.cwd()). The reserved session bypasses the allowlist —
+        // this is the user's own terminal, in a directory they chose.
+        workspaceRoot,
+        // A live TERMINAL mirror: model/autonomy are read live (they track /model and the
+        // always-approval); getAbort exposes the terminal's turn controller so the browser can
+        // interrupt (but not prompt — canPrompt stays false).
+        mirror: {
+          model: () => activeAgentModel,
+          autonomy: () => autonomy,
+          getAbort: () => cliAbort.get(),
+        },
+      });
+      webMirror = handle;
+      stdout.write(`\nMirroring this session at ${handle.url}\n`);
+      stdout.write('Read-only: approvals are answered here in the terminal.\n\n');
+      const { openBrowser } = await import('./web/browser.js');
+      openBrowser(handle.url);
+    } catch (e) {
+      // A mirror that fails to start must never take the agent run down with it.
+      stdout.write(`\nCould not start the web mirror: ${e instanceof Error ? e.message : String(e)}\n\n`);
+    }
+  }
+
   // A todo_write call updates the list → emit a `todo` event the TUI renders.
   todoList.onUpdate((items) => bus.emit({ type: 'todo', items }));
   planMode.onUpdate((plan) => bus.emit({ type: 'plan_mode', plan }));
@@ -1104,8 +981,8 @@ async function main(): Promise<void> {
   if (yolo) {
     flags.noSandbox = true; // ensure sandbox explicitly off
   }
-  // Mutable so the REPL's "always" approval can raise it across turns.
-  let autonomy: AutonomyLevel = yolo ? 'full' : cfg.autonomy;
+  // `autonomy` (mutable — the REPL's "always" approval raises it across turns) is declared above,
+  // hoisted over the --web mirror so its live getter is TDZ-safe.
 
   // M2: catastrophic-command guard. Forces confirmation for denylisted shell
   // commands regardless of autonomy level (even at `full`). Disabled under --yolo.
@@ -1140,27 +1017,6 @@ async function main(): Promise<void> {
     log.info('shadow ready', { provider: cfg.provider, model: cfg.model, autonomy });
   }
 
-  const contextOpts = {
-    contextBudget: cfg.contextBudget,
-    triggerRatio: cfg.summarizeTriggerRatio,
-    keepLastTurns: cfg.keepLastTurns,
-  };
-  let context: Context;
-  if (resumeSessionPath) {
-    ({ context } = resumeSession(resumeSessionPath, contextOpts));
-    stdout.write(
-      `Resumed session ${resumeSessionPath} (${context.messages().length} messages in context).\n`,
-    );
-    // Background sub-agent recovery note (tasks captured via extended snapshot)
-    const recoveredTasks = (context as any)._subAgentTasks || [];
-    if (recoveredTasks.length) {
-      stdout.write(` (recovered ${recoveredTasks.length} sub-agent bg task record(s) from prior snapshot)\n`);
-      const note = `Recovered bg sub-agent tasks from snapshot: ${JSON.stringify(recoveredTasks)}`;
-      context.append({ role: 'user', content: [{ type: 'text', text: note }] });
-    }
-  } else {
-    context = new Context(contextOpts);
-  }
 
   // Deliver bg agent (and future) task results + record launches for snapshot/recovery to the *main* context (not throwaway sub ctxs).
   attachBgAgentDelivery(bus, context);
@@ -1245,7 +1101,7 @@ async function main(): Promise<void> {
   // serving, so the sub-agent dies with "Unable to connect". The TUI updates these on every
   // switch via opts.onModelSwitch; the headless path keeps the startup values.
   let activeAgentProvider = provider;
-  let activeAgentModel = cfg.model;
+  // activeAgentModel is declared above (hoisted over the --web mirror for a TDZ-safe live getter).
 
   registry.register(
     makeAgentTool({
@@ -1283,7 +1139,7 @@ async function main(): Promise<void> {
   );
 
   let first = context.messages().length === 0;
-  const buildAndRun = async (task: string, gate: ApprovalGate, signal: AbortSignal): Promise<void> => {
+  const runTurnBody = async (task: string, gate: ApprovalGate, signal: AbortSignal): Promise<void> => {
     currentGate = gate; // so a sub-agent spawned this turn inherits the active gate, not auto-approve
 
     // user_prompt_submit hook (can deny the prompt before it enters context)
@@ -1300,6 +1156,9 @@ async function main(): Promise<void> {
     }
 
     sessionLog.record({ kind: 'user', task });
+    // See the matching emit in tui.tsx: this is for non-terminal subscribers (the `--web`
+    // mirror). attachRenderer's switch has `default: break`, so the headless path ignores it.
+    bus.emit({ type: 'user', text: task });
     const userMsg: Message = { role: 'user', content: [{ type: 'text', text: task }] };
     if (first) {
       context.pinTask(userMsg);
@@ -1357,11 +1216,37 @@ async function main(): Promise<void> {
     }
   };
 
+  /**
+   * Serialize every headless turn through the process-wide run lock — one turn at a time across
+   * the TUI and every web session (decision 1). priority:true because a CLI-initiated turn is the
+   * operator. This independently fixes a pre-existing collision: two `void buildAndRun(...)` wakeup
+   * calls used to run concurrently on the shared Context/currentGate; they now queue. `currentGate`
+   * is set inside runTurnBody, i.e. AFTER the lock is held, so a queued turn can't overwrite a
+   * running one. An abort while queued returns cleanly; release is always in the finally, never off
+   * a `stop` event (a sub-agent's stop is byte-identical on the shared bus).
+   */
+  const buildAndRun = async (task: string, gate: ApprovalGate, signal: AbortSignal): Promise<void> => {
+    let release: (() => void) | null = null;
+    try {
+      release = await runLock.acquire(CLI_HOLDER, { priority: true, signal });
+    } catch {
+      return; // aborted while queued behind another turn
+    }
+    try {
+      await runTurnBody(task, gate, signal);
+    } finally {
+      release();
+    }
+  };
+
   // Headless: one-shot --task, --repl, or piped/redirected stdio (no TTY for the raw-mode UI).
   if (headless) {
     wakeupHandler.fire = (task, reason) => {
       const gate: ApprovalGate = yolo ? new AutoApproveGate() : new AutoDenyGate();
-      void buildAndRun(`[wakeup: ${reason}] ${task}`, gate, new AbortController().signal);
+      // Fire-and-forget: the run lock now serializes it behind any in-flight turn, so this both
+      // needs a .catch (the queued/abort path is a new rejection surface — an unhandled rejection
+      // would exit the process under Node's default) and no longer races a concurrent wakeup.
+      void buildAndRun(`[wakeup: ${reason}] ${task}`, gate, new AbortController().signal).catch(() => {});
     };
     const detach = attachRenderer(bus, { animate: false });
     const controller = new AbortController();
@@ -1461,8 +1346,15 @@ async function main(): Promise<void> {
         activeAgentProvider = p;
         activeAgentModel = model;
       },
+      // Publish the TUI's live turn-abort getter into the shared box, so `shadow --web` can
+      // interrupt the terminal's turn from the browser (mirror.getAbort reads this).
+      setAbortGetter: (fn) => {
+        cliAbort.get = fn;
+      },
     });
   } finally {
+    // The mirror holds an open listener; without closing it the process would not exit.
+    if (webMirror) await webMirror.close().catch(() => {});
     if (cfg.hooks?.session_end?.length) {
       runHookPhase('session_end', cfg.hooks.session_end, { workspaceRoot });
     }

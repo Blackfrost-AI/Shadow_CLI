@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Shadow</title>
+  <link rel="stylesheet" href="/assets/styles.css" />
+</head>
+<body>
+  <div id="app">Loading...</div>
+  <!-- Inline error reporter: if the module graph fails to load or boot() throws, surface the
+       actual error on the page instead of leaving a blank screen. This inline script is allowed
+       by the CSP ('unsafe-inline'); the external module (app.js) does the real work. -->
+  <script>
+    window.addEventListener('error', function (e) {
+      var el = document.getElementById('app');
+      if (el) el.innerHTML = '<pre style="color:#ff6b6b;padding:16px;white-space:pre-wrap">Failed to start: ' +
+        (e && e.message ? e.message : String(e)) +
+        (e && e.filename ? '\\n  at ' + e.filename + ':' + (e.lineno||0) : '') + '</pre>';
+    });
+    window.addEventListener('unhandledrejection', function (e) {
+      var el = document.getElementById('app');
+      var reason = e && e.reason ? (e.reason.stack || e.reason.message || String(e.reason)) : String(e);
+      if (el) el.innerHTML = '<pre style="color:#ff6b6b;padding:16px;white-space:pre-wrap">Unhandled rejection: ' + reason + '</pre>';
+    });
+  </script>
+  <script type="module" src="/assets/app.js"></script>
+</body>
+</html>

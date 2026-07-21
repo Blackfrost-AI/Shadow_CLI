@@ -65,3 +65,35 @@ test('attachRenderer stop path: loop returns provider_error stopReason', async (
   assert.equal(result.stopReason, 'provider_error');
   assert.ok(stops.includes('provider_error'));
 });
+test('the headless renderer ignores the `user` event (the terminal echoes input itself)', async () => {
+  // Adding a LoopEvent variant is only safe if every existing subscriber ignores it. The TUI
+  // and the headless renderer both echo the user's input locally, so a `user` event reaching
+  // their switch would print the prompt TWICE. attachRenderer has `default: break`; this
+  // pins that so a future refactor cannot quietly turn it into a double-render.
+  const { EventBus } = await import('../src/agent/events.js');
+  const { attachRenderer } = await import('../src/tui.js');
+
+  const bus = new EventBus();
+  const written: string[] = [];
+  const realWrite = process.stdout.write.bind(process.stdout);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (process.stdout as any).write = (chunk: any, ...rest: any[]) => {
+    written.push(String(chunk));
+    return true;
+  };
+  let detach = (): void => {};
+  try {
+    detach = attachRenderer(bus, { animate: false });
+    bus.emit({ type: 'user', text: 'this must not be echoed by the renderer' });
+  } finally {
+    detach();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (process.stdout as any).write = realWrite;
+  }
+
+  assert.equal(
+    written.join('').includes('this must not be echoed'),
+    false,
+    'the headless renderer must not print the user event',
+  );
+});

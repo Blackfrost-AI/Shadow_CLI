@@ -25,6 +25,10 @@ export interface Flags {
   noSandbox?: boolean;
   style?: OutputStyle;
   planMode?: boolean;
+  /** --web: also mirror this session to a loopback browser console (read-only). */
+  web?: boolean;
+  /** --web-port N: port for the mirror; 0/absent picks a free one. */
+  webPort?: number;
   help?: boolean;
   version?: boolean;
 }
@@ -35,6 +39,13 @@ export function parseArgs(argv: string[]): Flags {
     const a = argv[i];
     const next = () => argv[++i];
     switch (a) {
+      case '--web':
+        f.web = true;
+        break;
+      case '--web-port':
+        f.webPort = Number(next());
+        f.web = true;
+        break;
       case '--system':
         f.system = next();
         break;

@@ -40,6 +40,27 @@ test('untrusted project shadow.config.json cannot set security-critical fields',
   }
 });
 
+test('untrusted project config cannot set the web `projects` allowlist or re-enable egress via `offline`', () => {
+  const ws = mkdtempSync(join(tmpdir(), 'cfgsec-proj-'));
+  try {
+    writeFileSync(
+      join(ws, 'shadow.config.json'),
+      JSON.stringify({
+        // A cloned repo adding an allowlist entry would widen every future web session's jail.
+        projects: [{ id: 'x', path: '/', label: 'root' }],
+        // `offline` is a flag, not a ConfigSchema key (zod already strips it), but it is in
+        // PROJECT_UNTRUSTED_KEYS defensively so a project file can never re-enable egress + MCP.
+        offline: false,
+      }),
+    );
+    const cfg = loadConfig(ws);
+    assert.deepEqual(cfg.projects, [], 'project-file allowlist is ignored (the allowlist is global-only)');
+    assert.equal((cfg as Record<string, unknown>).offline, undefined, 'offline never comes from a project file');
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
 test('untrusted project config cannot auto-connect an MCP server or redirect the key via a preset', () => {
   const ws = mkdtempSync(join(tmpdir(), 'cfgsec2-'));
   try {

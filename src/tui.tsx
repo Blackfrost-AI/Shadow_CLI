@@ -55,6 +55,7 @@ import type { TodoItem, TodoList } from './agent/todo.js';
 import type { PlanModeState, PlanSnapshot } from './agent/planMode.js';
 import { AgentLoop } from './agent/loop.js';
 import { buildLoopDeps } from './agent/loopDeps.js';
+import { runLock, CLI_HOLDER } from './web/runLock.js';
 import {
   type ApprovalDecision,
   type ApprovalGate,
@@ -901,6 +902,9 @@ export interface TuiOpts {
   /** Called on a live /model switch so the `agent` tool spawns sub-agents on the NEW model,
    *  not the startup one (which, on a single-model-at-a-time local box, may be an unloaded port). */
   onModelSwitch?: (provider: Provider, model: string) => void;
+  /** Publish the TUI's live turn-abort getter to the caller (main()), so the `shadow --web`
+   *  mirror can interrupt the terminal's turn from the browser. Called once at mount. */
+  setAbortGetter?: (fn: () => AbortController | null) => void;
 }
 
 // Big "SHADOW" wordmark (figlet "big"). MUST be a PLAIN template literal, NOT String.raw: Bun's
@@ -1595,6 +1599,19 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const firstRef = useRef(true);
   const controllerRef = useRef<AbortController | null>(null);
   const loopRef = useRef<AgentLoop | null>(null);
+  // Hand main() a getter for the live turn controller so `shadow --web` can interrupt the
+  // terminal's turn from the browser. controllerRef is stable; the closure always reads live.
+  // On unmount, abandon any in-flight turn's run lock: in production the TUI unmounts only at
+  // exit (harmless), and it keeps a torn-down instance from starving the process-wide lock (a
+  // turn whose loop can no longer complete would otherwise hold it forever). The turn's own
+  // finally release is then a no-op — the grant token no longer matches.
+  useEffect(() => {
+    opts.setAbortGetter?.(() => controllerRef.current);
+    return () => {
+      controllerRef.current?.abort();
+      runLock.releaseFor(CLI_HOLDER);
+    };
+  }, [opts]);
   const ctrlCArmedRef = useRef(false);
   const historyRef = useRef<string[]>([]);
   const histIdxRef = useRef(0);
@@ -3800,6 +3817,26 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         }
       }
       setRunning(true);
+      // Process-wide run lock: exactly one turn executes at a time across the TUI and every web
+      // session (decision 1 — two agents in one repo corrupt each other). priority:true — the
+      // operator at the terminal must never be starved behind browser sessions. The controller is
+      // created HERE (was at the old :3836) so ESC cancels the queued wait too; its signal is
+      // reused for the loop below. Acquire at the :3802/:3803 seam: `running` is the ONLY state
+      // set so far, so the abort path is a clean early return that stays OUTSIDE the try below —
+      // acquiring later (after context.pinTask/firstRef) would strand the TUI at running===true.
+      const controller = new AbortController();
+      controllerRef.current = controller;
+      let releaseLock: (() => void) | null = null;
+      try {
+        releaseLock = await runLock.acquire(CLI_HOLDER, { priority: true, signal: controller.signal });
+      } catch {
+        // ESC while queued behind another session: nothing but `running` (and the controller) has
+        // been touched. Re-enable the composer and drain type-ahead, exactly as a finished turn does.
+        controllerRef.current = null;
+        setRunning(false);
+        flushQueueRef.current?.();
+        return;
+      }
       runStartRef.current = Date.now();
       answerOpenRef.current = false;
       padCarryRef.current = false;
@@ -3828,9 +3865,11 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         context.append(userMsg);
       }
       sessionLog.record({ kind: 'user', task });
+      // For non-terminal subscribers (the `--web` mirror). The TUI has already echoed this
+      // locally via pushLine, and its own bus switch has no case for 'user', so this cannot
+      // double-render here.
+      bus.emit({ type: 'user', text: task });
 
-      const controller = new AbortController();
-      controllerRef.current = controller;
       const budget = new Budget(
         {
           maxIterations: opts.cfg.maxIterations,
@@ -3874,6 +3913,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       } catch (err) {
         pushLine({ text: `  ! ${(err as Error).message}`, color: C.red });
       } finally {
+        // Release the run lock in the finally around the awaited loop — NEVER off a `stop` event:
+        // sub-agents reuse the parent bus, so a sub-agent's `stop` is byte-identical on the wire and
+        // would unlock mid-turn on the first sub-agent completion. Idempotent, so double-call is safe.
+        releaseLock?.();
         loopRef.current = null;
         controllerRef.current = null;
         // Full live-state teardown, mirroring the 'stop' handler. A provider throw that never

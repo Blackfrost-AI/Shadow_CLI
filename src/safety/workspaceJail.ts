@@ -14,7 +14,7 @@ import { resolve, dirname, isAbsolute, relative } from 'node:path';
  */
 
 /** Is `target` equal to, or nested inside, `root`? (compares post-realpath paths) */
-function contains(root: string, target: string): boolean {
+export function contains(root: string, target: string): boolean {
   if (target === root) return true;
   const rel = relative(root, target);
   return rel.length > 0 && !rel.startsWith('..') && !isAbsolute(rel);

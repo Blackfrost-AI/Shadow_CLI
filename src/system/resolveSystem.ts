@@ -100,17 +100,34 @@ export function resolveSystem(cwd: string, opts: ResolveSystemOpts): string {
   const override = opts.systemPromptPath;
   if (override && existsSync(resolve(cwd, override))) return read(resolve(cwd, override));
 
+  // A user-owned base prompt at ~/.shadow/system_prompt.md REPLACES both Shadow's identity file
+  // AND its instruction modules: the user owns the whole "who you are + how to work" narrative,
+  // and Shadow contributes only mechanical glue — the tool-name preamble below, the runtime
+  // Environment block + skills index (appended in bootstrap.ts), and the fenced project agent
+  // files. This is the "give me the real prompt, drop the built-in prose" path. An empty or
+  // unreadable file is ignored so it can never silently blank the identity. (~/.shadow/SHADOW.md
+  // stays the swap-the-persona-but-keep-modules path; opts.systemPromptPath above stays the raw
+  // full-replace path.)
+  const ownPromptFile = resolve(opts.homedir, '.shadow', 'system_prompt.md');
+  let ownPrompt = '';
+  if (existsSync(ownPromptFile)) {
+    try { ownPrompt = read(ownPromptFile); } catch { /* unreadable — fall through to the layered base */ }
+  }
+  const useOwnPrompt = ownPrompt.length > 0;
+
   const globalProfile = resolve(opts.homedir, '.shadow', 'SHADOW.md');
   const bundledProfile = resolve(opts.installDir, 'prompts', 'SHADOW.md');
   let base = FALLBACK_SYSTEM;
-  if (existsSync(globalProfile)) base = read(globalProfile);
+  if (useOwnPrompt) base = ownPrompt;
+  else if (existsSync(globalProfile)) base = read(globalProfile);
   else if (existsSync(bundledProfile)) base = read(bundledProfile);
   else if (BUNDLED_PROMPTS['SHADOW.md']) base = BUNDLED_PROMPTS['SHADOW.md'].trim(); // compiled binary
 
-  // Load modular Shadow instructions (policies, reviewer, orchestration, harness driving)
-  const bundledModules = loadInstructionModules(resolve(opts.installDir, 'prompts'));
+  // Shadow's modular instructions + model profile are Shadow-authored prose; a user-owned base
+  // prompt deliberately replaces them, so skip both when system_prompt.md is in play.
+  const bundledModules = useOwnPrompt ? '' : loadInstructionModules(resolve(opts.installDir, 'prompts'));
   const globalModulesDir = resolve(opts.homedir, '.shadow', 'prompts');
-  const globalModules = existsSync(globalModulesDir) ? loadInstructionModules(globalModulesDir) : '';
+  const globalModules = !useOwnPrompt && existsSync(globalModulesDir) ? loadInstructionModules(globalModulesDir) : '';
 
   // The PROJECT SHADOW.md lives in the (untrusted) working repo, so it is capped + fenced
   // exactly like AGENTS.md/CLAUDE.md — never spliced at full system trust. The trusted global
@@ -132,6 +149,6 @@ export function resolveSystem(cwd: string, opts: ResolveSystemOpts): string {
 
   const modulesBlock = [bundledModules, globalModules].filter(Boolean).join('\n\n');
 
-  const modelProfile = loadModelProfile(resolve(opts.installDir, 'prompts'), opts.model);
+  const modelProfile = useOwnPrompt ? '' : loadModelProfile(resolve(opts.installDir, 'prompts'), opts.model);
   return [HARNESS_PREAMBLE, base, modulesBlock, modelProfile, agentBlock].filter(Boolean).join('\n\n');
 }

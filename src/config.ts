@@ -87,7 +87,7 @@ export function normalizeBaseUrl(raw: string | undefined): string | undefined {
 }
 
 /** One selectable model in the `/model` picker. */
-const ModelEntrySchema = z.object({
+export const ModelEntrySchema = z.object({
   label: z.string(),
   provider: z.enum(['anthropic', 'openai', 'mock']),
   model: z.string(),
@@ -102,10 +102,15 @@ const ModelEntrySchema = z.object({
    * non-secret, so a migrated config.json is safe to sync or paste. Takes precedence over a
    * co-present `apiKey` (which is then legacy residue). `apiKey`/`authToken` stay in the
    * schema permanently — that is the backward-compatibility contract for unmigrated configs.
+   *
+   * Case-tolerant on purpose: slots are derived from the model id (e.g. `model.GLM-5.2-derisk-r1`),
+   * which routinely carries uppercase — a lowercase-only pattern here rejected real configs Shadow
+   * itself wrote and broke strict `loadConfig` at startup. The lookup matches the slot string
+   * verbatim, so accepting uppercase changes nothing about resolution.
    */
   credRef: z
     .string()
-    .regex(/^[a-z0-9][a-z0-9._-]{0,63}$/)
+    .regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/)
     .optional(),
   fallback: z.string().optional(),
   disabled: z.boolean().optional(),
@@ -133,6 +138,19 @@ const ModelEntrySchema = z.object({
   gpuLayers: z.number().int().nonnegative().optional(), // GPU offload layers (-ngl); 999 = all (llama clamps)
 });
 
+/**
+ * A project on the web console's explicit allowlist. A session may only be created — and its
+ * filesystem jail rooted — in a directory that was added here on purpose. Stored in the GLOBAL
+ * config.json only; `projects` is in PROJECT_UNTRUSTED_KEYS so a cloned repo cannot widen it.
+ * `path` is absolute, tilde-expanded and realpath'd at WRITE time — never raw user input.
+ */
+const ProjectEntrySchema = z.object({
+  id: z.string(),
+  path: z.string(),
+  label: z.string().optional(),
+  addedAt: z.string().optional(),
+});
+
 const ConfigSchema = z.object({
   provider: z.enum(['anthropic', 'openai', 'mock']).default('anthropic'),
   model: z.string().default('claude-opus-4-8'),
@@ -143,6 +161,10 @@ const ConfigSchema = z.object({
   // Extra dirs (beyond the workspace) the file tools + sandbox may read/write. Trusted
   // source only (global/env/CLI) — a cloned project must not widen your jail. See --add-dir.
   additionalDirectories: z.array(z.string()).default([]),
+  // Web console project allowlist (global-only; see PROJECT_UNTRUSTED_KEYS). No per-project
+  // additionalDirectories on the wire — that was a total allowlist bypass (every deny rule is
+  // written against `path`; resolveWithin treats every root as equally authoritative).
+  projects: z.array(ProjectEntrySchema).default([]),
   models: z.array(ModelEntrySchema).default([]), // selectable presets for the `/model` picker
   fallbackModel: z.string().optional(), // global fallback when primary model fails
   lastModel: z.string().optional(), // label of the last model chosen via the picker
@@ -273,7 +295,12 @@ const CONFIG_FILE = 'shadow.config.json';
  * drive-by-RCE vectors, so they are stripped too (preset fields below).
  * These come only from ~/.shadow (global), env, or CLI flags.
  */
-const PROJECT_UNTRUSTED_KEYS = ['baseUrl', 'shellEnvAllowlist', 'autonomy', 'denylistExtra', 'systemPromptPath', 'sandbox', 'sandboxNetwork', 'additionalDirectories', 'hooks', 'statusLine', 'comfy', 'vision'];
+// `projects` is the web console's filesystem allowlist — a cloned repo that could add an entry
+// would widen every future session's jail, so it is global-only. `offline` is listed defensively:
+// it is currently resolved from flags.offline (not a ConfigSchema key, so zod already strips it
+// from a project file), but if it ever becomes config-settable this keeps a project file from
+// re-enabling egress + MCP for a session. One word now avoids a silent hole later.
+const PROJECT_UNTRUSTED_KEYS = ['baseUrl', 'shellEnvAllowlist', 'autonomy', 'denylistExtra', 'systemPromptPath', 'sandbox', 'sandboxNetwork', 'additionalDirectories', 'projects', 'offline', 'hooks', 'statusLine', 'comfy', 'vision'];
 
 /** Layered precedence: CLI flags > env > project config file (de-fanged) > global > defaults. */
 export function loadConfig(cwd: string, cliOverrides: Record<string, unknown> = {}): ShadowConfig {

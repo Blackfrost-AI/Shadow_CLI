@@ -12,7 +12,7 @@ export function modelGroup(e: ModelEntry): string {
   if (e.group) return e.group;
   const url = (e.baseUrl ?? '').toLowerCase();
   // Locality beats the model's maker (a local gemma is "Local", not "Google"). isLocalBaseUrl
-  // catches localhost AND private LAN/WG ranges (e.g. a quad-served model on 10.80.x) — the
+  // catches localhost AND private LAN/WG ranges (e.g. a quad-served model on 10.0.x) — the
   // regex adds the common local-runtime ports/keywords (ollama, LM Studio, host.docker).
   if (isLocalBaseUrl(e.baseUrl) || /ollama|:11434|:1234|:8000|host\.docker/.test(url)) return 'Local';
   const m = e.model.toLowerCase();

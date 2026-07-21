@@ -1,6 +1,7 @@
 import { EventBus } from '../agent/events.js';
 import { startWebServer } from './server.js';
 import { openBrowser } from './browser.js';
+import { ensureVaultReady } from '../auth/unlock.js';
 
 export interface RunWebOptions {
   write: (s: string) => void;
@@ -15,11 +16,22 @@ export interface RunWebOptions {
 /**
  * `shadow web` — start the loopback UI and block until interrupted.
  *
- * Phase 1 scope: the server, its security gate, and the live event stream. Provider and
- * credential management (phase 2) and driving a conversation from the browser (phase 5)
- * mount onto this same server and port.
+ * The web UI is the credential "single writer" (see WEBUI_RESEARCH/00-PLAN.md phase 2), so the
+ * vault is unlocked at startup exactly as a normal agent run does — via `ensureVaultReady`
+ * (keychain → env → prompt → migrate). Without this, saving a model with a key from the
+ * browser would have nowhere to seal it. A locked vault that can't be opened does not abort
+ * the server: read-only management still works, and writes that need the vault return a clear
+ * error (see api/models.ts).
  */
 export async function runWeb(opts: RunWebOptions): Promise<void> {
+  const vaultReady = await ensureVaultReady((s) => opts.write(s));
+  if (!vaultReady) {
+    opts.write(
+      'Vault is locked — credential writes from the UI will be refused until you set\n' +
+        'SHADOW_VAULT_PASSWORD or re-run from a terminal where you can type the master password.\n\n',
+    );
+  }
+
   const bus = opts.bus ?? new EventBus();
   const server = await startWebServer({ bus, port: opts.port });
 
