@@ -80,6 +80,13 @@ export function eventToKeystroke(ev: KeyEvent): ParsedKeystroke {
   if (ev.space || ev.input === ' ') return { key: 'space', ...mods };
   if (ev.input.length === 1) {
     const ch = ev.input;
+    // Ink/terminals often deliver Ctrl+Letter as a C0 control byte (Ctrl+A=0x01 … Ctrl+Z=0x1a)
+    // WITH or WITHOUT key.ctrl set. Map those back to the letter so bindings like `ctrl+t`
+    // match real keypresses (without this, Ctrl+T arrives as key='\x14' and never fires).
+    const code = ch.charCodeAt(0);
+    if (code >= 1 && code <= 26) {
+      return { key: String.fromCharCode(96 + code), ctrl: true, shift: false, meta: false };
+    }
     const key = /^[a-z]$/i.test(ch) ? ch.toLowerCase() : ch;
     return { key, ...mods };
   }

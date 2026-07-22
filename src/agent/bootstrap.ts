@@ -38,6 +38,11 @@ import { makeMemoryTool } from '../tools/memory.js';
 import { TodoList } from './todo.js';
 import { PlanModeState } from './planMode.js';
 import { buildStyledSystem } from './system.js';
+import {
+  clampLocalContextBudget,
+  keepLastTurnsForBudget,
+  triggerRatioForBudget,
+} from '../util/contextBudget.js';
 import { makeTodoTool } from '../tools/todo.js';
 import { type OutputStyle } from '../styles.js';
 import { resolveSystem } from '../system/resolveSystem.js';
@@ -265,12 +270,10 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     if (!decision.ok) fail(lc.red(decision.error!) + '\n');
     write(lc.bold(OFFLINE_BANNER) + '\n');
   }
-  // Local/open-weights models (private LAN/localhost endpoint) degrade on long context
-  // far sooner than a frontier API, so compact them earlier — summarize before they rot.
-  // Frontier APIs keep the configured budget; an explicit --context-budget always wins.
-  if (flags.contextBudget === undefined && isLocalBaseUrl(resolvedBaseUrl)) {
-    cfg = { ...cfg, contextBudget: Math.min(cfg.contextBudget, 48_000) };
-  }
+  // Local endpoints: ALWAYS clamp soft budget to the real server window (or a 32k default).
+  // Config contextBudget:128000 on a 32k llama.cpp is a no-op for capacity — without this clamp
+  // auto-compact never fires and the server 400s ("request exceeds available context size").
+  // Explicit --context-budget still wins as a *ceiling*, but never above the server window.
   let startProvider: string = cfg.provider;
   let startBaseUrl = resolvedBaseUrl;
   let startApiKey = apiKey;
@@ -282,11 +285,22 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     startProvider = local.provider;
     startBaseUrl = local.baseUrl;
     startApiKey = local.apiKey;
-    // A local llama.cpp server is bounded by its -c: keep the context budget under BOTH the
-    // historical 30k gguf clamp AND this entry's actual window MINUS real headroom (a --ctx
-    // 8192 model must compact well before 8192, or long sessions die on a provider 400 instead
-    // of compacting). The 2048 floor keeps a degenerate window functional rather than zero.
-    cfg = { ...cfg, contextBudget: Math.min(cfg.contextBudget, 30_000, Math.max(2_048, local.ctxWindow - 2_048)) };
+    const budget = clampLocalContextBudget(cfg.contextBudget, local.ctxWindow);
+    cfg = {
+      ...cfg,
+      contextBudget: budget,
+      keepLastTurns: keepLastTurnsForBudget(budget, cfg.keepLastTurns),
+      summarizeTriggerRatio: triggerRatioForBudget(budget, cfg.summarizeTriggerRatio),
+    };
+  } else if (isLocalBaseUrl(resolvedBaseUrl)) {
+    // OpenAI-compatible local URL without a managed launcher — assume 32k if unknown.
+    const budget = clampLocalContextBudget(cfg.contextBudget, activeModelEntry?.ctx);
+    cfg = {
+      ...cfg,
+      contextBudget: budget,
+      keepLastTurns: keepLastTurnsForBudget(budget, cfg.keepLastTurns),
+      summarizeTriggerRatio: triggerRatioForBudget(budget, cfg.summarizeTriggerRatio),
+    };
   }
 
   const provider = createProvider({

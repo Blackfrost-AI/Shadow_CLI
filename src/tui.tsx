@@ -74,7 +74,8 @@ import {
 } from './agent/approval.js';
 import { cycleAutonomy, type AutonomyLevel } from './safety/permissions.js';
 import { applyPermissionCommand } from './safety/permissionCmd.js';
-import { isLocalModelTarget } from './safety/offline.js';
+import { isLocalBaseUrl, isLocalModelTarget } from './safety/offline.js';
+import { clampLocalContextBudget } from './util/contextBudget.js';
 import { familyProfile } from './config/familyProfiles.js';
 import { SessionLog } from './state/session.js';
 import { createProvider, type ProviderName } from './provider/index.js';
@@ -1525,6 +1526,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const [autonomy, setAutonomyState] = useState<AutonomyLevel>(opts.autonomy);
   const [effort, setEffortState] = useState<Effort>(effortOrDefault(opts.cfg.effort));
   const [todoItems, setTodoItems] = useState<TodoItem[]>([]);
+  const todoItemsRef = useRef<TodoItem[]>([]);
+  todoItemsRef.current = todoItems;
   const [planMode, setPlanMode] = useState<PlanSnapshot>(opts.planMode?.snapshot() ?? { mode: 'implement' });
   const [goal, setGoal] = useState<string | null>(null); // standing objective (/goal); injected into system each turn
   const [tick, setTick] = useState(0);
@@ -1985,14 +1988,18 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     reflow('soft');
   }), [kbRegister, reflow]);
   useEffect(() => kbRegister('transcript:toggleTaskList', () => {
-    // Mid-turn the full block is suppressed (the summary glyph is pinned '▸'), so a toggle would
-    // be invisible now and pop the accordion open unprompted at turn end — drop the key instead.
-    if (runningRef.current) return;
+    // Works idle AND mid-turn — users hit Ctrl-T to inspect the list while the agent runs.
+    // (Key delivery for Ctrl+T is fixed in eventToKeystroke: C0 bytes map to letter+ctrl.)
+    if (todoItemsRef.current.length === 0) {
+      // Visible feedback so "does nothing" isn't silent when the model never wrote todos.
+      pushLine({ text: '  no task list yet — the model creates one with todo_write', dimColor: true });
+      return;
+    }
     setTodoCollapsed((v) => !v);
-    // The full block mounts/unmounts above <Static>; re-lock the composer to the bottom so the
-    // height change can't leave a blank gap or stale pinned rows (the old hardReflow invariant).
-    reflow('hard');
-  }), [kbRegister, reflow]);
+    // Soft reflow: remount Static chrome without wiping scrollback (hard was a flashbang for a
+    // pure live-height change).
+    reflow('soft');
+  }), [kbRegister, reflow, pushLine]);
 
   // Re-run the /statusline command (if any) and stash its output for the footer.
   const refreshStatusLine = useCallback(() => {
@@ -3385,8 +3392,15 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       // clampBudget:false so a mixed-window table doesn't bounce/print this line every route.
       if (opts2.clampBudget !== false) {
         if (baseBudgetRef.current == null) baseBudgetRef.current = opts.cfg.contextBudget;
-        const nextBudget = entry.gguf || entry.mlx || entry.vllm
-          ? Math.min(baseBudgetRef.current, 30_000, Math.max(2_048, (entry.ctx ?? 32_768) - 2_048))
+        // Match bootstrap: soft budget under the real server window so compact fires before 400.
+        const localish = !!(
+          entry.gguf ||
+          entry.mlx ||
+          entry.vllm ||
+          (entry.baseUrl && isLocalBaseUrl(resolveBaseUrl(entry.baseUrl, entry.provider)))
+        );
+        const nextBudget = localish
+          ? clampLocalContextBudget(baseBudgetRef.current, entry.ctx)
           : baseBudgetRef.current;
         if (nextBudget !== opts.cfg.contextBudget) {
           opts.cfg.contextBudget = nextBudget;
@@ -4739,10 +4753,11 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // slow/stalled model reads as "still waiting", not a frozen UI.
   const elapsedSec = running ? Math.floor((Date.now() - runStartRef.current) / 1000) : 0;
   const todoDone = todoItems.filter((item) => item.status === 'completed').length;
-  // The pinned Task list disappears once the work is genuinely finished — every item complete AND the
-  // turn has ended. It stays up mid-turn (live progress) and when a turn ends with items still open (so
-  // you can see what's left), so a COMPLETED list no longer lingers until the next task loads.
-  const showTodo = todoItems.length > 0 && (running || todoDone < todoItems.length);
+  // Task list chrome: visible while there are items, and when the user has expanded via Ctrl-T
+  // (so a finished list can still be inspected). Auto-hides only when collapsed + all done + idle.
+  const showTodo =
+    todoItems.length > 0 &&
+    (running || todoDone < todoItems.length || !todoCollapsed);
   const todoStatus = showTodo ? ` · todo ${todoDone}/${todoItems.length}` : '';
   const planStatus = planMode.mode === 'planning' ? ' · plan: planning' : '';
   const showPlan = !!planMode.title;
@@ -4818,14 +4833,12 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // Constant live slot: always request LIVE_SLOT_ROWS (unless menu steals the rows). Content is
   // bottom-aligned inside; idle leaves the slot blank. Same height idle ↔ running ⇒ no composer jump.
   const liveWant = menuOpen ? 0 : LIVE_SLOT_ROWS;
-  // Pinned agent state: ONE line by default (redesign: accordion dies). Ctrl-T expands the full
-  // list only when idle on a tall enough terminal; running always stays one line so the composer
-  // never jumps.
+  // Pinned agent state: ONE line by default. Ctrl-T expands the full list (idle OR mid-turn).
   const todoCurrent = todoItems.find((t) => t.status === 'in_progress')?.subject ?? '';
-  // Full multi-row PinnedState only on explicit Ctrl-T expand while idle (default is one-line).
-  // A GOAL alone never drives the full block — it always rides the one-line summary.
-  const idleFullBlock = !running && !todoCollapsed && !!(showPlan || showTodo);
-  const showFullPinned = idleFullBlock && terminalSize.rows >= 16;
+  // Full multi-row PinnedState when expanded on a tall enough terminal. A GOAL alone never
+  // drives the full block — it always rides the one-line summary.
+  const wantFullBlock = !todoCollapsed && !!(showPlan || showTodo);
+  const showFullPinned = wantFullBlock && terminalSize.rows >= 16;
   const hudPinnedLine = [
     goal ? `🎯 ${goal}` : '',
     showPlan ? `${planMode.mode === 'planning' ? 'plan' : 'implement'}: ${planMode.title ?? ''}` : '',

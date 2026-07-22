@@ -8,6 +8,7 @@ import { resolvePermissionRule, type PermissionRule } from '../safety/rules.js';
 import type { ShadowConfig } from '../config.js';
 import { runHooks, runHookPhase } from '../hooks/runner.js';
 import { isFallbackEligible, resolveFallbackModel } from '../provider/fallback.js';
+import { looksLikeTokenOverflow } from '../provider/stream.js';
 import type { UserQuestion } from './approval.js';
 import { askUserInputSchema } from '../tools/askUser.js';
 import type { ModelEntry } from '../config.js';
@@ -432,7 +433,7 @@ export class AgentLoop {
     }
   }
 
-  /** Try the active model; on fallback-eligible failure swap model once and retry. */
+  /** Try the active model; on context overflow force-compact once; else fallback-eligible swap. */
   private async runProviderTurnWithFallback(
     provider: Provider,
     req: CompletionRequest,
@@ -447,10 +448,43 @@ export class AgentLoop {
     providerError?: { code: string; message: string };
   }> {
     let model = this.deps.model;
-    for (let attempt = 0; attempt < 2; attempt++) {
+    let overflowCompactTried = false;
+    for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        const turn = await this.runProviderTurn(provider, { ...req, model });
+        // Always send LIVE context (after a compact retry it shrinks), still healing any
+        // dangling tool_use pairs so a corrupt snapshot can't 400 the retry.
+        const turn = await this.runProviderTurn(provider, {
+          ...req,
+          model,
+          messages: this.healDanglingToolUses(this.deps.context.messages()),
+        });
         const err = turn.providerError;
+        // Local 32k servers: "request (N tokens) exceeds available context size" — shrink history
+        // and retry once before giving up or falling back.
+        if (
+          !overflowCompactTried &&
+          err &&
+          !turn.text &&
+          turn.toolCalls.length === 0 &&
+          looksLikeTokenOverflow(err.message)
+        ) {
+          overflowCompactTried = true;
+          try {
+            const did = await this.deps.context.maybeSummarize(provider, model, true);
+            if (did) {
+              this.deps.bus.emit({ type: 'compaction', trigger: 'auto' });
+              this.deps.bus.emit({
+                type: 'retry',
+                attempt: 1,
+                delayMs: 0,
+                reason: 'context overflow — compacted and retrying',
+              });
+              continue;
+            }
+          } catch {
+            /* fall through */
+          }
+        }
         if (
           attempt === 0 &&
           err &&

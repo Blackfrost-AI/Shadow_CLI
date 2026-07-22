@@ -38,6 +38,26 @@ test('match: eventToKeystroke normalizes arrows/specials/letters', () => {
   assert.equal(eventToKeystroke(ev({ input: ' ' })).key, 'space');
 });
 
+test('match: C0 control bytes map to letter+ctrl (Ink delivers Ctrl+T as \\x14)', () => {
+  // Real terminal: Ctrl+A=0x01 … Ctrl+Z=0x1a. Without this map, key='\x14' never matches `ctrl+t`.
+  const t = eventToKeystroke(fromInkKey('\x14', { ctrl: true }));
+  assert.deepEqual(t, { key: 't', ctrl: true, shift: false, meta: false });
+  // Some terminals omit the ctrl flag and only send the control byte.
+  const o = eventToKeystroke(fromInkKey('\x0f', {}));
+  assert.deepEqual(o, { key: 'o', ctrl: true, shift: false, meta: false });
+  // Defaults bind ctrl+t → transcript:toggleTaskList — must match the C0 form too.
+  const { bindings } = buildDefaultBindings();
+  for (const ink of [
+    fromInkKey('\x14', { ctrl: true }),
+    fromInkKey('\x14', {}),
+    fromInkKey('t', { ctrl: true }),
+  ]) {
+    const r = resolveAction(ink, ['Transcript', 'Chat', 'Global'], bindings, []);
+    assert.equal(r.type, 'match', `expected match for ${JSON.stringify(ink)}`);
+    if (r.type === 'match') assert.equal(r.action, 'transcript:toggleTaskList');
+  }
+});
+
 test('match: chordEquals / chordStartsWith', () => {
   const cx = parseChord('ctrl+x')!;
   const cxck = parseChord('ctrl+x ctrl+k')!;

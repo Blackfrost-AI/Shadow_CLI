@@ -40,9 +40,16 @@ test('maybeSummarize(force) compacts even below the trigger threshold', async ()
   if (note.content[0]!.type === 'text') {
     const t = note.content[0]!.text;
     assert.match(t, /SUMMARY/, 'carries the generated summary');
-    assert.match(t, /compacted to free up context/i, 'framed as a mid-task compaction, not a fresh start');
-    assert.match(t, /NEXT STEP|pick up exactly where you left off/i, 'includes the continuation directive that prevents the greeting');
+    assert.match(t, /compacted to free context|PROGRESS SUMMARY/i, 'framed as a mid-task compaction, not a fresh start');
+    assert.match(t, /NEXT STEP|Continue directly from NEXT STEP/i, 'includes the continuation directive that prevents the greeting');
     assert.match(t, /do NOT greet|not greet/i, 'explicitly forbids greeting/asking after compaction');
+  }
+  // Pin is reframed as an in-progress objective so the model does not restart from a raw first prompt.
+  const pin = after[0]!;
+  assert.equal(pin.role, 'user');
+  if (pin.content[0]!.type === 'text') {
+    assert.match(pin.content[0]!.text, /SESSION OBJECTIVE \(in progress/i, 'pin reframed as in-progress objective');
+    assert.match(pin.content[0]!.text, /do NOT restart/i);
   }
 });
 
@@ -69,7 +76,7 @@ test('compaction preserves later-turn instructions verbatim even when the summar
   const text = ctx.messages().map((m) => m.content.map((b) => (b.type === 'text' ? b.text : '')).join(' ')).join('\n');
   assert.match(text, /fetchJson/, 'the load-bearing instruction survives verbatim');
   assert.match(text, /httpClient/, 'the target of the migration survives verbatim');
-  assert.match(text, /TASK & INSTRUCTIONS \(verbatim/, 'instructions are in the verbatim block, not left to the summary');
+  assert.match(text, /SESSION OBJECTIVE \(in progress/, 'objective rides the reframed pin, not a lossy summary alone');
   assert.doesNotMatch(text, /patched f\d/, 'tool_result turns are machine output, never harvested as instructions');
 });
 
@@ -119,4 +126,59 @@ test('recordActualTokens ignores non-positive counts', () => {
   const heuristic = ctx.estimateTokens(provider);
   ctx.recordActualTokens(0);
   assert.equal(ctx.estimateTokens(provider), heuristic, 'a zero usage report does not zero out the estimate');
+});
+
+test('hysteresis: auto-compact re-arms only when post-compact is under the trigger', async () => {
+  // Large budget + short history: after force-compact we sit under the trigger and rearm blocks
+  // a second auto-compact until tokens grow. (If still OVER trigger after compact, rearm is 0
+  // so we can fire again — that path is required to avoid 32k server 400s.)
+  const ctx = new Context({ contextBudget: 100_000, triggerRatio: 0.75, keepLastTurns: 2 });
+  ctx.pinTask({ role: 'user', content: [{ type: 'text', text: 'Ship the feature end to end.' }] });
+  for (let i = 0; i < 6; i++) {
+    ctx.append({ role: 'assistant', content: [{ type: 'text', text: `work ${i}` }] });
+    ctx.append({ role: 'user', content: [{ type: 'text', text: `ok ${i}` }] });
+  }
+  const provider = new MockProvider([
+    [{ type: 'text', delta: 'ALREADY DONE — early work.\nNEXT STEP — finish.' }, { type: 'done', stopReason: 'end_turn' }],
+    [{ type: 'text', delta: 'should not run' }, { type: 'done', stopReason: 'end_turn' }],
+  ]);
+  assert.equal(await ctx.maybeSummarize(provider, 'mock', true), true, 'first compact succeeds');
+  const mid = ctx.messages().length;
+  // Under threshold + rearmed → auto path no-ops.
+  assert.equal(await ctx.maybeSummarize(provider, 'mock', false), false, 'hysteresis blocks re-compact under threshold');
+  assert.equal(ctx.messages().length, mid, 'history unchanged under hysteresis');
+  // Force still works (manual /compact).
+  assert.equal(await ctx.maybeSummarize(provider, 'mock', true), true, 'force bypasses hysteresis');
+});
+
+test('after compact the pin is not a raw first prompt that invites a restart', async () => {
+  const ctx = new Context({ contextBudget: 1_000_000, triggerRatio: 0.75, keepLastTurns: 2 });
+  ctx.pinTask({
+    role: 'user',
+    content: [{ type: 'text', text: 'Refactor the auth module to use the new token helper.' }],
+  });
+  for (let i = 0; i < 6; i++) {
+    ctx.append({ role: 'assistant', content: [{ type: 'text', text: `step ${i}` }] });
+    ctx.append({ role: 'user', content: [{ type: 'text', text: `ok continue ${i}` }] });
+  }
+  const provider = new MockProvider([
+    [
+      {
+        type: 'text',
+        delta: 'TASK — auth refactor.\nALREADY DONE — steps 0-4.\nCURRENT WORK — step 5.\nNEXT STEP — finish step 5 then stop.',
+      },
+      { type: 'done', stopReason: 'end_turn' },
+    ],
+  ]);
+  assert.equal(await ctx.maybeSummarize(provider, 'mock', true), true);
+  const pin = ctx.messages()[0]!;
+  assert.equal(pin.content[0]!.type, 'text');
+  if (pin.content[0]!.type === 'text') {
+    const t = pin.content[0]!.text;
+    assert.match(t, /SESSION OBJECTIVE \(in progress/i);
+    assert.match(t, /token helper/, 'original objective preserved');
+    assert.doesNotMatch(t, /^Refactor the auth module/, 'not a bare replay of the first prompt as a new request');
+  }
+  const all = ctx.messages().map((m) => m.content.map((b) => (b.type === 'text' ? b.text : '')).join('')).join('\n');
+  assert.match(all, /ALREADY DONE|NEXT STEP/, 'progress note carries done/next so work is not restarted');
 });

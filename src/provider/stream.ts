@@ -294,7 +294,8 @@ export function parseRetryAfter(v: string | null): number | undefined {
 
 /** True if a 4xx message indicates the request exceeded the model's context/token budget. */
 export function looksLikeTokenOverflow(msg: string): boolean {
-  return /context[ _-]?(length|window)|maximum context|context_length_exceeded|max(?:imum)?[ _]?(?:new[ _])?tokens|too many tokens|reduce the (?:length|number)|prompt is too long|requested about \d+ tokens|exceeds? the (?:maximum|model)/i.test(
+  // Includes llama.cpp / many locals: "request (32925 tokens) exceeds the available context size (32768 tokens)"
+  return /context[ _-]?(length|window|size)|maximum context|available context|context_length_exceeded|max(?:imum)?[ _]?(?:new[ _])?tokens|too many tokens|reduce the (?:length|number)|prompt is too long|requested about \d+ tokens|exceeds? the (?:maximum|model|available)|n_keep|n_ctx/i.test(
     msg,
   );
 }

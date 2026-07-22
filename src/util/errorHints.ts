@@ -20,8 +20,12 @@ export function providerErrorHint(raw: string): string | null {
 
   // Context / token overflow — check FIRST: it often arrives as a generic http_400 whose message
   // is the only signal, and it's the most common recoverable failure on small-window local models.
-  if (has(/max_tokens|max_model_len|max_total_tokens|context length|context window|maximum context|too many tokens|reduce the length|exceeds? the (model|maximum|context)/)) {
-    return 'Request exceeds the model’s context. Lower the output cap (/config set maxOutputTokens <n>), /compact to shrink history, or serve the model with a bigger context (llama.cpp -c / vLLM --max-model-len).';
+  if (
+    has(
+      /max_tokens|max_model_len|max_total_tokens|context length|context window|context size|available context|maximum context|too many tokens|reduce the length|exceeds? the (model|maximum|context|available)|n_ctx|n_keep/,
+    )
+  ) {
+    return 'Request exceeds the model’s context. Shadow should auto-compact mid-turn — try /compact, lower contextBudget to fit the server window (e.g. 24000 for a 32k model), or serve with a bigger -c / --max-model-len.';
   }
   // Network / connection.
   if (code === 'network_error' || has(/unable to connect|econnrefused|enotfound|eai_again|network error|fetch failed|socket hang up|connection (refused|reset|timed out)|dns/)) {

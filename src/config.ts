@@ -230,13 +230,12 @@ const ConfigSchema = z.object({
   cacheTtl: z.enum(['5m', '1h']).default('5m'),
   // Anthropic "fast mode" (premium low-latency). Disables extended thinking when on.
   fastMode: z.boolean().default(false),
-  // Context window the agent budgets against (override per-model in config). 128k = the modern
-  // floor; compaction fires at contextBudget * summarizeTriggerRatio. Was 100k/0.75 (compact at
-  // 75k) which fired far too early on large-window models mid-research — now 128k/0.85 → ~109k,
-  // safe for a 128k model (leaves headroom for the reply) and much less frequent.
+  // Context window the agent budgets against (override per-model in config). Compaction fires at
+  // contextBudget * summarizeTriggerRatio, then re-arms only after hysteresis (see Context).
+  // 128k/0.90 → ~115k; keepLastTurns is message count (tool rounds burn 2 msgs each).
   contextBudget: z.number().int().positive().default(128_000),
-  summarizeTriggerRatio: z.number().positive().max(1).default(0.85),
-  keepLastTurns: z.number().int().positive().default(6),
+  summarizeTriggerRatio: z.number().positive().max(1).default(0.9),
+  keepLastTurns: z.number().int().positive().default(12),
   maxToolResultChars: z.number().int().positive().default(16_384),
 
   sandbox: z.enum(['auto', 'off']).default('auto'), // OS sandbox for run_shell (auto = on where supported)

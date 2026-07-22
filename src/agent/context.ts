@@ -2,20 +2,33 @@ import type { ContentBlock, Message, Provider } from '../provider/provider.js';
 
 export interface ContextOptions {
   contextBudget: number; // token budget that triggers summarization
-  triggerRatio: number; // summarize when estimate > contextBudget * ratio (default 0.75)
-  keepLastTurns: number; // most-recent turns kept verbatim
+  triggerRatio: number; // summarize when estimate > contextBudget * ratio (default 0.9)
+  keepLastTurns: number; // most-recent messages kept verbatim
 }
 
 /**
- * Running message history with a summarization buffer. The original task (and any
- * user-pinned turns) are never summarized away. Summarization never splits a
- * tool_use turn from its matching tool_result turn — both providers reject that.
+ * Running message history with a summarization buffer. The session objective is never
+ * summarized away. Summarization never splits a tool_use turn from its matching
+ * tool_result turn — both providers reject that.
+ *
+ * Two hard-won failure modes this class guards against:
+ *  1. **Thrashing** — compact fires every few tool rounds because a small local budget
+ *     re-triggers immediately after a weak shrink. Fixed with post-compact hysteresis.
+ *  2. **Restart from first prompt** — the pinned first user message still looks like a
+ *     fresh request after compact, so the model re-plans from scratch. Fixed by reframing
+ *     the pin as an in-progress SESSION OBJECTIVE and putting CURRENT WORK in a progress note.
  */
 export class Context {
   private msgs: Message[] = [];
   private pinnedPrefix = 0;
   /** Last REAL request size (input + cache tokens) from the provider's usage event. */
   private lastActualTokens = 0;
+  /**
+   * After a successful compact, auto-compact is suppressed until the estimate grows past
+   * this floor. Prevents the "compact → still over trigger → compact again next tool"
+   * death spiral on small local windows.
+   */
+  private rearmAtTokens = 0;
 
   constructor(private readonly opts: ContextOptions) {}
 
@@ -44,6 +57,7 @@ export class Context {
     this.msgs = [];
     this.pinnedPrefix = 0;
     this.lastActualTokens = 0;
+    this.rearmAtTokens = 0;
   }
 
   messages(): Message[] {
@@ -51,20 +65,34 @@ export class Context {
   }
 
   /** Export restorable state for session snapshots (resume / rewind). */
-  exportState(): { messages: Message[]; pinnedPrefix: number; lastActualTokens: number; subAgentTasks?: any[] } {
+  exportState(): {
+    messages: Message[];
+    pinnedPrefix: number;
+    lastActualTokens: number;
+    rearmAtTokens?: number;
+    subAgentTasks?: any[];
+  } {
     return {
       messages: [...this.msgs],
       pinnedPrefix: this.pinnedPrefix,
       lastActualTokens: this.lastActualTokens,
+      rearmAtTokens: this.rearmAtTokens,
       subAgentTasks: (this as any)._subAgentTasks || [],
     };
   }
 
   /** Replace history from a snapshot produced by `exportState` / `serializeContext`. */
-  loadState(data: { messages: Message[]; pinnedPrefix?: number; lastActualTokens?: number; subAgentTasks?: any[] }): void {
+  loadState(data: {
+    messages: Message[];
+    pinnedPrefix?: number;
+    lastActualTokens?: number;
+    rearmAtTokens?: number;
+    subAgentTasks?: any[];
+  }): void {
     this.msgs = [...data.messages];
     this.pinnedPrefix = data.pinnedPrefix ?? 0;
     this.lastActualTokens = data.lastActualTokens ?? 0;
+    this.rearmAtTokens = data.rearmAtTokens ?? 0;
     (this as any)._subAgentTasks = data.subAgentTasks || [];
   }
 
@@ -75,37 +103,45 @@ export class Context {
   }
 
   /**
-   * Collapse the oldest non-pinned turns into a single summary note when the
-   * estimate crosses contextBudget * triggerRatio. Returns true if it summarized.
+   * Collapse the oldest non-pinned turns into a progress note when the estimate crosses
+   * contextBudget * triggerRatio. Returns true if it summarized.
    */
   async maybeSummarize(provider: Provider, model: string, force = false): Promise<boolean> {
+    const trigger = this.opts.contextBudget * this.opts.triggerRatio;
     let tokens = this.estimateTokens(provider);
-    if (!force && tokens <= this.opts.contextBudget * this.opts.triggerRatio) {
-      // Opportunistic: if the provider can give a real count (Anthropic count_tokens),
-      // use it when we're in the "maybe" zone to avoid premature or late compaction.
-      if (provider.countTokens && tokens > this.opts.contextBudget * 0.6) {
-        try {
-          const real = await provider.countTokens({ model, messages: this.msgs });
-          if (real > 0) {
-            this.lastActualTokens = real; // cache for next estimates
-            tokens = real;
+
+    if (!force) {
+      // Hysteresis only applies when we are STILL under the trigger. Once we are over
+      // the trigger again, always compact — otherwise a weak compact + high rearm floor
+      // lets the request grow until the local server 400s (32k hard limit).
+      if (tokens <= trigger) {
+        if (this.rearmAtTokens > 0 && tokens < this.rearmAtTokens) return false;
+        // Opportunistic real count when we're in the "maybe" zone.
+        if (provider.countTokens && tokens > this.opts.contextBudget * 0.6) {
+          try {
+            const real = await provider.countTokens({ model, messages: this.msgs });
+            if (real > 0) {
+              this.lastActualTokens = real;
+              tokens = real;
+            }
+          } catch {
+            /* ignore, keep heuristic */
           }
-        } catch {
-          /* ignore, keep heuristic */
         }
+        if (tokens <= trigger) return false;
       }
-      if (tokens <= this.opts.contextBudget * this.opts.triggerRatio) return false;
     }
 
-    let end = this.msgs.length - this.opts.keepLastTurns;
+    // Small windows: keep a shorter tail so one compact actually frees space.
+    const keep =
+      this.opts.contextBudget <= 40_000
+        ? Math.min(this.opts.keepLastTurns, 6)
+        : this.opts.keepLastTurns;
+    let end = this.msgs.length - keep;
     if (end <= this.pinnedPrefix) return false;
 
-    // Don't begin the kept region on an orphaned tool_result: its matching
-    // tool_use lives in the preceding turn, which would be collapsed into the
-    // summary, and both providers reject a tool_result with no matching tool_use.
-    // Tool results are stored as `tool_result` blocks inside role:'user' turns
-    // (not a 'tool' role), so detect them by content, not by role, and advance
-    // past any such turn until the kept region starts on a clean boundary.
+    // Don't begin the kept region on an orphaned tool_result: its matching tool_use lives
+    // in the preceding turn. Tool results are `tool_result` blocks inside role:'user' turns.
     while (
       end < this.msgs.length &&
       this.msgs[end]!.content.some((b) => b.type === 'tool_result')
@@ -115,95 +151,128 @@ export class Context {
     if (end <= this.pinnedPrefix) return false;
 
     const toSummarize = this.msgs.slice(this.pinnedPrefix, end);
+    const pinnedSlice = this.msgs.slice(0, this.pinnedPrefix);
+
+    // Always fold the pinned objective into the summarizer prompt so a weak local model
+    // cannot invent a new task — and so the progress note is about THIS work.
+    const objectiveLines = harvestInstructions(pinnedSlice);
+    const middleLines = harvestInstructions(toSummarize);
+    const allInstructions = mergeInstructions(objectiveLines, middleLines);
+
     const transcript = toSummarize
       .map((m) => `${m.role}: ${m.content.map(blockText).join(' ')}`)
       .join('\n');
+
+    const objectiveBlock =
+      allInstructions.length > 0
+        ? `SESSION OBJECTIVE (must preserve verbatim in TASK):\n${allInstructions.map((l) => `• ${l}`).join('\n')}\n\n`
+        : '';
 
     let summary = '';
     try {
       for await (const ev of provider.send({
         model,
-        // Structured summary — not a terse blob. The agent reads this to RESUME with zero loss, so
-        // it must carry the task, the current work, and the concrete next step (not just "what
-        // happened"). The TASK section is load-bearing: it's what stops the model treating the
-        // compaction as a fresh session and greeting the user.
         system:
           'You are compacting an IN-PROGRESS agent session so it can continue with a smaller ' +
-          'context window. Write a structured summary the agent will read to resume its work with ' +
-          'ZERO loss of task or momentum. Use exactly these sections, terse but complete:\n' +
-          '1. TASK — the user\'s original request and current goal, stated so it cannot be misread. ' +
-          'This is the most important line; never drop or soften it.\n' +
-          '2. DECISIONS & FACTS — key findings, constraints, and choices made so far.\n' +
-          '3. FILES & COMMANDS — paths created/edited and notable command outcomes.\n' +
+          'context window. The agent must RESUME mid-work — it must NOT restart the original ' +
+          'request from scratch, re-greet the user, or re-plan work already done.\n' +
+          'Write a structured summary with exactly these sections, terse but complete:\n' +
+          '1. TASK — restate the SESSION OBJECTIVE (given below) so it cannot be misread.\n' +
+          '2. ALREADY DONE — concrete progress (files changed, decisions made). Critical: this ' +
+          'is what stops the model redoing finished work.\n' +
+          '3. DECISIONS & FACTS — constraints and choices that still apply.\n' +
           '4. CURRENT WORK — precisely what was underway at the moment of this summary.\n' +
-          '5. NEXT STEP — the single concrete next action to take to keep going.\n' +
+          '5. NEXT STEP — the single concrete next action. Do not list "start over" or "re-read the prompt".\n' +
           'No preamble, no meta-commentary, no sign-off.',
-        messages: [{ role: 'user', content: [{ type: 'text', text: transcript }] }],
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: `${objectiveBlock}TRANSCRIPT TO COMPACT:\n${transcript}`,
+              },
+            ],
+          },
+        ],
         tools: [],
-        maxOutputTokens: 2048, // room for the structured form; a truncated summary is a lost task
+        maxOutputTokens: 2048,
       })) {
         if (ev.type === 'text') summary += ev.delta;
       }
     } catch {
-      // If summarization fails, leave history intact rather than losing it.
       return false;
     }
-    if (!summary.trim()) return false; // empty summary → don't destroy history for nothing
+    if (!summary.trim()) return false;
 
-    // The note is a USER turn (a system-style directive), NOT an assistant turn. An assistant note
-    // spliced directly before the kept region — which begins on an assistant turn carrying leading
-    // SIGNED thinking + tool_use — coalesces with it on Anthropic, pushing the thinking block off the
-    // front → 400 "thinking blocks must be first"; it also emitted two back-to-back assistant messages
-    // that strict local (GLM/Lumix) chat templates reject. As a user turn it alternates cleanly with the
-    // kept assistant turn across every adapter. The directive still prevents the post-compaction
-    // "Hey! What can I help you with?" greeting: it tells the model to resume from NEXT STEP.
-    // The task must not depend on the summarizer faithfully copying it: preserve the human
-    // instruction turns verbatim, ABOVE the generated summary, so it survives even a lossy local
-    // summarizer. When there are none to harvest (task fully in the pinned prefix / all machine
-    // churn), the note is byte-identical to the pre-fix format.
-    const instructions = harvestInstructions(toSummarize);
-    const body = instructions.length
-      ? `${INSTR_HEADER}\n${renderInstructionBlock(instructions)}\n\n${SUMMARY_HEADER}\n${summary.trim()}`
-      : summary.trim();
-    const note: Message = {
+    // Reframe the pin: a raw first user prompt after compact reads as a FRESH request and
+    // models restart from it. Replace the pin with an explicit in-progress objective carrier,
+    // then a separate progress note (summary + next step). Verbatim instructions ride the pin.
+    const objectiveText =
+      allInstructions.length > 0
+        ? allInstructions.map((l) => `• ${l}`).join('\n')
+        : pinnedSlice
+            .map((m) => m.content.map(blockText).join(' ').trim())
+            .filter(Boolean)
+            .join('\n') || '(session objective — see progress note)';
+
+    const objectiveMsg: Message = {
       role: 'user',
       content: [
         {
           type: 'text',
           text:
-            `[System note: earlier turns in this session were compacted to free up context. Below is the ` +
-            `preserved state of the in-progress work. Continue the task directly from NEXT STEP — do NOT ` +
-            `greet, ask what to help with, or recap; pick up exactly where you left off and keep working.]` +
-            `\n\n${body}`,
+            `SESSION OBJECTIVE (in progress — do NOT restart from the beginning, do NOT re-greet, ` +
+            `do NOT re-plan finished work; continue from the progress note's NEXT STEP):\n` +
+            `${objectiveText}`,
         },
       ],
     };
-    this.msgs = [...this.msgs.slice(0, this.pinnedPrefix), note, ...this.msgs.slice(end)];
-    // History just shrank; drop the stale (larger) real count so it doesn't re-trigger
-    // summarization before the next turn re-measures.
+
+    const progressMsg: Message = {
+      role: 'user',
+      content: [
+        {
+          type: 'text',
+          text:
+            `[System note: earlier turns were compacted to free context. The SESSION OBJECTIVE above is ` +
+            `still the goal. Progress so far and the next action are below. Continue directly from NEXT STEP — ` +
+            `do NOT greet, ask what to help with, restate the whole plan, or start over.]` +
+            `\n\n${SUMMARY_HEADER}\n${summary.trim()}`,
+        },
+      ],
+    };
+
+    // Keep recent messages; trim fat tool_result bodies so a single compact actually frees room
+    // (otherwise rearm hysteresis is the only thing preventing thrash).
+    const kept = this.msgs.slice(end).map(trimKeptMessage);
+    this.msgs = [objectiveMsg, progressMsg, ...kept];
+    this.pinnedPrefix = 1; // only the objective carrier is protected
     this.lastActualTokens = 0;
+
+    // Rearm hysteresis only when compact clearly freed room under the trigger.
+    // If still near/over the trigger, rearmAt=0 so the next over-threshold check fires again
+    // (with a shorter keep on small budgets) instead of sailing into a server 400.
+    const after = provider.estimateTokens(this.msgs);
+    const gap = Math.max(2_000, Math.floor(this.opts.contextBudget * 0.1));
+    this.rearmAtTokens = after < trigger * 0.9 ? after + gap : 0;
+
     return true;
   }
 }
 
-// Stable markers delimiting the verbatim-instructions block inside a compaction note. The block is
-// the MODEL-INDEPENDENT carrier of the task: it survives compaction word-for-word even when the
-// summarizer model (often a small local one, for offline users) drops or softens its TASK line. The
-// markers must stay byte-stable — carry-forward across repeated compactions parses on them.
+// Stable markers for instruction carry-forward across repeated compactions.
 const INSTR_HEADER =
   '── TASK & INSTRUCTIONS (verbatim — the source of truth; follow these, the summary below is only a progress digest) ──';
 const SUMMARY_HEADER = '── PROGRESS SUMMARY ──';
-const INSTR_MAX_EACH = 1500; // per-instruction character cap
-const INSTR_MAX_TOTAL = 8000; // total verbatim budget (~2k tokens); earliest (task) instructions win
+const INSTR_MAX_EACH = 1500;
+const INSTR_MAX_TOTAL = 8000;
+/** Cap tool_result bodies kept after compact so the kept tail does not re-fill the window. */
+const KEPT_TOOL_RESULT_CAP = 2_500;
 
 /**
- * Pull the load-bearing human instructions out of the turns about to be summarized, VERBATIM, so the
- * original task survives compaction even when the summarizer model drops it. Only the first user
- * message is pinned, so a task stated in any later turn would otherwise live only inside the lossy
- * summary. Rules: a user turn carrying a tool_result is machine output, not an instruction (skip it);
- * a prior compaction note contributes only its already-preserved instruction block (parsed between
- * the markers), so instructions carry forward across repeated compactions without dragging the whole
- * prior summary along.
+ * Pull human instructions out of turns. Skips tool_result user turns. Prior compaction notes
+ * contribute only their instruction block (or the SESSION OBJECTIVE carrier).
  */
 function harvestInstructions(turns: Message[]): string[] {
   const out: string[] = [];
@@ -213,18 +282,28 @@ function harvestInstructions(turns: Message[]): string[] {
     if (!t) return;
     const capped = t.length > INSTR_MAX_EACH ? `${t.slice(0, INSTR_MAX_EACH)} …[truncated]` : t;
     const key = capped.slice(0, 200);
-    if (seen.has(key)) return; // dedupe repeated instructions / acks
+    if (seen.has(key)) return;
     seen.add(key);
     out.push(capped);
   };
   for (const m of turns) {
     if (m.role !== 'user') continue;
-    if (m.content.some((b) => b.type === 'tool_result')) continue; // machine output, not a human instruction
+    if (m.content.some((b) => b.type === 'tool_result')) continue;
     const text = m.content.map(blockText).join(' ').trim();
     if (!text) continue;
+
+    // New-style objective carrier
+    if (text.startsWith('SESSION OBJECTIVE')) {
+      const body = text.replace(/^SESSION OBJECTIVE[^\n]*:\n?/i, '');
+      for (const line of body.split('\n')) {
+        const l = line.replace(/^\s*•\s?/, '').trim();
+        if (l) add(l);
+      }
+      continue;
+    }
+
     const marker = text.indexOf(INSTR_HEADER);
     if (marker !== -1) {
-      // A prior compaction note — carry forward ONLY its verbatim instruction lines.
       const after = text.slice(marker + INSTR_HEADER.length);
       const endIdx = after.indexOf(SUMMARY_HEADER);
       const block = endIdx === -1 ? after : after.slice(0, endIdx);
@@ -234,25 +313,44 @@ function harvestInstructions(turns: Message[]): string[] {
       }
       continue;
     }
-    if (text.startsWith('[System note:')) continue; // a legacy/instruction-less note — don't re-preserve its summary
+    if (text.startsWith('[System note:')) continue;
     add(text);
   }
   return out;
 }
 
-/** Render harvested instructions as a bulleted block, earliest-first, bounded by the total budget. */
-function renderInstructionBlock(items: string[]): string {
-  const lines: string[] = [];
+/** Merge two instruction lists (objective first), deduped, budgeted. */
+function mergeInstructions(primary: string[], secondary: string[]): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
   let total = 0;
-  for (const it of items) {
+  for (const it of [...primary, ...secondary]) {
+    const key = it.slice(0, 200);
+    if (seen.has(key)) continue;
     if (total + it.length > INSTR_MAX_TOTAL) {
-      lines.push('• …[further instructions elided to save space]');
+      out.push('…[further instructions elided to save space]');
       break;
     }
-    lines.push(`• ${it}`);
+    seen.add(key);
+    out.push(it);
     total += it.length;
   }
-  return lines.join('\n');
+  return out;
+}
+
+/** Shrink tool_result payloads in a kept message so post-compact history stays lean. */
+function trimKeptMessage(m: Message): Message {
+  let changed = false;
+  const content = m.content.map((b) => {
+    if (b.type !== 'tool_result') return b;
+    if (b.content.length <= KEPT_TOOL_RESULT_CAP) return b;
+    changed = true;
+    return {
+      ...b,
+      content: `${b.content.slice(0, KEPT_TOOL_RESULT_CAP)}\n…[truncated after compact]`,
+    };
+  });
+  return changed ? { ...m, content } : m;
 }
 
 function blockText(b: ContentBlock): string {
@@ -260,11 +358,11 @@ function blockText(b: ContentBlock): string {
     case 'text':
       return b.text;
     case 'thinking':
-      return ''; // reasoning is ephemeral — excluded from the summarization transcript
+      return '';
     case 'redacted_thinking':
-      return ''; // encrypted reasoning — no readable text
+      return '';
     case 'image':
-      return '[image]'; // multimodal input — note its presence for the summarization transcript
+      return '[image]';
     case 'tool_use':
       return `[call ${b.name} ${JSON.stringify(b.input)}]`;
     case 'tool_result':
