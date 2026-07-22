@@ -2,6 +2,16 @@ import React, { useState, useEffect, useLayoutEffect, useRef, useCallback } from
 import { render, Box, Text, Static, useApp, useInput, useStdout } from 'ink';
 import { flattenItem, itemIsCollapsible, computeToolRuns } from './tui/flatten.js';
 import type { ToolRun } from './tui/rows.js';
+import {
+  collapseKind,
+  displayToolArg,
+  displayToolName,
+  formatReconSummary,
+  isCollapsibleTool,
+  isWriteTool,
+  reconCount,
+  type CollapseKind,
+} from './tui/toolDisplay.js';
 import { supportsInlineImages, saveAndOpen } from './util/termImage.js';
 import {
   extractCommittableUnits,
@@ -1097,17 +1107,28 @@ export function Markdown({ source, color = C.fg, width = PROSE_MAX_COLS }: { sou
                 );
               }
             }
-            const spans = highlight(b.code || ' ', b.lang);
+            // Quiet code — mirrors flatten.ts: dim lang label + │ gutter, NO Ink round border
+            // (design law: one border in the app = the composer). Live preview ≡ committed.
+            // Line-by-line so multi-line fences wrap correctly (role colors stay per token).
+            const sourceLines = (b.code || ' ').split('\n');
             return (
-              <Box key={i} flexDirection="column" borderStyle="round" borderColor="gray" paddingX={1} marginTop={i === 0 ? 0 : 1}>
-                {b.lang ? <Text color={C.dim}>{b.lang}</Text> : null}
-                <Text>
-                  {spans.map((s, j) => (
-                    <Text key={j} color={codeRoleColor(s.role)}>
-                      {s.text}
-                    </Text>
-                  ))}
-                </Text>
+              <Box key={i} flexDirection="column" marginTop={i === 0 ? 0 : 1}>
+                {b.lang ? <Text color={C.dim} italic>{b.lang}</Text> : null}
+                {sourceLines.map((line, j) => {
+                  const lineSpans = highlight(line || ' ', b.lang);
+                  return (
+                    <Box key={j}>
+                      <Text color={C.dim}>{'│ '}</Text>
+                      <Text>
+                        {lineSpans.map((s, k) => (
+                          <Text key={k} color={codeRoleColor(s.role)}>
+                            {s.text}
+                          </Text>
+                        ))}
+                      </Text>
+                    </Box>
+                  );
+                })}
               </Box>
             );
           }
@@ -1487,6 +1508,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // The tool currently executing — rendered as a persistent live ⏺ Name(args) row that appears the
   // instant the call starts and resolves in place (into the committed green/red ⏺ row) on tool_end.
   const [activeTool, setActiveTool] = useState<{ name: string; arg: string; agent?: { subagentType?: string; description?: string } } | null>(null);
+  // Mid-turn recon burst (read/grep/glob…): counts accumulate so the live row reads
+  // "Reading 3 files, Grepping 1 pattern · path" instead of flashing every single call.
+  // Cleared when a signal tool (edit/shell/…) starts or the turn ends.
+  const [liveRecon, setLiveRecon] = useState<{ kinds: Partial<Record<CollapseKind, number>>; hint?: string } | null>(null);
   const [shellPid, setShellPid] = useState<number | null>(null); // active run_shell child, for the HUD
   const [shellWarn, setShellWarn] = useState<string | null>(null); // set when that child may survive ESC
   const [running, setRunning] = useState(false);
@@ -3576,7 +3601,22 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           setThinkNow(''); // reasoning for this step is over once it acts (folded by default now)
           // Live row (activeTool) already shows name(args) — don't also mirror it into toolLine
           // (that used to double-print `↳ run_shell …` in the status tail under the same call).
-          setActiveTool({ name: e.call.name, arg: previewOf(e.call.input), agent: e.call.name === 'agent' ? agentAttr(e.call.input) : undefined });
+          {
+            const name = e.call.name;
+            const arg = previewOf(e.call.input);
+            setActiveTool({ name, arg, agent: name === 'agent' ? agentAttr(e.call.input) : undefined });
+            if (isCollapsibleTool(name)) {
+              const kind = collapseKind(name);
+              setLiveRecon((prev) => {
+                const kinds = { ...(prev?.kinds ?? {}) };
+                kinds[kind] = (kinds[kind] ?? 0) + 1;
+                return { kinds, hint: arg || prev?.hint };
+              });
+            } else {
+              // Signal tool (edit/shell/fetch/agent) breaks the recon burst.
+              setLiveRecon(null);
+            }
+          }
           setToolLine(null);
           break;
         case 'tool_end': {
@@ -3618,12 +3658,14 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
               bodyLines = capTranscriptBody(ans.split('\n')).map((l) => ({ text: l, color: C.dim }));
             }
           }
-          // Diff headers get a calm `+N −M` stats tail (redesign: ± edit path +12 −3) so you can
-          // scan churn without expanding the fold. Shell output keeps the model-facing summary.
+          // Diff headers: just the calm `+N −M` stats (redesign: Update(path) — +12 −3). The
+          // model-facing "Edited path — replaced N occurrence(s)" is redundant once the display
+          // name + arg already name the file. Shell / other tools keep their one-line summary.
           let summary = oneLine(e.result.summary);
           if (bodyMeta === 'diff' && bodyLines) {
             const stats = formatDiffStats(bodyLines);
-            if (stats) summary = summary ? `${summary} · ${stats}` : stats;
+            if (stats && isWriteTool(e.call.name)) summary = stats;
+            else if (stats) summary = summary ? `${summary} · ${stats}` : stats;
           }
           pushLine({
             kind: 'tool',
@@ -3789,6 +3831,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           setStreamNow('');
           setThinkNow('');
           setToolLine(null);
+          setActiveTool(null);
+          setLiveRecon(null);
           setShellPid(null);
           setShellWarn(null);
           if (e.reason !== 'end_turn') pushLine({ text: `  · ${e.reason}`, dimColor: true });
@@ -3936,6 +3980,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         setStreamNow('');
         setThinkNow('');
         setToolLine(null);
+        setActiveTool(null);
+        setLiveRecon(null);
         setRunning(false);
         // Per-task timer: total wall-clock the agent worked on this turn — paralleling the
         // per-tool `(2.3s)` and per-thought `thought for 9s`, but for the whole task. Only when
@@ -4826,7 +4872,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const toolTag = toolLine
     ? ` · ${toolLine.trim()}`
     : activeTool && hudFit.liveRows === 0
-      ? ` · ${activeTool.name}…`
+      ? liveRecon && reconCount(liveRecon.kinds) >= 2 && isCollapsibleTool(activeTool.name)
+        ? ` · ${formatReconSummary(liveRecon.kinds, { live: true })}…`
+        : ` · ${displayToolName(activeTool.name)}…`
       : '';
   // 'model slow to respond' means the MODEL is quiet — a tool executing (activeTool) is not the
   // model being slow, so an in-flight tool suppresses the heuristic.
@@ -4948,22 +4996,30 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
               {activeTool && !previewStream ? (
                 // Persistent live tool row: the ⏺ is orange while the call runs (matches the spinner),
                 // then tool_end commits the resolved green/red ⏺ row to <Static> in its place.
+                // Recon bursts (≥2 read/grep/…) show a progressive Claude-style group line so the
+                // HUD doesn't flash every single Read — "Reading 3 files, Grepping 1 pattern · path".
                 <Box paddingLeft={PAGE_MARGIN}>
                   <Text wrap="truncate">
                     <Text color={C.accent ?? CLAUDE_ORANGE}>{BLACK_CIRCLE} </Text>
                     {activeTool.name === 'agent' && activeTool.agent ? (
-                      // A running sub-agent shows `▸ <type> · <description>` (orange ▸ while it
-                      // runs, like the spinner dot) so delegated work is visible in the live row,
-                      // not an anonymous `agent(…)`.
                       <>
                         <Text color={C.cyan}>▸ </Text>
                         <Text bold>{activeTool.agent.subagentType ?? 'subagent'}</Text>
                         <Text color={C.dim}>{` · ${activeTool.agent.description ?? activeTool.arg}`}</Text>
                       </>
+                    ) : liveRecon && reconCount(liveRecon.kinds) >= 2 && isCollapsibleTool(activeTool.name) ? (
+                      <>
+                        <Text bold>{formatReconSummary(liveRecon.kinds, { live: true })}</Text>
+                        {(liveRecon.hint || activeTool.arg) ? (
+                          <Text color={C.dim}>{` · ${displayToolArg(liveRecon.hint || activeTool.arg, 40)}`}</Text>
+                        ) : null}
+                      </>
                     ) : (
                       <>
-                        <Text bold>{activeTool.name}</Text>
-                        {activeTool.arg ? <Text color={C.dim}>{`(${activeTool.arg})`}</Text> : null}
+                        <Text bold>{displayToolName(activeTool.name)}</Text>
+                        {activeTool.arg ? (
+                          <Text color={C.dim}>{`(${displayToolArg(activeTool.arg, 72)})`}</Text>
+                        ) : null}
                       </>
                     )}
                   </Text>

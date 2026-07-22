@@ -141,6 +141,30 @@ test('tool output child: short body (≤3 lines) stays inline even when collapse
   assert.ok(!rows.some((r) => r.spans.map((s) => s.text).join('').includes('⌄')));
 });
 
+test('collapsed long DIFF shows a 2-line teaser then fold for the rest', () => {
+  // Edits must stay scannable: first two hunk lines peek, remaining fold under ⌄.
+  const lines = Array.from({ length: 10 }, (_, i) => ({
+    text: i % 2 === 0 ? `+ added ${i}` : `- removed ${i}`,
+    color: i % 2 === 0 ? T.green : T.red,
+  }));
+  const item = {
+    id: 88,
+    kind: 'tool' as const,
+    text: '',
+    meta: 'diff',
+    tool: { name: 'edit_file', arg: 'src/x.ts', ok: true, durationMs: 40, summary: '+5 −5' },
+    lines,
+  };
+  const rows = flattenItem(item, 80, true, T);
+  // gap (signal tool) + header + 2 teaser + fold
+  const text = rows.map((r) => r.spans.map((s) => s.text).join('')).join('\n');
+  assert.ok(text.includes('Update'), 'edit display name');
+  assert.ok(text.includes('+ added 0'), 'first teaser line visible');
+  assert.ok(text.includes('- removed 1'), 'second teaser line visible');
+  assert.ok(text.includes('⌄ diff 8 lines'), 'remaining 8 lines folded');
+  assert.ok(!text.includes('+ added 2'), 'third line stays under the fold');
+});
+
 test('tool header + nested body: one ⏺ row + fold child when collapsed', () => {
   const item = {
     id: 9,
@@ -151,10 +175,13 @@ test('tool header + nested body: one ⏺ row + fold child when collapsed', () =>
     lines: Array.from({ length: 12 }, (_, i) => ({ text: `out ${i + 1}`, color: T.dim })),
   };
   const collapsed = flattenItem(item, 80, true, T);
-  assert.equal(collapsed.length, 2, 'header + one fold row');
-  const h = collapsed[0]!.spans.map((s) => s.text).join('');
-  assert.ok(h.includes('run_shell'), 'header carries tool name');
-  assert.match(collapsed[1]!.spans.map((s) => s.text).join(''), /⌄ output 12 lines · \^O/);
+  // Signal tools (Bash/Update/…) open with a blank block-boundary so they never blend into recon.
+  assert.equal(collapsed.length, 3, 'gap + header + one fold row');
+  assert.ok(collapsed[0]!.spans.every((s) => s.text === ''), 'leading blank before signal tool');
+  const h = collapsed[1]!.spans.map((s) => s.text).join('');
+  assert.ok(h.includes('Bash'), 'header carries display name (run_shell → Bash)');
+  assert.ok(h.includes('(npm test)'), 'shell $ prefix stripped from arg');
+  assert.match(collapsed[2]!.spans.map((s) => s.text).join(''), /⌄ output 12 lines · \^O/);
 });
 
 test('tool body expanded hard-caps at TOOL_BODY_EXPAND_CAP, keeping the TAIL (the signal end)', () => {
@@ -180,7 +207,7 @@ test('itemIsCollapsible: threshold 3, header-only tools never fold', () => {
   assert.equal(itemIsCollapsible({ kind: 'tool', tool: {}, text: 'ok' }), false, 'header-only (no lines) not collapsible');
 });
 
-test('tool rows flatten to EXACTLY one row, even with a huge URL', () => {
+test('tool rows flatten to EXACTLY one content row, even with a huge URL', () => {
   const rows = flattenItem(
     {
       id: 1, kind: 'tool', text: '',
@@ -188,8 +215,10 @@ test('tool rows flatten to EXACTLY one row, even with a huge URL', () => {
     },
     80, false, T,
   );
-  assert.equal(rows.length, 1, 'one row, no wrapping');
-  assert.ok(rows[0]!.spans.map((s) => s.text).join('').length <= 80);
+  // Fetch is a signal tool → leading blank + one truncated content row (never wraps).
+  assert.equal(rows.length, 2, 'gap + one content row');
+  assert.ok(rows[0]!.spans.every((s) => s.text === ''), 'leading blank');
+  assert.ok(rows[1]!.spans.map((s) => s.text).join('').length <= 80, 'content truncated to measure');
 });
 
 test('renderToolResult: protocol stripped, long args middle-truncated, URL not repeated in summary', () => {
@@ -292,28 +321,40 @@ test('collaboration speaker: colored ⏺ handle header once per turn, body inden
   assert.ok(!cont.some((r) => r.spans.map((s) => s.text).join('').includes('⏺')), 'continuation has no ⏺ header');
 });
 
-test('computeToolRuns: groups runs of ≥2 consecutive tools; lone tools + non-tools stay ungrouped', () => {
-  const tool = (id: number, name: string, ok: boolean, ms: number) => ({
-    id, kind: 'tool', text: '', tool: { name, ok, durationMs: ms, summary: '' },
+test('computeToolRuns: only collapsible tools stack; edits/shell break the group', () => {
+  const tool = (id: number, name: string, ok: boolean, ms: number, arg?: string) => ({
+    id, kind: 'tool', text: '', tool: { name, ok, durationMs: ms, summary: '', arg },
   });
   const items: object[] = [
     { id: 1, kind: 'user', text: 'q' },
-    tool(2, 'a', true, 100),
-    tool(3, 'b', false, 200),
-    tool(4, 'c', true, 300),
-    { id: 5, kind: 'assistant', text: 'ans' },
-    tool(6, 'd', true, 50), // lone tool — not grouped
+    tool(2, 'read_file', true, 100, 'a.ts'),
+    tool(3, 'read_file', true, 100, 'b.ts'),
+    tool(4, 'grep', true, 200, 'TODO'),
+    tool(5, 'edit_file', true, 50, 'a.ts'), // write — NEVER folds; breaks the run
+    tool(6, 'read_file', true, 80, 'c.ts'),
+    tool(7, 'glob', true, 90, '**/*.ts'),
+    tool(8, 'run_shell', true, 300, 'npm test'), // shell — NEVER folds
+    { id: 9, kind: 'assistant', text: 'ans' },
+    tool(10, 'read_file', true, 40, 'lonely.ts'), // lone read — not grouped
   ];
   const runs = computeToolRuns(items as never, false);
-  assert.equal(runs.size, 3, 'only the 3-item run (indices 1,2,3) is grouped');
+  // Run A: indices 1,2,3 (3 reads/greps before the edit)
   assert.equal(runs.get(1)!.len, 3);
   assert.equal(runs.get(1)!.pos, 0);
   assert.equal(runs.get(2)!.pos, 1);
   assert.equal(runs.get(3)!.pos, 2);
-  assert.equal(runs.get(1)!.okCount, 2);
-  assert.equal(runs.get(1)!.failCount, 1);
-  assert.equal(runs.get(1)!.totalMs, 600);
-  assert.equal(runs.get(1)!.collapsed, true, 'collapsed when not all-expanded');
-  assert.ok(!runs.has(5), 'the lone tool is not in any run');
+  assert.equal(runs.get(1)!.kinds.read, 2);
+  assert.equal(runs.get(1)!.kinds.search, 1);
+  assert.equal(runs.get(1)!.hint, 'TODO');
+  assert.equal(runs.get(1)!.collapsed, true);
+  // Edit and shell are never in a run
+  assert.ok(!runs.has(4), 'edit_file is never stacked');
+  assert.ok(!runs.has(7), 'run_shell is never stacked');
+  // Run B: indices 5,6 (read + glob after the edit)
+  assert.equal(runs.get(5)!.len, 2);
+  assert.equal(runs.get(5)!.kinds.read, 1);
+  assert.equal(runs.get(5)!.kinds.list, 1);
+  // Lone read at end is not grouped
+  assert.ok(!runs.has(9), 'lone collapsible tool is not in any run');
   assert.equal(computeToolRuns(items as never, true).get(1)!.collapsed, false, 'Ctrl-O flips collapsed off');
 });

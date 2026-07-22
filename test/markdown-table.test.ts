@@ -27,7 +27,7 @@ test('renders a horizontal box-drawing table that fits the width', () => {
   const t = parseMarkdown(md).find((b) => b.type === 'table')!;
   const lines = renderTableLines(t as Extract<typeof t, { type: 'table' }>, 100);
   assert.ok(lines.length >= 5); // top ╭, header, sep ├, body, bottom ╰
-  assert.equal(lines[0]![0], '╭'); // rounded top border — same family as code blocks
+  assert.equal(lines[0]![0], '╭'); // rounded top border (tables keep a grid; code is gutter-only)
   assert.match(lines[1]!, /Name/); // header on the row after the top border
   assert.ok(lines.some((l) => /Ada/.test(l))); // a body row
   assert.equal(lines[lines.length - 1]![0], '╰'); // rounded bottom border

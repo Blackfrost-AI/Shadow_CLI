@@ -10,6 +10,12 @@
 // which the ADA pass banned as unreadable.
 
 import type { StyledSpan, ViewportTheme } from './flatten.js';
+import {
+  displayToolArg,
+  displayToolName,
+  formatReconSummary,
+  type CollapseKind,
+} from './toolDisplay.js';
 
 /** The dot separator used throughout the chrome + meta rows. */
 const SEP = ' · ';
@@ -123,8 +129,10 @@ export interface ToolInfo {
   agent?: { subagentType?: string; description?: string };
 }
 
-/** A run of consecutive tool items collapsed into ONE row (tool-call stacking). `collapsed` is the
- *  run-level state — Ctrl-O (show-all-expanded) flips it for every run at once. */
+/** A run of consecutive COLLAPSIBLE tools (reads/searches) folded into ONE row.
+ *  Writes/edits/shell never join a run — they always render as their own row so you can
+ *  see when the agent is mutating the workspace. `collapsed` is the run-level state —
+ *  Ctrl-O (show-all-expanded) flips it for every run at once. */
 export interface ToolRun {
   /** This item's 0-based position within the run. */
   pos: number;
@@ -134,6 +142,10 @@ export interface ToolRun {
   failCount: number;
   totalMs: number;
   collapsed: boolean;
+  /** Per-kind counts for the Claude-style summary (`Read 3 files, Grep 2 patterns`). */
+  kinds: Partial<Record<CollapseKind, number>>;
+  /** Optional last path/pattern shown as a dim hint on the collapsed line. */
+  hint?: string;
 }
 
 /** Elapsed as "(10.2s)"; sub-100ms calls omit it (noise, and rounds to 0.0s). */
@@ -141,14 +153,6 @@ function elapsed(durationMs: number): string {
   if (durationMs < 100) return '';
   const s = durationMs / 1000;
   return s >= 60 ? ` (${Math.floor(s / 60)}m ${Math.round(s % 60)}s)` : ` (${s.toFixed(1)}s)`;
-}
-
-/** Display form of a tool arg: protocol stripped (URLs read as domain/path, the reference client way)
- *  and middle-truncated so one arg can never flood the row. */
-function shortArg(arg: string, max = 56): string {
-  let a = arg.replace(/^https?:\/\//, '');
-  if (a.length > max) a = `${a.slice(0, Math.ceil(max * 0.62))}…${a.slice(a.length - Math.floor(max * 0.34))}`;
-  return a;
 }
 
 /** Escape a string for use as a literal inside a RegExp. */
@@ -163,22 +167,29 @@ function reEsc(s: string): string {
 function shortSummary(summary: string, arg: string | undefined, max = 90): string {
   let s = summary;
   if (arg) {
-    for (const token of [arg, arg.replace(/^https?:\/\//, '')]) {
-      if (!token) continue;
+    const cleaned = displayToolArg(arg, 200);
+    for (const token of [arg, cleaned, arg.replace(/^https?:\/\//, ''), arg.replace(/^\$\s+/, '')]) {
+      if (!token || token.length < 2) continue;
       // Only strip the token when it stands alone (bounded by whitespace/start/end/punctuation),
       // not when it's a substring of another word.
       s = s.replace(new RegExp(`(^|[\\s(])${reEsc(token)}(?=$|[\\s).,;:—–-])`, 'g'), '$1').replace(/\s{2,}/g, ' ').trim();
     }
   }
-  s = s.replace(/^[-—–:,.]\s*/, '').trim();
+  // Drop the model-facing "Edited \"path\" — replaced N…" prefix once the row already shows
+  // Update(path) + a +N −M tail — leaves just the stats or a short remainder.
+  s = s
+    .replace(/^(?:Edited|Wrote|Created|Updated)\s+(?:"[^"]*"|'[^']*'|\S+)\s*[—–-]\s*/i, '')
+    .replace(/^replaced\s+\d+\s+occurrence\(s\)\.?\s*/i, '')
+    .replace(/^[-—–:,.]\s*/, '')
+    .trim();
   if (s.length > max) s = `${s.slice(0, max - 1)}…`;
   return s;
 }
 
 /**
- * One-row tool result: `✓ run_shell npm test — 630 pass (10.2s)`. The glyph (green ✓ / red ✗) is the
+ * One-row tool result: `⏺ Update(src/tui.tsx) — +12 −3 (0.4s)`. The glyph (green ⏺ / red ✗) is the
  * ONLY color — name, arg, summary and timing all sit in the quiet gray so a wall of tool calls reads
- * as texture, not noise. The name is printed exactly once.
+ * as texture, not noise. Display names are human verbs (Read/Update/Bash), never snake_case.
  */
 /** The signature bullet: ⏺ on macOS, ● elsewhere (the reference client figures.ts). */
 const TOOL_DOT = process.platform === 'darwin' ? '⏺' : '●';
@@ -199,15 +210,17 @@ export function renderToolResult(t: ToolInfo, theme: ViewportTheme): StyledSpan[
   // work. Falls back to the generic `name(arg)` form when agent attribution is absent.
   if (t.name === 'agent' && t.agent) {
     const type = t.agent.subagentType ?? 'subagent';
-    const desc = t.agent.description ?? (t.arg ? shortArg(t.arg) : '');
+    const desc = t.agent.description ?? (t.arg ? displayToolArg(t.arg) : '');
     spans.push(
       { text: '▸ ', color: theme.cyan },
       { text: type, color: theme.bright ?? theme.fg, bold: true },
     );
     if (desc) spans.push({ text: ` · ${desc}`, color: theme.dim });
   } else {
-    spans.push({ text: t.name, color: theme.bright ?? theme.fg, bold: true });
-    if (t.arg) spans.push({ text: `(${shortArg(t.arg)})`, color: theme.dim });
+    const label = displayToolName(t.name);
+    const arg = displayToolArg(t.arg);
+    spans.push({ text: label, color: theme.bright ?? theme.fg, bold: true });
+    if (arg) spans.push({ text: `(${arg})`, color: theme.dim });
   }
   const s = t.summary ? shortSummary(t.summary, t.arg) : '';
   if (s) spans.push({ text: ` — ${s}`, color: theme.dim });
@@ -217,20 +230,26 @@ export function renderToolResult(t: ToolInfo, theme: ViewportTheme): StyledSpan[
 }
 
 /**
- * Collapsed header for a run of consecutive tool calls — the "tool-call stacking" that keeps a
- * 15-tool turn from scrolling the transcript forever: `⏺ 5 tools · ✓4 ✗1 · (12.3s) · ⌄ ^O`.
+ * Collapsed header for a run of consecutive read/search tools — the "tool-call stacking" that
+ * keeps recon from flooding scrollback:
+ *   `⏺ Read 3 files, Grep 2 patterns · (1.2s) · ⌄ ^O`
+ * Writes/edits/shell NEVER enter a run (see computeToolRuns), so mutations stay one-row visible.
  * The dot is green when every call succeeded, red as soon as one failed (shape+color, WCAG 1.4.1).
  * Ctrl-O expands the run to the full per-tool ledger (each tool then renders via renderToolResult).
  */
 export function renderToolStack(run: ToolRun, theme: ViewportTheme): StyledSpan[] {
+  const headline = formatReconSummary(run.kinds, { fallbackLen: run.len });
+
   const spans: StyledSpan[] = [
     { text: `${TOOL_DOT} `, color: run.failCount > 0 ? theme.red : theme.green },
-    { text: `${run.len} tool${run.len === 1 ? '' : 's'}`, color: theme.bright ?? theme.fg, bold: true },
+    { text: headline, color: theme.bright ?? theme.fg, bold: true },
   ];
-  const tally: string[] = [];
-  if (run.okCount) tally.push(`✓${run.okCount}`);
-  if (run.failCount) tally.push(`✗${run.failCount}`);
-  if (tally.length) spans.push({ text: ` · ${tally.join(' ')}`, color: theme.dim });
+  if (run.hint && run.collapsed) {
+    spans.push({ text: ` · ${displayToolArg(run.hint, 40)}`, color: theme.dim });
+  }
+  if (run.failCount > 0) {
+    spans.push({ text: ` · ✗${run.failCount}`, color: theme.dim });
+  }
   const e = elapsed(run.totalMs);
   if (e) spans.push({ text: e, color: theme.dim });
   if (run.collapsed) spans.push({ text: ' · ⌄ ^O', color: theme.dim }); // expand hint

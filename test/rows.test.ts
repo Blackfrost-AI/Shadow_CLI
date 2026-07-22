@@ -74,11 +74,11 @@ test('renderBrand: narrow terminal falls back to the compact ✦ form', () => {
   assert.equal(rows[0]![1]!.text, 'shadow', 'compact form under a narrow width');
 });
 
-test('renderToolResult: a single ⏺ dot carries status by COLOR, name bold, args in parens, dim tail', () => {
+test('renderToolResult: a single ⏺ dot carries status by COLOR, display name bold, args in parens, dim tail', () => {
   const ok = renderToolResult({ name: 'run_shell', arg: 'npm test', ok: true, durationMs: 10200, summary: '630 pass' }, T);
   assert.equal(ok[0]!.text, '⏺ ', 'single dot, not ✓');
   assert.equal(ok[0]!.color, T.green, 'green = ok (color carries state)');
-  assert.equal(ok[1]!.text, 'run_shell');
+  assert.equal(ok[1]!.text, 'Bash', 'human display name, not run_shell');
   assert.equal(ok[1]!.bold, true, 'name is bold');
   assert.ok(ok.some((s) => s.text === '(npm test)'), 'arg in parens, printed once');
   assert.ok(ok.some((s) => s.text === ' — 630 pass'), 'summary');
@@ -89,7 +89,19 @@ test('renderToolResult: a single ⏺ dot carries status by COLOR, name bold, arg
   assert.equal(fail[0]!.text, '✗ ', 'failure swaps the SHAPE to ✗ — state must survive without color (WCAG 1.4.1)');
   assert.equal(fail[0]!.color, T.red, 'red = error (color reinforces the shape)');
   assert.equal(fail[0]!.bold, true, 'failure glyph is bold');
+  assert.equal(fail[1]!.text, 'Fetch', 'web_fetch → Fetch');
   assert.ok(fail.some((s) => s.text === ' (0.4s)'));
+
+  // Edits show as Update(path) — +N −M; model-facing "Edited …" is stripped when stats remain.
+  const edit = renderToolResult(
+    { name: 'edit_file', arg: 'src/tui.tsx', ok: true, durationMs: 40, summary: 'Edited "src/tui.tsx" — +12 −3' },
+    T,
+  );
+  const editText = edit.map((s) => s.text).join('');
+  assert.equal(edit[1]!.text, 'Update');
+  assert.ok(editText.includes('(src/tui.tsx)'));
+  assert.ok(editText.includes('+12 −3'), 'diff stats kept');
+  assert.ok(!editText.includes('Edited'), 'model-facing verb dropped');
 });
 
 test('renderToolResult: sub-100ms calls omit the (0.0s) noise; minutes format as Xm Ys', () => {
@@ -126,29 +138,48 @@ test('renderToolResult: subagent (agent tool) renders as ▸ type · description
   assert.ok(noDesc.some((s) => s.text === 'reviewer'));
   assert.ok(noDesc.some((s) => s.text === ' · Review the diff for races'), 'falls back to the prompt arg when no description');
 
-  // No agent attribution → generic name(arg) form (back-compat for older/odd items).
+  // No agent attribution → display-name(arg) form (Agent, not the snake_case protocol name).
   const generic = renderToolResult({ name: 'agent', arg: 'do thing', ok: true, durationMs: 12, summary: '' }, T);
-  assert.ok(generic.some((s) => s.text === 'agent'), 'generic form keeps the literal tool name');
+  assert.ok(generic.some((s) => s.text === 'Agent'), 'generic form uses the calm display name');
   assert.ok(generic.some((s) => s.text === '(do thing)'), 'generic form keeps args in parens');
 });
 
-test('renderToolStack: collapsed run = ⏺ N tools · ✓a ✗b · (total) · ⌄ ^O', () => {
-  const r = renderToolStack({ pos: 0, len: 5, okCount: 4, failCount: 1, totalMs: 12300, collapsed: true }, T);
+test('renderToolStack: collapsed run = ⏺ Read N files, Grep M patterns · hint · ⌄ ^O', () => {
+  const r = renderToolStack(
+    {
+      pos: 0,
+      len: 5,
+      okCount: 4,
+      failCount: 1,
+      totalMs: 12300,
+      collapsed: true,
+      kinds: { read: 3, search: 2 },
+      hint: 'src/tui/rows.ts',
+    },
+    T,
+  );
   const text = r.map((s) => s.text).join('');
   assert.equal(r[0]!.text, '⏺ ', 'status dot');
   assert.equal(r[0]!.color, T.red, 'red as soon as one call failed');
-  assert.ok(text.includes('5 tools'), 'run length');
-  assert.ok(text.includes('✓4'), 'ok tally');
-  assert.ok(text.includes('✗1'), 'fail tally');
+  assert.ok(text.includes('Read 3 files'), 'read tally with noun');
+  assert.ok(text.includes('Grep 2 patterns'), 'search tally with noun');
+  assert.ok(text.includes('src/tui/rows.ts'), 'last-path hint when collapsed');
+  assert.ok(text.includes('✗1'), 'fail tally when any failed');
   assert.ok(text.includes(' (12.3s)'), 'total elapsed');
   assert.ok(text.includes('⌄ ^O'), 'expand hint when collapsed');
+  assert.ok(!text.includes('5 tools'), 'no generic "N tools" when kinds are known');
 });
 
-test('renderToolStack: all-ok run is green; expanded drops the expand hint', () => {
-  const ok = renderToolStack({ pos: 0, len: 3, okCount: 3, failCount: 0, totalMs: 500, collapsed: false }, T);
+test('renderToolStack: all-ok run is green; expanded drops the expand hint and path hint', () => {
+  const ok = renderToolStack(
+    { pos: 0, len: 3, okCount: 3, failCount: 0, totalMs: 500, collapsed: false, kinds: { read: 3 }, hint: 'a.ts' },
+    T,
+  );
+  const text = ok.map((s) => s.text).join('');
   assert.equal(ok[0]!.color, T.green, 'green when no failures');
+  assert.ok(text.includes('Read 3 files'));
   assert.ok(!ok.some((s) => s.text.includes('⌄ ^O')), 'no expand hint when expanded');
-  assert.ok(ok.some((s) => s.text.includes('✓3')), 'ok tally shown');
+  assert.ok(!text.includes('a.ts'), 'path hint only on the collapsed line');
 });
 
 test('renderToolChild: collapsed output/diff — ⌄ glyph, +2 indent, dim, ^O hint', () => {

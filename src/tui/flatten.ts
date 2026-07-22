@@ -18,6 +18,7 @@ import { hyperlink, supportsHyperlinks } from '../util/hyperlinks.js';
 import { inlineImageEsc, formatBytes, supportsInlineImages } from '../util/termImage.js';
 import { renderBrand, renderToolResult, renderToolChild, renderReasoning, renderToolStack } from './rows.js';
 import type { BrandInfo, ToolInfo, ToolRun } from './rows.js';
+import { collapseKind, isCollapsibleTool, type CollapseKind } from './toolDisplay.js';
 
 export { TABLE_COLLAPSE_THRESHOLD };
 
@@ -30,7 +31,8 @@ const LINKS = supportsHyperlinks();
 // piped/redirected output (only emit when stdout is a real TTY on a capable terminal).
 const IMG = supportsInlineImages();
 
-/** Tool/blocked bodies longer than this fold by default (Ctrl-O expands). 1–3 lines stay inline. */
+/** Tool/blocked bodies longer than this fold by default (Ctrl-O expands). 1–3 lines stay inline
+ *  (including short edit hunks — the header already carries `+N −M` for scanning). */
 export const TOOL_BODY_COLLAPSE_THRESHOLD = 3;
 /**
  * Hard cap on lines painted when a body is expanded. Scrollback stays usable even if a tool
@@ -65,6 +67,31 @@ function appendToolBody(
 ): void {
   if (body.length === 0) return;
   const collapsible = body.length > TOOL_BODY_COLLAPSE_THRESHOLD;
+  // Diffs: when collapsed and long, show a 2-line teaser (first +/− hunk) so you can see
+  // WHAT changed without Ctrl-O — then the fold row for the rest. Other tool bodies stay
+  // fully hidden when folded (shell dumps stay quiet).
+  if (collapsible && collapsed && meta === 'diff') {
+    const PREVIEW = 2;
+    const teaser = body.slice(0, PREVIEW);
+    teaser.forEach((l, i) => {
+      const gutter: StyledSpan = i === 0 ? { text: '  ⎿ ', color: theme.dim } : { text: '    ' };
+      out.push({
+        key: `${kp}tp${i}`,
+        spans: truncateSpans(
+          [gutter, { text: l.text ?? '', color: l.color ?? color, dim: l.dimColor, bold: l.bold }],
+          cols,
+        ),
+      });
+    });
+    const rest = body.length - PREVIEW;
+    if (rest > 0) {
+      out.push({
+        key: `${kp}fold`,
+        spans: truncateSpans(renderToolChild(toolBodyLabel(meta), rest, theme), cols),
+      });
+    }
+    return;
+  }
   if (collapsible && collapsed) {
     out.push({
       key: `${kp}fold`,
@@ -431,14 +458,18 @@ function blockToLines(
   const out: ViewportLine[] = [];
   switch (block.type) {
     case 'heading': {
-      // Hierarchy: EVERY heading is bold, so it reads as a heading without relying on color (WCAG
-      // 1.4.1); the level is then tinted (H1 purple, H2 cyan, H3+ fg) and H1 gets a full-width
-      // underline rule for a strong top-level break.
+      // Hierarchy: EVERY heading is bold (WCAG 1.4.1 — state without color); tint by level
+      // (H1 purple, H2 cyan, H3+ bright). H1 gets a SHORT underline matching the title width —
+      // a full-terminal rule was the loudest thing in the transcript and fought the content.
       const hue = block.level <= 1 ? theme.purple : block.level === 2 ? theme.cyan : theme.bright ?? theme.fg;
       const spans = block.spans.map(s => ({ text: s.text, color: hue, bold: true, italic: s.italic }));
       out.push(...wrapLine(`${keyPrefix}h`, spans, cols));
       if (block.level <= 1) {
-        out.push({ key: `${keyPrefix}hu`, spans: [{ text: '─'.repeat(Math.max(1, cols)), color: theme.dim }] });
+        const titleW = Math.min(
+          cols,
+          Math.max(3, block.spans.reduce((n, s) => n + s.text.length, 0)),
+        );
+        out.push({ key: `${keyPrefix}hu`, spans: [{ text: '─'.repeat(titleW), color: theme.dim }] });
       }
       break;
     }
@@ -514,16 +545,19 @@ function blockToLines(
         }
       }
       const codeSpans = highlight(block.code || ' ', block.lang);
-      // A contained code block: a labeled top rule, a dim left gutter on each line, and a closing
-      // rule — so code is visually bounded (like the reference client's boxed blocks) instead of blending
-      // into prose. The gutter also makes wrapped code lines obvious.
-      const label = block.lang || 'code';
-      out.push({ key: `${keyPrefix}ctop`, spans: [{ text: `╭─ ${label} `, color: theme.dim }] });
+      // Quiet code (design law: ONE border in the app = the composer). No ╭─/╰─ frame —
+      // a dim language label + a │ gutter per line is enough to bound code without boxing.
+      // Live stream Markdown (tui.tsx) mirrors this so preview ≡ committed.
+      if (block.lang) {
+        out.push({
+          key: `${keyPrefix}clang`,
+          spans: [{ text: block.lang, color: theme.dim, italic: true }],
+        });
+      }
       const styled = codeSpans.map(cs => ({ text: cs.text, color: codeStyle(cs.role, theme).color }));
       wrapSpans(styled, Math.max(1, cols - 2)).forEach((row, ri) => {
         out.push({ key: `${keyPrefix}c${ri}`, spans: [{ text: '│ ', color: theme.dim }, ...row] });
       });
-      out.push({ key: `${keyPrefix}cbot`, spans: [{ text: '╰─', color: theme.dim }] });
       break;
     }
     case 'table': {
@@ -625,9 +659,15 @@ export function flattenItem(
   const kp = `i${item.id}`;
   const out: ViewportLine[] = [];
   const color = item.color ?? kindColor(item.kind, theme);
-  // Spacing: user turns ALWAYS open with a blank line (new question = air), even if `tight` is set —
-  // that's what keeps the transcript from reading as one continuous gray column. Assistant /
-  // reasoning / finding respect `tight` so multi-block answers can still hug.
+  // Spacing (design law: one blank = block boundary, never two):
+  //  - user turns ALWAYS open with a blank (new question = air), even if `tight`
+  //  - assistant / reasoning / finding respect `tight` so multi-block answers hug
+  //  - signal tools (writes/shell/network/agent) and the OPENING of a read/search stack
+  //    get a blank so mutations never blend into recon — absorbed stack children never gap
+  const signalTool =
+    item.kind === 'tool' &&
+    item.tool &&
+    (toolRun ? toolRun.pos === 0 : !isCollapsibleTool(item.tool.name));
   const gap =
     item.kind === 'user'
       ? 1
@@ -635,7 +675,9 @@ export function flattenItem(
         ? 0
         : item.kind === 'assistant' || item.kind === 'reasoning' || item.kind === 'finding'
           ? 1
-          : 0;
+          : signalTool
+            ? 1
+            : 0;
   // Gap blank line
   if (gap > 0) out.push({ key: `${kp}gap`, spans: [{ text: '' }] });
 
@@ -670,9 +712,9 @@ export function flattenItem(
   // (shell stdout / edit diff from tool_end), they render as a child: folded to one
   // `⌄ output N lines · ^O` row by default, or under a ⎿ branch when expanded / short.
   if (item.kind === 'tool' && item.tool) {
-    // Tool-call stacking: a run of ≥2 consecutive tools collapses to ONE summary header so a long
-    // tool-heavy turn can't flood scrollback. pos 0 draws the header; pos>0 is absorbed (no rows)
-    // when collapsed. Expanded (Ctrl-O) draws the header as a summary, then every tool's own row.
+    // Read/search stacking: a run of ≥2 consecutive collapsible tools collapses to ONE summary
+    // (`Read 3 files, Grep 2 patterns`). Writes/edits/shell never join a run. pos 0 draws the
+    // header; pos>0 is absorbed when collapsed. Ctrl-O expands to the full per-tool ledger.
     if (toolRun) {
       if (toolRun.pos > 0) {
         if (toolRun.collapsed) return out; // absorbed into the run header — emits zero rows
@@ -794,35 +836,59 @@ export function flattenItem(
 }
 
 /**
- * Group consecutive `kind:'tool'` items into runs for tool-call stacking. Returns a map keyed by
- * item index → the run descriptor, but ONLY for items in a run of ≥2 (single tools render normally).
+ * Group consecutive COLLAPSIBLE tool items (reads/greps/globs/views) into runs for stacking.
+ * Writes, edits, shell, agents, and network tools BREAK the group and always render as their
+ * own row — so a long recon burst collapses to `⏺ Read 5 files, Grep 2 patterns` while an
+ * `Update(src/foo.ts) — +12 −3` never gets buried. Returns a map keyed by item index → the run
+ * descriptor, but ONLY for items in a run of ≥2 (single tools never stack).
  * `allExpanded` (Ctrl-O) flips every run's `collapsed` false at once. One pass, O(n).
  */
 export function computeToolRuns(items: FlattenItem[], allExpanded: boolean): Map<number, ToolRun> {
   const runs = new Map<number, ToolRun>();
   let i = 0;
   while (i < items.length) {
-    if (items[i]!.kind !== 'tool') {
+    const item = items[i]!;
+    const name = item.kind === 'tool' ? item.tool?.name : undefined;
+    if (item.kind !== 'tool' || !name || !isCollapsibleTool(name)) {
       i++;
       continue;
     }
+    // Extend over consecutive collapsible tools only — a write/shell/etc. breaks the run.
     let j = i;
-    while (j < items.length && items[j]!.kind === 'tool') j++;
+    while (j < items.length) {
+      const n = items[j]!.kind === 'tool' ? items[j]!.tool?.name : undefined;
+      if (!n || !isCollapsibleTool(n)) break;
+      j++;
+    }
     const len = j - i;
     if (len >= 2) {
       let okCount = 0;
       let failCount = 0;
       let totalMs = 0;
+      const kinds: Partial<Record<CollapseKind, number>> = {};
+      let hint: string | undefined;
       for (let k = i; k < j; k++) {
         const t = items[k]!.tool;
         if (t) {
           if (t.ok) okCount++;
           else failCount++;
           totalMs += t.durationMs;
+          const kind = collapseKind(t.name);
+          kinds[kind] = (kinds[kind] ?? 0) + 1;
+          if (t.arg) hint = t.arg; // last path/pattern — live "currently on …" cue
         }
       }
       for (let k = i; k < j; k++) {
-        runs.set(k, { pos: k - i, len, okCount, failCount, totalMs, collapsed: !allExpanded });
+        runs.set(k, {
+          pos: k - i,
+          len,
+          okCount,
+          failCount,
+          totalMs,
+          collapsed: !allExpanded,
+          kinds,
+          hint,
+        });
       }
     }
     i = j;

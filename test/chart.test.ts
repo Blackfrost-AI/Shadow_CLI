@@ -128,7 +128,10 @@ test('flatten: a closed ```chart block renders bars (cyan series, no code frame)
 test('flatten: an OPEN (streaming) chart fence stays a code block; so does a non-parsing spec', () => {
   const streaming = flattenItem({ id: 2, kind: 'assistant', text: '```chart\na: 10\nb: 5' }, 60, false, T);
   const s = streaming.map((r) => r.spans.map((x) => x.text).join('')).join('\n');
-  assert.match(s, /╭─ chart/, 'open fence renders as code until it closes');
+  // Quiet code: dim lang label + │ gutter (no ╭─ frame — design law: one border = composer).
+  assert.match(s, /chart/, 'open fence still labels the language');
+  assert.match(s, /│ /, 'open fence uses the quiet │ gutter');
+  assert.ok(!s.includes('╭─'), 'no code-block frame mid-stream either');
   assert.ok(!s.includes('█'), 'no half-painted chart mid-stream');
   const prose = flattenItem({ id: 3, kind: 'assistant', text: '```chart\njust some notes\n```' }, 60, false, T);
   const p = prose.map((r) => r.spans.map((x) => x.text).join('')).join('\n');
