@@ -163,7 +163,7 @@ test('bg agent full listener path: main context receives task-notification appen
 
     // Drive the *real* shipped registration function (extracted, used by index.ts)
     const { attachBgAgentDelivery } = await import('../src/agent/busListeners.js');
-    attachBgAgentDelivery(bus, mainContext);
+    const pendingNotifications = attachBgAgentDelivery(bus, mainContext);
 
     const makeLoopDeps = (): LoopDeps => ({
       provider,
@@ -197,10 +197,21 @@ test('bg agent full listener path: main context receives task-notification appen
     const tasks = (mainContext as any)._subAgentTasks || [];
     assert.ok(tasks.some((t: any) => t.taskId === data.taskId), 'launch must have been recorded to main ctx via listener');
 
-    // Verify task_notification was appended as user message to main transcript
+    // T0-6: the notification is BUFFERED, not appended to the live context. Appending it live
+    // could land it between an assistant tool_use and its tool_result — which the Anthropic
+    // adapter coalesces into an ordering violation and OpenAI rejects outright, permanently
+    // 400ing the session. It is folded into the next USER turn instead (see index.ts).
     const msgs = mainContext.messages();
-    const hasNotif = msgs.some((m) => m.role === 'user' && m.content.some((b: any) => b.type === 'text' && b.text.includes(`task_id="${data.taskId}"`)));
-    assert.ok(hasNotif, 'task_notification must have been appended to main context transcript');
+    const appendedLive = msgs.some(
+      (m) => m.role === 'user' && m.content.some((b: any) => b.type === 'text' && b.text.includes(`task_id="${data.taskId}"`)),
+    );
+    assert.equal(appendedLive, false, 'a notification must never be appended to the live context mid-turn');
+    const drained = pendingNotifications.drain();
+    assert.ok(
+      drained.some((n) => n.includes(`task_id="${data.taskId}"`)),
+      'the notification must be waiting for the next user turn',
+    );
+    assert.equal(pendingNotifications.size(), 0, 'drain clears the buffer');
 
     // Recovery path: serialize + hydrate should preserve the subAgentTasks
     const snap = serializeContext(mainContext);

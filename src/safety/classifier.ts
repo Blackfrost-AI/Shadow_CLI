@@ -16,6 +16,8 @@ export interface ClassifyRequest {
   preview: string;
   risk: ToolRisk;
   permissionRules?: PermissionRule[];
+  /** Granted filesystem roots — scopes the read-only shell fast path (see isBashReadOnly). */
+  roots?: readonly string[];
 }
 
 export interface ClassifyResult {
@@ -34,7 +36,7 @@ export function shouldUseClassifier(cfg: Pick<ShadowConfig, 'autoClassifier'>): 
  * Safeguard: LLM call uses no-tools prompt, separate from agent loop, short output, timeout.
  */
 export async function classifyToolCall(req: ClassifyRequest & { provider?: any; model?: string }): Promise<ClassifyResult> {
-  const { call, preview, risk, permissionRules } = req;
+  const { call, preview, risk, permissionRules, roots } = req;
 
   if (permissionRules && permissionRules.length > 0) {
     const rule = resolvePermissionRule(call, preview, permissionRules);
@@ -53,7 +55,7 @@ export async function classifyToolCall(req: ClassifyRequest & { provider?: any; 
     // falls through to the gate, where the denylist still sees the full string.
     // We deliberately do NOT blanket hard-deny `$(...)`/backticks — they are
     // ordinary shell and the agent uses them constantly.
-    if (cmd && isBashReadOnly(cmd)) {
+    if (cmd && isBashReadOnly(cmd, roots ?? [])) {
       return { verdict: 'allow', reason: 'read-only shell command' };
     }
   }

@@ -67,3 +67,14 @@ test('write_file: blocked outside the workspace, but succeeds once the dir is gr
     for (const d of [ws, granted, ungranted]) rmSync(d, { recursive: true, force: true });
   }
 });
+
+test('resolveWithin: a workspace at a top-level directory is not mangled', () => {
+  // Regression: the walk-up used slice(parent.length + 1), but at the filesystem root `parent`
+  // is already "/", so the +1 ate the segment's first character — "/work/x" became "/ork/x" and
+  // was then rejected as outside the jail. Fails closed, but made a top-level workspace unusable.
+  assert.equal(resolveWithin(['/work/repo'], '/work/repo/src/index.ts'), '/work/repo/src/index.ts');
+  assert.equal(resolveWithin(['/srv/app'], 'lib/a.ts'), '/srv/app/lib/a.ts');
+  // …and still rejects a real escape from that same shape.
+  assert.throws(() => resolveWithin(['/work/repo'], '/work/other/x.ts'));
+  assert.throws(() => resolveWithin(['/work/repo'], '../escape.ts'));
+});

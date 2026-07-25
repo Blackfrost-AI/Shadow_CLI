@@ -22,6 +22,7 @@ import type { Tool, ToolResult } from './types.js';
 import { ok, fail } from './types.js';
 import { resolveWithin } from '../safety/workspaceJail.js';
 import { atomicWrite } from './util.js';
+import { saveCheckpoint, saveCheckpointAbsent } from '../state/checkpoints.js';
 import { diffLines, type DiffLine } from '../util/diff.js';
 
 // ── grammar markers ──────────────────────────────────────────────────────────
@@ -332,6 +333,14 @@ export const applyPatch: Tool<ApplyPatchInput, ApplyPatchData> = {
       for (const a of actions) {
         if (a.kind === 'write') {
           const prior = existsSync(a.abs) ? readFileSync(a.abs, 'utf8') : null;
+          // apply_patch wrote NO checkpoint either — and its in-memory `undo` stack only survives
+          // this call, so a deleted file was unrecoverable the moment the tool returned while
+          // /rewind still reported success. Record the pre-patch state (or its ABSENCE, so a
+          // rewind can delete a file the patch created).
+          if (ctx.checkpoint) {
+            if (prior === null) saveCheckpointAbsent(ctx.workspaceRoot, ctx.checkpoint.sessionId, ctx.checkpoint.turn, a.abs);
+            else saveCheckpoint(ctx.workspaceRoot, ctx.checkpoint.sessionId, ctx.checkpoint.turn, a.abs, prior);
+          }
           mkdirSync(dirname(a.abs), { recursive: true });
           atomicWrite(a.abs, a.after);
           undo.push(() => (prior === null ? unlinkSync(a.abs) : atomicWrite(a.abs, prior)));
@@ -340,6 +349,9 @@ export const applyPatch: Tool<ApplyPatchInput, ApplyPatchData> = {
           if (d.length) diff.push({ tag: ' ', text: `--- ${a.rel}` }, ...d);
         } else {
           const prior = existsSync(a.abs) ? readFileSync(a.abs, 'utf8') : null;
+          if (ctx.checkpoint && prior !== null) {
+            saveCheckpoint(ctx.workspaceRoot, ctx.checkpoint.sessionId, ctx.checkpoint.turn, a.abs, prior);
+          }
           try {
             unlinkSync(a.abs);
           } catch {

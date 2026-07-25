@@ -26,11 +26,32 @@ export interface SplitSpan {
   text: string;
 }
 
+/**
+ * Optional XML namespace prefix. The MiniMax-M family emits `<mm:think>` / `</mm:think>`, which
+ * matched none of these patterns and so fell straight through to the TEXT channel — a bare
+ * `</mm:think>` rendered at the head of the answer AND was persisted into history, replayed to
+ * the model on every later turn. The `{0,15}` bound keeps the hold-back in PARTIAL_RE short.
+ */
+const NS = String.raw`(?:[A-Za-z][\w.-]{0,15}\s*:\s*)?`;
+
 // Whitespace-tolerant, case-insensitive. Openers must NOT match a closer (the `/` guards that).
-const OPEN_RE = /<\s*think(?:ing)?\s*>/i;
-const CLOSE_RE = /<\s*\/\s*think(?:ing)?\s*>/i;
-// A trailing run that could still GROW into a tag (no `>` yet) — held back until the next chunk.
-const PARTIAL_RE = /<\s*\/?\s*(?:t(?:h(?:i(?:n(?:k(?:i(?:n(?:g)?)?)?)?)?)?)?)?\s*$/i;
+const OPEN_RE = new RegExp(String.raw`<\s*${NS}think(?:ing)?\s*>`, 'i');
+const CLOSE_RE = new RegExp(String.raw`<\s*\/\s*${NS}think(?:ing)?\s*>`, 'i');
+/**
+ * A trailing run that could still GROW into a tag (no `>` yet) — held back until the next chunk.
+ *
+ * This one has to be namespace-aware too, and it is the subtle one: without it a stream that
+ * splits mid-tag emits `</mm` as visible text and only then recognizes `:think>`, which is a
+ * partial leak that reproduces unreliably and is harder to spot than the original bug.
+ *
+ * Known tradeoff, taken deliberately: an optional leading identifier means a chunk ending in
+ * `<div` or `<span` is also held back one chunk. That is a DELAY, never data loss — it flushes on
+ * the next chunk or at flush().
+ */
+const PARTIAL_RE = new RegExp(
+  String.raw`<\s*\/?\s*(?:[A-Za-z][\w.-]{0,15}\s*:?\s*)?(?:t(?:h(?:i(?:n(?:k(?:i(?:n(?:g)?)?)?)?)?)?)?)?\s*$`,
+  'i',
+);
 
 /** Length of the trailing maybe-tag to hold back, or 0. */
 function partialTail(s: string): number {

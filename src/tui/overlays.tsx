@@ -10,7 +10,8 @@ import { recommendedIndex } from './questions.js';
 import type { QuestionSelection } from './questions.js';
 import type { PickerRow } from '../util/modelGroups.js';
 
-/** Faint slate panel behind menus/overlays. */
+/** Faint slate panel behind menus/overlays — the OG default. Themes override via `menuBg`;
+ *  these remain as the fallback for any palette that predates the field. */
 export const MENU_BG = '#1b2331';
 /** Stronger tone on the selected overlay/menu row. */
 export const MENU_SEL_BG = '#31465f';
@@ -23,6 +24,9 @@ export interface OverlayPalette {
   yellow: string;
   red: string;
   purple: string;
+  /** Panel tones from the active theme; absent on older palettes → the module defaults below. */
+  menuBg?: string;
+  menuSelBg?: string;
 }
 
 function barWidth(cols: number, pageMargin: number): number {
@@ -72,10 +76,10 @@ export function PendingOverlay({
 
   return (
     <Box flexDirection="column" paddingLeft={pageMargin} marginTop={1}>
-      <Text wrap="truncate" backgroundColor={MENU_BG} color={titleColor} bold>
+      <Text wrap="truncate" backgroundColor={C.menuBg ?? MENU_BG} color={titleColor} bold>
         {bar(` ${title}`)}
       </Text>
-      <Text wrap="truncate" backgroundColor={MENU_BG}>
+      <Text wrap="truncate" backgroundColor={C.menuBg ?? MENU_BG}>
         <Text color={C.yellow} bold>
           {pending.kind === 'user_question'
             ? ` question${pendingQuestionsLength > 1 ? ` ${activeQuestionIndex + 1}/${pendingQuestionsLength}` : ''}: `
@@ -197,17 +201,17 @@ export function ModelPickerOverlay({
   const bar = (s: string) => padBar(s, BAR_W);
   return (
     <Box flexDirection="column" paddingLeft={pageMargin} marginTop={1}>
-      <Text wrap="truncate" backgroundColor={MENU_BG} color={C.cyan} bold>
+      <Text wrap="truncate" backgroundColor={C.menuBg ?? MENU_BG} color={C.cyan} bold>
         {bar(' Select a model')}
       </Text>
       {pickStart > 0 ? (
-        <Text wrap="truncate" backgroundColor={MENU_BG} italic color={C.dim}>{bar(`  ↑ ${pickStart} more`)}</Text>
+        <Text wrap="truncate" backgroundColor={C.menuBg ?? MENU_BG} italic color={C.dim}>{bar(`  ↑ ${pickStart} more`)}</Text>
       ) : null}
       {pickerRows.slice(pickStart, pickStart + pickerMax).map((r, j) => {
         const i = pickStart + j;
         if (r.kind === 'header') {
           return (
-            <Text key={`h${i}`} wrap="truncate" backgroundColor={MENU_BG} bold color={C.yellow}>
+            <Text key={`h${i}`} wrap="truncate" backgroundColor={C.menuBg ?? MENU_BG} bold color={C.yellow}>
               {bar(` ${r.label}`)}
             </Text>
           );
@@ -215,7 +219,7 @@ export function ModelPickerOverlay({
         const e = r.entry;
         const active = e.provider === currentProvider && e.model === currentModel;
         const cur = i === pickerSel;
-        const bg = cur ? MENU_SEL_BG : MENU_BG;
+        const bg = cur ? (C.menuSelBg ?? MENU_SEL_BG) : (C.menuBg ?? MENU_BG);
         // Clip AND pad to the bar width (padBar used to do both): a long provider/model must not
         // spill past the shaded rectangle.
         const bodyMax = Math.max(0, BAR_W - 4); // 2 cursor + 2 marker cells
@@ -234,11 +238,11 @@ export function ModelPickerOverlay({
         );
       })}
       {pickStart + pickerMax < pickerRows.length ? (
-        <Text wrap="truncate" backgroundColor={MENU_BG} italic color={C.dim}>
+        <Text wrap="truncate" backgroundColor={C.menuBg ?? MENU_BG} italic color={C.dim}>
           {bar(`  ↓ ${pickerRows.length - pickStart - pickerMax} more`)}
         </Text>
       ) : null}
-      <Text wrap="truncate" backgroundColor={MENU_BG} color={C.dim}>
+      <Text wrap="truncate" backgroundColor={C.menuBg ?? MENU_BG} color={C.dim}>
         {bar(' ↑/↓ select · Enter switch · Esc cancel')}
       </Text>
     </Box>

@@ -16,7 +16,10 @@
 
 // `<|…|>` and `<|…>` (ChatML), `<word|>` (channel/tool_call), bare think tags, and DeepSeek's
 // fullwidth-bar tokens `<｜…｜>` (U+FF5C bar, e.g. <｜tool▁sep｜> / <｜end▁of▁sentence｜>).
-const CONTROL_TOKEN = /<\|[^>]{0,40}>|<[A-Za-z_]{1,24}\|>|<｜[^>]{0,40}>|<\/?think(?:ing)?>/gi;
+// The reasoning-tag arm is namespace-aware AND whitespace-tolerant, matching thinkingTags.ts:
+// `</mm:think>` (MiniMax-M) and `</think >` both used to survive into exports and replayed history.
+const CONTROL_TOKEN =
+  /<\|[^>]{0,40}>|<[A-Za-z_]{1,24}\|>|<｜[^>]{0,40}>|<\s*\/?\s*(?:[A-Za-z][\w.-]{0,15}\s*:\s*)?think(?:ing)?\s*>/gi;
 
 export function scrubControlTokens(text: string): string {
   if (!text) return text;

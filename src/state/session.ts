@@ -93,6 +93,23 @@ export class SessionLog {
   }
 
   /** Session id from a log path — basename without `.jsonl`. */
+  /**
+   * How many assistant turns this session has already snapshotted. The AgentLoop is constructed
+   * PER USER MESSAGE, so an instance counter restarted at 0 every message: turn 1 and turn 5 of
+   * the same session both wrote to checkpoints/<id>/1/, and the second overwrote the first —
+   * destroying the only pristine copy /rewind exists to restore. Seeding from the log makes the
+   * counter session-scoped, and survives --resume for free.
+   */
+  static countSnapshots(path: string): number {
+    let max = -1;
+    for (const e of SessionLog.load(path) as Array<Record<string, unknown>>) {
+      if (e.kind !== 'context_snapshot') continue;
+      const t = typeof e.turn === 'number' ? e.turn : -1;
+      if (t > max) max = t;
+    }
+    return max + 1;
+  }
+
   static sessionIdFromPath(path: string): string {
     return basename(path).replace(/\.jsonl$/, '');
   }

@@ -1032,7 +1032,7 @@ async function main(): Promise<void> {
 
 
   // Deliver bg agent (and future) task results + record launches for snapshot/recovery to the *main* context (not throwaway sub ctxs).
-  attachBgAgentDelivery(bus, context);
+  const pendingNotifications = attachBgAgentDelivery(bus, context);
 
   // Capture piped stdin NOW, before any async startup work — MCP registration in particular — can
   // disturb fd 0. Otherwise the startup delay from connecting an MCP server drops the piped task
@@ -1172,7 +1172,12 @@ async function main(): Promise<void> {
     // See the matching emit in tui.tsx: this is for non-terminal subscribers (the `--web`
     // mirror). attachRenderer's switch has `default: break`, so the headless path ignores it.
     bus.emit({ type: 'user', text: task });
-    const userMsg: Message = { role: 'user', content: [{ type: 'text', text: task }] };
+    // Fold any background sub-agent results into THIS user turn rather than letting them land
+    // mid-turn on their own. See busListeners.ts: appended live, one could split an assistant
+    // tool_use from its tool_result and 400 the session permanently.
+    const notifications = pendingNotifications.drain();
+    const userText = notifications.length ? `${notifications.join('\n')}\n${task}` : task;
+    const userMsg: Message = { role: 'user', content: [{ type: 'text', text: userText }] };
     if (first) {
       context.pinTask(userMsg);
       first = false;
@@ -1354,6 +1359,20 @@ async function main(): Promise<void> {
       planMode,
       wakeupHandler,
       additionalRoots,
+      // Safety posture must track LIVE autonomy, not process start. Two things were frozen:
+      // sub-agent inheritance (getAutonomy closed over this binding) and the unrestricted
+      // filesystem-root grant. Lowering autonomy mid-session now actually re-tightens both;
+      // RAISING it deliberately does NOT re-grant the fs root — `full` reached by Shift+Tab is
+      // not the same promise as `--yolo` chosen at launch, and silently widening the jail
+      // because someone tabbed one stop too far is exactly the surprise to avoid.
+      onAutonomyChange: (level) => {
+        autonomy = level;
+        if (!unrestricted && level !== 'full') {
+          const fsRoot = parse(workspaceRoot).root || '/';
+          const i = additionalRoots.indexOf(fsRoot);
+          if (i !== -1) additionalRoots.splice(i, 1);
+        }
+      },
       // Keep sub-agents (the `agent` tool) on the live model after a /model switch.
       onModelSwitch: (p, model) => {
         activeAgentProvider = p;

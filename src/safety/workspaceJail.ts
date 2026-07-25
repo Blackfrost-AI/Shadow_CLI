@@ -1,5 +1,5 @@
 import { realpathSync, existsSync } from 'node:fs';
-import { resolve, dirname, isAbsolute, relative } from 'node:path';
+import { resolve, dirname, basename, isAbsolute, relative } from 'node:path';
 
 /**
  * The filesystem jail. Every path a tool touches is run through `resolveWithin`,
@@ -59,7 +59,13 @@ export function resolveWithin(roots: string | string[], requested: string): stri
   while (!existsSync(existing)) {
     const parent = dirname(existing);
     if (parent === existing) break; // reached the filesystem root
-    tail.unshift(existing.slice(parent.length + 1));
+    // basename, NOT slice(parent.length + 1): at the filesystem root `parent` is already "/",
+    // so the +1 ate the first CHARACTER of the segment — "/work/x" walked up to "/work" and
+    // unshifted "ork", producing "/ork/x". Any path whose deepest existing ancestor is "/" was
+    // silently mangled and then rejected as outside the jail. Fails closed, so it read as a
+    // confusing denial rather than a breach — but it made the jail unusable for a workspace at
+    // a top-level directory.
+    tail.unshift(basename(existing));
     existing = parent;
   }
   const real = existsSync(existing) ? resolve(realpathSync(existing), ...tail) : abs;

@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { inlineImageEsc, supportsInlineImages, formatBytes } from '../src/util/termImage.js';
+import { inlineImageEsc, supportsInlineImages, formatBytes, canOpenViewer, saveImage } from '../src/util/termImage.js';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { basename } from 'node:path';
 
 // A real 1×1 PNG (valid header so any terminal that decodes won't choke on garbage).
 const PNG = Buffer.from(
@@ -78,4 +80,35 @@ test('formatBytes: B / KB / MB tiers', () => {
   assert.equal(formatBytes(512), '512 B');
   assert.equal(formatBytes(2048), '2 KB');
   assert.equal(formatBytes(1_500_000), '1.4 MB');
+});
+
+// ── the GUI viewer must never launch when nobody is watching ─────────────────────────────────
+test('canOpenViewer: only on a real interactive terminal', () => {
+  // The distinction that was missing. supportsInlineImages() false means EITHER "a TTY that
+  // can't draw inline" (open the viewer) OR "not a terminal at all" (piped/headless/CI/test),
+  // where launching Preview is exactly wrong — and is what spammed the operator's screen on
+  // every `npm test`, one window per run, each showing a 7-byte fixture.
+  assert.equal(canOpenViewer({}, false), false, 'never on a non-TTY');
+  assert.equal(canOpenViewer({}, true), true, 'yes on a plain interactive terminal');
+  assert.equal(canOpenViewer({ SHADOW_NO_IMAGE_OPEN: '1' }, true), false, 'explicit opt-out wins');
+  assert.equal(canOpenViewer({ NODE_ENV: 'test' }, true), false, 'never from a test runner');
+});
+
+test('saveImage writes the bytes and never opens anything', () => {
+  const p = saveImage(Buffer.from([0x89, 0x50, 0x4e, 0x47]), 'image/png', '/var/folders/xy/tmp/pic.png');
+  assert.ok(existsSync(p));
+  assert.equal(readFileSync(p).length, 4);
+  // basename first: the filename used to embed the whole flattened directory path, which is why
+  // the cache filled with `_var_folders_cz_…-<uuid>.png` entries nobody could identify.
+  assert.match(basename(p), /^pic\.png-[0-9a-f-]{36}\.png$/);
+  assert.ok(!basename(p).includes('_var_folders'), 'the directory must not leak into the name');
+  rmSync(p, { force: true });
+});
+
+test('an unknown media type still gets a usable extension', () => {
+  // `??` did not fall through on extname()'s empty string, so this produced a file with NO
+  // extension — which the OS viewer reports as an unrecognized format even for valid bytes.
+  const p = saveImage(Buffer.from([1, 2, 3]), 'application/octet-stream', 'noext');
+  assert.match(basename(p), /\.png$/);
+  rmSync(p, { force: true });
 });

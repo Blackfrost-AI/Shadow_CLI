@@ -14,7 +14,7 @@ import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { join, extname } from 'node:path';
+import { join, basename, extname } from 'node:path';
 
 /** Cap inline emission: a base64 string this large in a single Ink <Text> node gets slow/memory-
  *  heavy, and huge in-place images are a poor UX. Beyond this, fall back to save+open only. */
@@ -124,23 +124,59 @@ const MEDIA_EXT: Record<string, string> = {
   'image/webp': '.webp',
 };
 
-/** File extension for a media type, with a name/uuid fallback. */
+/** File extension for a media type, with a name fallback. */
 function extFor(mediaType: string, name?: string): string {
-  return MEDIA_EXT[mediaType] ?? (name ? extname(name) : '') ?? '.png';
+  // `||` not `??`: extname() returns an EMPTY STRING for a name with no extension, and `??` only
+  // falls through on null/undefined — so an unknown media type used to produce a file with NO
+  // extension at all, which is one of the ways the OS viewer ends up saying "format not
+  // recognized" even when the bytes are fine.
+  return MEDIA_EXT[mediaType] || (name ? extname(name) : '') || '.png';
 }
 
 /**
- * Durable fallback that works on EVERY terminal: write the bytes to `~/.shadow/img-cache/` and open
- * them in the OS viewer (Preview.app on macOS, xdg-open elsewhere). Returns the saved path. Used as
- * the universal non-inline path AND the "re-view" action for the persistent placeholder.
+ * Write image bytes to `~/.shadow/img-cache/` and return the path. Never opens anything.
+ *
+ * `name` is only a readability hint for the filename. It is frequently a full PATH, and the
+ * sanitizer turns every separator into `_`, which is why these files look like
+ * `_var_folders_cz_…-<uuid>.png` — the leading segment is a flattened directory, not a title.
  */
-export function saveAndOpen(bytes: Buffer, mediaType: string, name?: string): string {
+export function saveImage(bytes: Buffer, mediaType: string, name?: string): string {
   const dir = join(homedir(), '.shadow', 'img-cache');
   mkdirSync(dir, { recursive: true });
-  const safeName = name ? name.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 40) : '';
+  // basename first: a full path contributed nothing but noise to the filename.
+  const hint = name ? basename(name) : '';
+  const safeName = hint.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 40);
   const fname = `${safeName ? safeName + '-' : ''}${randomUUID()}${extFor(mediaType, name)}`;
   const path = join(dir, fname);
   writeFileSync(path, bytes);
+  return path;
+}
+
+/**
+ * True when launching a GUI viewer is appropriate: a real interactive terminal, not opted out.
+ *
+ * The distinction this draws was previously missing, and it mattered: `supportsInlineImages()`
+ * returning false means EITHER "a TTY that can't draw inline graphics" (open the viewer — correct)
+ * OR "stdout isn't a terminal at all" (piped, headless, CI, a test) — where launching Preview is
+ * exactly wrong. The test suite mounts the TUI and exercises `/image`, so every `npm test` run
+ * popped a Preview window over the user's screen showing a 7-byte fixture, and left the file
+ * behind in the REAL ~/.shadow/img-cache. 99 of them accumulated before anyone traced it.
+ */
+export function canOpenViewer(env: NodeJS.ProcessEnv = process.env, isTTY = !!process.stdout.isTTY): boolean {
+  if (!isTTY) return false;
+  if (env.SHADOW_NO_IMAGE_OPEN === '1') return false;
+  if (env.NODE_ENV === 'test' || env.VITEST || env.JEST_WORKER_ID) return false;
+  return true;
+}
+
+/**
+ * Durable fallback for terminals that can't draw inline: save the bytes and open them in the OS
+ * viewer (Preview.app on macOS, xdg-open elsewhere). Returns the saved path — which is returned
+ * whether or not the viewer was launched, so a non-interactive caller can still surface it.
+ */
+export function saveAndOpen(bytes: Buffer, mediaType: string, name?: string): string {
+  const path = saveImage(bytes, mediaType, name);
+  if (!canOpenViewer()) return path; // nobody is watching — never launch a GUI
   const opener = process.platform === 'darwin' ? 'open' : 'xdg-open';
   try {
     execFileSync(opener, [path], { stdio: 'ignore' });

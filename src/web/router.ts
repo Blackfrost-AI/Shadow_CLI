@@ -6,7 +6,7 @@ import type { AutonomyLevel } from '../safety/permissions.js';
 import type { ModelEntry } from '../config.js';
 import { registerModelsRoutes, mask as maskModel } from './api/models.js';
 import { registerAgentsRoutes } from './api/agents.js';
-import { registerMcpRoutes } from './api/mcp.js';
+import { registerMcpRoutes, maskConfig as maskMcp } from './api/mcp.js';
 import { registerSessionsRoutes } from './api/sessions.js';
 import { registerProjectsRoutes } from './api/projects.js';
 import type { SessionRegistry } from './registry.js';
@@ -115,7 +115,14 @@ function registerStateRoutes(route: RouteFn, ctx: ApiContext): void {
       maxIterations: a.maxIterations,
       builtin: a.builtin === true,
     }));
-    const mcpServers = loadGlobalMcpServers();
+    // MASKED, exactly as /api/mcp does it: an MCP server's `env`/`headers` values are routinely
+    // bearer tokens, and this response is fetched by the Home view on every load — unmasked they
+    // landed in the DevTools network log, the page's JS heap, and any extension with 127.0.0.1
+    // host permission. The masking helper already existed one module over; this path just never
+    // called it.
+    const rawMcp = loadGlobalMcpServers();
+    const mcpServers: Record<string, unknown> = {};
+    for (const [name, cfg] of Object.entries(rawMcp)) mcpServers[name] = maskMcp(cfg);
     const models = Array.isArray(cfg.models) ? (cfg.models as Array<Record<string, unknown>>) : [];
     return {
       status: 200,

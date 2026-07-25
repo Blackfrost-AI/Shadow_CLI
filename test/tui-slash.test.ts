@@ -643,6 +643,12 @@ test('imageMediaType maps extensions and rejects non-images', () => {
 });
 
 test('/image attaches a file (footer shows 📎), rejects bad types, and clears', async () => {
+  // SHADOW_NO_IMAGE_OPEN: mounting the real TUI and attaching an image reaches pushImage, whose
+  // non-inline fallback used to shell out to `open` — so this test popped a Preview window over
+  // the operator's screen showing the 7-byte fixture below, and left the file in the REAL
+  // ~/.shadow/img-cache. 99 accumulated before it was traced. canOpenViewer() now refuses on a
+  // non-TTY anyway; this belt-and-braces keeps it true even if someone runs the suite on a tty.
+  process.env.SHADOW_NO_IMAGE_OPEN = '1';
   const png = join(mkdtempSync(join(tmpdir(), 'img-')), 'pic.png');
   writeFileSync(png, Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3])); // bytes are opaque to the attach path
   const { stdin, frames, lastFrame, unmount } = render(React.createElement(TuiApp, { opts: makeOpts({ workspaceRoot: tmpdir() }) }));

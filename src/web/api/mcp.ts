@@ -46,7 +46,7 @@ function validateServer(name: string, body: Record<string, unknown>): { ok: true
   return { ok: true, cfg };
 }
 
-function maskConfig(cfg: McpServerConfig): Record<string, unknown> {
+export function maskConfig(cfg: McpServerConfig): Record<string, unknown> {
   // Headers/env values may be bearer tokens; show keys only, never values.
   const out: Record<string, unknown> = {};
   if (cfg.command) out.command = cfg.command;

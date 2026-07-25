@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { saveCheckpoint } from '../state/checkpoints.js';
 import { z } from 'zod';
 import type { Tool, ToolResult } from './types.js';
 import { ok, fail } from './types.js';
@@ -107,6 +108,12 @@ export const multiEdit: Tool<MultiEditInput, MultiEditData> = {
     }
 
     try {
+      // multi_edit wrote NO checkpoint at all, so /rewind silently skipped every file it touched
+      // while still reporting success. Same contract as write_file/edit_file: back up the
+      // pre-edit content, first-write-wins per turn.
+      if (ctx.checkpoint) {
+        saveCheckpoint(ctx.workspaceRoot, ctx.checkpoint.sessionId, ctx.checkpoint.turn, input.path, original);
+      }
       atomicWrite(abs, text);
     } catch (e) {
       return fail('multi_edit', 'write', Date.now() - start, 'write_failed', `write failed: ${(e as Error).message}`);

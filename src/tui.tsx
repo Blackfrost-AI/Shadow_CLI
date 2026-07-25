@@ -12,7 +12,7 @@ import {
   reconCount,
   type CollapseKind,
 } from './tui/toolDisplay.js';
-import { supportsInlineImages, saveAndOpen } from './util/termImage.js';
+import { supportsInlineImages, saveAndOpen, canOpenViewer } from './util/termImage.js';
 import {
   extractCommittableUnits,
   clampTail,
@@ -22,7 +22,7 @@ import {
   leadsWithBlock,
 } from './tui/streamCommit.js';
 import { computeLayout, formatStatusStrip, pinnedMaxItems, fitHud } from './tui/layout.js';
-import { MENU_BG, MENU_SEL_BG, PendingOverlay, ModelPickerOverlay } from './tui/overlays.js';
+import { PendingOverlay, ModelPickerOverlay } from './tui/overlays.js';
 import { buildSeats, resolveTableEntries, parseTableInput, seatTag, MIN_SEATS, MAX_SEATS, type Seat, type SpeakerTag } from './tui/roundTable.js';
 import { execFileSync, spawn } from 'node:child_process';
 import type { Message, Provider, ToolCall, ContentBlock, ImageBlock, Effort } from './provider/provider.js';
@@ -207,6 +207,9 @@ const THEMES = {
     user: '#22d38f',
     accent: '#d97757', // warm turn-bullet orange
     codeBg: '#2d333b',
+    bg: null,
+    menuBg: '#1b2331',
+    menuSelBg: '#31465f',
   },
   // Backward-compatible alias for configs saved before the OG name existed.
   dark: {
@@ -222,6 +225,9 @@ const THEMES = {
     user: '#22d38f',
     accent: '#d97757',
     codeBg: '#2d333b',
+    bg: null,
+    menuBg: '#1b2331',
+    menuSelBg: '#31465f',
   },
   pipboy: {
     fg: '#e6ffcf', // bright green-white
@@ -236,6 +242,9 @@ const THEMES = {
     user: '#b6f58a',
     accent: '#ecd977',
     codeBg: '#1e2a14',
+    bg: null,
+    menuBg: '#16210d',
+    menuSelBg: '#2b3f1c',
   },
   cyberpunk: {
     fg: '#f7fbff',
@@ -250,6 +259,9 @@ const THEMES = {
     user: '#4fe0ff',
     accent: '#e08cff',
     codeBg: '#2a2438',
+    bg: null,
+    menuBg: '#1d1830',
+    menuSelBg: '#38265c',
   },
   'coder-chick': {
     fg: '#fff7fb',
@@ -264,6 +276,9 @@ const THEMES = {
     user: '#7fe0a0',
     accent: '#ff9fd4',
     codeBg: '#382631',
+    bg: null,
+    menuBg: '#281a22',
+    menuSelBg: '#4a2f3d',
   },
   light: {
     fg: '#0a0a0a', // near-black (for light terminals)
@@ -278,6 +293,9 @@ const THEMES = {
     user: '#047857',
     accent: '#c2410c', // orange-700 — AA on white
     codeBg: '#eaeef2',
+    bg: null,
+    menuBg: '#e4e9ef',
+    menuSelBg: '#c9d6e6',
   },
   matrix: {
     fg: '#5cff9f', // brighter phosphor green
@@ -292,6 +310,9 @@ const THEMES = {
     user: '#33ffd6',
     accent: '#d6ff33',
     codeBg: '#06210f',
+    bg: null,
+    menuBg: '#04160a',
+    menuSelBg: '#0b3d1c',
   },
   mono: {
     fg: '#f4f4f4', // bright grayscale — minimal color, terminal-default friendly
@@ -306,6 +327,9 @@ const THEMES = {
     user: '#ffffff', // mono relies on the ▌ bar shape — bar goes full bright
     accent: '#e2e2e2',
     codeBg: '#2e2e2e',
+    bg: null,
+    menuBg: '#1e1e1e',
+    menuSelBg: '#3a3a3a',
   },
   // Okabe–Ito palette: every accent pair stays distinguishable under deuteranopia,
   // protanopia, AND tritanopia (the standard colorblind-safe set, lightness-tuned for
@@ -324,6 +348,9 @@ const THEMES = {
     user: '#56b4e9', // sky bar …
     accent: '#e69f00', // … vs orange bullet: blue/orange survives all three CVD axes
     codeBg: '#2d333b',
+    bg: null,
+    menuBg: '#1b2331',
+    menuSelBg: '#31465f',
   },
   // Maximum-contrast mode: pure white text, loud accents, brighter "quiet" tier —
   // for low vision, glare, or projector terminals. Everything clears AAA (7:1).
@@ -340,14 +367,49 @@ const THEMES = {
     user: '#00ff7f',
     accent: '#ffa347',
     codeBg: '#262626',
+    bg: null,
+    menuBg: '#161616',
+    menuSelBg: '#3d3d3d',
+  },
+  // The only theme that ASSERTS a background. `bg` is pushed to the terminal itself via OSC 11
+  // (see backgroundSequence) rather than painted per cell — in the stock renderer the app writes
+  // into the terminal's normal buffer and does not own the screen, so a per-<Text> background
+  // would leave a ragged edge everywhere a line is shorter than the window.
+  //
+  // Accents are Okabe–Ito-derived (as `colorblind` is) so the focused look costs nothing under
+  // deuteranopia/protanopia/tritanopia, and every tier is measured against TRUE black rather than
+  // an assumed one: body 15.3:1, dim 9.6:1, sky 8.5:1, orange 8.4:1 — all AAA for body text.
+  shadow: {
+    fg: '#ffffff',
+    body: '#d5dbe1', // 15.3:1 on #000 — soft enough not to bloom on a pure-black field
+    bright: '#ffffff',
+    dim: '#a7b0b9', // 9.6:1 — de-emphasis by role, never by illegibility
+    cyan: '#5cb8ec', // OI sky blue
+    green: '#00c99a', // OI bluish-green
+    red: '#ef7a45', // OI vermillion
+    yellow: '#f0e442', // OI yellow
+    purple: '#dd93c0', // OI reddish-purple
+    // The ▌user bar vs the ⏺ turn bullet is the most load-bearing color pair in the transcript.
+    // OI sky/orange survives deuteranopia, protanopia and tritanopia on HUE — but at their stock
+    // values the two sit 0.011 apart in luminance (the `colorblind` theme has the same collision,
+    // and leans on the bar's SHAPE for it). On true black there is headroom to lift the sky, so
+    // this pair is separated on luminance too (0.158) and stays legible in grayscale and under
+    // achromatopsia — belt and braces, at no cost to either hue.
+    user: '#8ed0f5', // sky bar, brightened — 12.5:1 …
+    accent: '#e69f00', // … vs orange bullet — 9.3:1
+    codeBg: '#141414', // barely-lifted charcoal: a code chip reads as a panel, not a hole
+    bg: '#000000',
+    menuBg: '#101010',
+    menuSelBg: '#2b2b2b',
   },
 } as const;
 export type ThemeName = keyof typeof THEMES;
-export const THEME_NAMES = ['og', 'pipboy', 'cyberpunk', 'coder-chick', 'matrix', 'mono', 'light', 'colorblind', 'high-contrast'] as const;
+export const THEME_NAMES = ['og', 'shadow', 'pipboy', 'cyberpunk', 'coder-chick', 'matrix', 'mono', 'light', 'colorblind', 'high-contrast'] as const;
 type CanonicalThemeName = (typeof THEME_NAMES)[number];
 
 const THEME_DESCRIPTIONS: Record<CanonicalThemeName, string> = {
   og: 'Original Shadow palette: calm dark terminal with cyan/violet accents.',
+  shadow: 'True black. Sets the terminal background itself for a focused session; colorblind-safe accents.',
   pipboy: 'Soft green phosphor with amber warnings; retro but low-glare.',
   cyberpunk: 'Cyan, magenta, and yellow accents on a high-contrast dark base.',
   'coder-chick': 'Rose/pink accent palette with neutral text and readable status colors.',
@@ -360,6 +422,9 @@ const THEME_DESCRIPTIONS: Record<CanonicalThemeName, string> = {
 
 const THEME_ALIASES: Record<string, CanonicalThemeName> = {
   dark: 'og',
+  black: 'shadow',
+  oled: 'shadow',
+  focus: 'shadow',
   pink: 'coder-chick',
   coderchick: 'coder-chick',
   chick: 'coder-chick',
@@ -373,7 +438,31 @@ const THEME_ALIASES: Record<string, CanonicalThemeName> = {
   highcontrast: 'high-contrast',
 };
 
-const C = { ...THEMES.og };
+/**
+ * The active palette. Every theme defines EVERY field — including `bg: null` for the ones that
+ * leave the terminal's own background alone — because `applyTheme` is an in-place Object.assign:
+ * a field missing from the incoming theme would keep the outgoing theme's value.
+ */
+export interface Palette {
+  fg: string;
+  body: string;
+  bright: string;
+  dim: string;
+  cyan: string;
+  green: string;
+  red: string;
+  yellow: string;
+  purple: string;
+  user: string;
+  accent: string;
+  codeBg: string;
+  /** Terminal background this theme asserts via OSC 11, or null to inherit the user's own. */
+  bg: string | null;
+  menuBg: string;
+  menuSelBg: string;
+}
+
+const C: Palette = { ...THEMES.og };
 
 function normalizeThemeName(name: string | undefined): CanonicalThemeName | null {
   if (!name) return null;
@@ -389,8 +478,33 @@ export function applyTheme(name: ThemeName | string): void {
 }
 
 /** Test seam: a copy of the active palette (colors change in place via applyTheme). */
-export function paletteSnapshot(): Record<string, string> {
+export function paletteSnapshot(): Palette {
   return { ...C };
+}
+
+/**
+ * The escape that asks the TERMINAL to change its default background (OSC 11), or resets it to the
+ * user's own (OSC 111) when a theme asserts no background. Pure so the sequencing is unit-tested.
+ *
+ * Why the terminal and not per-cell painting: in the stock renderer Shadow writes into the normal
+ * screen buffer and does not own the screen, so `backgroundColor` on a <Text> paints only as far
+ * as that line's characters — every short line would end in a ragged edge against the real
+ * background, and the margins would never fill at all. OSC 11 colors the whole window, costs
+ * nothing per frame, and leaves native scrollback intact.
+ *
+ * It is WINDOW-WIDE and persists until reset, so runTui must restore it on exit exactly as it
+ * already does for the window title. `SHADOW_NO_BG=1` opts out (tmux without passthrough, or a
+ * terminal whose background you never want an app to touch).
+ */
+export function backgroundSequence(bg: string | null, isTTY: boolean, env: NodeJS.ProcessEnv = process.env): string {
+  if (!isTTY || env.SHADOW_NO_BG === '1') return '';
+  return bg ? `\x1b]11;${bg}\x07` : '\x1b]111\x07';
+}
+
+/** The background the named theme asserts (null = inherit the terminal's own). */
+export function themeBackground(name: string | undefined): string | null {
+  const theme = normalizeThemeName(name) ?? 'og';
+  return THEMES[theme].bg;
 }
 
 // `imageMediaType` now lives in util/image.ts (shared with the view_image tool);
@@ -496,6 +610,8 @@ interface SlashCommand {
  *  `name` then holds the full submission text ("/theme colorblind") and `base` the command. */
 interface SlashMenuItem extends SlashCommand {
   base?: string;
+  /** An informational row ("no prior sessions yet") — shown, but never completed or run. */
+  hint?: boolean;
 }
 const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/help', desc: 'Show keybindings and commands' },
@@ -546,7 +662,6 @@ const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/color', desc: 'Switch color theme (alias for /theme)', dispatch: '/theme' },
   { name: '/theme', desc: 'Switch color theme (list, preview <name>, or name; no arg cycles)' },
   { name: '/vim', desc: 'Toggle modal (NORMAL/INSERT) editing in the composer' },
-  { name: '/mouse', desc: 'Toggle click-to-place-caret (off returns the wheel to the terminal)' },
   { name: '/statusline', desc: 'Set a shell command for a custom footer line (/statusline none to clear)' },
   { name: '/add-dir', desc: 'Grant an extra directory to file tools for this session' },
   { name: '/image', desc: 'Attach an image file to your next message (/image clear to drop)' },
@@ -561,7 +676,34 @@ const SLASH_NAME_WIDTH = Math.max(...SLASH_COMMANDS.map((c) => c.name.length)) +
 // vocabularies belong here (a completion that the command then rejects is worse than none).
 const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
 const AUTONOMY_LEVELS: AutonomyLevel[] = ['manual', 'auto-read', 'auto-edit', 'full'];
-const SLASH_ARG_COMPLETIONS: Record<string, { value: string; desc: string }[]> = {
+
+/** One selectable argument row. */
+export interface ArgCompletion {
+  value: string;
+  desc: string;
+}
+
+/**
+ * What a DYNAMIC completion may look at. The commands that most need a picker are exactly the
+ * ones whose vocabulary only exists at runtime — which session to resume, which turn to rewind
+ * to, which rule to remove — so a completion may be a function of the live session instead of a
+ * constant. Keep this surface small and cheap: it is called on every keystroke while the menu
+ * is open.
+ */
+export interface ArgContext {
+  cfg: ShadowConfig;
+  workspaceRoot: string;
+  /** Prior sessions, newest first (for /resume). */
+  sessions: { id: string; label: string }[];
+  /** How many user turns this session has (for /rewind). */
+  turns: number;
+  /** Extra directories granted this session (for /add-dir remove). */
+  extraRoots: string[];
+}
+
+type ArgProvider = ArgCompletion[] | ((ctx: ArgContext) => ArgCompletion[]);
+
+const SLASH_ARG_COMPLETIONS: Record<string, ArgProvider> = {
   '/theme': [
     ...THEME_NAMES.map((n) => ({ value: n, desc: THEME_DESCRIPTIONS[n] })),
     { value: 'preview', desc: 'Try a theme without saving it (/theme preview <name>)' },
@@ -591,27 +733,87 @@ const SLASH_ARG_COMPLETIONS: Record<string, { value: string; desc: string }[]> =
     { value: 'parallelTools', desc: 'on/off — run independent tools in parallel' },
     { value: 'costWarnUSD', desc: 'warn when session cost passes this (USD)' },
   ],
-  '/model': [
-    { value: 'list', desc: 'Show configured model presets' },
-    { value: 'add', desc: 'Add a preset: /model add <name> …' },
-    { value: 'remove', desc: 'Remove a preset by name' },
-    { value: 'enable', desc: 'Enable a disabled preset' },
-    { value: 'disable', desc: 'Disable a preset (kept in config)' },
-    { value: 'test', desc: 'Capability-check a preset (tools, vision, context)' },
-  ],
   '/mcp': [
     { value: 'list', desc: 'List configured MCP servers' },
     { value: 'get', desc: 'Inspect one server: /mcp get <name>' },
     { value: 'enable', desc: 'Enable a server: /mcp enable <name>' },
     { value: 'disable', desc: 'Disable a server: /mcp disable <name>' },
   ],
-  '/local': [{ value: 'list', desc: 'Show local model presets (.gguf / MLX / vLLM)' }],
   '/tasks': [{ value: 'clear', desc: 'Clear the live task list' }],
   '/image': [{ value: 'clear', desc: 'Drop queued image attachments' }],
   '/goal': [{ value: 'clear', desc: 'Remove the standing goal' }],
   '/keybindings': [{ value: 'init', desc: 'Write a starter ~/.shadow/keybindings.json' }],
   '/table': [{ value: 'done', desc: 'End the round-table and return to single-model chat' }],
   '/statusline': [{ value: 'none', desc: 'Clear the custom footer line' }],
+
+  // ── on/off toggles ─────────────────────────────────────────────────────────
+  // Bare `/vim` flips the switch, so the menu's job is to let you set it EXPLICITLY (and to show
+  // which way it currently points via the "✓ current" row).
+  '/vim': [
+    { value: 'on', desc: 'Modal editing — Esc for NORMAL, i/a to insert' },
+    { value: 'off', desc: 'Standard composer editing' },
+  ],
+  '/fast': [
+    { value: 'on', desc: 'Lower latency, no extended thinking (Anthropic)' },
+    { value: 'off', desc: 'Normal latency with extended thinking' },
+  ],
+
+  // ── verbs whose vocabulary is fixed ────────────────────────────────────────
+  '/permissions': [
+    { value: 'list', desc: 'Show every rule in match order' },
+    { value: 'add', desc: 'Add a rule: /permissions add <allow|ask|deny> <tool> [pattern]' },
+    { value: 'remove', desc: 'Remove a rule by index: /permissions remove <n>' },
+    { value: 'set', desc: 'Replace a rule: /permissions set <n> <allow|ask|deny>' },
+    { value: 'clear', desc: 'Remove every rule (back to the autonomy defaults)' },
+  ],
+  '/doctor': [{ value: 'model', desc: 'Probe the active model: tools, vision, context window' }],
+  '/login': [{ value: 'codex', desc: 'Sign in with ChatGPT/Codex' }],
+
+  // ── dynamic: the vocabulary only exists at runtime ─────────────────────────
+  // These are the reason ArgProvider accepts a function. A constant table cannot list YOUR
+  // sessions or YOUR turn count, which is exactly where "type the id from memory" hurt most.
+  '/resume': (ctx) =>
+    ctx.sessions.length
+      ? ctx.sessions.map((s) => ({ value: s.id, desc: s.label }))
+      : [{ value: '', desc: 'No prior sessions in this workspace yet' }],
+  // Turn indexes are 0-based (`0` = the first assistant turn — see the /rewind handler), and the
+  // newest is listed first because that is overwhelmingly the one you want.
+  '/rewind': (ctx) =>
+    ctx.turns > 0
+      ? Array.from({ length: ctx.turns }, (_, i) => ctx.turns - 1 - i).map((n) => ({
+          value: String(n),
+          desc: n === ctx.turns - 1 ? `Turn ${n} — the most recent` : n === 0 ? 'Turn 0 — the first turn' : `Turn ${n}`,
+        }))
+      : [{ value: '', desc: 'Nothing to rewind to yet — no turns this session' }],
+  '/add-dir': (ctx) =>
+    ctx.extraRoots.length
+      ? ctx.extraRoots.map((d) => ({ value: d, desc: 'Already granted this session' }))
+      : [{ value: '', desc: 'Type a path to grant it to the file tools' }],
+  '/model': (ctx) => [
+    { value: 'list', desc: 'Show configured model presets' },
+    { value: 'add', desc: 'Add a preset: /model add <name> …' },
+    { value: 'remove', desc: 'Remove a preset by name' },
+    { value: 'enable', desc: 'Enable a disabled preset' },
+    { value: 'disable', desc: 'Disable a preset (kept in config)' },
+    { value: 'test', desc: 'Capability-check a preset (tools, vision, context)' },
+    // Bare `/model` opens the grouped picker; naming a preset switches straight to it.
+    ...(ctx.cfg.models ?? [])
+      .filter((m) => !m.disabled)
+      .map((m) => ({ value: m.label, desc: `Switch to ${m.provider}/${m.model}` })),
+  ],
+  '/local': (ctx) => [
+    { value: 'list', desc: 'Show local model presets (.gguf / MLX / vLLM)' },
+    { value: 'add', desc: 'Register one: /local add <path.gguf | mlx-folder | org/repo>' },
+    { value: 'use', desc: 'Switch to a registered local model' },
+    { value: 'test', desc: 'Launch it and check it answers' },
+    { value: 'remove', desc: 'Unregister a local model' },
+    // The registered locals by name, so `/local use <tab-completed>` never needs the name typed
+    // from memory — the failure mode that made a hash-named preset unreachable in the first place.
+    ...listLocalModels(ctx.cfg.models ?? []).map((m) => ({
+      value: `use ${m.label}`,
+      desc: `Switch to ${m.label} (${m.gguf ? 'gguf' : m.mlx ? 'MLX' : 'vLLM'})`,
+    })),
+  ],
 };
 
 /**
@@ -621,7 +823,11 @@ const SLASH_ARG_COMPLETIONS: Record<string, { value: string; desc: string }[]> =
  *  - `/cmd part` → the command's known first arguments, fuzzy-filtered; `current` (dispatch →
  *    active value) marks the live setting so pickers double as status readouts
  */
-function slashMatches(input: string, current?: Record<string, string | undefined>): SlashMenuItem[] {
+function slashMatches(
+  input: string,
+  current?: Record<string, string | undefined>,
+  ctx?: ArgContext,
+): SlashMenuItem[] {
   if (!input.startsWith('/')) return [];
   if (isPathLikeSlashToken(input)) return []; // a path (/Users/…, /x.y) is not a command — no menu
   const sp = input.indexOf(' ');
@@ -635,16 +841,23 @@ function slashMatches(input: string, current?: Record<string, string | undefined
   }
   const cmd = findSlashCommand(input.slice(0, sp));
   if (!cmd) return [];
-  const completions = SLASH_ARG_COMPLETIONS[slashDispatchName(cmd)];
-  if (!completions) return [];
+  const provider = SLASH_ARG_COMPLETIONS[slashDispatchName(cmd)];
+  if (!provider) return [];
+  // A dynamic provider needs the live session; without a context (headless/unit callers) it
+  // simply contributes nothing rather than throwing.
+  const completions = typeof provider === 'function' ? (ctx ? provider(ctx) : []) : provider;
+  // An empty `value` is a HINT row ("no sessions yet") — informational, never completable, so it
+  // can't put a bare `/resume ` on the composer and run the wrong thing on Enter.
+  if (!completions.length) return [];
   const partial = input.slice(sp + 1);
   if (/\s/.test(partial)) return []; // only the FIRST argument completes
   const active = current?.[slashDispatchName(cmd)];
   const items: SlashMenuItem[] = completions.map((a) => ({
-    name: `${cmd.name} ${a.value}`,
+    name: a.value ? `${cmd.name} ${a.value}` : cmd.name,
     desc: a.value === active ? `✓ current · ${a.desc}` : a.desc,
     dispatch: cmd.dispatch,
     base: cmd.name,
+    ...(a.value ? {} : { hint: true }),
   }));
   if (!partial) return items;
   return fuzzyRank(items, partial, (i) => i.name.slice(cmd.name.length + 1)).map((r) => r.item);
@@ -924,6 +1137,13 @@ export interface TuiOpts {
   wakeupHandler?: { fire: (task: string, reason: string) => void };
   /** Extra granted roots (--add-dir / additionalDirectories) — widens jail + shell sandbox. */
   additionalRoots?: string[];
+  /**
+   * Called whenever autonomy changes (Shift+Tab ring, `/autonomy`, an approval-dialog `a`).
+   * Without it the process-level binding stayed at its STARTUP value, so a sub-agent spawned
+   * after the user dropped to `manual` was still constructed at the startup level — directly
+   * contradicting AgentToolDeps' own claim that a sub-agent "inherits it, never escalates".
+   */
+  onAutonomyChange?: (level: AutonomyLevel) => void;
   /** Called on a live /model switch so the `agent` tool spawns sub-agents on the NEW model,
    *  not the startup one (which, on a single-model-at-a-time local box, may be an unloaded port). */
   onModelSwitch?: (provider: Provider, model: string) => void;
@@ -1686,6 +1906,27 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const histIdxRef = useRef(0);
   /** The unsent draft, parked when ↑ steps into history so ↓ can bring it back. */
   const draftRef = useRef('');
+  /**
+   * Live values the DYNAMIC argument menus read (which session, which turn, which granted dir).
+   * Refreshed each render and held in a ref so the key handler — which is not re-created per
+   * render — always sees the current one.
+   *
+   * `sessions` is deliberately read from disk ONCE per mount: listResumableSessions opens every
+   * session log in the workspace looking for a snapshot, and the menu re-filters on every
+   * keystroke. The set only grows when a NEW session starts, which by definition is not this one.
+   */
+  const argCtxRef = useRef<ArgContext | null>(null);
+  const resumableRef = useRef<{ id: string; label: string }[] | null>(null);
+  if (resumableRef.current === null) {
+    try {
+      resumableRef.current = listResumableSessions(opts.workspaceRoot).map((s) => ({
+        id: s.id,
+        label: s.ts ? `Snapshot ${s.ts}` : s.path,
+      }));
+    } catch {
+      resumableRef.current = []; // an unreadable session dir must never break the menu
+    }
+  }
   const menuIndexRef = useRef(0);
   const cursorRef = useRef(0);
   // Rows rendered BELOW the composer input's last line (bottom rule + hint + custom-status),
@@ -1733,10 +1974,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const vimModeRef = useRef<VimMode>('insert'); // start in INSERT so typing works immediately
   const [vimModeState, setVimModeState] = useState<VimMode>('insert');
   const vimPendingRef = useRef(''); // operator awaiting a motion (d/c)
-  // Click-to-place-caret (/mouse). ON unless the config or SHADOW_MOUSE=0 says otherwise.
-  const mouseInitial = process.env.SHADOW_MOUSE === '0' ? false : process.env.SHADOW_MOUSE === '1' ? true : opts.cfg.mouse !== false;
+  // Click-to-place-caret. OFF unless explicitly opted in — enabling mouse reporting takes the
+  // WHEEL away from the terminal, and native scrollback is not negotiable here. Opt in per-run
+  // with SHADOW_MOUSE=1 (or `"mouse": true` in config); there is deliberately no slash command,
+  // because a toggle invites exactly the "why is my scrolling broken" state this caused.
+  const mouseInitial = process.env.SHADOW_MOUSE === '1' || opts.cfg.mouse === true;
   const mouseEnabledRef = useRef<boolean>(mouseInitial);
-  const [mouseEnabled, setMouseEnabled] = useState<boolean>(mouseInitial);
+  const [mouseEnabled] = useState<boolean>(mouseInitial); // fixed at mount — no runtime toggle by design
   // Images queued via /image, sent with (and cleared by) the next submitted message.
   const attachmentsRef = useRef<ImageBlock[]>([]);
   const [attachCount, setAttachCount] = useState(0);
@@ -2012,7 +2256,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     // `text` is the plain-text fallback (export / headless / stock Ink path); the styled flatten
     // render uses `image` for the placeholder + inline pixels.
     pushLine({ kind: 'image', text: `🖼 ${alt}`, image: { bytes, mediaType, alt, source } });
-    if (!supportsInlineImages()) void saveAndOpen(Buffer.from(bytes, 'base64'), mediaType, alt);
+    // Save+open ONLY when there is an interactive terminal to open it on. The returned path is
+    // discarded here, so on a non-TTY (piped, headless, CI, the test suite) the write had no
+    // consumer at all — it just deposited fixtures in the user's real ~/.shadow/img-cache and,
+    // before canOpenViewer existed, threw a Preview window over their screen for each one.
+    if (!supportsInlineImages() && canOpenViewer()) {
+      void saveAndOpen(Buffer.from(bytes, 'base64'), mediaType, alt);
+    }
   }, [pushLine]);
 
   // Scan a committed assistant text for markdown images and render each. data: URIs decode locally
@@ -2092,10 +2342,16 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     });
   }, [opts, pushLine]);
 
-  const setAutonomy = useCallback((l: AutonomyLevel) => {
-    autonomyRef.current = l;
-    setAutonomyState(l);
-  }, []);
+  const setAutonomy = useCallback(
+    (l: AutonomyLevel) => {
+      autonomyRef.current = l;
+      setAutonomyState(l);
+      // Tell the process-level binding too: sub-agents and the fs-root grant read it, and both
+      // were frozen at the startup value until now.
+      opts.onAutonomyChange?.(l);
+    },
+    [opts],
+  );
 
   // Apply a new reasoning effort live: updates state, the mutable config, persists it
   // for next launch, and pushes it to the running loop (takes effect next turn).
@@ -2807,7 +3063,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             break;
           }
           try {
-            const { context: rewound, restoredFiles, turn } = rewindToTurn(
+            const { context: rewound, restoredFiles, deletedFiles, turn } = rewindToTurn(
               sessionLog.path,
               turnIndex,
               opts.workspaceRoot,
@@ -2826,7 +3082,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
                 { text: `Rewound to turn ${turn} (${context.messages().length} messages).`, color: C.cyan },
                 ...(restoredFiles.length
                   ? [{ text: `Restored ${restoredFiles.length} file(s): ${restoredFiles.join(', ')}`, dimColor: true }]
-                  : [{ text: 'No file checkpoints to restore for that turn.', dimColor: true }]),
+                  : []),
+                ...(deletedFiles.length
+                  ? [{ text: `Removed ${deletedFiles.length} file(s) created after that turn: ${deletedFiles.join(', ')}`, dimColor: true }]
+                  : []),
+                ...(!restoredFiles.length && !deletedFiles.length
+                  ? [{ text: 'No file checkpoints to restore for that turn.', dimColor: true }]
+                  : []),
               ],
             });
           } catch (e) {
@@ -3380,10 +3642,19 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             next = resolved;
           }
           applyTheme(next);
+          // Push (or release) the terminal background the theme asserts. Switching AWAY from a
+          // background theme resets to the user's own — the palette is swapped in place, so this
+          // has to fire on every switch, not just when the new theme has a bg.
+          if (process.stdout.isTTY) process.stdout.write(backgroundSequence(THEMES[next].bg, true));
           opts.cfg.lastTheme = next; // keep the in-memory cfg in sync for the next cycle
           saveGlobalConfig({ lastTheme: next });
           setThemeTick((t) => t + 1); // repaint with the new palette
-          pushLine({ text: `Theme: ${next}`, color: C.cyan });
+          pushLine({
+            text: THEMES[next].bg
+              ? `Theme: ${next} — the terminal background is now ${THEMES[next].bg} (restored on exit; SHADOW_NO_BG=1 opts out).`
+              : `Theme: ${next}`,
+            color: C.cyan,
+          });
           break;
         }
         case '/add-dir': {
@@ -3474,21 +3745,6 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           saveGlobalConfig({ statusLine: arg });
           refreshStatusLine();
           pushLine({ text: `Status line set: ${arg}`, color: C.cyan });
-          break;
-        }
-        case '/mouse': {
-          const mArg = arg.toLowerCase();
-          const next = mArg === 'on' ? true : mArg === 'off' ? false : !mouseEnabledRef.current;
-          mouseEnabledRef.current = next;
-          setMouseEnabled(next);
-          opts.cfg.mouse = next;
-          saveGlobalConfig({ mouse: next });
-          pushLine({
-            text: next
-              ? 'Mouse ON — click in the composer to place the caret. The terminal no longer owns the wheel: use Shift+wheel to scroll and Option/Shift+drag to select.'
-              : 'Mouse OFF — the terminal owns the wheel, scrollback and drag-select again. Click-to-caret is disabled.',
-            dimColor: true,
-          });
           break;
         }
         case '/vim': {
@@ -4648,13 +4904,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       // (A pending approval/question dialog is handled above and always returns, so
       // by here no dialog is open — the resolver only sees the normal editing view.)
       if (pickerOpenRef.current) kbContexts.push('ModelPicker');
-      if (slashMatches(inputRef.current).length > 0) kbContexts.push('Autocomplete');
+      if (slashMatches(inputRef.current, undefined, argCtxRef.current ?? undefined).length > 0) kbContexts.push('Autocomplete');
       kbContexts.push('Transcript', 'Chat', 'Global');
       if (kbConsume(ch, key, kbContexts)) return;
 
       // 3.5) Slash-command menu: while "/word" has matches it captures ↑/↓/Tab/Enter — including
       // mid-turn, so you can still pick a command while the model works.
-      const menu = slashMatches(inputRef.current);
+      const menu = slashMatches(inputRef.current, undefined, argCtxRef.current ?? undefined);
       if (menu.length > 0) {
         const sel = Math.min(menuIndexRef.current, menu.length - 1);
         if (key.upArrow) {
@@ -4666,6 +4922,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           return;
         }
         if (key.tab) {
+          if (menu[sel]!.hint) return; // informational row — nothing to complete to
           setLine(menu[sel]!.name); // autocomplete to the selected command
           setMenuIndex(0);
           return;
@@ -4679,7 +4936,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           const spIdx = inputRef.current.indexOf(' ');
           const argPartial = item.base && spIdx >= 0 ? inputRef.current.slice(spIdx + 1) : '';
           const argHintOnly = !!item.base && argPartial === '' && sel === 0 && menuIndexRef.current === 0;
-          if (!argHintOnly) {
+          // `item.hint` is the other kind of hint: a row with no value at all ("no prior sessions
+          // yet"). Running it would fire the bare command, which is not what the row says.
+          if (!argHintOnly && !item.hint) {
             // An argument row ("/theme colorblind") resolves to its BASE command; runSlash slices
             // the arg off item.name by the base's name length, so the completed value flows through.
             const cmd = (item.base ? findSlashCommand(item.base) : item) ?? item;
@@ -4977,21 +5236,33 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     };
   }, []);
 
-  // Mouse reporting (DECSET 1000 + SGR 1006) for click-to-place-caret. ON by default; `/mouse off`
-  // or SHADOW_MOUSE=0 turns it off and persists that.
+  // Mouse reporting (DECSET 1000 + SGR 1006) for click-to-place-caret. OPT-IN ONLY.
   //
-  // The trade is real and worth stating: mode 1000 reports the WHEEL to the app as well as clicks,
-  // so while it is on the terminal no longer scrolls its own scrollback on a bare wheel. Every
-  // terminal keeps an escape hatch — Shift+wheel (xterm/GNOME/Kitty/WezTerm/VS Code) or
-  // Option/Fn+drag (Terminal.app/iTerm2) bypasses reporting for scroll and selection — which is
-  // why mouse-driven TUIs (vim, tmux, htop) take this deal too. We ask for as little as possible:
-  // 1000 is press/release only, NOT 1002/1003 motion tracking, and we act on left-press alone.
+  // Enabling it routes the WHEEL to the app, so the terminal stops scrolling its own scrollback.
+  // That is a bad trade for this project and it shipped on by default in 3.6.0 — worse, mode 1000
+  // is a TERMINAL-level mode that survives the process: a session killed before the cleanup
+  // effect ran left the user's terminal stuck reporting mouse events with nothing listening.
+  // The reset is now also bound to process exit and to the fatal signals, so no exit path can
+  // strand a terminal again.
   useEffect(() => {
     if (!process.stdout.isTTY) return;
     if (!mouseEnabled) return;
-    process.stdout.write('\x1b[?1000h\x1b[?1006h'); // click + SGR coordinates
+    const enable = '\x1b[?1000h\x1b[?1006h';
+    const disable = '\x1b[?1000l\x1b[?1006l';
+    process.stdout.write(enable);
+    const off = (): void => {
+      try {
+        process.stdout.write(disable);
+      } catch {
+        /* stream already torn down */
+      }
+    };
+    process.once('exit', off);
+    for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) process.once(sig, off);
     return () => {
-      process.stdout.write('\x1b[?1000l\x1b[?1006l');
+      off();
+      process.off('exit', off);
+      for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) process.off(sig, off);
     };
   }, [mouseEnabled]);
 
@@ -5047,18 +5318,32 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     effortStatus: ` · ${effortSymbol(effort)} ${effort}`,
     status,
   };
+  // Refresh what the dynamic argument menus see, before the menu is built below.
+  argCtxRef.current = {
+    cfg: opts.cfg,
+    workspaceRoot: opts.workspaceRoot,
+    sessions: resumableRef.current ?? [],
+    turns: historyRef.current.length,
+    extraRoots: additionalRootsRef.current,
+  };
   // The slash menu shows whenever "/word" has matches — including while a turn runs, so you can
   // still autocomplete a command to queue it (or run a live-safe one). Only an active overlay
   // (approval / model picker) suppresses it.
   // Live settings surfaced inside argument menus (the "✓ current" row) — a picker that shows
   // where you ARE doubles as a status readout.
   const menu = !pending && !pickerOpen
-    ? slashMatches(input, {
-        '/theme': normalizeThemeName(opts.cfg.lastTheme as string | undefined) ?? 'og',
-        '/effort': effortRef.current,
-        '/autonomy': autonomy,
-        '/style': style,
-      })
+    ? slashMatches(
+        input,
+        {
+          '/theme': normalizeThemeName(opts.cfg.lastTheme as string | undefined) ?? 'og',
+          '/effort': effortRef.current,
+          '/autonomy': autonomy,
+          '/style': style,
+          '/vim': vimEnabled ? 'on' : 'off',
+          '/fast': opts.cfg.fastMode ? 'on' : 'off',
+        },
+        argCtxRef.current,
+      )
     : [];
   const selIndex = Math.min(menuIndex, Math.max(0, menu.length - 1));
   // Slash menu is windowed (10 rows) and scrolls with the selection so ↑/↓ can reach
@@ -5441,25 +5726,25 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             moves the input box: the menu grows downward, shifting only the status strip. `menuOpen`
             already accounts for the terminal being tall enough to hold the box under the wipe line. */}
         {menuOpen ? (
-          // A borderless but SHADED command list: a faint slate panel (MENU_BG) sits behind every row
+          // A borderless but SHADED command list: the palette's menu panel sits behind every row
           // so the menu reads as its own surface instead of blending into the transcript, and the
-          // selected row gets a brighter bar (MENU_SEL_BG). Every row is padded to a common width so
+          // selected row gets a brighter bar (menuSelBg). Every row is padded to a common width so
           // the panel is a clean rectangle. (No box, no reverse-video — the contrast carries it.)
           (() => {
             const BAR_W = Math.max(24, Math.min(terminalSize.cols - PAGE_MARGIN * 2 - 1, 74));
             const bar = (s: string) => (s.length >= BAR_W ? s.slice(0, BAR_W) : s + ' '.repeat(BAR_W - s.length));
             return (
               <Box flexDirection="column" paddingLeft={PAGE_MARGIN}>
-                <Text wrap="truncate" backgroundColor={MENU_BG} color={C.cyan} bold>
+                <Text wrap="truncate" backgroundColor={C.menuBg} color={C.cyan} bold>
                   {bar(` ${menu[0]?.base ? `${menu[0].base} — pick an argument` : 'Commands'} (${selIndex + 1}/${menu.length})`)}
                 </Text>
                 {menuStart > 0 ? (
-                  <Text wrap="truncate" backgroundColor={MENU_BG} color={C.dim} italic>{bar(`   ↑ ${menuStart} more`)}</Text>
+                  <Text wrap="truncate" backgroundColor={C.menuBg} color={C.dim} italic>{bar(`   ↑ ${menuStart} more`)}</Text>
                 ) : null}
                 {menu.slice(menuStart, menuStart + MENU_MAX).map((c, j) => {
                   const i = menuStart + j;
                   const cur = i === selIndex;
-                  const bg = cur ? MENU_SEL_BG : MENU_BG;
+                  const bg = cur ? C.menuSelBg : C.menuBg;
                   const namePart = c.name.padEnd(SLASH_NAME_WIDTH);
                   const used = 2 + namePart.length + 1 + c.desc.length; // pointer + name + space + desc
                   const pad = used < BAR_W ? ' '.repeat(BAR_W - used) : '';
@@ -5474,7 +5759,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
                   );
                 })}
                 {menuStart + MENU_MAX < menu.length ? (
-                  <Text wrap="truncate" backgroundColor={MENU_BG} color={C.dim} italic>{bar(`   ↓ ${menu.length - menuStart - MENU_MAX} more`)}</Text>
+                  <Text wrap="truncate" backgroundColor={C.menuBg} color={C.dim} italic>{bar(`   ↓ ${menu.length - menuStart - MENU_MAX} more`)}</Text>
                 ) : null}
               </Box>
             );
@@ -5535,8 +5820,16 @@ export function runTui(opts: TuiOpts): Promise<void> {
   // history from scroll-up). See startupSequence. Title is popped on exit via cleanup.
   const ownsTitle = !!process.stdout.isTTY;
   if (ownsTitle) process.stdout.write(startupSequence(true));
+  // A theme that asserts a background (currently only `shadow`) pushes it to the TERMINAL here,
+  // before the first frame, so the session opens on the intended field instead of flashing the
+  // user's own background first. Restored on exit beside the window title — same lifecycle, same
+  // exposure if the process is hard-killed.
+  const startBg = themeBackground(opts.cfg.lastTheme as string | undefined);
+  if (startBg) process.stdout.write(backgroundSequence(startBg, ownsTitle));
   const cleanup = (): void => {
     if (ownsTitle) process.stdout.write('\x1b[23;2t');
+    // Only reset what we set — a user whose terminal is already black keeps it.
+    if (startBg) process.stdout.write(backgroundSequence(null, ownsTitle));
   };
   // Atomic frames (synchronized output, DEC mode 2026) — kills the tmux/terminal repaint flicker; a
   // silent no-op on terminals that don't support it. Only for a real TTY (piped/CI writes stay clean).

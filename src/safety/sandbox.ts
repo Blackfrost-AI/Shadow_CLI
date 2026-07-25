@@ -39,6 +39,14 @@ const real = (p: string): string => {
 const hasBwrap = (): boolean =>
   ['/usr/bin/bwrap', '/bin/bwrap', '/usr/local/bin/bwrap'].some((p) => existsSync(p));
 
+/**
+ * Credential directories no agent-run shell should ever read. Absolute, resolved once at module
+ * load. These are DENY rules layered over `(allow default)` — nothing here is granted by the
+ * workspace allow, so adding a path only ever removes access.
+ */
+const SECRET_READ_DENY: readonly string[] = ['.ssh', '.aws', '.gnupg', '.config/gh', '.netrc', '.docker/config.json', '.kube']
+  .map((rel) => join(homedir(), rel));
+
 /** The macOS seatbelt profile, parameterized by WS (workspace) and SD (~/.shadow). */
 function seatbeltProfile(allowNetwork: boolean, extraWrite: string[]): string {
   return [
@@ -58,6 +66,12 @@ function seatbeltProfile(allowNetwork: boolean, extraWrite: string[]): string {
     // Without the write deny, a sandboxed run_shell could overwrite config.json with an attacker baseUrl+key.
     '(deny file-write* (subpath (param "SD")))',
     '(deny file-read* (subpath (param "SD")))',
+    // Credential stores OUTSIDE ~/.shadow get the same treatment, and for the same reason: the
+    // profile is `(allow default)` minus writes, so a sandboxed read of ~/.ssh/id_rsa or
+    // ~/.aws/credentials was permitted and its contents would be handed to the provider as a tool
+    // result. Independent of the read-only classifier's path scoping — that stops the AUTO-run,
+    // this stops the read even when the user approves a shell command that reaches for them.
+    ...SECRET_READ_DENY.map((p) => `(deny file-read* (subpath ${JSON.stringify(p)}))`),
     allowNetwork ? '' : '(deny network*)',
   ]
     .filter(Boolean)
@@ -116,6 +130,10 @@ export function wrapCommand(opts: {
       '--bind', '/tmp', '/tmp', // …and /tmp…
       ...extra.flatMap((d) => ['--bind', d, d]), // …and any granted dirs writable…
       '--tmpfs', shadowDir, // …and ~/.shadow hidden behind an empty tmpfs (no creds read)
+      // Same treatment for the credential stores outside ~/.shadow. A tmpfs makes them read as
+      // empty rather than erroring, which is the friendlier failure and still leaks nothing.
+      // Only bind paths that EXIST — bwrap aborts on a missing source.
+      ...SECRET_READ_DENY.filter((d) => existsSync(d)).flatMap((d) => ['--tmpfs', d]),
       '--chdir', ws,
     ];
     if (!allowNetwork) flags.push('--unshare-net');

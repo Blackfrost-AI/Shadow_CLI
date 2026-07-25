@@ -191,3 +191,29 @@ test('every mcp endpoint requires the token', async () => {
     assert.equal((await raw(h.port, 'DELETE', '/api/mcp/x', hdrs)).status, 401);
   });
 });
+
+/**
+ * T0-9 regression: /api/state is a DIFFERENT route that also serialized mcpServers — and it
+ * returned them verbatim, while /api/mcp one module over already had the masking helper. The
+ * Home view fetches /api/state on every load, so a configured bearer token landed in the
+ * DevTools network log and the page's JS heap. Fails against the pre-fix router.
+ */
+test('GET /api/state masks MCP env and header VALUES too', async () => {
+  store.saveGlobalConfig({
+    mcpServers: {
+      'http-server': { url: 'https://x/v1', headers: { Authorization: 'Bearer ghp_STATE_LEAK' } },
+      'stdio-server': { command: 'node', args: ['s.js'], env: { TOKEN: 'env-STATE-LEAK' } },
+    },
+  });
+  await withServer(async (h) => {
+    const r = await raw(h.port, 'GET', '/api/state', auth(h));
+    assert.equal(r.status, 200);
+    assert.doesNotMatch(r.body, /ghp_STATE_LEAK/, 'header value must never be serialized');
+    assert.doesNotMatch(r.body, /env-STATE-LEAK/, 'env value must never be serialized');
+    const servers = JSON.parse(r.body).mcpServers;
+    // The KEYS still ship — the user must be able to see that a header/env var is configured.
+    assert.deepEqual(servers['http-server'].headerKeys, ['Authorization']);
+    assert.deepEqual(servers['stdio-server'].envKeys, ['TOKEN']);
+    assert.equal(servers['stdio-server'].command, 'node');
+  });
+});
