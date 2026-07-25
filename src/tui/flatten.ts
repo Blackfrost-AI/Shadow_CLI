@@ -668,16 +668,17 @@ export function flattenItem(
     item.kind === 'tool' &&
     item.tool &&
     (toolRun ? toolRun.pos === 0 : !isCollapsibleTool(item.tool.name));
-  const gap =
-    item.kind === 'user'
-      ? 1
-      : item.tight
-        ? 0
-        : item.kind === 'assistant' || item.kind === 'reasoning' || item.kind === 'finding'
-          ? 1
-          : signalTool
-            ? 1
-            : 0;
+  //  - system / error / blocked / image are their OWN blocks (a /help table, a theme confirmation,
+  //    a failure) and used to weld onto the end of the answer above them with no separator at all
+  const ownBlock =
+    item.kind === 'assistant' ||
+    item.kind === 'reasoning' ||
+    item.kind === 'finding' ||
+    item.kind === 'system' ||
+    item.kind === 'error' ||
+    item.kind === 'blocked' ||
+    item.kind === 'image';
+  const gap = item.kind === 'user' ? 1 : item.tight ? 0 : ownBlock || signalTool ? 1 : 0;
   // Gap blank line
   if (gap > 0) out.push({ key: `${kp}gap`, spans: [{ text: '' }] });
 

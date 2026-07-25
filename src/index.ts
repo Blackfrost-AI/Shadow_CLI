@@ -78,7 +78,7 @@ import { AutoApproveGate, AutoDenyGate, type ApprovalGate } from './agent/approv
 import { ReplGate } from './replGate.js';
 import { ProjectMemory } from './state/memory.js';
 import { SessionLog } from './state/session.js';
-import { saveGlobalConfig, ensureShadowLayout } from './state/globalStore.js';
+import { loadGlobalConfig, saveGlobalConfig, ensureShadowLayout } from './state/globalStore.js';
 import { listResumableSessions, resumeSession } from './state/resume.js';
 import { buildCodexAuthUrl } from './auth/oauth.js';
 import { makeMemoryTool } from './tools/memory.js';
@@ -659,6 +659,19 @@ async function runLogin(args: string[]): Promise<void> {
 
 async function main(): Promise<void> {
   ensureShadowLayout();
+  // Self-heal local presets whose label is a bare HuggingFace snapshot hash (added before
+  // deriveLocalName understood model FOLDERS). Cosmetic-only and best-effort: it renames the
+  // label the `/model` picker shows, never the wire model an MLX server hot-loads.
+  try {
+    const { repairLocalLabels } = await import('./local/garage.js');
+    const g = loadGlobalConfig();
+    if (Array.isArray(g.models) && g.models.length > 0) {
+      const fixed = repairLocalLabels(g.models as ModelEntry[]);
+      if (fixed.renamed.length > 0) saveGlobalConfig({ models: fixed.models });
+    }
+  } catch {
+    /* never block startup on a cosmetic migration */
+  }
   // Windows self-update renames the prior exe to shadow.exe.old (a running exe can
   // only be renamed, not deleted) — clean it up best-effort on the next launch.
   if (process.platform === 'win32') {

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react';
-import { render, Box, Text, Static, useApp, useInput, useStdout } from 'ink';
+import { render, Box, Text, Static, useApp, useInput, useStdin, useStdout } from 'ink';
 import { flattenItem, itemIsCollapsible, computeToolRuns } from './tui/flatten.js';
 import type { ToolRun } from './tui/rows.js';
 import {
@@ -46,6 +46,19 @@ import {
   visibleComposerWindow,
   clickToCursor,
   parseSgrMouse,
+  hasSgrMouse,
+  stripSgrMouse,
+  wordLeft,
+  wordRight,
+  lineStart,
+  lineEnd,
+  deleteWordLeft,
+  deleteWordRight,
+  deleteCharRight,
+  prevGrapheme,
+  nextGrapheme,
+  killToLineEnd,
+  killToLineStart,
   COMPOSER_MAX_VISIBLE_ROWS,
   COMPOSER_GUTTER,
 } from './tui/composer.js';
@@ -533,6 +546,7 @@ const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/color', desc: 'Switch color theme (alias for /theme)', dispatch: '/theme' },
   { name: '/theme', desc: 'Switch color theme (list, preview <name>, or name; no arg cycles)' },
   { name: '/vim', desc: 'Toggle modal (NORMAL/INSERT) editing in the composer' },
+  { name: '/mouse', desc: 'Toggle click-to-place-caret (off returns the wheel to the terminal)' },
   { name: '/statusline', desc: 'Set a shell command for a custom footer line (/statusline none to clear)' },
   { name: '/add-dir', desc: 'Grant an extra directory to file tools for this session' },
   { name: '/image', desc: 'Attach an image file to your next message (/image clear to drop)' },
@@ -996,6 +1010,17 @@ const PROSE_MAX_COLS = 100;
 /** Left/right page margin for transcript content — floats content off the terminal edges
  *  like the reference client instead of running flush to column 1. */
 const PAGE_MARGIN = 4;
+/** Terminal answer to a DSR cursor-position query (CSI 6n). Ink strips a chunk-leading ESC. */
+const DSR_REPLY = /\x1b?\[(\d+);(\d+)R/;
+/** The same reply as a WHOLE stdin chunk — the shape a terminal actually delivers it in. */
+const DSR_REPLY_EXACT = /^\x1b?\[\d+;\d+R$/;
+// Keys Ink's `key` object has no field for (Home/End) or actively mis-reports (forward-delete,
+// which it collapses onto the same key.delete as Backspace). Matched against the RAW stdin chunk
+// (App.js emits it before parsing), so the leading ESC is required — without it `OH` would make a
+// typed capital H read as Home.
+const HOME_KEYS = /^\x1b(\[1~|\[7~|\[H|OH)$/;
+const END_KEYS = /^\x1b(\[4~|\[8~|\[F|OF)$/;
+const FORWARD_DELETE = /^\x1b\[3(;\d+)?~$/;
 /** Collaboration Mode: the baton is always this warm orange (Shadow's brand ⏺ color) — never a seat color. */
 const BATON_ORANGE = '#d97757';
 const MARGIN_PAD = ' '.repeat(PAGE_MARGIN);
@@ -1240,7 +1265,9 @@ function PinnedState({
     : '';
   // todoLabel FIRST: the row truncates right, and the task count must survive a verbose plan title.
   const header = [todoLabel, planLabel].filter(Boolean).join('   ·   ');
-  const rule = '─'.repeat(Math.max(8, cols));
+  // The block is inset by PAGE_MARGIN on both sides (see the Box below), so its rules measure the
+  // same span as the composer's — not the full terminal width.
+  const rule = '─'.repeat(Math.max(8, cols - PAGE_MARGIN * 2));
   const MAX = maxItems ?? 8;
   const shown = todos.slice(0, MAX);
   const mark = (s: TodoItem['status']) => (s === 'completed' ? '✔' : s === 'in_progress' ? '▶' : '·');
@@ -1251,7 +1278,10 @@ function PinnedState({
     // counts physical rows. A model-written 70-char todo subject (or long goal / plan path)
     // wrapping to 2+ rows on a narrow terminal blew the budget and re-armed Ink's scrollback-
     // wiping clearTerminal fallback — maxItems bounds item COUNT, truncation bounds each row.
-    <Box flexDirection="column" flexShrink={0} marginTop={1} width={cols}>
+    // paddingLeft=PAGE_MARGIN: expanded (Ctrl-T) and collapsed forms must share the transcript's
+    // left edge. Without it the same task list jumped 4 columns left when you expanded it, and its
+    // two rules ran the full terminal width — the loudest lines on screen.
+    <Box flexDirection="column" flexShrink={0} marginTop={1} width={cols} paddingLeft={PAGE_MARGIN}>
       <Text color={C.dim}>{rule}</Text>
       {goal ? <Text wrap="truncate" bold color={C.purple}>{`🎯 Goal: ${goal}`}</Text> : null}
       {header ? (
@@ -1280,7 +1310,9 @@ function StatusStrip({ text, marker }: { text: string; marker?: { text: string; 
     // wrap="truncate": the strip is budgeted at exactly ONE row. A verbose /statusline command
     // (customStatus renders through this too) used to wrap to several rows on narrow terminals,
     // silently blowing the frame budget and re-triggering Ink's scrollback-wiping fallback.
-    <Box paddingX={1}>
+    // No paddingX here: the call site already insets by PAGE_MARGIN, and the two composed to a
+    // 5-column indent — one off from every other chrome row, which reads as a rendering glitch.
+    <Box>
       <Text wrap="truncate" color={C.dim}>
         {marker ? (
           <Text color={marker.color} bold>
@@ -1291,6 +1323,11 @@ function StatusStrip({ text, marker }: { text: string; marker?: { text: string; 
       </Text>
     </Box>
   );
+}
+
+/** Small chrome rows (confirmations, errors, denials) — one block when they arrive back to back. */
+function isChatter(kind: string | undefined): boolean {
+  return kind === 'system' || kind === 'error' || kind === 'blocked';
 }
 
 /** Empty-composer placeholder — a dim prompt, not an example that could be mistaken for real input. */
@@ -1323,12 +1360,16 @@ function Composer({
 }) {
   const caret = Math.min(cursor, input.length);
   const empty = input.length === 0;
-  // Inner width after the `❯ ` gutter (also used as continuation indent).
-  const inner = Math.max(8, cols - COMPOSER_GUTTER - PAGE_MARGIN * 2);
+  // The composer sits on the SAME left edge as the transcript (PAGE_MARGIN) and stops the same
+  // distance from the right — anything else reads as a misaligned column. `inner` is what's left
+  // for text after the `❯ ` gutter (also the continuation indent), and it is exactly the width the
+  // caret math uses, so the draft now wraps at the rule's right end instead of 8 columns short.
+  const boxW = Math.max(12, cols - PAGE_MARGIN * 2);
+  const inner = Math.max(8, boxW - COMPOSER_GUTTER);
   const win = visibleComposerWindow(input, caret, inner, Math.max(1, maxRows));
 
   return (
-    <Box flexDirection="column" flexShrink={0} width={cols}>
+    <Box flexDirection="column" flexShrink={0} width={cols} paddingLeft={PAGE_MARGIN}>
       {/* Open-sided input: top + bottom rule only. Multi-line drafts grow up to
           COMPOSER_MAX_VISIBLE_ROWS, then scroll around the caret. */}
       <Box
@@ -1338,7 +1379,7 @@ function Composer({
         borderLeft={false}
         borderRight={false}
         paddingX={0}
-        width={cols}
+        width={boxW}
       >
         {empty ? (
           <Text>
@@ -1643,6 +1684,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const ctrlCArmedRef = useRef(false);
   const historyRef = useRef<string[]>([]);
   const histIdxRef = useRef(0);
+  /** The unsent draft, parked when ↑ steps into history so ↓ can bring it back. */
+  const draftRef = useRef('');
   const menuIndexRef = useRef(0);
   const cursorRef = useRef(0);
   // Rows rendered BELOW the composer input's last line (bottom rule + hint + custom-status),
@@ -1690,6 +1733,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const vimModeRef = useRef<VimMode>('insert'); // start in INSERT so typing works immediately
   const [vimModeState, setVimModeState] = useState<VimMode>('insert');
   const vimPendingRef = useRef(''); // operator awaiting a motion (d/c)
+  // Click-to-place-caret (/mouse). ON unless the config or SHADOW_MOUSE=0 says otherwise.
+  const mouseInitial = process.env.SHADOW_MOUSE === '0' ? false : process.env.SHADOW_MOUSE === '1' ? true : opts.cfg.mouse !== false;
+  const mouseEnabledRef = useRef<boolean>(mouseInitial);
+  const [mouseEnabled, setMouseEnabled] = useState<boolean>(mouseInitial);
   // Images queued via /image, sent with (and cleared by) the next submitted message.
   const attachmentsRef = useRef<ImageBlock[]>([]);
   const [attachCount, setAttachCount] = useState(0);
@@ -1732,6 +1779,117 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     setInput(nextInput);
     setCursor(nextCursor);
   }, []);
+
+  // ── Composer editing: kill ring + undo ──────────────────────────────────────
+  // The kill ring is readline's single-slot clipboard: whatever Ctrl+W / Ctrl+U / Ctrl+K /
+  // Option+Delete removed, ready for Ctrl+Y. Undo snapshots every DESTRUCTIVE edit (never plain
+  // typing — a per-character stack would make Ctrl+Z useless), so an over-eager word delete costs
+  // one keystroke to take back.
+  const killRingRef = useRef('');
+  const undoRef = useRef<{ text: string; cursor: number }[]>([]);
+  const pushUndo = useCallback(() => {
+    const top = undoRef.current[undoRef.current.length - 1];
+    if (top && top.text === inputRef.current) return; // don't stack identical states
+    undoRef.current.push({ text: inputRef.current, cursor: cursorRef.current });
+    if (undoRef.current.length > 100) undoRef.current.shift();
+  }, []);
+  /** Apply an EditResult from the pure helpers: snapshot for undo, load the kill ring, commit. */
+  const applyEdit = useCallback(
+    (r: { text: string; cursor: number; killed: string }) => {
+      if (r.killed === '' && r.text === inputRef.current) return; // no-op (caret at a buffer edge)
+      pushUndo();
+      if (r.killed) killRingRef.current = r.killed;
+      setComposer(r.text, r.cursor);
+      setMenuIndex(0);
+    },
+    [pushUndo, setComposer],
+  );
+  const moveCaret = useCallback((next: number) => {
+    const c = Math.max(0, Math.min(inputRef.current.length, next));
+    cursorRef.current = c;
+    setCursor(c);
+  }, []);
+
+  // ── Click-to-place-caret ────────────────────────────────────────────────────
+  // A click reports a TERMINAL cell (x, y); to turn that into a caret we need to know which screen
+  // row the composer's first input line is on. The old code assumed the live frame is pinned to the
+  // bottom of the terminal — true only once the transcript has scrolled the screen full, and wrong
+  // for the whole first screenful (exactly when you type your first long prompt). So we ask the
+  // terminal instead: Ink's log-update writes `frame + '\n'`, parking the cursor on the row directly
+  // BELOW the frame, and a DSR query (CSI 6n) reports it. One round trip per click, resolved in the
+  // raw tap below; if the terminal never answers we fall back to the bottom-anchored estimate.
+  const pendingClickRef = useRef<{ x: number; y: number; token: number } | null>(null);
+  const clickTokenRef = useRef(0);
+  /** Turn a click at 1-based cell (x, y) into a caret, given the cursor's resting row (1-based). */
+  const resolveClick = useCallback(
+    (x: number, y: number, restingRow: number) => {
+      const below = belowComposerRef.current;
+      if (below < 0) return; // a menu/overlay owns the rows under the composer
+      const cols = process.stdout.columns ?? 80;
+      const rows = process.stdout.rows ?? 24;
+      const inner = Math.max(8, cols - COMPOSER_GUTTER - PAGE_MARGIN * 2);
+      const winMax = Math.max(1, Math.min(COMPOSER_MAX_VISIBLE_ROWS, rows - 3));
+      const win = visibleComposerWindow(inputRef.current, cursorRef.current, inner, winMax);
+      // restingRow = frameLastRow + 1; frameLastRow = lastInputRow + below (bottom rule + hint + custom)
+      const lastInputRow = restingRow - 1 - below;
+      const firstInputRow = lastInputRow - win.lines.length + 1;
+      if (y < firstInputRow || y > lastInputRow) return; // clicked outside the input — not a caret move
+      const localRow = y - firstInputRow;
+      const localCol = Math.max(0, x - 1 - PAGE_MARGIN - COMPOSER_GUTTER);
+      moveCaret(clickToCursor(inputRef.current, localRow, localCol, inner, win.offset));
+    },
+    [moveCaret],
+  );
+  const handleMouse = useCallback(
+    (raw: string) => {
+      if (!mouseEnabledRef.current) return;
+      const ev = parseSgrMouse(raw);
+      // Left-button PRESS only. Wheel (64/65), right/middle, drags and releases are ignored —
+      // we take as little from the terminal as the protocol allows.
+      if (!ev || !ev.press || ev.button !== 0) return;
+      if (belowComposerRef.current < 0) return;
+      const token = (clickTokenRef.current += 1);
+      pendingClickRef.current = { x: ev.x, y: ev.y, token };
+      process.stdout.write('\x1b[6n'); // DSR — answered as CSI row ; col R on stdin
+      setTimeout(() => {
+        const p = pendingClickRef.current;
+        if (!p || p.token !== token) return; // already resolved by the DSR reply
+        pendingClickRef.current = null;
+        // No answer: assume the frame is bottom-anchored (cursor parked on the last row).
+        resolveClick(p.x, p.y, process.stdout.rows ?? 24);
+      }, 150);
+    },
+    [resolveClick],
+  );
+
+  // ── Raw keypress tap ────────────────────────────────────────────────────────
+  // Ink's `key` object has no field for Home/End, and it collapses forward-delete (\x1b[3~) onto
+  // the SAME `key.delete` as Backspace (\x7f) — so through useInput alone those keys are either
+  // invisible or actively wrong (forward-delete deleting backwards). Ink emits every raw stdin
+  // chunk on its internal input emitter before parsing it, so we tap that and keep the bytes for
+  // the current keypress; the composer consults them only to disambiguate. Declared ABOVE the
+  // useInput(onKey) call so this listener is registered FIRST and the ref is fresh inside onKey.
+  const rawKeyRef = useRef('');
+  const { internal_eventEmitter: inkInputEvents } = useStdin();
+  useEffect(() => {
+    if (!inkInputEvents) return;
+    const onData = (d: unknown): void => {
+      const raw = typeof d === 'string' ? d : String(d);
+      rawKeyRef.current = raw;
+      // A cursor-position report answering our click DSR — resolve the parked click here, before
+      // Ink's parser turns `[38;1R` into composer text (onKey drops it by the same test).
+      const dsr = DSR_REPLY.exec(raw);
+      if (dsr && pendingClickRef.current) {
+        const p = pendingClickRef.current;
+        pendingClickRef.current = null;
+        resolveClick(p.x, p.y, Number(dsr[1]));
+      }
+    };
+    inkInputEvents.on('input', onData);
+    return () => {
+      inkInputEvents.removeListener('input', onData);
+    };
+  }, [inkInputEvents, resolveClick]);
 
   // Insert text into the composer at the caret. Enormous blobs condense to a
   // `[Pasted text #N +M lines]` chip (content parked in pastesRef, spliced back at submit);
@@ -3318,6 +3476,21 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           pushLine({ text: `Status line set: ${arg}`, color: C.cyan });
           break;
         }
+        case '/mouse': {
+          const mArg = arg.toLowerCase();
+          const next = mArg === 'on' ? true : mArg === 'off' ? false : !mouseEnabledRef.current;
+          mouseEnabledRef.current = next;
+          setMouseEnabled(next);
+          opts.cfg.mouse = next;
+          saveGlobalConfig({ mouse: next });
+          pushLine({
+            text: next
+              ? 'Mouse ON — click in the composer to place the caret. The terminal no longer owns the wheel: use Shift+wheel to scroll and Option/Shift+drag to select.'
+              : 'Mouse OFF — the terminal owns the wheel, scrollback and drag-select again. Click-to-caret is disabled.',
+            dimColor: true,
+          });
+          break;
+        }
         case '/vim': {
           const vimArg = arg.toLowerCase();
           const next = vimArg === 'on' ? true : vimArg === 'off' ? false : !vimEnabledRef.current;
@@ -4210,9 +4383,18 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // Key handling — uses Ink's `key` object (NOT raw control bytes in `input`).
   const onKey = useCallback(
     (ch: string, key: import('ink').Key) => {
-      // Mouse-tracking CSI (\x1b[< … ) is consumed by the wheel listener; never let
-      // it reach the Esc/abort or composer-typing paths. (ESC[< can't be typed.)
-      if (ch && (ch.includes('\x1b[<') || /\[<\d/.test(ch))) return;
+      // Mouse-tracking CSI (\x1b[< … ) never reaches the Esc/abort or composer-typing paths — a
+      // report is not typed text. It IS routed to the click-to-caret handler first (which returns
+      // for everything it doesn't use). Before 3.5.2 this branch returned unconditionally, which
+      // made the click handler further down dead code: mouse mode did nothing but eat the wheel.
+      if (ch && hasSgrMouse(ch)) {
+        handleMouse(ch);
+        return;
+      }
+      // Cursor-position report (the answer to our own click DSR, already consumed by the raw tap).
+      // Ink would otherwise insert it as the literal text `[38;1R`. Matched against the WHOLE raw
+      // chunk so the same digits appearing inside a paste can't swallow the paste.
+      if (DSR_REPLY_EXACT.test(rawKeyRef.current)) return;
       // Any key other than a second Ctrl-C disarms the "press again to quit" latch, so an old
       // Ctrl-C never lingers to make a later one quit unexpectedly.
       if (ctrlCArmedRef.current && !(key.ctrl && ch === 'c')) ctrlCArmedRef.current = false;
@@ -4536,19 +4718,97 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         return;
       }
 
+      // 4.5) Word- and line-wise editing — the readline/macOS set every native text field has.
+      // Ink gives us `key` flags plus the raw bytes (rawKeyRef) for the keys it can't express.
+      // Sequence notes (macOS Terminal.app + iTerm2 defaults, and what Ink makes of them):
+      //   Option+Delete  \x1b\x7f      → key.delete + key.meta      (the user's "delete faster")
+      //   Option+←/→     \x1b[1;3D/C or \x1bb / \x1bf → arrow+meta, or input 'b'/'f' + meta
+      //   Ctrl+←/→       \x1b[1;5D/C   → arrow + key.ctrl
+      //   Home/End       \x1b[H \x1b[F \x1b[1~ \x1b[4~ \x1bOH \x1bOF → NO Ink field at all: raw only
+      //   fwd-Delete     \x1b[3~       → Ink collapses onto key.delete (same as Backspace) — raw only
+      const rawSeq = rawKeyRef.current;
+      const editText = inputRef.current;
+      const editCur = cursorRef.current;
+      const isHome = HOME_KEYS.test(rawSeq);
+      const isEnd = END_KEYS.test(rawSeq);
+      const isForwardDelete = FORWARD_DELETE.test(rawSeq);
+      // Delete word LEFT — Option/Alt+Delete, Ctrl+W, Ctrl+Backspace.
+      if (((key.backspace || key.delete) && (key.meta || key.ctrl) && !isForwardDelete) || (key.ctrl && ch === 'w')) {
+        applyEdit(deleteWordLeft(editText, editCur));
+        return;
+      }
+      // Delete word RIGHT — Option/Alt+D, or a modified forward-delete.
+      if ((key.meta && (ch === 'd' || ch === 'D')) || (isForwardDelete && (key.meta || key.ctrl))) {
+        applyEdit(deleteWordRight(editText, editCur));
+        return;
+      }
+      // Forward-delete (the key above the arrows / fn+Delete) and Ctrl+D on a non-empty draft.
+      if (isForwardDelete || (key.ctrl && ch === 'd' && editText.length > 0)) {
+        applyEdit(deleteCharRight(editText, editCur));
+        return;
+      }
+      // Word motion — Option/Alt or Ctrl with ←/→, and the emacs aliases Option+B / Option+F.
+      if ((key.leftArrow || key.rightArrow) && (key.meta || key.ctrl)) {
+        moveCaret(key.leftArrow ? wordLeft(editText, editCur) : wordRight(editText, editCur));
+        return;
+      }
+      if (key.meta && (ch === 'b' || ch === 'B')) {
+        moveCaret(wordLeft(editText, editCur));
+        return;
+      }
+      if (key.meta && (ch === 'f' || ch === 'F')) {
+        moveCaret(wordRight(editText, editCur));
+        return;
+      }
+      // Line ends — Ctrl+A / Ctrl+E and the Home / End keys.
+      if (isHome || (key.ctrl && ch === 'a')) {
+        moveCaret(lineStart(editText, editCur));
+        return;
+      }
+      if (isEnd || (key.ctrl && ch === 'e')) {
+        moveCaret(lineEnd(editText, editCur));
+        return;
+      }
+      // Kills — Ctrl+K to end of line, Ctrl+U to start of line. Both feed the Ctrl+Y kill ring.
+      if (key.ctrl && ch === 'k') {
+        applyEdit(killToLineEnd(editText, editCur));
+        return;
+      }
+      if (key.ctrl && ch === 'u') {
+        applyEdit(killToLineStart(editText, editCur));
+        return;
+      }
+      // Yank — paste back whatever the last kill removed.
+      if (key.ctrl && ch === 'y') {
+        const kill = killRingRef.current;
+        if (kill) {
+          pushUndo();
+          setComposer(editText.slice(0, editCur) + kill + editText.slice(editCur), editCur + kill.length);
+          setMenuIndex(0);
+        }
+        return;
+      }
+      // Char motion — Ctrl+B / Ctrl+F (emacs), so a hand already on Ctrl doesn't have to move.
+      if (key.ctrl && (ch === 'b' || ch === 'f')) {
+        moveCaret(ch === 'b' ? editCur - 1 : editCur + 1);
+        return;
+      }
+      // Undo the last DESTRUCTIVE edit (word/line kills, history swaps) — Ctrl+Z or Ctrl+_.
+      if ((key.ctrl && ch === 'z') || rawSeq === '\x1f' || ch === '\x1f') {
+        const prev = undoRef.current.pop();
+        if (prev) setComposer(prev.text, prev.cursor);
+        return;
+      }
+
       // 5) Caret movement within the (possibly multi-row) composer.
       // Inner width must match Composer paint (cols − gutter − page margins).
       const editInner = Math.max(8, (process.stdout.columns ?? 80) - COMPOSER_GUTTER - PAGE_MARGIN * 2);
       if (key.leftArrow) {
-        const next = Math.max(0, cursorRef.current - 1);
-        cursorRef.current = next;
-        setCursor(next);
+        moveCaret(prevGrapheme(inputRef.current, cursorRef.current));
         return;
       }
       if (key.rightArrow) {
-        const next = Math.min(inputRef.current.length, cursorRef.current + 1);
-        cursorRef.current = next;
-        setCursor(next);
+        moveCaret(nextGrapheme(inputRef.current, cursorRef.current));
         return;
       }
 
@@ -4563,6 +4823,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           return;
         }
         if (historyRef.current.length && histIdxRef.current > 0) {
+          // Park an unsent draft before stepping off it, so ↑ out of habit can't destroy three
+          // paragraphs of spec with no way back (↓ past the newest entry restores it — bash/
+          // readline behavior). Only the FIRST step stashes; walking further up must not clobber it.
+          if (histIdxRef.current === historyRef.current.length) draftRef.current = inputRef.current;
           histIdxRef.current -= 1;
           setLine(historyRef.current[histIdxRef.current] ?? '');
         }
@@ -4578,19 +4842,23 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         }
         if (histIdxRef.current < historyRef.current.length) {
           histIdxRef.current += 1;
-          setLine(historyRef.current[histIdxRef.current] ?? '');
+          // Past the newest entry we're back on the user's own unsent draft, not an empty box.
+          setLine(
+            histIdxRef.current === historyRef.current.length
+              ? draftRef.current
+              : (historyRef.current[histIdxRef.current] ?? ''),
+          );
         }
         return;
       }
 
-      // 7) Backspace — delete the char before the caret. (macOS Delete key reports
-      //    as key.delete; treat both as backspace — forward-delete is rarely used.)
+      // 7) Backspace — delete the visual character before the caret. (macOS Delete reports as
+      //    key.delete; the real forward-delete key is separated out by raw sequence in 4.5.)
+      //    Grapheme-safe: one press removes a whole emoji/flag/combining cluster, never half of it.
       if (key.backspace || key.delete) {
         const c = cursorRef.current;
         const s = inputRef.current;
-        if (c > 0) {
-          setComposer(s.slice(0, c - 1) + s.slice(c), c - 1);
-        }
+        if (c > 0) setComposer(s.slice(0, prevGrapheme(s, c)) + s.slice(c), prevGrapheme(s, c));
         setMenuIndex(0);
         return;
       }
@@ -4673,39 +4941,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         return;
       }
 
-      // 9) Mouse click (SGR) — place the caret when the user clicks inside the composer zone.
-      // Only left-button press (button 0). Wheel is ignored so we don't steal scrollback scrolling
-      // more than the terminal already does under mouse reporting. Only active under SHADOW_MOUSE=1.
-      if (ch && ch.includes('\x1b[<')) {
-        const ev = parseSgrMouse(ch);
-        if (ev && ev.press && (ev.button === 0 || ev.button === 32)) {
-          // Composer sits at the bottom of the frame. Approximate its top row from terminal height
-          // and the current multi-row draft height (same numbers Composer paints).
-          const rows = process.stdout.rows ?? 24;
-          const cols = process.stdout.columns ?? 80;
-          const inner = Math.max(8, cols - COMPOSER_GUTTER - PAGE_MARGIN * 2);
-          const below = belowComposerRef.current;
-          if (below < 0) return; // a menu/overlay is open below the composer — clicks aren't caret placement
-          const winMax = Math.max(1, Math.min(COMPOSER_MAX_VISIBLE_ROWS, rows - 3));
-          const win = visibleComposerWindow(inputRef.current, cursorRef.current, inner, winMax);
-          const inputRows = win.lines.length;
-          // Composer input's last line sits `below` rows above the terminal bottom (bottom rule +
-          // hint + custom status, counted live in belowComposerRef); its top is that minus the rows.
-          const composerTop = Math.max(0, rows - inputRows - below);
-          const y0 = ev.y - 1; // 0-based
-          const x0 = ev.x - 1;
-          if (y0 >= composerTop && y0 < composerTop + inputRows) {
-            const localRow = y0 - composerTop;
-            const localCol = Math.max(0, x0 - COMPOSER_GUTTER); // after `❯ `/`  `
-            const next = clickToCursor(inputRef.current, localRow, localCol, inner, win.offset);
-            cursorRef.current = next;
-            setCursor(next);
-          }
-          return;
-        }
-        // Swallow other mouse reports so they don't insert garbage.
-        if (ev) return;
-      }
+      // (Mouse clicks are routed to handleMouse at the TOP of this handler — see the SGR branch
+      // there. They used to be handled here, unreachably, behind that same early return.)
 
       // 10) Printable input — insert at the caret (unbracketed pastes land here too).
       if (!key.ctrl && !key.meta && ch) {
@@ -4713,12 +4950,17 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         // carriage returns: terminals paste line ends as \r (not \n), which defeated the
         // paste-chip line count and rendered as invisible garbage in the composer. A lone
         // typed Enter arrives as key.return (handled above), so any \r here IS a paste.
-        const clean = ch.replace(/\x1b\[<\d+;\d+;\d+[Mm]/g, '').replace(/\r\n?/g, '\n');
+        // Control bytes are dropped too: 0x1c–0x1f (Ctrl+\ ] ^ _) fall through every branch of
+        // Ink's parser with NO flags set, so they used to splice an invisible C0 byte into the
+        // draft — shifting every later caret index and riding out to the provider on submit.
+        // Tab and newline survive; nothing else unprintable does.
+
+        const clean = stripSgrMouse(ch).replace(/\r\n?/g, '\n').replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
         if (!clean) return;
         insertPastable(clean);
       }
     },
-    [exit, pushLine, runOne, runSlash, selectModel, setAutonomy, setComposer, setLine, setQuestionIndex, setQuestionSelection, opts, startTurn, setQueued, kbConsume, insertPastable],
+    [exit, pushLine, runOne, runSlash, selectModel, setAutonomy, setComposer, setLine, setQuestionIndex, setQuestionSelection, opts, startTurn, setQueued, kbConsume, insertPastable, applyEdit, moveCaret, pushUndo, handleMouse],
   );
 
   useInput(onKey);
@@ -4735,18 +4977,23 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     };
   }, []);
 
-  // Mouse reporting for click-to-place caret is OPT-IN (SHADOW_MOUSE=1). Default OFF: enabling
-  // \x1b[?1000h routes wheel + click to the app, which breaks native scrollback scrolling and
-  // plain drag-to-select-copy — the whole premise of this stock-renderer branch. Off by default,
-  // the terminal keeps the mouse; a user who wants click-to-caret trades that away explicitly.
+  // Mouse reporting (DECSET 1000 + SGR 1006) for click-to-place-caret. ON by default; `/mouse off`
+  // or SHADOW_MOUSE=0 turns it off and persists that.
+  //
+  // The trade is real and worth stating: mode 1000 reports the WHEEL to the app as well as clicks,
+  // so while it is on the terminal no longer scrolls its own scrollback on a bare wheel. Every
+  // terminal keeps an escape hatch — Shift+wheel (xterm/GNOME/Kitty/WezTerm/VS Code) or
+  // Option/Fn+drag (Terminal.app/iTerm2) bypasses reporting for scroll and selection — which is
+  // why mouse-driven TUIs (vim, tmux, htop) take this deal too. We ask for as little as possible:
+  // 1000 is press/release only, NOT 1002/1003 motion tracking, and we act on left-press alone.
   useEffect(() => {
     if (!process.stdout.isTTY) return;
-    if (process.env.SHADOW_MOUSE !== '1') return;
+    if (!mouseEnabled) return;
     process.stdout.write('\x1b[?1000h\x1b[?1006h'); // click + SGR coordinates
     return () => {
       process.stdout.write('\x1b[?1000l\x1b[?1006l');
     };
-  }, []);
+  }, [mouseEnabled]);
 
   const spinner = SPINNER[tick % SPINNER.length];
   // Elapsed seconds of the current turn — re-derived each spinner tick (~120ms) so a
@@ -4830,9 +5077,15 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // box + composer + strip under the wipe threshold, the menu simply doesn't open (you can still type
   // the whole command); MENU_MAX+5 for the box, +5 for composer(4)+strip(1), +1 headroom.
   const menuOpen = menu.length > 0 && terminalSize.rows >= MENU_MAX + 5 + 5 + 1;
-  // Constant live slot: always request LIVE_SLOT_ROWS (unless menu steals the rows). Content is
-  // bottom-aligned inside; idle leaves the slot blank. Same height idle ↔ running ⇒ no composer jump.
-  const liveWant = menuOpen ? 0 : LIVE_SLOT_ROWS;
+  // Live slot: LIVE_SLOT_ROWS whenever there is (or is about to be) something live to show — a
+  // running turn, a thought, an in-flight tool, an uncommitted stream tail. ZERO when the screen is
+  // genuinely idle. It used to be reserved unconditionally so the composer could not move mid-turn,
+  // but nothing ever renders into it while idle, so the reserve was two permanently BLANK rows
+  // between the transcript and the input on every idle screen. The no-jump property that actually
+  // matters still holds: the height is constant for the whole of a turn. (The content flags — not
+  // `running` alone — because live events can arrive without this TUI owning the turn.)
+  const liveActive = running || !!think || !!stream || !!activeTool;
+  const liveWant = menuOpen || !liveActive ? 0 : LIVE_SLOT_ROWS;
   // Pinned agent state: ONE line by default. Ctrl-T expands the full list (idle OR mid-turn).
   const todoCurrent = todoItems.find((t) => t.status === 'in_progress')?.subject ?? '';
   // Full multi-row PinnedState when expanded on a tall enough terminal. A GOAL alone never
@@ -4981,7 +5234,11 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         {(item, index) => (
           <FlatItem
             key={String(item.id)}
-            item={item}
+            // A system/error/blocked row is its own block and opens with a blank — but a RUN of
+            // them (a multi-line /help echo, a burst of confirmations) is one block, so every row
+            // after the first hugs. `kind` defaults to 'system' for untagged pushLine calls, which
+            // is most of the small chatter, so without this the gap rule would double-space it.
+            item={isChatter(item.kind) && isChatter(committed[index - 1]?.kind) ? { ...item, tight: true } : item}
             cols={terminalSize.cols}
             collapsed={isCollapsible(item) && !showAllExpanded && !expandedIds.has(item.id)}
             // ⏺ once per contiguous assistant run: continuation if the previous committed item was
@@ -5070,7 +5327,12 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
                   // under it — one seamless answer, live and committed rendered identically.
                   return (
                     <FlatItem
-                      item={{ id: -1, kind: 'assistant', text: clamped, color: C.fg } as TranscriptItem}
+                      // `tight` once the turn has committed a block: without it flattenItem opens
+                      // the preview with a blank gap row, which split the in-progress paragraph
+                      // down the middle AND ate one of the two live rows, so the tail could only
+                      // ever show one line. At turn start (nothing committed) the gap is correct —
+                      // it separates the answer from the user's prompt above.
+                      item={{ id: -1, kind: 'assistant', text: clamped, color: C.fg, tight: answerOpenRef.current } as TranscriptItem}
                       cols={terminalSize.cols}
                       collapsed={false}
                       continuation={answerOpenRef.current}
@@ -5080,17 +5342,16 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
               ) : null}
             </Box>
           ) : null}
-          {hudFit.status ? (
+          {hudFit.status && running ? (
+            // Only while a turn runs. Idle, this used to paint a blank spacer row "to keep the
+            // band" — which, stacked on the composer's own marginTop, put TWO empty rows above
+            // the input on every idle screen. One (marginTop) is the breathing room; two is a gap.
             <Box paddingLeft={PAGE_MARGIN}>
-              {running ? (
-                <Text wrap="truncate">
-                  <Text color={C.accent ?? CLAUDE_ORANGE}>{spinner}</Text>
-                  <Text> {statusVerb}</Text>
-                  {statusTail ? <Text color={C.dim}>{statusTail}</Text> : null}
-                </Text>
-              ) : (
-                <Text> </Text>
-              )}
+              <Text wrap="truncate">
+                <Text color={C.accent ?? CLAUDE_ORANGE}>{spinner}</Text>
+                <Text> {statusVerb}</Text>
+                {statusTail ? <Text color={C.dim}>{statusTail}</Text> : null}
+              </Text>
             </Box>
           ) : null}
         </>

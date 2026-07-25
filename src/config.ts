@@ -200,6 +200,10 @@ const ConfigSchema = z.object({
     .default('og'),
   statusLine: z.string().optional(), // shell command whose stdout renders in the footer (/statusline)
   vimMode: z.boolean().default(false), // modal (NORMAL/INSERT) editing in the composer (/vim)
+  // Click-to-place-caret in the composer (/mouse). ON by default. The cost is real: while mouse
+  // reporting is on the TERMINAL stops owning the wheel, so scrollback scrolling needs Shift+wheel
+  // (and drag-to-select needs Option/Shift+drag) on most terminals. `/mouse off` gives it all back.
+  mouse: z.boolean().default(true),
   planMode: z.boolean().default(false),
   systemPromptPath: z.string().optional(),
   style: z.enum(outputStyles).default('proactive'),

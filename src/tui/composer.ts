@@ -193,10 +193,14 @@ export function clickToCursor(
 /**
  * Parse an SGR mouse event (CSI < Pb ; Px ; Py M/m). Returns null if `raw` is not one.
  * Coordinates are 1-based cell positions as reported by the terminal.
+ *
+ * NOTE the leading ESC is OPTIONAL: Ink strips a chunk-leading \x1b before the handler sees it
+ * (use-input.js), so a click that arrives in its own stdin read reads as `[<0;12;30M`. Matching
+ * only the ESC form is what made click-to-caret dead code for the whole 3.x line.
  */
 export function parseSgrMouse(raw: string): { button: number; x: number; y: number; press: boolean } | null {
   // May be embedded in a longer paste/batch — find the last complete event.
-  const re = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/g;
+  const re = /\x1b?\[<(\d+);(\d+);(\d+)([Mm])/g;
   let m: RegExpExecArray | null;
   let last: RegExpExecArray | null = null;
   while ((m = re.exec(raw)) !== null) last = m;
@@ -207,4 +211,155 @@ export function parseSgrMouse(raw: string): { button: number; x: number; y: numb
     y: Number(last[3]),
     press: last[4] === 'M',
   };
+}
+
+/** True when `raw` carries an SGR mouse report (with or without Ink's stripped leading ESC). */
+export function hasSgrMouse(raw: string): boolean {
+  return /\x1b?\[<\d+;\d+;\d+[Mm]/.test(raw);
+}
+
+/** Strip every SGR mouse report out of a chunk, so a report glued to typed text can't insert garbage. */
+export function stripSgrMouse(raw: string): string {
+  return raw.replace(/\x1b?\[<\d+;\d+;\d+[Mm]/g, '');
+}
+
+// ── Word / line motion + kills (readline + macOS Option-key semantics) ────────
+//
+// One shared definition of a "word" for every motion and kill, so Option+←, Option+Delete and
+// Ctrl+W all agree: a run of word chars (letters/digits/_) OR a run of punctuation, with any
+// whitespace on the leading side absorbed. That is what makes `src/tui/composer.ts` peel off as
+// `ts` → `.` → `composer` → `/` … the way it does in every native macOS text field.
+
+const WS = /\s/;
+const WORD = /[\p{L}\p{N}_]/u;
+
+/** True for a "word" character (letter, digit or underscore — Unicode-aware). */
+export function isWordChar(c: string | undefined): boolean {
+  return !!c && WORD.test(c);
+}
+
+const clampIdx = (text: string, i: number): number => Math.max(0, Math.min(text.length, i | 0));
+
+/** Start of the word to the LEFT of the caret (Option/Alt+←, Ctrl+W target). */
+export function wordLeft(text: string, cursor: number): number {
+  let i = clampIdx(text, cursor);
+  while (i > 0 && WS.test(text[i - 1]!)) i--; // absorb whitespace before the word
+  if (i === 0) return 0;
+  const inWord = isWordChar(text[i - 1]);
+  while (i > 0 && !WS.test(text[i - 1]!) && isWordChar(text[i - 1]) === inWord) i--;
+  return i;
+}
+
+/** End of the word to the RIGHT of the caret (Option/Alt+→, Option+D target). */
+export function wordRight(text: string, cursor: number): number {
+  const n = text.length;
+  let i = clampIdx(text, cursor);
+  while (i < n && WS.test(text[i]!)) i++;
+  if (i >= n) return n;
+  const inWord = isWordChar(text[i]);
+  while (i < n && !WS.test(text[i]!) && isWordChar(text[i]) === inWord) i++;
+  return i;
+}
+
+/** Index of the first char of the caret's HARD line (Ctrl+A / Home). */
+export function lineStart(text: string, cursor: number): number {
+  const i = clampIdx(text, cursor);
+  // Guard i === 0 explicitly: lastIndexOf clamps a negative fromIndex to 0, so on a draft that
+  // BEGINS with a newline it would find that newline and report line start 1 for cursor 0.
+  if (i === 0) return 0;
+  return text.lastIndexOf('\n', i - 1) + 1;
+}
+
+/** Index just past the last char of the caret's HARD line (Ctrl+E / End). */
+export function lineEnd(text: string, cursor: number): number {
+  const i = clampIdx(text, cursor);
+  const nl = text.indexOf('\n', i);
+  return nl === -1 ? text.length : nl;
+}
+
+/** Result of an editing operation: the new buffer, the new caret, and what was removed (kill ring). */
+export interface EditResult {
+  text: string;
+  cursor: number;
+  /** Removed text, for the Ctrl+Y kill ring. Empty when the edit was a no-op. */
+  killed: string;
+}
+
+const cut = (text: string, from: number, to: number): EditResult => {
+  const a = Math.min(from, to);
+  const b = Math.max(from, to);
+  return { text: text.slice(0, a) + text.slice(b), cursor: a, killed: text.slice(a, b) };
+};
+
+/** Option/Alt+Delete, Ctrl+W — delete the word before the caret. */
+export function deleteWordLeft(text: string, cursor: number): EditResult {
+  const c = clampIdx(text, cursor);
+  return cut(text, wordLeft(text, c), c);
+}
+
+/** Option/Alt+D, Ctrl+Delete — delete the word after the caret. */
+export function deleteWordRight(text: string, cursor: number): EditResult {
+  const c = clampIdx(text, cursor);
+  return cut(text, c, wordRight(text, c));
+}
+
+/** Ctrl+K — kill from the caret to the end of the line (or, at a line end, the newline itself). */
+export function killToLineEnd(text: string, cursor: number): EditResult {
+  const c = clampIdx(text, cursor);
+  const e = lineEnd(text, c);
+  return cut(text, c, e === c && text[c] === '\n' ? c + 1 : e);
+}
+
+/** Ctrl+U — kill from the start of the line to the caret. */
+export function killToLineStart(text: string, cursor: number): EditResult {
+  const c = clampIdx(text, cursor);
+  return cut(text, lineStart(text, c), c);
+}
+
+// ── Grapheme-safe single-character motion ────────────────────────────────────
+// Indexing by UTF-16 code unit splits an emoji (or a flag, or an accented cluster) in half: one
+// Backspace after 😀 left a LONE SURROGATE in the draft, which paints as a replacement glyph,
+// shifts every later caret index, and gets sent to the provider on submit. Intl.Segmenter is in
+// Node 18+ with no dependency; the code-unit path stays as the fallback.
+
+const segmenter: { segment(s: string): Iterable<{ index: number; segment: string }> } | null =
+  typeof Intl !== 'undefined' && 'Segmenter' in Intl
+    ? new (Intl as unknown as { Segmenter: new (l?: string, o?: object) => never }).Segmenter(undefined, {
+        granularity: 'grapheme',
+      })
+    : null;
+
+/** Index of the start of the grapheme cluster ending at `cursor` (one visual char to the left). */
+export function prevGrapheme(text: string, cursor: number): number {
+  const c = clampIdx(text, cursor);
+  if (c === 0) return 0;
+  if (!segmenter) return c - 1;
+  let start = c - 1;
+  for (const g of segmenter.segment(text.slice(0, c))) {
+    if (g.index < c) start = g.index;
+  }
+  return start;
+}
+
+/** Index just past the grapheme cluster starting at `cursor` (one visual char to the right). */
+export function nextGrapheme(text: string, cursor: number): number {
+  const c = clampIdx(text, cursor);
+  if (c >= text.length) return text.length;
+  if (!segmenter) return c + 1;
+  for (const g of segmenter.segment(text.slice(c))) {
+    return c + g.segment.length; // the first cluster from the caret
+  }
+  return c + 1;
+}
+
+/** Backspace — delete the visual character before the caret (never half an emoji). */
+export function deleteCharLeft(text: string, cursor: number): EditResult {
+  const c = clampIdx(text, cursor);
+  return c === 0 ? { text, cursor: c, killed: '' } : cut(text, prevGrapheme(text, c), c);
+}
+
+/** Ctrl+D / forward-delete — delete the visual character after the caret. */
+export function deleteCharRight(text: string, cursor: number): EditResult {
+  const c = clampIdx(text, cursor);
+  return c >= text.length ? { text, cursor: c, killed: '' } : cut(text, c, nextGrapheme(text, c));
 }

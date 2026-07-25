@@ -35,9 +35,67 @@ export function sanitizeLocalName(raw: string): string {
   return cleaned || 'local-model';
 }
 
-/** Derive a clean preset name from a .gguf filename: drop dir + extension, sanitize. */
+/** A bare content hash — a HuggingFace snapshot dir name, useless as a model label. */
+const HASH_ONLY = /^[0-9a-f]{16,}$/i;
+/** HuggingFace cache directory naming: `models--<org>--<name>` (org/name may contain `--`). */
+const HF_CACHE_DIR = /^(?:models|datasets)--(.+)$/;
+
+/**
+ * Derive a human preset name from ANY local model reference: a `.gguf` file, an MLX/HF model
+ * FOLDER, or a `org/model` repo id.
+ *
+ * The folder case is why this exists. A HuggingFace cache path ends in the snapshot's content
+ * hash — `…/models--EZCon--Some-Model-mlx/snapshots/404364e7467a87a9e31777b71408e96caabd9d5b` —
+ * so a plain `basename()` named the preset `404364e7467a…`, and the `/model` picker listed a
+ * 40-char hash you could neither recognize nor type. Walk up to the `models--org--name` segment
+ * and use the model name from it; fall back to the nearest parent that isn't itself a hash.
+ */
 export function deriveLocalName(path: string): string {
-  return sanitizeLocalName(basename(path).replace(/\.gguf$/i, ''));
+  const clean = path.trim().replace(/[/\\]+$/, '');
+  if (/\.gguf$/i.test(clean)) return sanitizeLocalName(basename(clean).replace(/\.gguf$/i, ''));
+
+  // Walk from the deepest segment outward for the first name that actually identifies the model.
+  const segments = clean.split(/[/\\]+/).filter(Boolean);
+  for (let i = segments.length - 1; i >= 0; i--) {
+    const seg = segments[i]!;
+    const hf = HF_CACHE_DIR.exec(seg);
+    if (hf) {
+      // `models--org--name` → prefer the model name; `--` separates org from name.
+      const parts = hf[1]!.split('--');
+      return sanitizeLocalName(parts.length > 1 ? parts.slice(1).join('--') : parts[0]!);
+    }
+    // Skip the structural/opaque segments of an HF cache path.
+    if (HASH_ONLY.test(seg) || seg === 'snapshots' || seg === 'blobs' || seg === 'refs') continue;
+    return sanitizeLocalName(seg);
+  }
+  return sanitizeLocalName(basename(clean));
+}
+
+/**
+ * Re-label local presets whose name is a bare snapshot hash (see deriveLocalName). Pure: returns
+ * the repaired list and whether anything changed, so the caller decides about persisting.
+ *
+ * Only MLX and vLLM presets are touched, and only when the label carries no information. For MLX
+ * the label is purely cosmetic (`model` holds the real target the server hot-loads), and for vLLM
+ * Shadow launches the server itself with `--served-model-name`, so renaming both stays consistent.
+ * `.gguf` presets are left alone — their names come from the filename and can't be hashes.
+ */
+export function repairLocalLabels(models: ModelEntry[]): { models: ModelEntry[]; renamed: { from: string; to: string }[] } {
+  const renamed: { from: string; to: string }[] = [];
+  const taken = new Set(models.map((m) => m.label.trim().toLowerCase()));
+  const next = models.map((m) => {
+    const target = m.mlx ?? m.vllm;
+    if (!target || !HASH_ONLY.test(m.label.trim())) return m;
+    let derived = deriveLocalName(target);
+    if (!derived || HASH_ONLY.test(derived) || taken.has(derived.toLowerCase())) return m;
+    taken.delete(m.label.trim().toLowerCase());
+    taken.add(derived.toLowerCase());
+    renamed.push({ from: m.label, to: derived });
+    // vLLM serves under the label, so its wire `model` tracks the rename; MLX's `model` is the
+    // real path/repo id the server loads and must NOT be touched.
+    return m.vllm && m.model === m.label ? { ...m, label: derived, model: derived } : { ...m, label: derived };
+  });
+  return { models: next, renamed };
 }
 
 export interface LocalAddOptions {
@@ -129,7 +187,9 @@ export function buildLocalEntry(opts: LocalAddOptions): PresetResult<ModelEntry>
       return { ok: false, message: `--ctx ${opts.ctx} is not usable (minimum 2048) — here it bounds Shadow's context budget, not the server.` };
     }
     const target = looksModelDir ? absMaybe : raw;
-    const name = opts.name ? sanitizeLocalName(opts.name) : sanitizeLocalName(basename(target));
+    // deriveLocalName, NOT basename: a HuggingFace cache folder ends in the snapshot's content
+    // hash, which basename turned into a 40-char hex preset name.
+    const name = opts.name ? sanitizeLocalName(opts.name) : deriveLocalName(target);
     if (!name) return { ok: false, message: 'Could not derive a model name; pass --name <name>.' };
     const ctxHint = opts.ctx !== undefined ? { ctx: opts.ctx } : {};
 
