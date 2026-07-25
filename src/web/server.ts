@@ -220,9 +220,10 @@ export function startWebServer(opts: WebServerOptions): Promise<WebServerHandle>
   };
 
   return new Promise<WebServerHandle>((resolve, reject) => {
-    let server: Server;
     const onError = (e: Error): void => reject(e);
-    server = createServer((req, res) => {
+    // `const` despite the self-reference: the handler only reads `server.address()` when a
+    // request arrives, which is necessarily after initialization, so the TDZ never bites.
+    const server: Server = createServer((req, res) => {
       const addr = server.address() as AddressInfo | null;
       // handle() is async; a rejected promise must not become an unhandled rejection.
       void handle(req, res, addr?.port ?? 0).catch((e: unknown) => {

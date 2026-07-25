@@ -49,7 +49,7 @@ export class OpenAIProvider implements Provider {
       url: `${this.baseUrl}/chat/completions`,
       headers,
       body: buildOpenAIBody(req, model, true),
-      parse: parseOpenAISSE,
+      parse: (lines) => parseOpenAISSE(lines, model),
       signal: req.signal,
       nonStreamBody: buildOpenAIBody(req, model, false),
       parseNonStream: eventsFromOpenAICompletion,
@@ -180,6 +180,20 @@ export function isQwenReasoner(model: string): boolean {
 }
 
 /**
+ * Models that emit their reasoning INLINE in `content` as `<think>…</think>`, rather than on a
+ * separate `reasoning_content` field.
+ *
+ * This gate is why it matters (C6): every `delta.content` used to be pushed through
+ * ThinkingSplitter for EVERY model. So asking Shadow to document `<think>` tags, write a chat
+ * template, or explain this very feature made the answer visibly truncate mid-sentence — the
+ * prose after the tag was routed to the reasoning channel and lost from history, because only
+ * `turn.text` is committed. Splitting is now limited to the families that actually do it.
+ */
+export function emitsInlineThinking(model: string): boolean {
+  return isDeepSeekReasoner(model) || isQwenReasoner(model) || /minimax|glm|yi-|internlm|skywork/i.test(model);
+}
+
+/**
  * One place, every family: any model that does HIDDEN reasoning and therefore needs the output
  * budget floored so thinking can't consume it all. Replaces the scattered per-provider checks.
  */
@@ -271,7 +285,10 @@ function findKeyById(calls: Map<string, OAICallState>, id: string): string | und
   return undefined;
 }
 
-export async function* parseOpenAISSE(lines: AsyncIterable<string>): AsyncIterable<ProviderEvent> {
+export async function* parseOpenAISSE(
+  lines: AsyncIterable<string>,
+  model = '',
+): AsyncIterable<ProviderEvent> {
   let inputTokens = 0;
   let outputTokens = 0;
   let cacheReadTokens = 0;
@@ -284,11 +301,35 @@ export async function* parseOpenAISSE(lines: AsyncIterable<string>): AsyncIterab
   const indexToKey = new Map<number, string>();
   let lastKey: string | null = null;
   let keySeq = 0;
+  // Only split inline <think> for the families that actually emit it (see emitsInlineThinking).
+  // An unknown/empty model keeps the old permissive behavior — a local serve whose id we don't
+  // recognize is far more likely to be a reasoner than to be writing prose ABOUT think tags.
+  const splitInline = model === '' || emitsInlineThinking(model);
   const splitter = new ThinkingSplitter(); // routes inline <think>/<thinking> spans to the reasoning channel
+  /**
+   * Did ANY `data:` frame arrive? A gateway that ignores `stream: true` (a misconfigured
+   * LiteLLM/vLLM, a corporate proxy, an older Ollama /v1) answers 200 with a plain JSON completion
+   * body. Every line of it fails the `data:` test and is skipped, so the turn used to parse to
+   * exactly [usage 0/0/0, done end_turn] — no text, no tool calls, no error. The loop saw a clean
+   * finish and stopped, so EVERY turn came back blank, forever, with no diagnostic anywhere. The
+   * non-stream fallback could not help: it only fires when the parse THROWS, and this never throws.
+   */
+  let sawDataFrame = false;
+  /** Bounded copy of a non-SSE body so we can still recover the turn from it. */
+  const rawBody: string[] = [];
+  let rawBodyBytes = 0;
+  const RAW_BODY_CAP = 8 * 1024 * 1024; // never buffer an unbounded stream
 
   for await (const rawLine of lines) {
     const line = rawLine.trim();
-    if (!line.startsWith('data:')) continue;
+    if (!line.startsWith('data:')) {
+      if (!sawDataFrame && rawBodyBytes < RAW_BODY_CAP) {
+        rawBody.push(rawLine);
+        rawBodyBytes += rawLine.length + 1;
+      }
+      continue;
+    }
+    sawDataFrame = true;
     const payload = line.slice(5).trim();
     if (!payload || payload === '[DONE]') continue;
 
@@ -327,8 +368,12 @@ export async function* parseOpenAISSE(lines: AsyncIterable<string>): AsyncIterab
     if (typeof reasoning === 'string' && reasoning) yield { type: 'thinking', delta: reasoning };
     // Inline <think>/<thinking> spans in the content are split out to the same channel.
     if (delta?.content) {
-      for (const span of splitter.push(delta.content)) {
-        yield span.kind === 'thinking' ? { type: 'thinking', delta: span.text } : { type: 'text', delta: span.text };
+      if (!splitInline) {
+        yield { type: 'text', delta: delta.content };
+      } else {
+        for (const span of splitter.push(delta.content)) {
+          yield span.kind === 'thinking' ? { type: 'thinking', delta: span.text } : { type: 'text', delta: span.text };
+        }
       }
     }
 
@@ -385,6 +430,19 @@ export async function* parseOpenAISSE(lines: AsyncIterable<string>): AsyncIterab
     let id = c.id || `call_${idx}`;
     while (usedIds.has(id)) id = `call_${idx}_${usedIds.size}`;
     usedIds.add(id);
+    // A call with args but NO name: some OpenAI-compatible wires stream the arguments without
+    // ever sending the function name. Emitting it produced `unknown tool: ` downstream and a
+    // wasted round trip; the Anthropic parser already handles the identical case as a recoverable
+    // `nameless_tool_call`, so mirror that and let the model resend.
+    if (!c.name) {
+      yield {
+        type: 'error',
+        recoverable: true,
+        code: 'nameless_tool_call',
+        message: 'tool call streamed without a name (endpoint omitted the function name) — resend the call',
+      };
+      continue;
+    }
     const parsed = parseToolArgs(c.args); // repair ladder before giving up
     if (parsed.ok) {
       yield {
@@ -399,6 +457,43 @@ export async function* parseOpenAISSE(lines: AsyncIterable<string>): AsyncIterab
         message: `tool "${c.name}" ${parsed.error}`,
       };
     }
+  }
+
+  // Not an SSE stream at all — the body was a plain completion (or nothing).
+  if (!sawDataFrame) {
+    const body = rawBody.join('\n').trim();
+    if (body) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(body);
+      } catch {
+        parsed = undefined;
+      }
+      if (parsed !== undefined) {
+        // It IS a valid completion, just not streamed. Recover the turn rather than failing it —
+        // the same generator the non-stream path uses, so the two agree exactly. It emits its own
+        // usage + done, so return immediately after.
+        let produced = false;
+        for (const ev of eventsFromOpenAICompletion(parsed)) {
+          produced = true;
+          yield ev;
+        }
+        if (produced) return;
+      }
+    }
+    // Nothing usable. Say so LOUDLY: a clean `done` here is what made this silent and permanent.
+    yield {
+      type: 'error',
+      recoverable: true,
+      code: 'not_sse',
+      message:
+        'the endpoint returned a 200 with no SSE frames — it is ignoring `stream: true`. ' +
+        'Check the base URL and any gateway/proxy in front of it' +
+        (body ? `. First bytes: ${body.slice(0, 200)}` : ' (the body was empty)'),
+    };
+    yield { type: 'usage', inputTokens, outputTokens, cacheReadTokens };
+    yield { type: 'done', stopReason };
+    return;
   }
 
   // Some servers omit finish_reason:'tool_calls'; infer it from emitted calls.

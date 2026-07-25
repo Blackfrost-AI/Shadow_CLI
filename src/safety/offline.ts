@@ -47,6 +47,11 @@ export function isLocalHost(host: string): boolean {
 /** Extract the host from a baseUrl and classify it. Empty/undefined → not local. */
 export function isLocalBaseUrl(baseUrl: string | undefined | null): boolean {
   if (!baseUrl) return false;
+  // Bracketed IPv6 FIRST: `http://[::1]:8000` is a real local-serve shape, and the plain
+  // `[^/:]+` capture below stops at the first colon INSIDE the brackets — yielding "[" and
+  // reporting loopback as remote. isLocalHost wants the bare address, so strip the brackets.
+  const v6 = baseUrl.match(/^[a-z]+:\/\/\[([^\]]+)\]/i)?.[1];
+  if (v6) return isLocalHost(v6.toLowerCase());
   const host = (baseUrl.match(/^[a-z]+:\/\/([^/:]+)/i)?.[1] ?? '').toLowerCase();
   return isLocalHost(host);
 }

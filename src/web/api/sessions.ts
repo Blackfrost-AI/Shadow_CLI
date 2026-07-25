@@ -59,4 +59,15 @@ export function registerSessionsRoutes(route: RouteFn, ctx: ApiContext): void {
     const id = m[1]!;
     return { status: 200, body: { interrupted: ctx.registry.interrupt(id) } };
   });
+
+  // E2 — close a session: aborts any in-flight turn, stops its MCP stdio children and frees the
+  // replay ring. registry.remove() existed but had ZERO production callers, so every
+  // "+ new session" was permanent: contexts, child processes and 2 MB rings accumulated for the
+  // life of the server with no way to shed one. Revocation-style, like interrupt: 200 with
+  // removed:false for an unknown id or the reserved mirror. The pattern is single-segment so it
+  // cannot also match /api/sessions/<id>/chat.
+  route('DELETE', /^\/api\/sessions\/([^/]+)$/, async (_req, _res, m) => ({
+    status: 200,
+    body: { removed: await ctx.registry.remove(m[1]!) },
+  }));
 }

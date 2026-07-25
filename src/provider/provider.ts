@@ -157,6 +157,8 @@ export interface Provider {
     system?: string;
     messages: Message[];
     tools?: any[];
+    /** Interrupt the count — it runs inside maybeSummarize, which ESC must be able to stop. */
+    signal?: AbortSignal;
   }): Promise<number>;
 }
 

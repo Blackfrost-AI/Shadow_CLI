@@ -30,7 +30,33 @@ export class Context {
    */
   private rearmAtTokens = 0;
 
-  constructor(private readonly opts: ContextOptions) {}
+  constructor(private opts: ContextOptions) {}
+
+  /**
+   * Move the compaction threshold for a LIVE session (D1).
+   *
+   * `contextBudget` was copied into readonly opts at construction with no setter, while
+   * `/model` mutated `cfg.contextBudget` — which reached the HUD but never `maybeSummarize`.
+   * Switching a 200k session onto a 32k local serve therefore showed a red context bar that
+   * never triggered a compaction: every turn overflowed, ate a wasted round trip and printed an
+   * error, and only recovered because `looksLikeTokenOverflow` force-compacts after the fact.
+   * The clamp's own comment already admitted it was "cosmetic".
+   *
+   * Re-arms the hysteresis: a budget that just SHRANK must be allowed to trigger immediately
+   * rather than waiting for the old, larger re-arm point.
+   */
+  setBudget(contextBudget: number): void {
+    if (!Number.isFinite(contextBudget) || contextBudget <= 0) return;
+    if (contextBudget === this.opts.contextBudget) return;
+    const shrank = contextBudget < this.opts.contextBudget;
+    this.opts = { ...this.opts, contextBudget };
+    if (shrank) this.rearmAtTokens = 0;
+  }
+
+  /** The live compaction budget (test seam + HUD parity). */
+  budget(): number {
+    return this.opts.contextBudget;
+  }
 
   /**
    * Record the exact request size the provider just reported (input + cache-read +
@@ -106,7 +132,16 @@ export class Context {
    * Collapse the oldest non-pinned turns into a progress note when the estimate crosses
    * contextBudget * triggerRatio. Returns true if it summarized.
    */
-  async maybeSummarize(provider: Provider, model: string, force = false): Promise<boolean> {
+  async maybeSummarize(
+    provider: Provider,
+    model: string,
+    force = false,
+    /** ESC must be able to stop a compaction — it is a full provider round trip (D3). */
+    signal?: AbortSignal,
+    /** The live system prompt + tool schemas, so the count matches the REAL request (D4). */
+    countCtx?: { system?: string; tools?: unknown[] },
+  ): Promise<boolean> {
+    if (signal?.aborted) return false;
     const trigger = this.opts.contextBudget * this.opts.triggerRatio;
     let tokens = this.estimateTokens(provider);
 
@@ -119,10 +154,23 @@ export class Context {
         // Opportunistic real count when we're in the "maybe" zone.
         if (provider.countTokens && tokens > this.opts.contextBudget * 0.6) {
           try {
-            const real = await provider.countTokens({ model, messages: this.msgs });
+            // Pass system + tools (D4): the adapter has always supported them, and omitting them
+            // undercounts by exactly the fixed overhead every real request carries.
+            const real = await provider.countTokens({
+              model,
+              messages: this.msgs,
+              system: countCtx?.system,
+              tools: countCtx?.tools as never,
+              signal,
+            });
+            // NEVER let a count RATCHET THE RECORDED SIZE DOWN. lastActualTokens is the
+            // high-water mark of the true size — and a previous reading may have included
+            // system+tools+cache that this call omits. Assigning unconditionally could lower it
+            // and push the estimate back under the trigger, so a session that genuinely needed
+            // compaction quietly stopped compacting.
             if (real > 0) {
-              this.lastActualTokens = real;
-              tokens = real;
+              if (real > this.lastActualTokens) this.lastActualTokens = real;
+              tokens = Math.max(tokens, real);
             }
           } catch {
             /* ignore, keep heuristic */
@@ -171,6 +219,8 @@ export class Context {
     let summary = '';
     try {
       for await (const ev of provider.send({
+        signal, // D3: compaction is a full round trip; without this ESC left the composer locked
+                // for 30-60s on a slow local model AFTER "interrupted" had already printed.
         model,
         system:
           'You are compacting an IN-PROGRESS agent session so it can continue with a smaller ' +

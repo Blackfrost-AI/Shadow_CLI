@@ -13,6 +13,7 @@ import type { ModelEntry } from '../config.js';
 import { looksAnthropicDistilled, toAnthropicBaseUrl } from '../util/transport.js';
 import { normalizeBaseUrl } from '../config.js';
 import type { Message } from '../provider/provider.js';
+import { registerSecret, redactString } from '../util/redact.js';
 
 const ESC = '\x1b[';
 const c = {
@@ -610,6 +611,18 @@ async function testConnection(o: {
   authToken?: string;
   baseUrl?: string;
 }): Promise<{ ok: boolean; error?: string }> {
+  // Teach the redactor about the key BEFORE anything can echo it (C8). Provider keys are
+  // otherwise only registered at bootstrap.ts, which onboarding never reaches — so a gateway
+  // that reflects the request back in its error body (and readErrorMessage returns a non-JSON
+  // body verbatim) landed the just-typed key in the user's terminal scrollback.
+  registerSecret(o.apiKey);
+  registerSecret(o.authToken);
+  /** Never print a raw provider body: redact known secrets, then bound the length. */
+  const safeErr = (msg: string): string => {
+    const clean = redactString(msg);
+    return clean.length > 500 ? clean.slice(0, 500) + '… (truncated)' : clean;
+  };
+
   let provider;
   try {
     provider = createProvider({
@@ -620,7 +633,7 @@ async function testConnection(o: {
       baseUrl: o.baseUrl,
     });
   } catch (e) {
-    return { ok: false, error: (e as Error).message };
+    return { ok: false, error: safeErr((e as Error).message) };
   }
 
   const messages: Message[] = [
@@ -638,19 +651,22 @@ async function testConnection(o: {
         // ANY error fails the test — recoverable ones (network down, a persistent
         // 429, a typo'd base URL that 5xx's) are exactly the broken-config cases the
         // live test exists to catch, so they must not be saved as "✓ connected".
-        if (ev.type === 'error') return { ok: false, error: `${ev.code}: ${ev.message}` };
-        if (
-          ev.type === 'usage' ||
-          ev.type === 'text' ||
-          ev.type === 'done' ||
-          ev.type === 'tool_call'
-        ) {
-          return { ok: true };
-        }
+        if (ev.type === 'error') return { ok: false, error: safeErr(`${ev.code}: ${ev.message}`) };
+        // Require EVIDENCE the endpoint actually generated something. Accepting a bare `usage`
+        // or `done` was the onboarding half of the non-SSE bug: a gateway ignoring `stream: true`
+        // produced exactly [usage 0/0/0, done end_turn], and onboarding printed "✓ connected" —
+        // blessing a config in which every later turn comes back blank.
+        if (ev.type === 'text' || ev.type === 'tool_call') return { ok: true };
+        if (ev.type === 'usage' && (ev.inputTokens > 0 || ev.outputTokens > 0)) return { ok: true };
       }
-      return { ok: false, error: 'no response from provider' };
+      return {
+        ok: false,
+        error:
+          'the endpoint accepted the request but produced no output — check the model id, and any ' +
+          'gateway in front of it (one that ignores `stream: true` looks exactly like this)',
+      };
     } catch (e) {
-      return { ok: false, error: (e as Error).message };
+      return { ok: false, error: safeErr((e as Error).message) };
     }
   })();
   const timeout = new Promise<{ ok: boolean; error?: string }>((res) =>

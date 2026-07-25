@@ -19,6 +19,9 @@ import { runLock } from './runLock.js';
  * reserved session, and the read path (GET /api/sessions).
  */
 
+/** Hard ceiling on browser-created sessions — see create(). */
+export const MAX_WEB_SESSIONS = 8;
+
 export const CLI_SESSION_ID = 'cli';
 
 /**
@@ -225,7 +228,20 @@ export function createSessionRegistry(deps: { builder: AgentBuilder; runTurn: Tu
   /** The build+run flow behind submit(). Streams progress on the session bus; never awaited by
    *  the route (submit returns 202). The run-lock (C5) and the real builder/runTurn (C6) plug in
    *  without changing this shape. */
+  /** Terminal frame for every early return out of drive(), so the browser can clear its state. */
+  const emitInterrupted = (s: WebSessionInternal): void => {
+    s.bus.emit({ type: 'stop', reason: 'interrupted', finalAnswer: '' });
+  };
+
   async function drive(s: WebSessionInternal, prompt: string): Promise<void> {
+    // E3a — interruptible from the FIRST tick, including the build.
+    //
+    // The controller used to be created AFTER `await s.building`, so during 'initializing' —
+    // which this code itself notes can take MINUTES (MCP servers, model warmup) — interrupt()
+    // read a null `s.abort`, returned {interrupted:false}, and the turn then ran anyway. The
+    // comment claiming "s.abort is set BEFORE acquiring so an interrupt cancels the queued wait
+    // too" was true of the queue and false of the build.
+    s.abort = new AbortController();
     try {
       if (!s.agent) {
         if (!s.building) {
@@ -245,16 +261,24 @@ export function createSessionRegistry(deps: { builder: AgentBuilder; runTurn: Tu
         }
         await s.building;
       }
+      // Interrupted DURING the build: stop here rather than running the turn the user cancelled.
+      if (s.abort.signal.aborted) {
+        s.status = 'idle';
+        emitInterrupted(s);
+        return;
+      }
       // Serialize the actual turn through the process-wide run lock — one at a time across the TUI
       // and every session. Web sessions wait WITHOUT priority (the operator's TUI jumps ahead).
-      // s.abort is set BEFORE acquiring so an interrupt cancels the queued wait too.
-      s.abort = new AbortController();
       s.status = 'queued';
       let release: (() => void) | null = null;
       try {
         release = await runLock.acquire(s.id, { signal: s.abort.signal });
       } catch {
         s.status = 'idle'; // interrupted while queued
+        // E3b — the browser set an optimistic running state on send, and clears it ONLY on a
+        // `stop` frame. Returning silently here left the textarea disabled and the Interrupt
+        // button visible until the view was re-mounted.
+        emitInterrupted(s);
         return;
       }
       try {
@@ -318,6 +342,14 @@ export function createSessionRegistry(deps: { builder: AgentBuilder; runTurn: Tu
     },
 
     create(spec: CreateSessionSpec): WebSession {
+      // E2b — a hard ceiling. Each web session costs an agent context, its own MCP stdio
+      // children and a 2 MB SSE replay ring, and (before the DELETE route) nothing ever freed
+      // one — so "+ new session" was an unbounded allocation driven by a mouse click.
+      let live = 0;
+      for (const existing of sessions.values()) if (existing.origin === 'web') live++;
+      if (live >= MAX_WEB_SESSIONS) {
+        throw new Error(`session limit reached (${MAX_WEB_SESSIONS}) — close one first`);
+      }
       const s = makeSession({
         id: randomBytes(8).toString('hex'),
         origin: 'web',

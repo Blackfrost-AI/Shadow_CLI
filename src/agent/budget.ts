@@ -44,12 +44,26 @@ export class Budget {
 
   constructor(
     private readonly limits: BudgetLimits,
-    private readonly model: string,
+    private model: string,
     private readonly prices: PriceTable,
     now: number,
   ) {
     this.startMs = now;
   }
+
+  /**
+   * Re-price against the model actually in use (D5).
+   *
+   * `prices[this.model]` was fixed at construction. That is harmless in the TUI (a fresh Budget
+   * per user message) but UNBOUNDED in headless `--task`, where ONE Budget spans the whole run:
+   * after a `/model` switch or an automatic fallback, every later token was still costed at the
+   * ORIGINAL model's rate — so the reported spend, and any cost ceiling built on it, drifted
+   * further from reality the longer the run went.
+   */
+  setModel(model: string): void {
+    if (model) this.model = model;
+  }
+
 
   /** Record one provider call's usage and accrue cost. */
   recordUsage(

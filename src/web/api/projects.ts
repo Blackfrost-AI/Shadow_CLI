@@ -1,5 +1,6 @@
 import { readJsonBody, type ApiContext, type RouteFn } from '../router.js';
-import { listProjects, addProject, removeProject } from '../projects.js';
+import { listProjects, addProject, removeProject, normalizeProjectPath } from '../projects.js';
+import { contains } from '../../safety/workspaceJail.js';
 
 /**
  * The project allowlist surface. Routes key on the opaque entry `id` (in the body for remove),
@@ -7,7 +8,7 @@ import { listProjects, addProject, removeProject } from '../projects.js';
  * is a bug generator. Revocation ALWAYS succeeds; a removal must never 409, or it would fail
  * exactly when the offending session is the one that is active.
  */
-export function registerProjectsRoutes(route: RouteFn, _ctx: ApiContext): void {
+export function registerProjectsRoutes(route: RouteFn, ctx: ApiContext): void {
   route('GET', /^\/api\/projects$/, () => ({ status: 200, body: { projects: listProjects() } }));
 
   route('POST', /^\/api\/projects$/, async (req) => {
@@ -30,6 +31,34 @@ export function registerProjectsRoutes(route: RouteFn, _ctx: ApiContext): void {
     if (!body || typeof body.id !== 'string') {
       return { status: 400, body: { error: 'id (string) is required' } };
     }
-    return { status: 200, body: { removed: removeProject(body.id) } };
+    // E1 — revocation must CASCADE. Removing the entry alone edited config.json and returned 200
+    // while every already-open session kept its frozen jail and carried on reading and writing
+    // the directory at auto-edit. Look the entry up BEFORE deleting (removeProject returns only a
+    // boolean), then close every WEB session rooted at or under it.
+    const entry = listProjects().find((e) => e.id === body.id);
+    const removed = removeProject(body.id);
+    let closed = 0;
+    if (removed && entry) {
+      let root: string | null = null;
+      try {
+        root = normalizeProjectPath(entry.path);
+      } catch {
+        root = null; // an unresolvable path can't contain anything — nothing to cascade to
+      }
+      if (root) {
+        // Collect ids first: each() walks the live map, and remove() mutates it.
+        const doomed: string[] = [];
+        ctx.registry.each((s) => {
+          if (s.origin !== 'web') return; // never the reserved CLI mirror, which may legitimately
+          try {                            // sit inside a removed project
+            if (contains(root!, normalizeProjectPath(s.displayPath))) doomed.push(s.id);
+          } catch {
+            /* unresolvable session path — leave it alone */
+          }
+        });
+        for (const id of doomed) if (await ctx.registry.remove(id)) closed++;
+      }
+    }
+    return { status: 200, body: { removed, sessionsClosed: closed } };
   });
 }

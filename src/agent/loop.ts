@@ -453,7 +453,10 @@ export class AgentLoop {
         if (this.deps.hooks?.pre_compact?.length) {
           runHookPhase('pre_compact', this.deps.hooks.pre_compact, { workspaceRoot: this.deps.workspaceRoot });
         }
-        const didCompact = await context.maybeSummarize(provider, this.deps.model);
+        const didCompact = await context.maybeSummarize(provider, this.deps.model, false, this.deps.signal, {
+          system: this.deps.system,
+          tools: this.deps.registry.toSchemas(),
+        });
         if (didCompact) {
           // Surface auto-compaction: the TUI shows it live, and the eval harness can
           // confirm the compaction task ACTUALLY summarized (not merely got the sum right).
@@ -505,7 +508,10 @@ export class AgentLoop {
         ) {
           overflowCompactTried = true;
           try {
-            const did = await this.deps.context.maybeSummarize(provider, model, true);
+            const did = await this.deps.context.maybeSummarize(provider, model, true, this.deps.signal, {
+              system: this.deps.system,
+              tools: this.deps.registry.toSchemas(),
+            });
             if (did) {
               this.deps.bus.emit({ type: 'compaction', trigger: 'auto' });
               this.deps.bus.emit({

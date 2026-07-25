@@ -14,6 +14,10 @@ import type { ContextName, KeybindingWarning, ParsedBinding } from './types.js';
 
 /** Compact, readable source: context → { keystroke string → action id }. */
 const RAW_DEFAULTS: Record<ContextName, Record<string, string>> = {
+  // Global stays EMPTY on purpose. `app:redraw` has a registered handler (so the documented
+  // user-config example works) but is deliberately NOT a default: it re-flushes the entire
+  // transcript on every press, which is O(transcript) — a perf footgun nobody should get by
+  // accident. Opt in explicitly with {"ctrl+l": "app:redraw"} if you want it.
   Global: {},
   Chat: {
     enter: 'chat:submit',
@@ -88,3 +92,33 @@ export function buildDefaultBindings(): { bindings: ParsedBinding[]; warnings: K
 
 /** All action ids the engine knows about (for the /keybindings listing). */
 export const KEYBINDING_ACTIONS: readonly string[] = Object.values(RAW_DEFAULTS).flatMap((m) => Object.values(m));
+
+/**
+ * Action ids still dispatched by KEY in the legacy inline handler rather than through the
+ * resolver (B6).
+ *
+ * `consume()` deliberately returns false for a matched-but-unregistered action so the inline
+ * chain keeps working — that is what made incremental migration safe. The cost is that these ids
+ * are LISTED and REBINDABLE while a rebind cannot take effect: the inline branch keys on
+ * `key.return` / `key.upArrow` / … , not on the action. Before this list, that failed silently —
+ * the config parsed, warned about nothing, and simply did not work.
+ *
+ * The loader warns when a USER config rebinds one of these. Remove an entry the moment its
+ * handler is registered via `kbRegister`.
+ */
+export const UNMIGRATED_ACTIONS: ReadonlySet<string> = new Set([
+  'chat:submit',
+  'chat:cycleMode',
+  'chat:historyPrevious',
+  'chat:historyNext',
+  'chat:cancel',
+  'menu:accept',
+  'menu:previous',
+  'menu:next',
+  'menu:run',
+  'menu:dismiss',
+  'picker:previous',
+  'picker:next',
+  'picker:accept',
+  'picker:dismiss',
+]);

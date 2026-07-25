@@ -18,7 +18,7 @@
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { GLOBAL_DIR } from '../../state/globalStore.js';
-import { buildDefaultBindings } from './defaultBindings.js';
+import { buildDefaultBindings, UNMIGRATED_ACTIONS } from './defaultBindings.js';
 import { parseChord, keystrokeToString } from './parser.js';
 import { checkReserved } from './reserved.js';
 import { KEYBINDING_CONTEXTS, type ContextName, type KeybindingWarning, type LoadedBindings, type ParsedBinding, type UserKeybindingsFile } from './types.js';
@@ -84,6 +84,17 @@ function parseUserBlock(block: unknown, warnings: KeybindingWarning[]): ParsedBi
       if (r.severity === 'warn') {
         warnings.push({ kind: 'reserved', message: `${ctx}: "${stroke}" — ${r.reason}` });
       }
+    }
+    // B6 — an id the resolver knows but nothing dispatches BY id. Rebinding it parses cleanly
+    // and then silently does nothing, because the legacy inline handler keys on the KEY. Say so
+    // rather than letting the user conclude their config file is being ignored wholesale.
+    if (typeof action === 'string' && UNMIGRATED_ACTIONS.has(action)) {
+      warnings.push({
+        kind: 'unmigrated',
+        message:
+          `${ctx}: "${stroke}" → ${action} is not rebindable yet — that action is still dispatched ` +
+          'by its built-in key, so this binding will not take effect',
+      });
     }
     out.push({ context: ctx, chord, action });
   }

@@ -736,9 +736,13 @@ export function flattenItem(
     const sev = item.severity ?? 'info';
     const bColor = sev === 'error' ? theme.red : sev === 'warn' ? theme.yellow : theme.cyan;
     out.push({ key: `${kp}ft`, spans: [{ text: `╭─ ${item.title ?? 'Finding'} ─`, color: bColor }] });
-    for (const line of (item.text || '').split('\n')) {
-      out.push(...wrapLine(`${kp}fb`, [{ text: line, color: theme.fg }], cols - 2));
-    }
+    // Index the loop (F4): every source line reused the key `${kp}fb`, and wrapLine restarts its
+    // own counter at 0 per call — so a 3-line finding that wrapped produced 6 rows carrying only
+    // 4 distinct keys. React then reconciles two different rows onto one key, which silently
+    // drops or mis-orders body lines. Reachable on any grep with matches.
+    ;(item.text || '').split('\n').forEach((line, li) => {
+      out.push(...wrapLine(`${kp}fb${li}`, [{ text: line, color: theme.fg }], cols - 2));
+    });
     out.push({ key: `${kp}fb2`, spans: [{ text: '╰──', color: bColor }] });
     return out;
   }

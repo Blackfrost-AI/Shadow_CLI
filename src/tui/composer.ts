@@ -38,6 +38,60 @@ export function expandPastes(text: string, pastes: ReadonlyArray<{ id: number; c
   });
 }
 
+// ── Display width ────────────────────────────────────────────────────────────
+//
+// Wrapping by UTF-16 code unit made every CJK/emoji row overrun the box: `layoutComposer('你好…', 10)`
+// returned rows of 10 CHARACTERS = 20 terminal columns, so Ink truncated them and the caret drifted
+// by up to 2× across the row. A local implementation rather than `string-width`: that package is
+// only a TRANSITIVE dependency of ink, and the release artifact is a Bun single-file binary — an
+// undeclared dep is exactly the kind of thing that survives `npm test` and dies in the binary.
+
+/** Ranges that occupy TWO terminal columns (East Asian Wide/Fullwidth + emoji presentation). */
+const WIDE_RANGES: ReadonlyArray<readonly [number, number]> = [
+  [0x1100, 0x115f], [0x2e80, 0x303e], [0x3041, 0x33ff], [0x3400, 0x4dbf], [0x4e00, 0x9fff],
+  [0xa000, 0xa4cf], [0xa960, 0xa97f], [0xac00, 0xd7a3], [0xf900, 0xfaff], [0xfe10, 0xfe19],
+  [0xfe30, 0xfe6f], [0xff00, 0xff60], [0xffe0, 0xffe6], [0x1f300, 0x1f64f], [0x1f900, 0x1f9ff],
+  [0x1fa70, 0x1faff], [0x20000, 0x3fffd],
+];
+
+/** Combining marks and other zero-width code points. */
+function isZeroWidth(cp: number): boolean {
+  return (
+    (cp >= 0x0300 && cp <= 0x036f) || // combining diacriticals
+    (cp >= 0x200b && cp <= 0x200f) || // ZWSP/ZWNJ/ZWJ + bidi marks
+    cp === 0xfe0f || cp === 0xfe0e || // variation selectors
+    (cp >= 0xe0100 && cp <= 0xe01ef)
+  );
+}
+
+/** Terminal columns occupied by one code point. */
+function codePointWidth(cp: number): number {
+  if (isZeroWidth(cp)) return 0;
+  if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0)) return 0; // control
+  for (const [lo, hi] of WIDE_RANGES) if (cp >= lo && cp <= hi) return 2;
+  return 1;
+}
+
+/**
+ * Terminal columns a string occupies. A grapheme CLUSTER is measured by its widest code point, so
+ * an emoji built from a ZWJ sequence counts once, not once per component.
+ */
+export function displayWidth(s: string): number {
+  let w = 0;
+  for (const g of graphemes(s)) {
+    let gw = 0;
+    for (const ch of g) gw = Math.max(gw, codePointWidth(ch.codePointAt(0) ?? 0));
+    w += gw;
+  }
+  return w;
+}
+
+/** Split into grapheme clusters (Intl.Segmenter when present, else code points). */
+function graphemes(s: string): string[] {
+  if (segmenter) return Array.from(segmenter.segment(s), (g) => g.segment);
+  return Array.from(s);
+}
+
 // ── Multi-row layout / caret ─────────────────────────────────────────────────
 
 /** Max visual rows the composer shows before scrolling the window around the caret. */
@@ -53,47 +107,59 @@ export interface ComposerLayout {
 }
 
 /**
- * Layout `text` into visual rows of at most `innerWidth` columns.
- * Hard newlines always break; long lines soft-wrap at `innerWidth` (char cells, not grapheme-aware).
+ * Layout `text` into visual rows of at most `innerWidth` COLUMNS (not characters).
+ *
+ * Hard newlines always break; long lines soft-wrap when the next grapheme cluster would exceed
+ * the width. Wrapping used to count UTF-16 code units, so a CJK row carried `innerWidth`
+ * characters = 2× that many columns, overran the box, and got truncated by Ink while the caret
+ * drifted. `starts` remains a list of SOURCE indices, so every caller that maps a cursor through
+ * this layout is unaffected.
  */
 export function layoutComposer(text: string, innerWidth: number): ComposerLayout {
   const w = Math.max(1, innerWidth | 0);
   const lines: string[] = [];
   const starts: number[] = [];
-  // Walk the source, producing visual lines.
-  let i = 0;
   const n = text.length;
-  if (n === 0) {
-    return { lines: [''], starts: [0, 0] };
-  }
+  if (n === 0) return { lines: [''], starts: [0, 0] };
+
+  let i = 0;
   while (i < n) {
     starts.push(i);
-    // Hard break at \n
+    let width = 0;
     let j = i;
-    while (j < n && text[j] !== '\n' && j - i < w) j++;
+    while (j < n && text[j] !== '\n') {
+      // Advance a whole grapheme cluster at a time — a wrap must never land inside one.
+      const cluster = nextCluster(text, j);
+      const cw = displayWidth(cluster);
+      if (width + cw > w && j > i) break; // the cluster would overflow: wrap before it
+      width += cw;
+      j += cluster.length;
+      if (width >= w) break; // exactly full
+    }
     if (j < n && text[j] === '\n') {
-      // Line is text[i..j) then consume the newline (empty line after is next start)
       lines.push(text.slice(i, j));
       i = j + 1;
       continue;
     }
-    if (j - i >= w) {
-      // Soft wrap at w (or earlier space if we want word-wrap — char wrap is simpler for caret math)
-      lines.push(text.slice(i, i + w));
-      i = i + w;
-      continue;
-    }
-    // Rest of buffer (no trailing newline)
     lines.push(text.slice(i, j));
     i = j;
   }
-  // Trailing newline → extra empty visual line (caret can sit on it)
   if (n > 0 && text[n - 1] === '\n') {
     starts.push(n);
     lines.push('');
   }
   starts.push(n); // sentinel
   return { lines, starts };
+}
+
+/** The grapheme cluster beginning at `i` (never empty for a valid index). */
+function nextCluster(text: string, i: number): string {
+  if (!segmenter) {
+    const cp = text.codePointAt(i);
+    return cp === undefined ? text[i] ?? '' : String.fromCodePoint(cp);
+  }
+  for (const g of segmenter.segment(text.slice(i))) return g.segment;
+  return text[i] ?? '';
 }
 
 /** Map a source cursor index to a visual (row, col) within the layout. */
@@ -187,7 +253,25 @@ export function clickToCursor(
   windowOffset = 0,
 ): number {
   const absRow = windowOffset + Math.max(0, localRow);
-  return rowColToCursor(text, absRow, Math.max(0, localCol), innerWidth);
+  const { lines, starts } = layoutComposer(text, innerWidth);
+  if (!lines.length) return 0;
+  const r = Math.max(0, Math.min(lines.length - 1, absRow));
+  // A click reports a DISPLAY column; `starts` are SOURCE indices. On an ASCII row those are the
+  // same number, which is why this was invisible — but one wide character ahead of the click and
+  // the caret lands a cell late for every column after it. Walk the row by cluster, accumulating
+  // width, and stop at the first cluster that reaches the clicked column.
+  const line = lines[r]!;
+  const want = Math.max(0, localCol);
+  let width = 0;
+  let off = 0;
+  while (off < line.length && width < want) {
+    const cluster = nextCluster(line, off);
+    const cw = displayWidth(cluster);
+    if (width + cw > want) break; // the click landed on the LEFT half of a wide cluster
+    width += cw;
+    off += cluster.length;
+  }
+  return starts[r]! + off;
 }
 
 /**
@@ -362,4 +446,36 @@ export function deleteCharLeft(text: string, cursor: number): EditResult {
 export function deleteCharRight(text: string, cursor: number): EditResult {
   const c = clampIdx(text, cursor);
   return c >= text.length ? { text, cursor: c, killed: '' } : cut(text, c, nextGrapheme(text, c));
+}
+
+// ── Reverse history search (Ctrl+R) ──────────────────────────────────────────
+
+export interface HistorySearchState {
+  /** What the user has typed into the search prompt. */
+  query: string;
+  /** Index into `history` of the current hit, or -1 when nothing matches. */
+  index: number;
+  /** The draft that was on screen when the search opened — restored on Esc. */
+  saved: string;
+}
+
+/**
+ * Find the most recent history entry at or before `from` containing `query` (case-insensitive).
+ * Returns -1 when there is no match. Searching BACKWARDS is the readline contract: Ctrl+R walks
+ * from newest to oldest, and pressing it again steps to the next older hit.
+ */
+export function searchHistoryBack(history: readonly string[], query: string, from: number): number {
+  if (!query) return -1;
+  const q = query.toLowerCase();
+  for (let i = Math.min(from, history.length - 1); i >= 0; i--) {
+    if ((history[i] ?? '').toLowerCase().includes(q)) return i;
+  }
+  return -1;
+}
+
+/** The prompt line shown while a reverse search is open — mirrors bash/readline. */
+export function historySearchPrompt(st: HistorySearchState, history: readonly string[]): string {
+  const hit = st.index >= 0 ? (history[st.index] ?? '') : '';
+  const failed = st.query && st.index < 0 ? 'failed ' : '';
+  return `(${failed}reverse-i-search)\`${st.query}': ${hit}`;
 }

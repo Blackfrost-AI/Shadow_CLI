@@ -66,7 +66,14 @@ export function readAsset(name: string): string | null {
       }
     }
   }
-  return BUNDLED_WEB_ASSETS[clean] ?? null;
+  // hasOwnProperty, not a bare index: the generated map is a plain object literal, so
+  // `readAsset('__proto__')` returned Object.prototype. `res.end(obj)` then throws, the catch
+  // tries writeHead AFTER headers are sent, that throws too and is swallowed — and the socket
+  // hangs INDEFINITELY on a tokenless public path. (`constructor`/`toString` return functions,
+  // which res.end treats as a callback → a clean empty 200, so __proto__ was the exploitable one.)
+  return Object.prototype.hasOwnProperty.call(BUNDLED_WEB_ASSETS, clean)
+    ? (BUNDLED_WEB_ASSETS[clean] ?? null)
+    : null;
 }
 
 /** Every asset name known to the codegen map (used to list bundled assets in tests). */

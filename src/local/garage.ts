@@ -86,7 +86,7 @@ export function repairLocalLabels(models: ModelEntry[]): { models: ModelEntry[];
   const next = models.map((m) => {
     const target = m.mlx ?? m.vllm;
     if (!target || !HASH_ONLY.test(m.label.trim())) return m;
-    let derived = deriveLocalName(target);
+    const derived = deriveLocalName(target);
     if (!derived || HASH_ONLY.test(derived) || taken.has(derived.toLowerCase())) return m;
     taken.delete(m.label.trim().toLowerCase());
     taken.add(derived.toLowerCase());

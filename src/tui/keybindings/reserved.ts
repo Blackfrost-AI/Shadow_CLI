@@ -22,7 +22,10 @@ const k = (key: string, ctrl = false, shift = false, meta = false): ParsedKeystr
 const RESERVED: ReadonlyArray<{ ks: ParsedKeystroke; entry: ReservedEntry }> = [
   // Hardcoded by Shadow — never rebindable.
   { ks: k('c', true), entry: { reason: 'ctrl+c is Shadow’s interrupt/quit handshake (hardcoded)', severity: 'hard' } },
-  { ks: k('d', true), entry: { reason: 'ctrl+d is hardcoded as quit', severity: 'hard' } },
+  // Corrected (B6): there has never been a ctrl+d QUIT handler — the composer binds ctrl+d to
+  // forward-delete (readline), which is why it stays unrebindable. Saying "quit" sent anyone
+  // reading this looking for a handler that does not exist.
+  { ks: k('d', true), entry: { reason: 'ctrl+d is the composer’s forward-delete (hardcoded)', severity: 'hard' } },
   { ks: k('m', true), entry: { reason: 'ctrl+m is delivered as Enter by terminals (hardcoded)', severity: 'hard' } },
   // Terminal-owned signals — rebind at your own risk.
   { ks: k('z', true), entry: { reason: 'ctrl+z suspends the process (SIGTSTP) in most terminals', severity: 'warn' } },

@@ -103,7 +103,7 @@ export type EditResult =
 /** A fuzzy block must score at least this to be considered a match at all. */
 const FUZZY_THRESHOLD = 0.85;
 /** …and must beat the runner-up by at least this margin to be unique. */
-const FUZZY_UNIQUE_MARGIN = 0.1;
+const FUZZY_UNIQUE_MARGIN = 0.2; // was 0.1 — too narrow to distinguish near-identical blocks (G1)
 
 function countOccurrences(haystack: string, needle: string): number {
   if (!needle) return 0;
@@ -230,6 +230,16 @@ function findFuzzyBlock(
 ): { kind: 'match'; start: number } | { kind: 'ambiguous' } | { kind: 'none' } {
   const n = oldLines.length;
   if (n === 0 || n > fileLines.length) return { kind: 'none' };
+  // G1 — NEVER fuzzy-match a SINGLE line.
+  //
+  // Bigram similarity is least discriminating on short strings: verified,
+  // `old_string: "  const RETRY_LIMIT = 5;"` matched a file containing `= 3;` at 0.85+ and
+  // rewrote it — silently changing a value the model never actually read, with no approval at
+  // the default autonomy. The repair ladder earns its keep on MULTI-LINE hunks whose whitespace
+  // has drifted; on one line the exact/trailing-ws/indent strategies above already cover every
+  // legitimate case, so anything reaching here is a guess. A caller that really means it can
+  // pass more context.
+  if (n < 2) return { kind: 'none' };
   const normOld = oldLines.map((l) => l.trim());
   let best = -1;
   let bestScore = 0;

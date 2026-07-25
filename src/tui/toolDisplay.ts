@@ -90,7 +90,10 @@ export function displayToolName(name: string): string {
     case 'enter_plan_mode':
     case 'exit_plan_mode':
       return 'Plan';
-    default:
+    default: {
+      // Braced: a lexical declaration in a bare case block is scoped to the WHOLE switch, so it
+      // is in the temporal dead zone for every other case — a reference from one of them throws
+      // at runtime rather than failing to compile.
       // MCP / unknown: Title-case the last segment of "server__tool" or snake_case.
       const bare = name.includes('__') ? name.split('__').pop()! : name;
       return bare
@@ -98,6 +101,7 @@ export function displayToolName(name: string): string {
         .filter(Boolean)
         .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
         .join('') || name;
+    }
   }
 }
 

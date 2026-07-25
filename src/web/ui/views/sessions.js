@@ -1,5 +1,5 @@
 import { el, mount } from '../dom.js';
-import { getJson, postJson } from '../api.js';
+import { getJson, postJson, del } from '../api.js';
 import { viewShell, blockHead, statusDot, statusBadge, reason } from '../parts.js';
 import { refreshRail } from '../rail.js';
 
@@ -99,6 +99,23 @@ export function sessionsView(host) {
       ...(s.lastError ? [el('span', { class: 'err' }, [s.lastError])] : []),
       el('span', { class: 'meta' }, [meta]),
     ]);
+    // Close: the only way to free a session's agent context, its MCP stdio children and its 2 MB
+    // replay ring. Without it "+ new session" was permanent for the life of the server. The row
+    // is itself role=button, so stop propagation or closing would also open the console.
+    const closeBtn = el('button', { class: 'btn-mini', title: 'close this session' }, ['close']);
+    closeBtn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      closeBtn.disabled = true;
+      try {
+        await del(`/api/sessions/${s.id}`);
+        await load();
+      } catch (err) {
+        closeBtn.disabled = false;
+        closeBtn.textContent = reason(err);
+      }
+    });
+    closeBtn.addEventListener('keydown', (e) => e.stopPropagation());
+    row.appendChild(closeBtn);
     row.addEventListener('click', () => open(s.id));
     row.addEventListener('keydown', (e) => {
       if (e.key === 'Enter' || e.key === ' ') {

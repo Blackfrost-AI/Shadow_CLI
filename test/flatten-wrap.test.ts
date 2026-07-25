@@ -358,3 +358,24 @@ test('computeToolRuns: only collapsible tools stack; edits/shell break the group
   assert.ok(!runs.has(9), 'lone collapsible tool is not in any run');
   assert.equal(computeToolRuns(items as never, true).get(1)!.collapsed, false, 'Ctrl-O flips collapsed off');
 });
+
+test('F4: a finding card emits one unique React key per row', () => {
+  // The body loop reused `${kp}fb` for every SOURCE line while wrapLine restarts its own counter
+  // per call, so a wrapped multi-line finding produced more rows than distinct keys. React then
+  // reconciles two different rows onto one key and silently drops or mis-orders body lines.
+  // Reachable on any grep with matches.
+  const theme = {
+    fg: '#fff', dim: '#999', green: '#0f0', red: '#f00', yellow: '#ff0', cyan: '#0ff', purple: '#f0f',
+  } as never;
+  const item = {
+    id: 7,
+    kind: 'finding',
+    title: 'grep hits',
+    severity: 'info',
+    text: ['a line long enough that it definitely wraps at this narrow width for sure', 'second', 'third'].join('\n'),
+  } as never;
+  const lines = flattenItem(item, 40, false, theme, false, false);
+  const keys = lines.map((l) => l.key);
+  assert.ok(keys.length > 4, 'the fixture must actually wrap, or the test proves nothing');
+  assert.equal(new Set(keys).size, keys.length, `duplicate keys: ${keys.filter((k, i) => keys.indexOf(k) !== i).join(', ')}`);
+});

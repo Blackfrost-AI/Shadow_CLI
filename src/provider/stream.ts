@@ -12,13 +12,16 @@
  * unit-tested with no network.
  */
 import type { ProviderEvent } from './provider.js';
+import { isLocalBaseUrl } from '../safety/offline.js';
 
-const MAX_ATTEMPTS = 4;
+const MAX_ATTEMPTS = 5; // ~24s of ride-out across the ladder — see backoff()
 /** Max times we shrink an over-budget output cap and retry a 400 that says the request is too long. */
 // Enough halvings to walk a large cap down to the floor: 16000 → 8000 → 4096 → 2048 → 1024.
 const MAX_TOKEN_SHRINKS = 5;
 /** Abort a request that produces no bytes for this long (initial wait or mid-stream stall). */
 const IDLE_MS = 120_000;
+/** The non-stream rescue gets its own bound — it used to inherit no timeout at all. */
+const NON_STREAM_TIMEOUT_MS = 180_000;
 
 /**
  * Aborts its controller after `ms` with no `kick()`. Used both as the fetch
@@ -132,12 +135,16 @@ export async function* streamWithRetry(a: StreamAttempt): AsyncIterable<Provider
       idle.clear();
       if (a.signal?.aborted) return; // user interrupt — stop silently (loop reports 'interrupted')
       if (idle.fired) {
-        if (yield* nonStreamFallback(a)) return;
+        if (yield* nonStreamFallback(a, 'idle')) return;
         yield idleError();
         return;
       }
       if (attempt < MAX_ATTEMPTS) {
-        await backoff(attempt);
+        try {
+          await backoff(attempt, undefined, a.signal);
+        } catch {
+          return; // ESC during the wait — stop silently, the loop reports 'interrupted'
+        }
         continue;
       }
       yield { type: 'error', recoverable: true, code: 'network_error', message: (e as Error).message };
@@ -149,7 +156,11 @@ export async function* streamWithRetry(a: StreamAttempt): AsyncIterable<Provider
       const retryAfterMs = parseRetryAfter(res.headers.get('retry-after'));
       const message = await readErrorMessage(res);
       if (attempt < MAX_ATTEMPTS) {
-        await backoff(attempt, retryAfterMs); // honor the server's Retry-After when it sends one
+        try {
+          await backoff(attempt, retryAfterMs, a.signal); // honor the server's Retry-After when sent
+        } catch {
+          return; // ESC during the wait — a 60s Retry-After used to ignore the interrupt entirely
+        }
         continue;
       }
       yield { type: 'error', recoverable: true, code: `http_${res.status}`, message };
@@ -179,6 +190,18 @@ export async function* streamWithRetry(a: StreamAttempt): AsyncIterable<Provider
         if (a.nonStreamBody) stripImagesFromBody(a.nonStreamBody);
         imagesStripped = true;
         continue;
+      }
+      // The image itself is bad (corrupt, oversized, undecodable). Same recovery — the run must
+      // not wedge — but say what actually happened instead of blaming the model's capabilities,
+      // and surface the provider's own words ONCE as a recoverable error so the user can fix it.
+      if (res.status === 400 && !imagesStripped && looksLikeBadImagePayload(message)) {
+        const why = `the provider rejected it: ${message}`;
+        if (stripImagesFromBody(a.body, why)) {
+          if (a.nonStreamBody) stripImagesFromBody(a.nonStreamBody, why);
+          imagesStripped = true;
+          yield { type: 'error', recoverable: true, code: 'image_rejected', message };
+          continue;
+        }
       }
       // 400 (bad request) / 401 (auth) / 403 (forbidden) / other 4xx — terminal.
       yield { type: 'error', recoverable: false, code: `http_${res.status}`, message };
@@ -243,13 +266,29 @@ export async function fetchNonStreamResponse(
 }
 
 /** Try the non-stream fallback once; yields events and returns true on success. */
-async function* nonStreamFallback(a: StreamAttempt): AsyncGenerator<ProviderEvent, boolean> {
+async function* nonStreamFallback(a: StreamAttempt, reason: 'idle' | 'empty' = 'empty'): AsyncGenerator<ProviderEvent, boolean> {
   if (!a.nonStreamBody || !a.parseNonStream) return false;
   if (a.signal?.aborted) return false;
+  // C4 — do NOT re-fire an identical prompt at a LOCAL server that has merely gone quiet.
+  //
+  // An idle trip immediately re-POSTed the same body. On a llama.cpp/MLX serve doing prompt eval
+  // over 60k tokens that is catastrophic: the already-saturated server now has a SECOND copy of
+  // the same prompt queued, the first two minutes of work are thrown away, and the machine is
+  // doing double the work to answer once. A remote endpoint that goes silent is usually a dropped
+  // connection worth retrying; a local one is usually just busy.
+  if (reason === 'idle' && isLocalBaseUrl(a.url)) return false;
   try {
-    const obj = await fetchNonStreamResponse(a.url, a.headers, a.nonStreamBody, a.signal);
-    yield* a.parseNonStream(obj);
-    return true;
+    // The fallback gets its OWN timeout. It previously attached only `a.signal`, so the request
+    // that was supposed to rescue a stall could itself hang indefinitely.
+    const watchdog = new IdleWatchdog(NON_STREAM_TIMEOUT_MS);
+    const signal = a.signal ? AbortSignal.any([watchdog.signal, a.signal]) : watchdog.signal;
+    try {
+      const obj = await fetchNonStreamResponse(a.url, a.headers, a.nonStreamBody, signal);
+      yield* a.parseNonStream(obj);
+      return true;
+    } finally {
+      watchdog.clear();
+    }
   } catch (e) {
     yield {
       type: 'error',
@@ -270,16 +309,49 @@ function idleError(): ProviderEvent {
   };
 }
 
-/** Sleep before the next attempt: the server's Retry-After when given (capped at 60s), else an
- *  exponentially growing, jittered local backoff. */
-async function backoff(attempt: number, retryAfterMs?: number): Promise<void> {
+/**
+ * Sleep before the next attempt: the server's Retry-After when given (capped at 60s), else an
+ * exponentially growing, jittered local backoff.
+ *
+ * ABORTABLE (C2). This used to be a bare `setTimeout` promise with no signal, and there is no
+ * in-flight fetch to cancel during a backoff — the abort check happens at the TOP of the next
+ * iteration. So on a `429 + Retry-After: 60` the process ignored ESC for a full minute per retry
+ * while the TUI cheerfully showed the turn as running. Rejecting on abort makes the wait
+ * interruptible; the caller's existing abort handling takes it from there.
+ */
+function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(new DOMException('Aborted', 'AbortError'));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    function onAbort(): void {
+      clearTimeout(timer);
+      reject(new DOMException('Aborted', 'AbortError'));
+    }
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/**
+ * How long the local backoff ladder rides out a transient failure (C3).
+ *
+ * Was MAX_ATTEMPTS=4 over `250 * 2**(n-1)` — about 2.3s total, and the 8000ms cap was literally
+ * unreachable. Anthropic 529 bursts last 5–30s, so a blip any well-behaved client rides out
+ * instead tripped `isFallbackEligible` and silently swapped the user onto a weaker model
+ * mid-task. The ladder now spans ~24s (1s, 3s, 7s, 13s + jitter), which is long enough to
+ * outlast a normal burst — and it only got safe to lengthen because C2 made the wait
+ * interruptible, so a user who doesn't want to wait presses ESC.
+ */
+async function backoff(attempt: number, retryAfterMs?: number, signal?: AbortSignal): Promise<void> {
   if (retryAfterMs != null) {
-    await new Promise((resolve) => setTimeout(resolve, Math.min(retryAfterMs, 60_000)));
+    await abortableSleep(Math.min(retryAfterMs, 60_000), signal);
     return;
   }
-  const base = Math.min(8_000, 250 * 2 ** (attempt - 1)); // 250, 500, 1000, 2000…
+  const base = Math.min(13_000, 1_000 * (2 ** attempt - 1)); // 1s, 3s, 7s, 13s…
   const jitter = Math.random() * base * 0.3;
-  await new Promise((resolve) => setTimeout(resolve, base + jitter));
+  await abortableSleep(base + jitter, signal);
 }
 
 /** Parse an HTTP `Retry-After` header (delta-seconds OR an HTTP-date) to milliseconds, or undefined. */
@@ -328,6 +400,22 @@ export function shrinkMaxTokens(body: unknown): boolean {
   return changed;
 }
 
+/**
+ * A problem with THIS IMAGE — decode/size/format/fetch — as opposed to the model lacking vision.
+ *
+ * Both outcomes must still STRIP AND RETRY, which is the trap C7 nearly walked into: narrowing
+ * `looksLikeVisionUnsupported` so a corrupt image no longer matched meant the 400 became terminal
+ * — and because the image stays in conversation history and every request body is rebuilt from
+ * history, the identical 400 then fired on EVERY subsequent turn. The session was wedged until
+ * /clear. Showing the real error is right; showing it INSTEAD of recovering is not. So the two
+ * predicates differ only in the REASON the user is told, never in whether we recover.
+ */
+export function looksLikeBadImagePayload(msg: string): boolean {
+  const m = msg.toLowerCase();
+  if (!(m.includes('image') || m.includes('image_url'))) return false;
+  return /base64|decode|dimension|pixel|too large|exceeds|corrupt|truncat|malformed|file size|bytes|could not (?:be )?(?:fetch|download|process)|format/.test(m);
+}
+
 /** True if a 4xx message indicates the endpoint rejected image content (a text-only model/server). */
 export function looksLikeVisionUnsupported(msg: string): boolean {
   const m = msg.toLowerCase();
@@ -338,6 +426,18 @@ export function looksLikeVisionUnsupported(msg: string): boolean {
   if (m.includes('multimodal') && /not a |is not |non-/.test(m)) return true;
   if (/not a multimodal|non-multimodal|text-only model|does not support (multi-?modal|vision|images?)/.test(m)) return true;
   // Generic "image(s) unsupported / invalid content type" variants across servers.
+  //
+  // NARROWED (C7): the old arm was `image` + (not support|unsupported|invalid|cannot|does not),
+  // which also matched ordinary, fixable image problems — verified true for
+  // "invalid base64 data" and "image dimensions exceed 8000 pixels". Those got the attachment
+  // silently replaced with "[image omitted — the current model has no vision support]" and the
+  // REAL error was never shown, so a user with a corrupt or oversized file was told their model
+  // lacks a capability it actually has. Anything that names a decode/size/format problem is about
+  // THIS image, not about the model, and must surface as itself.
+  // The DISCRIMINATOR is this negative guard, checked first: anything naming a decode/size/format
+  // problem is about THIS image, not about the model. The positive arm below then keeps its
+  // original breadth, so genuine phrasings like "invalid content type: image" still strip.
+  if (/base64|decode|dimension|pixel|too large|exceeds|corrupt|truncat|malformed|file size|bytes/.test(m)) return false;
   if ((m.includes('image_url') || m.includes('image')) && /not support|unsupported|invalid|cannot|does not|no vision|only text/.test(m)) return true;
   return false;
 }
@@ -348,7 +448,7 @@ export function looksLikeVisionUnsupported(msg: string): boolean {
  * Anthropic (`image`) part shapes. Returns true if it changed anything (there were images to
  * strip), so the caller only retries when stripping actually helps. Mutates in place.
  */
-export function stripImagesFromBody(body: unknown): boolean {
+export function stripImagesFromBody(body: unknown, reason?: string): boolean {
   if (!body || typeof body !== 'object') return false;
   const b = body as Record<string, unknown>;
   // Chat-completions carries messages under `messages`; the Responses API (/v1/responses) carries them
@@ -371,7 +471,9 @@ export function stripImagesFromBody(body: unknown): boolean {
       .filter((p) => p && isTxt(p.type) && typeof p.text === 'string')
       .map((p) => p.text as string);
     texts.push(
-      '[image omitted — the current model has no vision support; use the describe_media tool to see it]',
+      reason
+        ? `[image omitted — ${reason}]`
+        : '[image omitted — the current model has no vision support; use the describe_media tool to see it]',
     );
     msg.content = texts.join('\n');
     stripped = true;

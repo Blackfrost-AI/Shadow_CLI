@@ -59,6 +59,9 @@ import {
   nextGrapheme,
   killToLineEnd,
   killToLineStart,
+  searchHistoryBack,
+  historySearchPrompt,
+  type HistorySearchState,
   COMPOSER_MAX_VISIBLE_ROWS,
   COMPOSER_GUTTER,
 } from './tui/composer.js';
@@ -163,6 +166,23 @@ import { redactString } from './util/redact.js';
 import { useKeybindings } from './tui/keybindings/useKeybinding.js';
 import { bindingsForDisplay, initKeybindingsFile } from './tui/keybindings/loader.js';
 import type { ContextName } from './tui/keybindings/types.js';
+import { stripCtl, formatUsage, formatCount, shellCommandOf, agentAttr, oneLine, formatDiffStats, shortPath } from './tui/format.js';
+import {
+  THEMES,
+  THEME_NAMES,
+  THEME_DESCRIPTIONS,
+  THEME_ALIASES,
+  C,
+  normalizeThemeName,
+  applyTheme,
+  paletteSnapshot,
+  backgroundSequence,
+  themeBackground,
+  type ThemeName,
+  type CanonicalThemeName,
+  type Palette,
+} from './tui/theme.js';
+
 
 interface TuiStyleState {
   style: OutputStyle;
@@ -170,342 +190,6 @@ interface TuiStyleState {
   systemForStyle?: (style: OutputStyle) => string;
 }
 
-// ── Theme ────────────────────────────────────────────────────────────────────
-// Ink/chalk color names + hex. These are passed as Ink `color` PROPS (never as
-// raw ANSI escapes embedded in text — Ink does its own styling). The plain
-// headless renderer below uses raw ANSI because it writes straight to stdout.
-/**
- * Color palette. `C` is a MUTABLE singleton: `/theme` mutates it in place via
- * Object.assign and forces a re-render. Because every `C.xxx` is read at render
- * time (never captured), all ~85 call sites pick up the new palette on the next
- * paint without threading a context through the tree.
- */
-// ACCESSIBILITY (WCAG 2.1 AA): primary text `fg` is WHITE for maximum legibility, and `dim` is an
-// EXPLICIT readable gray (NOT Ink's `dimColor` faint attribute, which terminals render unpredictably
-// and which routinely fails the 4.5:1 contrast floor). Every `fg`/`dim` here clears 4.5:1 on a black or
-// dark-gray terminal; accents (cyan/green/yellow/purple/red) are chosen to clear it too.
-//
-// Role tokens beyond the six accents:
-//   body   — transcript prose tier (softer than `bright` so bold/headers can pop above it)
-//   bright — the pop tier (bold text, header cells, tool names)
-//   user   — the ▌ gutter bar marking every line of a user turn (shape + color cue)
-//   accent — the ⏺ assistant-turn bullet
-//   codeBg — inline-code chip background (must contrast the theme's implied terminal bg)
-// `user` vs `accent` are chosen per-theme to stay distinguishable under color-vision
-// deficiency — and the cue is never color-alone: user turns carry the ▌ bar SHAPE.
-const THEMES = {
-  og: {
-    fg: '#ffffff', // white — high contrast
-    body: '#c9d2da', // transcript prose — soft, readable tier under bright
-    bright: '#ffffff',
-    dim: '#b6bcc3', // ~9:1 on black — readable secondary text
-    cyan: '#38dbf5',
-    green: '#22d38f', // emerald, brightened for contrast
-    red: '#ff6b6b', // red, brightened past AA
-    yellow: '#f5b62e', // amber
-    purple: '#b9a3ff', // violet, brightened
-    user: '#22d38f',
-    accent: '#d97757', // warm turn-bullet orange
-    codeBg: '#2d333b',
-    bg: null,
-    menuBg: '#1b2331',
-    menuSelBg: '#31465f',
-  },
-  // Backward-compatible alias for configs saved before the OG name existed.
-  dark: {
-    fg: '#ffffff',
-    body: '#c9d2da',
-    bright: '#ffffff',
-    dim: '#b6bcc3',
-    cyan: '#38dbf5',
-    green: '#22d38f',
-    red: '#ff6b6b',
-    yellow: '#f5b62e',
-    purple: '#b9a3ff',
-    user: '#22d38f',
-    accent: '#d97757',
-    codeBg: '#2d333b',
-    bg: null,
-    menuBg: '#1b2331',
-    menuSelBg: '#31465f',
-  },
-  pipboy: {
-    fg: '#e6ffcf', // bright green-white
-    body: '#cde8ad',
-    bright: '#e6ffcf',
-    dim: '#a9cf86',
-    cyan: '#9be07a',
-    green: '#b6f58a',
-    red: '#ff8a7a',
-    yellow: '#ecd977',
-    purple: '#c8ea86',
-    user: '#b6f58a',
-    accent: '#ecd977',
-    codeBg: '#1e2a14',
-    bg: null,
-    menuBg: '#16210d',
-    menuSelBg: '#2b3f1c',
-  },
-  cyberpunk: {
-    fg: '#f7fbff',
-    body: '#d7deea',
-    bright: '#f7fbff',
-    dim: '#b3bccb',
-    cyan: '#4fe0ff',
-    green: '#4ff0b3',
-    red: '#ff6f93',
-    yellow: '#ffdc80',
-    purple: '#e08cff',
-    user: '#4fe0ff',
-    accent: '#e08cff',
-    codeBg: '#2a2438',
-    bg: null,
-    menuBg: '#1d1830',
-    menuSelBg: '#38265c',
-  },
-  'coder-chick': {
-    fg: '#fff7fb',
-    body: '#eedbe5',
-    bright: '#fff7fb',
-    dim: '#dcc3cf',
-    cyan: '#9fdcff',
-    green: '#7fe0a0',
-    red: '#ff7ba6',
-    yellow: '#ffd485',
-    purple: '#ff9fd4',
-    user: '#7fe0a0',
-    accent: '#ff9fd4',
-    codeBg: '#382631',
-    bg: null,
-    menuBg: '#281a22',
-    menuSelBg: '#4a2f3d',
-  },
-  light: {
-    fg: '#0a0a0a', // near-black (for light terminals)
-    body: '#1f2328',
-    bright: '#000000',
-    dim: '#565656', // ~6:1 on a light background
-    cyan: '#0369a1', // sky-700
-    green: '#047857', // emerald-700
-    red: '#b91c1c', // red-700
-    yellow: '#b45309', // amber-700
-    purple: '#6d28d9', // violet-700
-    user: '#047857',
-    accent: '#c2410c', // orange-700 — AA on white
-    codeBg: '#eaeef2',
-    bg: null,
-    menuBg: '#e4e9ef',
-    menuSelBg: '#c9d6e6',
-  },
-  matrix: {
-    fg: '#5cff9f', // brighter phosphor green
-    body: '#54e893',
-    bright: '#c9ffdf',
-    dim: '#3fbf7a',
-    cyan: '#33ffd6',
-    green: '#5cff9f',
-    red: '#ff5f7d',
-    yellow: '#d6ff33',
-    purple: '#7fffbf',
-    user: '#33ffd6',
-    accent: '#d6ff33',
-    codeBg: '#06210f',
-    bg: null,
-    menuBg: '#04160a',
-    menuSelBg: '#0b3d1c',
-  },
-  mono: {
-    fg: '#f4f4f4', // bright grayscale — minimal color, terminal-default friendly
-    body: '#d6d6d6',
-    bright: '#ffffff',
-    dim: '#b4b4b4', // ~8:1 on black
-    cyan: '#cfd3d8',
-    green: '#d6d6d6',
-    red: '#ff8a8a',
-    yellow: '#ededed',
-    purple: '#c4c4c4',
-    user: '#ffffff', // mono relies on the ▌ bar shape — bar goes full bright
-    accent: '#e2e2e2',
-    codeBg: '#2e2e2e',
-    bg: null,
-    menuBg: '#1e1e1e',
-    menuSelBg: '#3a3a3a',
-  },
-  // Okabe–Ito palette: every accent pair stays distinguishable under deuteranopia,
-  // protanopia, AND tritanopia (the standard colorblind-safe set, lightness-tuned for
-  // dark terminals to clear WCAG AA). user (sky blue) vs accent (orange) is the
-  // strongest CVD-safe pairing — and the ▌ bar shape marks user turns regardless.
-  colorblind: {
-    fg: '#ffffff',
-    body: '#ccd4dc',
-    bright: '#ffffff',
-    dim: '#b6bcc3',
-    cyan: '#56b4e9', // OI sky blue
-    green: '#00c092', // OI bluish-green, brightened
-    red: '#e8763b', // OI vermillion, brightened
-    yellow: '#f0e442', // OI yellow
-    purple: '#d98cbb', // OI reddish-purple, brightened
-    user: '#56b4e9', // sky bar …
-    accent: '#e69f00', // … vs orange bullet: blue/orange survives all three CVD axes
-    codeBg: '#2d333b',
-    bg: null,
-    menuBg: '#1b2331',
-    menuSelBg: '#31465f',
-  },
-  // Maximum-contrast mode: pure white text, loud accents, brighter "quiet" tier —
-  // for low vision, glare, or projector terminals. Everything clears AAA (7:1).
-  'high-contrast': {
-    fg: '#ffffff',
-    body: '#ffffff',
-    bright: '#ffffff',
-    dim: '#dcdcdc', // quiet tier stays ~15:1 — de-emphasis by role, never by illegibility
-    cyan: '#00ffff',
-    green: '#00ff7f',
-    red: '#ff5555',
-    yellow: '#ffff00',
-    purple: '#e0b0ff',
-    user: '#00ff7f',
-    accent: '#ffa347',
-    codeBg: '#262626',
-    bg: null,
-    menuBg: '#161616',
-    menuSelBg: '#3d3d3d',
-  },
-  // The only theme that ASSERTS a background. `bg` is pushed to the terminal itself via OSC 11
-  // (see backgroundSequence) rather than painted per cell — in the stock renderer the app writes
-  // into the terminal's normal buffer and does not own the screen, so a per-<Text> background
-  // would leave a ragged edge everywhere a line is shorter than the window.
-  //
-  // Accents are Okabe–Ito-derived (as `colorblind` is) so the focused look costs nothing under
-  // deuteranopia/protanopia/tritanopia, and every tier is measured against TRUE black rather than
-  // an assumed one: body 15.3:1, dim 9.6:1, sky 8.5:1, orange 8.4:1 — all AAA for body text.
-  shadow: {
-    fg: '#ffffff',
-    body: '#d5dbe1', // 15.3:1 on #000 — soft enough not to bloom on a pure-black field
-    bright: '#ffffff',
-    dim: '#a7b0b9', // 9.6:1 — de-emphasis by role, never by illegibility
-    cyan: '#5cb8ec', // OI sky blue
-    green: '#00c99a', // OI bluish-green
-    red: '#ef7a45', // OI vermillion
-    yellow: '#f0e442', // OI yellow
-    purple: '#dd93c0', // OI reddish-purple
-    // The ▌user bar vs the ⏺ turn bullet is the most load-bearing color pair in the transcript.
-    // OI sky/orange survives deuteranopia, protanopia and tritanopia on HUE — but at their stock
-    // values the two sit 0.011 apart in luminance (the `colorblind` theme has the same collision,
-    // and leans on the bar's SHAPE for it). On true black there is headroom to lift the sky, so
-    // this pair is separated on luminance too (0.158) and stays legible in grayscale and under
-    // achromatopsia — belt and braces, at no cost to either hue.
-    user: '#8ed0f5', // sky bar, brightened — 12.5:1 …
-    accent: '#e69f00', // … vs orange bullet — 9.3:1
-    codeBg: '#141414', // barely-lifted charcoal: a code chip reads as a panel, not a hole
-    bg: '#000000',
-    menuBg: '#101010',
-    menuSelBg: '#2b2b2b',
-  },
-} as const;
-export type ThemeName = keyof typeof THEMES;
-export const THEME_NAMES = ['og', 'shadow', 'pipboy', 'cyberpunk', 'coder-chick', 'matrix', 'mono', 'light', 'colorblind', 'high-contrast'] as const;
-type CanonicalThemeName = (typeof THEME_NAMES)[number];
-
-const THEME_DESCRIPTIONS: Record<CanonicalThemeName, string> = {
-  og: 'Original Shadow palette: calm dark terminal with cyan/violet accents.',
-  shadow: 'True black. Sets the terminal background itself for a focused session; colorblind-safe accents.',
-  pipboy: 'Soft green phosphor with amber warnings; retro but low-glare.',
-  cyberpunk: 'Cyan, magenta, and yellow accents on a high-contrast dark base.',
-  'coder-chick': 'Rose/pink accent palette with neutral text and readable status colors.',
-  matrix: 'Green phosphor mode with sharper signal colors.',
-  mono: 'Minimal grayscale for plain terminal focus.',
-  light: 'Near-black text and restrained color for light terminals.',
-  colorblind: 'Okabe–Ito accessible palette — accents stay distinct under deuteranopia, protanopia, and tritanopia.',
-  'high-contrast': 'Maximum contrast (WCAG AAA): pure white text, loud accents, brighter quiet tier.',
-};
-
-const THEME_ALIASES: Record<string, CanonicalThemeName> = {
-  dark: 'og',
-  black: 'shadow',
-  oled: 'shadow',
-  focus: 'shadow',
-  pink: 'coder-chick',
-  coderchick: 'coder-chick',
-  chick: 'coder-chick',
-  pip: 'pipboy',
-  cb: 'colorblind',
-  a11y: 'colorblind',
-  accessible: 'colorblind',
-  'okabe-ito': 'colorblind',
-  hc: 'high-contrast',
-  contrast: 'high-contrast',
-  highcontrast: 'high-contrast',
-};
-
-/**
- * The active palette. Every theme defines EVERY field — including `bg: null` for the ones that
- * leave the terminal's own background alone — because `applyTheme` is an in-place Object.assign:
- * a field missing from the incoming theme would keep the outgoing theme's value.
- */
-export interface Palette {
-  fg: string;
-  body: string;
-  bright: string;
-  dim: string;
-  cyan: string;
-  green: string;
-  red: string;
-  yellow: string;
-  purple: string;
-  user: string;
-  accent: string;
-  codeBg: string;
-  /** Terminal background this theme asserts via OSC 11, or null to inherit the user's own. */
-  bg: string | null;
-  menuBg: string;
-  menuSelBg: string;
-}
-
-const C: Palette = { ...THEMES.og };
-
-function normalizeThemeName(name: string | undefined): CanonicalThemeName | null {
-  if (!name) return null;
-  const raw = name.toLowerCase();
-  if ((THEME_NAMES as readonly string[]).includes(raw)) return raw as CanonicalThemeName;
-  return THEME_ALIASES[raw] ?? null;
-}
-
-/** Swap the active palette in place. Caller must trigger a re-render to repaint. */
-export function applyTheme(name: ThemeName | string): void {
-  const theme = normalizeThemeName(name) ?? 'og';
-  Object.assign(C, THEMES[theme]);
-}
-
-/** Test seam: a copy of the active palette (colors change in place via applyTheme). */
-export function paletteSnapshot(): Palette {
-  return { ...C };
-}
-
-/**
- * The escape that asks the TERMINAL to change its default background (OSC 11), or resets it to the
- * user's own (OSC 111) when a theme asserts no background. Pure so the sequencing is unit-tested.
- *
- * Why the terminal and not per-cell painting: in the stock renderer Shadow writes into the normal
- * screen buffer and does not own the screen, so `backgroundColor` on a <Text> paints only as far
- * as that line's characters — every short line would end in a ragged edge against the real
- * background, and the margins would never fill at all. OSC 11 colors the whole window, costs
- * nothing per frame, and leaves native scrollback intact.
- *
- * It is WINDOW-WIDE and persists until reset, so runTui must restore it on exit exactly as it
- * already does for the window title. `SHADOW_NO_BG=1` opts out (tmux without passthrough, or a
- * terminal whose background you never want an app to touch).
- */
-export function backgroundSequence(bg: string | null, isTTY: boolean, env: NodeJS.ProcessEnv = process.env): string {
-  if (!isTTY || env.SHADOW_NO_BG === '1') return '';
-  return bg ? `\x1b]11;${bg}\x07` : '\x1b]111\x07';
-}
-
-/** The background the named theme asserts (null = inherit the terminal's own). */
-export function themeBackground(name: string | undefined): string | null {
-  const theme = normalizeThemeName(name) ?? 'og';
-  return THEMES[theme].bg;
-}
 
 // `imageMediaType` now lives in util/image.ts (shared with the view_image tool);
 // re-exported here so existing importers (and tui tests) keep working.
@@ -661,6 +345,7 @@ const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/version', desc: 'Show Shadow version' },
   { name: '/color', desc: 'Switch color theme (alias for /theme)', dispatch: '/theme' },
   { name: '/theme', desc: 'Switch color theme (list, preview <name>, or name; no arg cycles)' },
+  { name: '/terminal-setup', desc: 'Make Shift+Enter insert a newline (per-terminal instructions)' },
   { name: '/vim', desc: 'Toggle modal (NORMAL/INSERT) editing in the composer' },
   { name: '/statusline', desc: 'Set a shell command for a custom footer line (/statusline none to clear)' },
   { name: '/add-dir', desc: 'Grant an extra directory to file tools for this session' },
@@ -1241,6 +926,18 @@ const DSR_REPLY_EXACT = /^\x1b?\[\d+;\d+R$/;
 const HOME_KEYS = /^\x1b(\[1~|\[7~|\[H|OH)$/;
 const END_KEYS = /^\x1b(\[4~|\[8~|\[F|OF)$/;
 const FORWARD_DELETE = /^\x1b\[3(;\d+)?~$/;
+/**
+ * Shift+Enter, in the encodings terminals actually send once configured (A3).
+ *
+ * Out of the box Terminal.app, iTerm2 and the VS Code terminal all send a BARE `\r` for
+ * Shift+Enter — indistinguishable from Enter — so the `key.shift` test could never be true and
+ * the composer spent the whole 3.x line advertising a binding that did not work. A terminal
+ * configured for CSI-u (kitty/foot/WezTerm natively; iTerm2 + VS Code via `/terminal-setup`)
+ * sends `ESC [ 13 ; 2 u`; xterm's modifyOtherKeys sends `ESC [ 27 ; 2 ; 13 ~`.
+ */
+const SHIFT_ENTER = /^\x1b\[(?:13;(\d+)u|27;(\d+);13~)$/;
+/** Alt/Option+Enter — the one that DOES work everywhere today, and Ctrl+J (0x0a). */
+const ALT_ENTER = /^\x1b\r?$|^\x1b\n$/;
 /** Collaboration Mode: the baton is always this warm orange (Shadow's brand ⏺ color) — never a seat color. */
 const BATON_ORANGE = '#d97757';
 const MARGIN_PAD = ' '.repeat(PAGE_MARGIN);
@@ -1551,7 +1248,7 @@ function isChatter(kind: string | undefined): boolean {
 }
 
 /** Empty-composer placeholder — a dim prompt, not an example that could be mistaken for real input. */
-const COMPOSER_PLACEHOLDER = 'Send a message…  ( / for commands · Shift+Enter newline )';
+const COMPOSER_PLACEHOLDER = 'Send a message…  ( / for commands · Option+Enter newline )';
 
 /**
  * Multi-row composer: soft-wraps long lines, keeps a real caret on any row, scrolls a window when
@@ -1906,27 +1603,6 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const histIdxRef = useRef(0);
   /** The unsent draft, parked when ↑ steps into history so ↓ can bring it back. */
   const draftRef = useRef('');
-  /**
-   * Live values the DYNAMIC argument menus read (which session, which turn, which granted dir).
-   * Refreshed each render and held in a ref so the key handler — which is not re-created per
-   * render — always sees the current one.
-   *
-   * `sessions` is deliberately read from disk ONCE per mount: listResumableSessions opens every
-   * session log in the workspace looking for a snapshot, and the menu re-filters on every
-   * keystroke. The set only grows when a NEW session starts, which by definition is not this one.
-   */
-  const argCtxRef = useRef<ArgContext | null>(null);
-  const resumableRef = useRef<{ id: string; label: string }[] | null>(null);
-  if (resumableRef.current === null) {
-    try {
-      resumableRef.current = listResumableSessions(opts.workspaceRoot).map((s) => ({
-        id: s.id,
-        label: s.ts ? `Snapshot ${s.ts}` : s.path,
-      }));
-    } catch {
-      resumableRef.current = []; // an unreadable session dir must never break the menu
-    }
-  }
   const menuIndexRef = useRef(0);
   const cursorRef = useRef(0);
   // Rows rendered BELOW the composer input's last line (bottom rule + hint + custom-status),
@@ -2016,6 +1692,47 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     setInput(v);
     setCursor(v.length);
   }, []);
+
+  /**
+   * Reverse history search (Ctrl+R). Null when closed. The composer keeps showing the current
+   * HIT while this is open — typing narrows, Ctrl+R again steps to the next older match, Enter
+   * accepts it, Esc restores the draft that was there before the search opened.
+   */
+  const searchRef = useRef<HistorySearchState | null>(null);
+  const [searchLine, setSearchLine] = useState<string | null>(null);
+  const applySearch = useCallback(
+    (st: HistorySearchState | null) => {
+      searchRef.current = st;
+      if (!st) {
+        setSearchLine(null);
+        return;
+      }
+      setSearchLine(historySearchPrompt(st, historyRef.current));
+      setLine(st.index >= 0 ? (historyRef.current[st.index] ?? '') : '');
+    },
+    [setLine],
+  );
+  /**
+   * Live values the DYNAMIC argument menus read (which session, which turn, which granted dir).
+   * Refreshed each render and held in a ref so the key handler — which is not re-created per
+   * render — always sees the current one.
+   *
+   * `sessions` is deliberately read from disk ONCE per mount: listResumableSessions opens every
+   * session log in the workspace looking for a snapshot, and the menu re-filters on every
+   * keystroke. The set only grows when a NEW session starts, which by definition is not this one.
+   */
+  const argCtxRef = useRef<ArgContext | null>(null);
+  const resumableRef = useRef<{ id: string; label: string }[] | null>(null);
+  if (resumableRef.current === null) {
+    try {
+      resumableRef.current = listResumableSessions(opts.workspaceRoot).map((s) => ({
+        id: s.id,
+        label: s.ts ? `Snapshot ${s.ts}` : s.path,
+      }));
+    } catch {
+      resumableRef.current = []; // an unreadable session dir must never break the menu
+    }
+  }
 
   const setComposer = useCallback((nextInput: string, nextCursor: number) => {
     inputRef.current = nextInput;
@@ -2401,6 +2118,11 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     });
     reflow('soft');
   }), [kbRegister, reflow]);
+  // B6 — `app:redraw` is the action loader.ts uses as ITS DOCUMENTED EXAMPLE
+  // (`{"ctrl+l": "app:redraw"}`), but Global was `{}` and nothing registered the id — so a user
+  // copying the doc's own example got a binding that parsed, warned about nothing, and never
+  // fired. Bound to the hard reflow the resize path already uses.
+  useEffect(() => kbRegister('app:redraw', () => reflow('hard')), [kbRegister, reflow]);
   useEffect(() => kbRegister('transcript:toggleTaskList', () => {
     // Works idle AND mid-turn — users hit Ctrl-T to inspect the list while the agent runs.
     // (Key delivery for Ctrl+T is fixed in eventToKeystroke: C0 bytes map to letter+ctrl.)
@@ -2548,7 +2270,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
               { text: 'Commands:', bold: true },
               ...SLASH_COMMANDS.map((c) => ({ text: `  ${c.name.padEnd(SLASH_NAME_WIDTH)} ${c.desc}`, dimColor: true })),
               {
-                text: 'Keys: Shift+Tab mode · Shift+Enter newline · ↑/↓ edit multi-line (history at edges) · click to place caret · Ctrl-O fold · Ctrl-T tasks · Ctrl-V paste · Alt-C copy answer · Esc interrupt · Ctrl-C quit',
+                text: 'Keys: Shift+Tab mode · Option+Enter newline (/terminal-setup enables Shift+Enter) · ↑/↓ edit multi-line (history at edges) · Ctrl-O fold · Ctrl-T tasks · Ctrl-V paste · Alt-C copy answer · Esc interrupt · Ctrl-C quit',
                 dimColor: true,
               },
               { text: 'Approvals: y/n · s session · f prefix (shell) · a always', dimColor: true },
@@ -2605,6 +2327,12 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           opts.todoList?.write([]); // clear the backing source so the agent starts fresh
           attachmentsRef.current = []; // drop any queued image attachments
           setAttachCount(0);
+          // Exit plan mode for REAL, not just in React state (D2). setPlanMode alone changed the
+          // badge while PlanModeState stayed active — so plan.block() kept going into the system
+          // prompt and every write was denied afterwards with NO on-screen explanation, because
+          // the UI had already stopped saying plan mode was on. Drive the state object and let its
+          // bus event update the UI, so the two can't disagree again.
+          opts.planMode?.exit();
           setPlanMode({ mode: 'implement' }); // drop any stale plan title
           showBanner();
           pushLine({ text: 'Cleared — conversation reset. (goal kept — use /goal clear to drop it)', dimColor: true });
@@ -3747,6 +3475,47 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           pushLine({ text: `Status line set: ${arg}`, color: C.cyan });
           break;
         }
+        case '/terminal-setup': {
+          // Terminal.app, iTerm2 and the VS Code terminal all send a BARE \r for Shift+Enter, so
+          // no application can distinguish it from Enter. Shadow understands the CSI-u and
+          // modifyOtherKeys encodings; this tells you how to make your terminal send one.
+          // Deliberately PRINTS rather than writes: these are files outside the workspace
+          // (iTerm2 prefs, VS Code keybindings.json) and silently editing them is not something a
+          // CLI should do on its own.
+          const tp = process.env.TERM_PROGRAM ?? '';
+          const term = process.env.TERM ?? '';
+          const native = /kitty|wezterm|ghostty|foot/i.test(term) || /WezTerm|ghostty/i.test(tp);
+          const lines: { text: string; color?: string; dimColor?: boolean }[] = [];
+          lines.push({ text: 'Shift+Enter — insert a newline instead of sending', color: C.cyan });
+          lines.push({ text: '' });
+          if (native) {
+            lines.push({ text: `Your terminal (${tp || term}) speaks CSI-u natively — Shift+Enter should already work.`, dimColor: true });
+            lines.push({ text: 'If it does not, check that no keybinding overrides it.', dimColor: true });
+          } else if (tp === 'iTerm.app') {
+            lines.push({ text: 'iTerm2:', color: C.green });
+            lines.push({ text: '  Settings → Profiles → Keys → Key Mappings → +', dimColor: true });
+            lines.push({ text: '  Shortcut: Shift+Enter   Action: Send Escape Sequence', dimColor: true });
+            lines.push({ text: '  Esc+:  [13;2u', dimColor: true });
+          } else if (tp === 'vscode') {
+            lines.push({ text: 'VS Code — add to keybindings.json (⌘⇧P → "Open Keyboard Shortcuts (JSON)"):', color: C.green });
+            lines.push({ text: '  {', dimColor: true });
+            lines.push({ text: '    "key": "shift+enter",', dimColor: true });
+            lines.push({ text: '    "command": "workbench.action.terminal.sendSequence",', dimColor: true });
+            lines.push({ text: '    "when": "terminalFocus",', dimColor: true });
+            lines.push({ text: '    "args": { "text": "\\u001b[13;2u" }', dimColor: true });
+            lines.push({ text: '  }', dimColor: true });
+          } else if (tp === 'Apple_Terminal') {
+            lines.push({ text: 'Terminal.app cannot send CSI-u — it has no per-key escape mapping.', color: C.yellow });
+            lines.push({ text: 'Use Option+Enter (works today), or switch to iTerm2/WezTerm/kitty.', dimColor: true });
+          } else {
+            lines.push({ text: `Terminal not recognised (TERM_PROGRAM=${tp || 'unset'}, TERM=${term || 'unset'}).`, dimColor: true });
+            lines.push({ text: 'Bind Shift+Enter to send the escape sequence:  ESC [ 1 3 ; 2 u', dimColor: true });
+          }
+          lines.push({ text: '' });
+          lines.push({ text: 'Working today with no setup: Option+Enter, Ctrl+J, or a trailing \\ then Enter.', dimColor: true });
+          pushLine({ kind: 'system', text: 'terminal-setup', lines });
+          break;
+        }
         case '/vim': {
           const vimArg = arg.toLowerCase();
           const next = vimArg === 'on' ? true : vimArg === 'off' ? false : !vimEnabledRef.current;
@@ -3833,6 +3602,11 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           : baseBudgetRef.current;
         if (nextBudget !== opts.cfg.contextBudget) {
           opts.cfg.contextBudget = nextBudget;
+          // …and tell the LIVE Context, not just the HUD. Without this the clamp was cosmetic:
+          // maybeSummarize kept comparing against the budget captured at construction, so a
+          // 200k session moved onto a 32k serve showed a red bar, never auto-compacted, and
+          // 400'd once per turn until looksLikeTokenOverflow force-compacted after the fact.
+          context.setBudget(nextBudget);
           pushLine({ text: `  context budget → ${nextBudget.toLocaleString()} tokens (fits the model's window)`, dimColor: true });
         }
       }
@@ -4881,6 +4655,41 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         }
       }
 
+      // 2.95) Reverse history search (Ctrl+R). While open it owns typing, backspace, Enter and Esc.
+      if (searchRef.current) {
+        const st = searchRef.current;
+        if (key.escape) {
+          const saved = st.saved;
+          applySearch(null);
+          setLine(saved); // Esc restores exactly what was there before the search opened
+          return;
+        }
+        if (key.return) {
+          applySearch(null); // accept the hit that is already in the composer
+          return;
+        }
+        if (key.ctrl && ch === 'r') {
+          const next = searchHistoryBack(historyRef.current, st.query, st.index - 1);
+          applySearch({ ...st, index: next >= 0 ? next : st.index }); // stick at the oldest hit
+          return;
+        }
+        if (key.backspace || key.delete) {
+          const query = st.query.slice(0, -1);
+          applySearch({ ...st, query, index: searchHistoryBack(historyRef.current, query, historyRef.current.length - 1) });
+          return;
+        }
+        if (!key.ctrl && !key.meta && ch && !hasSgrMouse(ch)) {
+          const query = st.query + ch;
+          applySearch({ ...st, query, index: searchHistoryBack(historyRef.current, query, historyRef.current.length - 1) });
+          return;
+        }
+        return; // swallow everything else while the search owns the line
+      }
+      if (key.ctrl && ch === 'r' && historyRef.current.length > 0) {
+        applySearch({ query: '', index: -1, saved: inputRef.current });
+        return;
+      }
+
       // 3) Esc — the interrupt key. While a turn runs, Esc stops it (and the type-ahead queue
       // then flushes, so a queued message runs next). When idle, Esc cancels a pending queue,
       // else clears the composer. Session always survives — only Ctrl-C quits.
@@ -4988,6 +4797,14 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       const rawSeq = rawKeyRef.current;
       const editText = inputRef.current;
       const editCur = cursorRef.current;
+      // Shift+Enter via CSI-u / modifyOtherKeys. Ink has no field for it and its parser does not
+      // recognise the shape, so without this branch the literal text `[13;2u` was inserted into
+      // the draft on any terminal properly configured to send it.
+      if (SHIFT_ENTER.test(rawSeq)) {
+        setComposer(editText.slice(0, editCur) + '\n' + editText.slice(editCur), editCur + 1);
+        setMenuIndex(0);
+        return;
+      }
       const isHome = HOME_KEYS.test(rawSeq);
       const isEnd = END_KEYS.test(rawSeq);
       const isForwardDelete = FORWARD_DELETE.test(rawSeq);
@@ -5124,7 +4941,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
 
       // 8) Submit — or insert a newline (Shift+Enter / Alt+Enter / trailing `\`).
       if (key.return) {
-        const wantNewline = key.shift || key.meta || inputRef.current.endsWith('\\');
+        // `key.shift` alone is not enough: most terminals send a bare \r for Shift+Enter, and
+        // the ones that don't send a CSI-u/modifyOtherKeys sequence Ink reports as neither.
+        const shiftEnterRaw = SHIFT_ENTER.test(rawKeyRef.current);
+        const wantNewline = key.shift || key.meta || shiftEnterRaw || inputRef.current.endsWith('\\');
         if (wantNewline) {
           const s = inputRef.current;
           const c = cursorRef.current;
@@ -5478,12 +5298,16 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     ? `◆ baton: you · ${table.seats.map((s) => '@' + s.handle).join(' ')} · @handle to route · /table done`
     : '';
   const composerHint =
-    attachTag +
+    // A reverse search owns the hint row while it is open — that IS the search prompt, exactly
+    // as readline shows it: (reverse-i-search)`que': the matching entry.
+    searchLine !== null
+      ? searchLine
+      : attachTag +
     vimTag +
     (menu.length > 0
       ? `${idlePrefix}↑/↓ select · Tab complete · Enter ${running ? 'queues' : 'runs'} · Esc cancel`
       : running
-        ? `${idlePrefix}Type to queue · Enter queues · Shift+Enter newline · Esc interrupts · Ctrl-C ×2 quits`
+        ? `${idlePrefix}Type to queue · Enter queues · Option+Enter newline · Esc interrupts · Ctrl-C ×2 quits`
         : table
           ? `${idlePrefix}${tableLegend}`
           : `${idlePrefix}${idleStrip}${idleTail}`);
@@ -5848,26 +5672,6 @@ const A = {
   cyan: '\x1b[36m',
 };
 
-/** A lightweight renderer for the headless path that writes directly to stdout. */
-/** Strip terminal control sequences (ESC / CSI / OSC / BEL / C1) from UNTRUSTED content before the
- *  headless renderer writes it RAW to stdout. Model output, tool output, and fetched web / file content
- *  can smuggle OSC 52 (clipboard write), window-retitle, forged clickable hyperlinks, or cursor moves
- *  that hide output. Keeps \t \n \r; drops everything else dangerous. The renderer's own A.* color
- *  constants are trusted and applied AFTER this, so they still render. (The interactive Ink TUI is
- *  already safe — Ink escapes — so only this raw path needed it.) */
-function stripCtl(s: string): string {
-  return (
-    s
-      // OSC … terminated by BEL or ST
-      .replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/g, '')
-      // Fe / single-char escapes
-      .replace(/\x1b[@-Z\\-_]/g, '')
-      // CSI sequences
-      .replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '')
-      // stray C0 controls (keep \t \n \r) + C1 CSI/OSC introducers
-      .replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\x9b\x9d]/g, '')
-  );
-}
 
 export function attachRenderer(bus: EventBus, _opts?: { animate: boolean }): () => void {
   return bus.on((e) => {
@@ -5927,42 +5731,10 @@ export function attachRenderer(bus: EventBus, _opts?: { animate: boolean }): () 
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-interface UsageEvent {
-  inputTokens: number;
-  outputTokens: number;
-  costUSD: number;
-  contextPct: number;
-}
 
-/** Usage chrome fragment. Hides `$0.0000` (local / free runs) so the strip stays calm. */
-function formatUsage(e: UsageEvent): string {
-  const total = e.inputTokens + e.outputTokens;
-  const base = `${formatCount(total)} tokens · ctx ${Math.round(e.contextPct * 100)}%`;
-  if (!(e.costUSD > 0)) return base;
-  return `${base} · $${e.costUSD.toFixed(4)}`;
-}
 
-function formatCount(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}m`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
-  return String(n);
-}
 
-function shellCommandOf(input: unknown): string | null {
-  const o = input as Record<string, unknown> | undefined;
-  if (o && typeof o.command === 'string') return o.command;
-  return null;
-}
 
-/** Pull subagent attribution (type + description) from an `agent` tool call's parsed input, so the
- *  TUI can render a sub-agent distinctly (`▸ type · description`) instead of an anonymous row. */
-function agentAttr(input: unknown): { subagentType?: string; description?: string } | undefined {
-  const o = input as Record<string, unknown> | undefined;
-  if (!o) return undefined;
-  const description = typeof o.description === 'string' ? o.description : undefined;
-  const subagentType = typeof o.subagent_type === 'string' ? o.subagent_type : undefined;
-  return description || subagentType ? { description, subagentType } : undefined;
-}
 
 function previewOf(input: unknown): string {
   const o = input as Record<string, unknown> | undefined;
@@ -5980,29 +5752,12 @@ function previewOf(input: unknown): string {
   return '';
 }
 
-function oneLine(s: string): string {
-  const flat = s.replace(/\s+/g, ' ').trim();
-  return flat.length > 140 ? `${flat.slice(0, 137)}…` : flat;
-}
 
-/** Count +/- lines in a UI diff body for the one-row tool summary (`+12 −3`). */
-export function formatDiffStats(lines: { text: string }[]): string {
-  let plus = 0;
-  let minus = 0;
-  for (const l of lines) {
-    const t = l.text;
-    if (t.startsWith('…')) continue; // elision notice from capTranscriptBody
-    if (t.startsWith('+') && !t.startsWith('+++')) plus++;
-    else if (t.startsWith('-') && !t.startsWith('---')) minus++;
-  }
-  if (!plus && !minus) return '';
-  if (plus && minus) return `+${plus} −${minus}`;
-  if (plus) return `+${plus}`;
-  return `−${minus}`;
-}
 
-function shortPath(path: string): string {
-  const home = process.env.HOME;
-  const value = home && path.startsWith(home) ? `~${path.slice(home.length)}` : path;
-  return value.length > 42 ? `…${value.slice(-41)}` : value;
-}
+
+
+// Re-exported so existing importers (tests, scripts/demo-tui.ts) keep working after the
+// theme table moved to tui/theme.ts.
+export { THEMES, THEME_NAMES, applyTheme, paletteSnapshot, backgroundSequence, themeBackground };
+export type { ThemeName, Palette };
+export { formatDiffStats, shellCommandOf } from './tui/format.js'; // re-exported for existing importers

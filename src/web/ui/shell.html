@@ -12,16 +12,33 @@
        actual error on the page instead of leaving a blank screen. This inline script is allowed
        by the CSP ('unsafe-inline'); the external module (app.js) does the real work. -->
   <script>
+    // textContent, never innerHTML. These are the only two markup-parsing sites in the console,
+    // and the strings they render come from api.js Errors that INTERPOLATE raw server response
+    // bodies. Every call site currently catches, so this was latent rather than live — but one
+    // uncaught getJson() would turn it into XSS on a page that holds the session token and can
+    // POST to /api/*. replaceChildren + textContent cannot become markup.
+    function fatal(title, detail) {
+      var host = document.getElementById('app');
+      if (!host) return;
+      var pre = document.createElement('pre');
+      pre.style.color = '#ff6b6b';
+      pre.style.padding = '16px';
+      pre.style.whiteSpace = 'pre-wrap';
+      pre.textContent = title + ': ' + detail;
+      host.replaceChildren(pre);
+    }
     window.addEventListener('error', function (e) {
-      var el = document.getElementById('app');
-      if (el) el.innerHTML = '<pre style="color:#ff6b6b;padding:16px;white-space:pre-wrap">Failed to start: ' +
+      fatal(
+        'Failed to start',
         (e && e.message ? e.message : String(e)) +
-        (e && e.filename ? '\\n  at ' + e.filename + ':' + (e.lineno||0) : '') + '</pre>';
+          (e && e.filename ? '\\n  at ' + e.filename + ':' + (e.lineno || 0) : ''),
+      );
     });
     window.addEventListener('unhandledrejection', function (e) {
-      var el = document.getElementById('app');
-      var reason = e && e.reason ? (e.reason.stack || e.reason.message || String(e.reason)) : String(e);
-      if (el) el.innerHTML = '<pre style="color:#ff6b6b;padding:16px;white-space:pre-wrap">Unhandled rejection: ' + reason + '</pre>';
+      fatal(
+        'Unhandled rejection',
+        e && e.reason ? (e.reason.stack || e.reason.message || String(e.reason)) : String(e),
+      );
     });
   </script>
   <script type="module" src="/assets/app.js"></script>

@@ -83,7 +83,7 @@ test('saveAgentDef round-trips through the loader', () => {
   const raw = readFileSync(path, 'utf8');
   assert.match(raw, /^---\nname: security-auditor/);
   assert.match(raw, /maxIterations: 15/);
-  assert.match(raw, /^  - read_file$/m);
+  assert.match(raw, /^ {2}- read_file$/m);
   // And it reloads with every field preserved.
   const loaded = loadAgentDefs(home.home).find((d) => d.name === 'security-auditor');
   assert.ok(loaded, 'saved agent appears in loadAgentDefs');
@@ -138,7 +138,7 @@ test('serializeAgentDef produces frontmatter the parser reads back', () => {
   });
   assert.match(md, /^---\n/);
   assert.match(md, /---\n\nDo the thing\.\n$/);
-  assert.match(md, /^tools:\n  - read_file\n  - grep$/m);
+  assert.match(md, /^tools:\n {2}- read_file\n {2}- grep$/m);
 });
 
 test('isValidAgentName / isValidToolName', () => {

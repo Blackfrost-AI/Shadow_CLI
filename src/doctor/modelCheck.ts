@@ -130,6 +130,13 @@ async function collectTurn(
   } finally {
     clearTimeout(timer);
   }
+  // The abort may never surface as a THROW: streamWithRetry swallows aborts and returns cleanly
+  // (see its `if (a.signal?.aborted) return` paths), so the catch above never ran and `timedOut`
+  // stayed false. Every one of the five `timedOut ?` branches downstream was therefore dead code,
+  // and a slow local .gguf — which is exactly what this command exists to diagnose — was reported
+  // as "did not emit a valid write_file call", i.e. the model was blamed for the timeout. Check
+  // the signal directly after the loop, which is true whether or not anything threw.
+  if (ac.signal.aborted) out.timedOut = true;
   return out;
 }
 

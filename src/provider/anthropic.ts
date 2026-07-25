@@ -54,6 +54,7 @@ export class AnthropicProvider implements Provider {
     system?: string;
     messages: Message[];
     tools?: any[];
+    signal?: AbortSignal;
   }): Promise<number> {
     // Build a minimal count_tokens request body.
     const body: any = {
@@ -82,11 +83,17 @@ export class AnthropicProvider implements Provider {
     if (this.authToken) headers['authorization'] = `Bearer ${this.authToken}`;
     else if (this.apiKey) headers['x-api-key'] = this.apiKey;
 
-    const res = await fetch(countUrl, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(body),
-    });
+    // Bounded + interruptible (D4). This runs INSIDE maybeSummarize with no timeout of its own,
+    // so on a slow or wedged endpoint it could hang for undici's default (~5 min) with ESC doing
+    // nothing. A count is an optimization — never let it outlast the thing it optimizes.
+    const timeout = AbortSignal.timeout(10_000);
+    const signal = args.signal ? AbortSignal.any([timeout, args.signal]) : timeout;
+    let res: Response;
+    try {
+      res = await fetch(countUrl, { method: 'POST', headers, body: JSON.stringify(body), signal });
+    } catch {
+      return estimateTokensFromMessages(args.messages ?? []); // timed out / aborted → estimate
+    }
     if (!res.ok) {
       // Fall back to local heuristic on error (don't break compaction).
       return estimateTokensFromMessages(args.messages ?? []);

@@ -6,7 +6,8 @@ import { WebDenyGate } from './webGate.js';
 import type { LoopDeps } from '../agent/loop.js';
 import type { ShadowConfig } from '../config.js';
 import type { ToolCall } from '../provider/provider.js';
-import type { TurnRunner, WebSession } from './registry.js';
+import type { JailCapability, TurnRunner, WebSession } from './registry.js';
+import { resolveJail } from './projects.js';
 
 /**
  * Assemble the LoopDeps for one web turn. THE JAIL ENFORCEMENT POINT: workspaceRoot /
@@ -60,10 +61,20 @@ export function buildTurnDeps(session: WebSession): LoopDeps {
  * The real `TurnRunner`: record the user's turn, assemble deps (the jail enforcement above), and
  * run one loop. The run lock is held by the registry around this call.
  */
-export function makeTurnRunner(): TurnRunner {
+export function makeTurnRunner(resolve: (root: string) => JailCapability = resolveJail): TurnRunner {
   return async (session: WebSession, prompt: string) => {
     const agent = session.agent;
     if (!agent) throw new Error('runTurn called before the session was built');
+
+    // E1 — RE-RESOLVE the jail from the allowlist on EVERY turn.
+    //
+    // `session.jail` was written once, by the builder, and every later turn read the frozen copy.
+    // So removing a project made its card disappear and returned 200 while the still-open session
+    // kept reading and writing that directory at auto-edit. `projects.ts` and `api/projects.ts`
+    // both document the opposite ("never once at session-create", "revocation ALWAYS succeeds").
+    // resolveJail throws when the path is no longer allowlisted; that propagates into
+    // registry.drive()'s catch, which marks the session errored and emits a terminal frame.
+    session.jail = resolve(session.displayPath);
 
     // Record the user's turn on the shared context and the wire (the browser echoes it).
     agent.context.append({ role: 'user', content: [{ type: 'text', text: prompt }] });
