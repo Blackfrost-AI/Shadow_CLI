@@ -233,6 +233,14 @@ export function createSessionRegistry(deps: { builder: AgentBuilder; runTurn: Tu
     s.bus.emit({ type: 'stop', reason: 'interrupted', finalAnswer: '' });
   };
 
+  const disposeBuilt = (built: { agent: AgentSession; mcp: McpHandle[] }): void => {
+    for (const c of built.mcp) {
+      try { c.stop(); } catch { /* best-effort */ }
+    }
+    try { built.agent.bg.killAll(); } catch { /* best-effort */ }
+    try { built.agent.wakeup.clear(); } catch { /* best-effort */ }
+  };
+
   async function drive(s: WebSessionInternal, prompt: string): Promise<void> {
     // E3a — interruptible from the FIRST tick, including the build.
     //
@@ -249,6 +257,12 @@ export function createSessionRegistry(deps: { builder: AgentBuilder; runTurn: Tu
           s.building = deps
             .builder(s)
             .then((built) => {
+              // close() may win while the lazy build is awaiting credentials, MCP, or a local
+              // model. A closed session can never own the result: dispose it at the handoff.
+              if (s.status === 'closed') {
+                disposeBuilt(built);
+                return built.agent;
+              }
               s.agent = built.agent;
               s.mcpClients = built.mcp;
               s.jail = built.jail;
@@ -261,6 +275,7 @@ export function createSessionRegistry(deps: { builder: AgentBuilder; runTurn: Tu
         }
         await s.building;
       }
+      if (s.status === 'closed') return;
       // Interrupted DURING the build: stop here rather than running the turn the user cancelled.
       if (s.abort.signal.aborted) {
         s.status = 'idle';

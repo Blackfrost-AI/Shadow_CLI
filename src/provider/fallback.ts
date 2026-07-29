@@ -31,6 +31,23 @@ export function resolveFallbackModel(
   return alt?.model ?? null;
 }
 
+/** Resolve the complete destination entry; provider/base URL/credentials are part of a fallback. */
+export function resolveFallbackEntry<T extends ModelEntryLike>(
+  currentModel: string,
+  entries: T[],
+  globalFallback?: string,
+): T | null {
+  const current = entries.find((entry) => entry.model === currentModel);
+  const requested = current?.fallback ?? globalFallback;
+  if (requested) {
+    const exact = entries.find(
+      (entry) => !entry.disabled && entry.model !== currentModel && (entry.model === requested || entry.label === requested),
+    );
+    if (exact) return exact;
+  }
+  return entries.find((entry) => !entry.disabled && entry.model !== currentModel) ?? null;
+}
+
 export function isModelDisabled(model: string, entries: ModelEntryLike[]): boolean {
   const entry = entries.find((e) => e.model === model);
   return entry?.disabled === true;

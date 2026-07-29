@@ -76,6 +76,53 @@ export function redactString(s: string): string {
 }
 
 /**
+ * Config/JSON keys whose VALUE is a credential regardless of what it looks like.
+ *
+ * Shape matching is not enough here. `/config get` printed `apiKey` verbatim, and a locally-served
+ * key ("lm-studio", a bare hex string, a LAN token) matches none of the PATTERNS above — so the
+ * shape-based scrubber returned it untouched onto a screen that gets shared and recorded. When the
+ * KEY says credential, the value is masked whatever its shape.
+ */
+const SECRET_KEY_RE =
+  /^(?:.*[_-])?(?:api_?key|auth_?token|access_?token|refresh_?token|secret|client_?secret|password|passwd|pwd|private_?key|credential|bearer)s?$/i;
+
+/** True when a config/JSON key names a credential. */
+export function isSecretKey(key: string): boolean {
+  return SECRET_KEY_RE.test(key);
+}
+
+/** Mask a value for display, keeping a short prefix so the user can still tell two keys apart. */
+export function maskSecret(value: unknown): string {
+  const s = typeof value === 'string' ? value : JSON.stringify(value);
+  if (!s) return '(unset)';
+  if (s.length <= 8) return '[REDACTED]';
+  return `${s.slice(0, 4)}…[REDACTED]`;
+}
+
+/**
+ * Deep-clone `value`, masking any entry whose KEY names a credential (whatever the value looks
+ * like) and shape-scrubbing every remaining string. This is what display paths should use for
+ * config: `redact()` alone only catches recognised shapes.
+ */
+export function redactConfig<T>(value: T): T {
+  return redactConfigValue(value, new WeakSet<object>()) as T;
+}
+
+function redactConfigValue(value: unknown, seen: WeakSet<object>): unknown {
+  if (typeof value === 'string') return redactString(value);
+  if (value === null || typeof value !== 'object') return value;
+  if (value instanceof Date) return new Date(value.getTime());
+  if (seen.has(value)) return value;
+  seen.add(value);
+  if (Array.isArray(value)) return value.map((v) => redactConfigValue(v, seen));
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    out[k] = isSecretKey(k) && v != null && v !== '' ? maskSecret(v) : redactConfigValue(v, seen);
+  }
+  return out;
+}
+
+/**
  * Deep-clone `value`, masking every string it contains (in nested objects and
  * arrays). Non-string primitives pass through unchanged; Dates are cloned. A
  * best-effort cycle guard returns the original reference on a revisit rather

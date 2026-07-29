@@ -44,15 +44,18 @@ const authHeaders = (h: WebServerHandle): Record<string, string> => ({
   authorization: `Bearer ${h.token}`,
 });
 
+const headerText = (value: string | string[] | undefined): string =>
+  Array.isArray(value) ? value.join('; ') : (value ?? '');
+
 test('the shell page references the app module and stylesheet', async () => {
   await withServer(async (h) => {
     const r = await raw(h.port, 'GET', '/', authHeaders(h));
     assert.equal(r.status, 200);
-    assert.match(r.headers['content-type'] ?? '', /text\/html/);
+    assert.match(headerText(r.headers['content-type']), /text\/html/);
     assert.match(r.body, /<script type="module" src="\/assets\/app\.js"/);
     assert.match(r.body, /\/assets\/styles\.css/);
     // The CSP must still forbid remote origins.
-    assert.match(r.headers['content-security-policy'] ?? '', /default-src 'none'/);
+    assert.match(headerText(r.headers['content-security-policy']), /default-src 'none'/);
   });
 });
 
@@ -60,7 +63,7 @@ test('serves an app asset as text/javascript with correct MIME', async () => {
   await withServer(async (h) => {
     const r = await raw(h.port, 'GET', '/assets/app.js', authHeaders(h));
     assert.equal(r.status, 200);
-    assert.match(r.headers['content-type'] ?? '', /text\/javascript/);
+    assert.match(headerText(r.headers['content-type']), /text\/javascript/);
     assert.match(r.body, /startRouter/);
   });
 });
@@ -69,7 +72,7 @@ test('serves the stylesheet as text/css', async () => {
   await withServer(async (h) => {
     const r = await raw(h.port, 'GET', '/assets/styles.css', authHeaders(h));
     assert.equal(r.status, 200);
-    assert.match(r.headers['content-type'] ?? '', /text\/css/);
+    assert.match(headerText(r.headers['content-type']), /text\/css/);
     assert.match(r.body, /--accent/);
   });
 });

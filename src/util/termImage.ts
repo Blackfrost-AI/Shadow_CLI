@@ -3,7 +3,7 @@
  * stay dep-light (Shadow runs on ink/react/undici/zod only); the two protocols cover every common
  * macOS terminal:
  *   - iTerm2 OSC 1337 (`ESC ]1337;File=inline=1;...:<base64> BEL`) — iTerm2, Ghostty, WezTerm.
- *   - Kitty graphics APC (`ESC G ... ESC \`, chunked base64) — Kitty (and Ghostty/WezTerm).
+ *   - Kitty graphics APC (`ESC _ G ... ESC \`, chunked base64) — Kitty (and Ghostty/WezTerm).
  *
  * IMPORTANT scrollback caveat: inline images are out-of-band pixel writes — on most terminals they
  * do NOT survive scroll-up (scrollback stores characters, not pixels). Callers MUST also render a
@@ -91,7 +91,12 @@ function kittyImage(bytes: Buffer, cols: number): string {
     const more = i + CHUNK < b64.length;
     // First chunk carries the action/format; m=1 on every chunk that has another following it.
     const opts = i === 0 ? `${colOpt}a=T,t=f${more ? ',m=1' : ''}` : more ? 'm=1' : '';
-    parts.push(`\x1bG${opts};${slice}${ST}`);
+    // APC introducer is ESC _ (0x1b 0x5f), then 'G'. This emitted a bare `ESC G` (0x1b 0x47) —
+    // not a recognised escape at all, so Kitty rendered no image AND slice-ansi counted the base64
+    // as visible text, letting the row's wrap="truncate" shred it into ~100 chars of garbage in
+    // the transcript. The save+open fallback was suppressed too, because supportsInlineImages()
+    // had already claimed success.
+    parts.push(`\x1b_G${opts};${slice}${ST}`);
   }
   return parts.join('');
 }

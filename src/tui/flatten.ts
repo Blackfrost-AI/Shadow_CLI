@@ -19,6 +19,7 @@ import { inlineImageEsc, formatBytes, supportsInlineImages } from '../util/termI
 import { renderBrand, renderToolResult, renderToolChild, renderReasoning, renderToolStack } from './rows.js';
 import type { BrandInfo, ToolInfo, ToolRun } from './rows.js';
 import { collapseKind, isCollapsibleTool, type CollapseKind } from './toolDisplay.js';
+import { displayWidth, takeByWidth, nextCluster } from './width.js';
 
 export { TABLE_COLLAPSE_THRESHOLD };
 
@@ -175,20 +176,26 @@ export interface ViewportTheme {
 // ── wrapping ─────────────────────────────────────────────────────────────────
 
 /**
- * Wrap a list of styled spans into rows of at most `cols` characters. Char-based (1 char = 1 col);
- * a documented approximation for double-width/CJK characters (the cell fork's stringWidth is not
- * available under "no jacking"). Newlines within span text start new rows.
+ * Wrap a list of styled spans into rows of at most `cols` COLUMNS. Newlines within span text start
+ * new rows.
+ *
+ * This used to count UTF-16 code units and call that "a documented approximation" for CJK. It was
+ * not an approximation — every transcript row renders inside `<Text wrap="truncate">`
+ * (tui.tsx:1383), so a row measured at `cols` characters but occupying 2×`cols` columns had its
+ * overflow DELETED rather than wrapped. A 40-segment CJK answer lost 17 segments outright, with no
+ * marker and no way to scroll them back. Measurement now goes through ./width.js, which is the same
+ * measure the composer uses.
  */
 export function wrapSpans(spans: StyledSpan[], cols: number): StyledSpan[][] {
   const w = Math.max(1, cols);
   const rows: StyledSpan[][] = [];
   let cur: StyledSpan[] = [];
-  let curLen = 0;
+  let curW = 0;
 
   const flush = (): void => {
     rows.push(cur);
     cur = [];
-    curLen = 0;
+    curW = 0;
   };
 
   for (const sp of spans) {
@@ -197,20 +204,30 @@ export function wrapSpans(spans: StyledSpan[], cols: number): StyledSpan[][] {
       if (p > 0) flush(); // newline → new row
       let text = parts[p]!;
       while (text.length > 0) {
-        const room = w - curLen;
+        const room = w - curW;
         if (room <= 0) {
           flush();
           continue;
         }
-        if (text.length <= room) {
-          cur.push({ ...sp, text });
-          curLen += text.length;
-          text = '';
-        } else {
-          cur.push({ ...sp, text: text.slice(0, room) });
-          text = text.slice(room);
+        const { head, rest, width } = takeByWidth(text, room);
+        if (head === '') {
+          // The next cluster is wider than the room left. Wrap and retry on a full row; if the row
+          // was ALREADY empty the cluster is wider than `cols` itself, so emit it alone — better one
+          // over-wide row than an infinite loop.
+          if (curW > 0) {
+            flush();
+            continue;
+          }
+          const cluster = nextCluster(text, 0) || text.slice(0, 1);
+          cur.push({ ...sp, text: cluster });
+          text = text.slice(cluster.length);
           flush();
+          continue;
         }
+        cur.push({ ...sp, text: head });
+        curW += width;
+        text = rest;
+        if (text.length > 0) flush(); // couldn't take it all → the row is full
       }
     }
   }
@@ -229,11 +246,40 @@ export function wrapSpansWord(spans: StyledSpan[], cols: number): StyledSpan[][]
   const w = Math.max(1, cols);
   const rows: StyledSpan[][] = [];
   let cur: StyledSpan[] = [];
-  let curLen = 0;
+  let curW = 0;
   const flush = (): void => {
     rows.push(cur);
     cur = [];
-    curLen = 0;
+    curW = 0;
+  };
+  // Fill the current row with as much of `token` as fits, then keep wrapping until it's placed.
+  // Replaces three near-identical `.slice(0, w - curLen)` loops, all of which cut by CHARACTER and
+  // so produced over-wide rows for CJK — the rows Ink then truncated away.
+  const emitHardSplit = (sp: StyledSpan, token: string): void => {
+    let rest = token;
+    while (rest !== '') {
+      const room = w - curW;
+      if (room <= 0) {
+        flush();
+        continue;
+      }
+      const { head, rest: tail, width } = takeByWidth(rest, room);
+      if (head === '') {
+        if (curW > 0) {
+          flush(); // retry on a full-width row
+          continue;
+        }
+        const cluster = nextCluster(rest, 0) || rest.slice(0, 1); // wider than `cols` itself
+        cur.push({ ...sp, text: cluster });
+        rest = rest.slice(cluster.length);
+        flush();
+        continue;
+      }
+      cur.push({ ...sp, text: head });
+      curW += width;
+      rest = tail;
+      if (rest !== '') flush();
+    }
   };
   // True until the first WORD of the current LOGICAL line is emitted. Leading whitespace at a
   // logical-line start is INDENTATION (nested bullets, user-typed alignment) and must be kept;
@@ -251,64 +297,37 @@ export function wrapSpansWord(spans: StyledSpan[], cols: number): StyledSpan[][]
       for (const tok of parts[p]!.split(/(\s+)/)) {
         if (tok === '') continue;
         const isSpace = /^\s+$/.test(tok);
+        const tw = displayWidth(tok);
         if (isSpace) {
-          if (curLen === 0 && !atLineStart) continue; // drop only the wrap-point space
-          if (curLen + tok.length <= w) {
+          if (curW === 0 && !atLineStart) continue; // drop only the wrap-point space
+          if (curW + tw <= w) {
             cur.push({ ...sp, text: tok });
-            curLen += tok.length;
+            curW += tw;
           } else if (atLineStart) {
-            // Indentation wider than the measure — hard-split like an over-wide token.
-            let rest = tok;
-            while (rest.length > w - curLen) {
-              cur.push({ ...sp, text: rest.slice(0, w - curLen) });
-              rest = rest.slice(w - curLen);
-              flush();
-            }
-            if (rest) { cur.push({ ...sp, text: rest }); curLen += rest.length; }
+            emitHardSplit(sp, tok); // indentation wider than the measure
           } else {
             flush(); // the space IS the wrap point
           }
           continue;
         }
         atLineStart = false;
-        if (curLen + tok.length <= w) {
+        if (curW + tw <= w) {
           cur.push({ ...sp, text: tok });
-          curLen += tok.length;
+          curW += tw;
           continue;
         }
         // Doesn't fit. If the row so far is ONLY indentation, keep it and split the word right
         // after it (popping it would erase the indent and flush a bogus empty row). Otherwise
         // start a fresh row (dropping the trailing wrap space), then hard-split an over-wide token.
-        if (curLen > 0 && curLen < w && cur.every((s) => /^\s+$/.test(s.text))) {
-          let rest = tok;
-          cur.push({ ...sp, text: rest.slice(0, w - curLen) });
-          rest = rest.slice(w - curLen);
-          flush();
-          while (rest.length > w) {
-            cur.push({ ...sp, text: rest.slice(0, w) });
-            rest = rest.slice(w);
-            flush();
-          }
-          if (rest) {
-            cur.push({ ...sp, text: rest });
-            curLen = rest.length;
-          }
+        if (curW > 0 && curW < w && cur.every((s) => /^\s+$/.test(s.text))) {
+          emitHardSplit(sp, tok);
           continue;
         }
-        if (curLen > 0) {
+        if (curW > 0) {
           if (cur.length && /^\s+$/.test(cur[cur.length - 1]!.text)) cur.pop();
           flush();
         }
-        let rest = tok;
-        while (rest.length > w) {
-          cur.push({ ...sp, text: rest.slice(0, w) });
-          rest = rest.slice(w);
-          flush();
-        }
-        if (rest) {
-          cur.push({ ...sp, text: rest });
-          curLen = rest.length;
-        }
+        emitHardSplit(sp, tok);
       }
     }
   }
@@ -323,21 +342,38 @@ export function truncateSpans(spans: StyledSpan[], cols: number): StyledSpan[] {
   const out: StyledSpan[] = [];
   let len = 0;
   for (const sp of spans) {
-    if (len + sp.text.length <= w) {
+    const sw = displayWidth(sp.text);
+    if (len + sw <= w) {
       out.push(sp);
-      len += sp.text.length;
+      len += sw;
       continue;
     }
     // Doesn't fit → an ellipsis must be appended, so guarantee room for it: trim already-emitted
     // spans back until there's a free column (a span that filled EXACTLY to `w` would otherwise let
     // the row reach w+1 and wrap — the one thing this function exists to prevent).
     const room = w - 1 - len;
-    if (room > 0) out.push({ ...sp, text: sp.text.slice(0, room) });
-    else {
+    if (room > 0) {
+      const { head, width } = takeByWidth(sp.text, room);
+      if (head !== '') {
+        out.push({ ...sp, text: head });
+        len += width;
+      }
+    } else {
       while (out.length && len >= w) {
         const last = out[out.length - 1]!;
-        if (last.text.length <= 1) { out.pop(); len -= last.text.length; }
-        else { const cut = len - (w - 1); out[out.length - 1] = { ...last, text: last.text.slice(0, last.text.length - cut) }; len -= cut; }
+        const lastW = displayWidth(last.text);
+        if (lastW <= 1) {
+          out.pop();
+          len -= lastW;
+        } else {
+          // Trim by COLUMNS, not characters: one CJK glyph frees two columns, and slicing by
+          // character count here could leave the row still over-wide (or split a surrogate pair).
+          const keep = Math.max(0, lastW - (len - (w - 1)));
+          const { head, width } = takeByWidth(last.text, keep);
+          out[out.length - 1] = { ...last, text: head };
+          len -= lastW - width;
+          if (head === '') out.pop();
+        }
       }
     }
     out.push({ text: '…', ...(sp.color !== undefined ? { color: sp.color } : {}) });

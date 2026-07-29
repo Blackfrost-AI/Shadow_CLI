@@ -81,7 +81,7 @@ test('rejects a cross-site Origin even with a valid token', async () => {
       headers: { origin: 'http://evil.com' },
     });
     assert.equal(r.status, 403);
-    assert.equal((await r.json()).error, 'bad origin');
+    assert.equal(((await r.json()) as { error: string }).error, 'bad origin');
   });
 });
 

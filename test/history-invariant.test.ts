@@ -24,7 +24,7 @@ export function assertPairedHistory(messages: Message[]): void {
     assert.ok(next, `assistant tool_use at ${i} has no following turn`);
     assert.equal(next!.role, 'user', `tool_use at ${i} must be followed by a user turn, got ${next!.role}`);
     const satisfied = new Set(
-      (next!.content as any[]).filter((b) => b.type === 'tool_result').map((b) => b.tool_use_id as string),
+      next!.content.filter((b) => b.type === 'tool_result').map((b) => b.toolCallId),
     );
     for (const u of uses) {
       assert.ok(satisfied.has(u.id), `tool_use ${u.id} at index ${i} has no tool_result in the next turn`);
@@ -33,7 +33,7 @@ export function assertPairedHistory(messages: Message[]): void {
 }
 
 const toolUse = (id: string): Message => ({ role: 'assistant', content: [{ type: 'tool_use', id, name: 'run_shell', input: {} }] } as Message);
-const toolResult = (id: string): Message => ({ role: 'user', content: [{ type: 'tool_result', tool_use_id: id, content: 'ok' }] } as Message);
+const toolResult = (id: string): Message => ({ role: 'user', content: [{ type: 'tool_result', toolCallId: id, ok: true, content: 'ok' }] });
 const text = (t: string): Message => ({ role: 'user', content: [{ type: 'text', text: t }] } as Message);
 
 test('assertPairedHistory catches the exact shape the bug produced', () => {

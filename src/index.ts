@@ -16,7 +16,7 @@ import {
 import { vaultExists } from './auth/vault.js';
 import { vaultUnlocked } from './state/globalStore.js';
 import { createProvider } from './provider/index.js';
-import { ensureLocalServer, stopGgufServers, ggufServerUp, isLocalServedEntry, MLX_INSTALL_HINT, mlxOfflineReady } from './gguf.js';
+import { configuredContextWindow, detectServerContextWindow, ensureLocalServer, stopGgufServers, forceStopGgufServers, ggufServerUp, isLocalServedEntry, MLX_INSTALL_HINT, mlxOfflineReady } from './gguf.js';
 import {
   addLocalModel,
   formatLocalList,
@@ -33,7 +33,7 @@ import { BgRegistry } from './tools/bgShell.js';
 import { runWebOnboard } from './onboard/webOnboard.js';
 import { runWeb, parseWebArgs } from './web/cli.js';
 import { runLock, CLI_HOLDER } from './web/runLock.js';
-import { windowsPowerShell } from './update/winShell.js';
+import { updateInstalledBinary } from './update/binary.js';
 import { ensureVaultReady } from './auth/unlock.js';
 import {
   makeAgentTool,
@@ -208,28 +208,16 @@ function helpText(): string {
 
 
 /**
- * Binary install (`curl install.sh`): no .git, and the repo may be private (so a git
- * pull can't authenticate). The prebuilt binaries are served from the PUBLIC install
- * host, so re-fetch by re-running the canonical installer in place. dir + URL are
- * passed through the environment (never string-interpolated into the shell) so a
- * crafted SHADOW_INSTALL_* value can't inject a command.
+ * Binary install: no .git, so fetch the platform asset from the fixed release origin,
+ * authenticate its signed manifest with the pinned offline key, verify SHA-256, and replace
+ * atomically. No downloaded script is ever executed and installer env overrides are ignored.
  */
-function updateBinary(): never {
+async function updateBinary(): Promise<never> {
   const dir = parse(process.execPath).dir;
-  const shUrl = process.env.SHADOW_INSTALL_URL || 'https://shadow.redpillreader.com/install.sh';
   stdout.write(`Updating Shadow binary in ${dir} (current v${VERSION})…\n`);
   try {
-    if (process.platform === 'win32') {
-      execFileSync(windowsPowerShell(), ['-NoProfile', '-Command', 'irm $env:SHADOW_INSTALL_URL | iex'], {
-        stdio: 'inherit',
-        env: { ...process.env, SHADOW_INSTALL_DIR: dir, SHADOW_INSTALL_URL: shUrl.replace(/install\.sh$/, 'install.ps1') },
-      });
-    } else {
-      execFileSync('sh', ['-c', 'curl -fsSL "$1" | sh', 'sh', shUrl], {
-        stdio: 'inherit',
-        env: { ...process.env, SHADOW_INSTALL_DIR: dir },
-      });
-    }
+    const verified = await updateInstalledBinary(process.execPath);
+    stdout.write(`Verified signed ${verified.asset} from ${verified.base}.\n`);
   } catch (e) {
     process.stderr.write(`\nupdate failed: ${(e as Error).message}\n`);
     process.exit(1);
@@ -245,29 +233,45 @@ function updateBinary(): never {
  *   code matches the source we just pulled. Refuses on the source box (unpushed local commits).
  * - binary install (no .git): re-fetch the binary from the public host (see updateBinary).
  */
-function runUpdate(): void {
+async function runUpdate(): Promise<void> {
   if (!existsSync(resolve(INSTALL_DIR, '.git'))) {
-    updateBinary(); // never returns
+    await updateBinary(); // never returns
   }
   const before = VERSION;
   stdout.write(`Updating Shadow in ${INSTALL_DIR} (current v${before})…\n`);
   const git = (args: string[]): string => execFileSync('git', args, { cwd: INSTALL_DIR }).toString().trim();
   try {
+    const dirty = git(['status', '--porcelain', '--untracked-files=normal']);
+    if (dirty) {
+      process.stderr.write(
+        '\nThis checkout has uncommitted or untracked changes — refusing to overwrite them.\n' +
+          'Commit, stash, or remove the listed work before updating:\n' +
+          dirty.split('\n').map((line) => `  ${line}`).join('\n') + '\n',
+      );
+      process.exit(1);
+    }
     execFileSync('git', ['fetch', 'origin', '--prune'], { cwd: INSTALL_DIR, stdio: 'inherit' });
     const branch = git(['rev-parse', '--abbrev-ref', 'HEAD']) || 'main';
+    if (branch === 'HEAD') throw new Error('cannot update a detached HEAD checkout');
+    let upstream = `origin/${branch}`;
+    try {
+      upstream = git(['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{u}']);
+    } catch {
+      // Preserve the historical origin/<branch> default when no upstream is configured.
+    }
     // Refuse to discard local commits the remote doesn't have — that's the source/master box, not a mirror.
-    const ahead = git(['rev-list', '--count', `origin/${branch}..HEAD`]);
+    const ahead = git(['rev-list', '--count', `${upstream}..HEAD`]);
     if (ahead !== '0') {
       process.stderr.write(
-        `\nThis checkout has ${ahead} local commit(s) not on origin/${branch} — refusing to discard them.\n` +
+        `\nThis checkout has ${ahead} local commit(s) not on ${upstream} — refusing to discard them.\n` +
           `Looks like the source box rather than a pull-only mirror. Push your work first, or if this box\n` +
-          `is meant to mirror the remote exactly, run:  git reset --hard origin/${branch}\n`,
+          `is meant to mirror the remote exactly, run:  git reset --hard ${upstream}\n`,
       );
       process.exit(1);
     }
     // Pull-only mirror: hard-reset to the remote so a rebuilt dist/ or a re-resolved package-lock.json
     // (which makes `git pull --ff-only` refuse) never blocks the update.
-    execFileSync('git', ['reset', '--hard', `origin/${branch}`], { cwd: INSTALL_DIR, stdio: 'inherit' });
+    execFileSync('git', ['reset', '--hard', upstream], { cwd: INSTALL_DIR, stdio: 'inherit' });
     execFileSync('npm', ['install', '--no-fund', '--no-audit'], { cwd: INSTALL_DIR, stdio: 'inherit' });
     // Recompile: the pulled dist/ is a tracked artifact that can lag the source (a release may
     // forget to recommit it), which silently keeps `shadow update` running old code. Building
@@ -529,7 +533,7 @@ async function runLocal(args: string[]): Promise<void> {
     }
     stdout.write(lc.gray(`Testing "${entry.label}" — starting local server…`) + '\n');
     const res = await testLocalModel(entry, (m) => stdout.write(lc.gray(`  ${m}`) + '\n'));
-    stopGgufServers(); // tear down the server we started for the one-shot test
+    await stopGgufServers(); // tear down the server we started for the one-shot test
     if (res.ok) {
       stdout.write(lc.green(`✓ PASS — ${entry.label}`) + '\n');
       stdout.write(`    endpoint: ${res.endpoint}\n`);
@@ -631,7 +635,7 @@ async function runDoctorModel(name: string | undefined, cwd: string): Promise<vo
     isLocal,
     log: (m) => stdout.write(lc.gray(`  ${m}`) + '\n'),
   });
-  if (entry?.gguf) stopGgufServers(); // tear down the server we spun up for the probe
+  if (entry?.gguf) await stopGgufServers(); // tear down the server we spun up for the probe
 
   stdout.write(
     '\n' +
@@ -732,7 +736,7 @@ async function main(): Promise<void> {
     return;
   }
   if (argv[0] === 'update') {
-    runUpdate();
+    await runUpdate();
     return;
   }
   if (argv[0] === 'export') {
@@ -910,7 +914,10 @@ async function main(): Promise<void> {
           provider: 'openai',
           baseUrl: r.baseUrl,
           apiKey: activeModelEntry!.apiKey ?? 'sk-local',
-          ctxWindow: activeModelEntry!.ctx ?? 32_768,
+          ctxWindow:
+            (await detectServerContextWindow(r.baseUrl)) ??
+            configuredContextWindow(activeModelEntry!) ??
+            32_768,
         };
       } catch (e) {
         console.error(`local model failed: ${(e as Error).message}`);
@@ -1054,10 +1061,10 @@ async function main(): Promise<void> {
   // killAll() and client.stop() previously had no call sites, so every session leaked stray processes
   // holding ports/FDs across launches. All calls are synchronous (safe in an 'exit' handler). Registered
   // once and idempotent, so multiple exit paths (natural return, SIGINT-abort, SIGTERM) all clean up.
-  let cleanedUp = false;
-  const shutdownCleanup = (): void => {
-    if (cleanedUp) return;
-    cleanedUp = true;
+  let coreCleanedUp = false;
+  const shutdownCore = (): void => {
+    if (coreCleanedUp) return;
+    coreCleanedUp = true;
     try {
       bg.killAll();
     } catch {
@@ -1070,12 +1077,14 @@ async function main(): Promise<void> {
         /* best effort */
       }
     }
-    stopGgufServers();
   };
-  process.on('exit', shutdownCleanup);
+  process.on('exit', () => {
+    shutdownCore();
+    forceStopGgufServers();
+  });
   process.on('SIGTERM', () => {
-    shutdownCleanup();
-    process.exit(143);
+    shutdownCore();
+    void stopGgufServers().finally(() => process.exit(143));
   });
 
   // Expose send_notification path for 'notification' hook phase (Claude parity)
@@ -1114,6 +1123,7 @@ async function main(): Promise<void> {
   // serving, so the sub-agent dies with "Unable to connect". The TUI updates these on every
   // switch via opts.onModelSwitch; the headless path keeps the startup values.
   let activeAgentProvider = provider;
+  let activeMainProvider = provider;
   // activeAgentModel is declared above (hoisted over the --web mirror for a TDZ-safe live getter).
 
   registry.register(
@@ -1207,7 +1217,7 @@ async function main(): Promise<void> {
     );
     const deps = buildLoopDeps({
       cfg,
-      provider,
+      provider: activeMainProvider,
       registry,
       gate,
       bus,
@@ -1223,6 +1233,14 @@ async function main(): Promise<void> {
       planMode,
       streamShell: !headless,
       sessionLog,
+      continuityState: '',
+      resolveFallback: async (entry) => {
+        const activated = await session.activateModel(entry);
+        activeMainProvider = activated.provider;
+        activeAgentProvider = activated.provider;
+        activeAgentModel = activated.model;
+        return activated;
+      },
     });
     const { stopReason, finalAnswer } = await new AgentLoop(deps, autonomy).run();
     // Headless: an error-class stop — OR a reasoning run that hit the output cap before
@@ -1326,6 +1344,7 @@ async function main(): Promise<void> {
     } finally {
       detach();
       process.removeListener('SIGINT', onSigint);
+      await stopGgufServers();
       if (cfg.hooks?.session_end?.length) {
         runHookPhase('session_end', cfg.hooks.session_end, { workspaceRoot });
       }
@@ -1350,6 +1369,7 @@ async function main(): Promise<void> {
       system: fullSystem,
       workspaceRoot,
       cfg,
+      baseContextPolicy: session.baseContextPolicy,
       autonomy,
       bypass: yolo,
       offline,
@@ -1387,6 +1407,7 @@ async function main(): Promise<void> {
   } finally {
     // The mirror holds an open listener; without closing it the process would not exit.
     if (webMirror) await webMirror.close().catch(() => {});
+    await stopGgufServers();
     if (cfg.hooks?.session_end?.length) {
       runHookPhase('session_end', cfg.hooks.session_end, { workspaceRoot });
     }

@@ -13,6 +13,12 @@ import { createProvider } from '../src/provider/index.js';
 import { loadConfig } from '../src/config.js';
 import { makeAskUserQuestionTool } from '../src/tools/askUser.js';
 
+// The type-ahead guard (DIALOG_ARM_MS, see tui-typeahead-guard.test.ts) ignores keys pressed in the
+// first ~275 ms a dialog is up — they were in flight before it opened. A test driver answers in the
+// same tick, which no human can do, so without this the dialog stays open and the awaiting turn
+// never settles. Zeroed here so these tests exercise what they are about.
+process.env.SHADOW_DIALOG_ARM_MS = '0';
+
 /**
  * End-to-end through the real component: type a task, press Enter, and confirm the
  * key handler submits, runOne drives the AgentLoop, the mock provider streams a

@@ -70,6 +70,5 @@ test('ordered lists keep their SOURCE numbers (blank-separated steps no longer a
   const blocks = parseMarkdown('1. first\n\n2. second\n\n3. third\n');
   const lists = blocks.filter((b) => b.type === 'list');
   assert.equal(lists.length, 3, 'blank-separated items parse as three lists');
-  // @ts-expect-error narrow
   assert.deepEqual(lists.map((l) => l.start ?? 1), [1, 2, 3], 'each keeps its source start number');
 });

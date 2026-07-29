@@ -67,3 +67,38 @@ test('unrecognized NORMAL keys are reported not-consumed (so they never insert t
   assert.equal(r.consumed, false);
   assert.equal(r.input, 'hello', 'no text mutation');
 });
+
+// ── Grapheme safety ───────────────────────────────────────────────────────────────────────────
+// `cursor ± 1` walks UTF-16 CODE UNITS. On an emoji (surrogate pair) or a ZWJ cluster that lands
+// INSIDE the character, so `x`/`s`/`dl`/`dh` deleted half of one — producing a lone surrogate that
+// went to the provider in the submitted message.
+
+const NO_ORPHAN_SURROGATE = /[\uD800-\uDFFF]/;
+
+test('x deletes a whole emoji, not half a surrogate pair', () => {
+  const r = run('\u{1F389}ab', 0, 'x');
+  assert.equal(r.input, 'ab');
+  assert.ok(!NO_ORPHAN_SURROGATE.test(r.input), 'no orphaned surrogate may survive');
+});
+
+test('x deletes a whole ZWJ family cluster', () => {
+  const r = run('\u{1F468}\u200D\u{1F469}\u200D\u{1F467}\u200D\u{1F466}!', 0, 'x');
+  assert.equal(r.input, '!');
+});
+
+test('s replaces a whole cluster and enters insert', () => {
+  const r = run('\u4E2D\u6587', 0, 's');
+  assert.equal(r.input, '\u6587');
+  assert.equal(r.mode, 'insert');
+});
+
+test('dl deletes one whole cluster forward', () => {
+  const r = run('\u{1F680}xy', 0, 'dl');
+  assert.equal(r.input, 'xy');
+  assert.ok(!NO_ORPHAN_SURROGATE.test(r.input));
+});
+
+test('h/l motions step over a whole cluster', () => {
+  assert.equal(run('\u{1F680}ab', 0, 'l').cursor, 2, 'a surrogate pair is 2 code units — clear both');
+  assert.equal(run('\u{1F680}ab', 2, 'h').cursor, 0);
+});

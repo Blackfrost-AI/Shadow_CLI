@@ -45,17 +45,37 @@ export class Context {
    * Re-arms the hysteresis: a budget that just SHRANK must be allowed to trigger immediately
    * rather than waiting for the old, larger re-arm point.
    */
-  setBudget(contextBudget: number): void {
-    if (!Number.isFinite(contextBudget) || contextBudget <= 0) return;
-    if (contextBudget === this.opts.contextBudget) return;
+  setPolicy(next: Partial<ContextOptions>, resetActualTokens = false): void {
+    const contextBudget =
+      Number.isFinite(next.contextBudget) && (next.contextBudget ?? 0) > 0
+        ? next.contextBudget!
+        : this.opts.contextBudget;
+    const triggerRatio =
+      Number.isFinite(next.triggerRatio) && (next.triggerRatio ?? 0) > 0 && (next.triggerRatio ?? 0) <= 1
+        ? next.triggerRatio!
+        : this.opts.triggerRatio;
+    const keepLastTurns =
+      Number.isInteger(next.keepLastTurns) && (next.keepLastTurns ?? 0) > 0
+        ? next.keepLastTurns!
+        : this.opts.keepLastTurns;
     const shrank = contextBudget < this.opts.contextBudget;
-    this.opts = { ...this.opts, contextBudget };
-    if (shrank) this.rearmAtTokens = 0;
+    this.opts = { contextBudget, triggerRatio, keepLastTurns };
+    // Usage from the previous provider/model is not a valid request-size floor for the new one.
+    if (resetActualTokens) this.lastActualTokens = 0;
+    if (shrank || resetActualTokens) this.rearmAtTokens = 0;
+  }
+
+  setBudget(contextBudget: number): void {
+    this.setPolicy({ contextBudget });
   }
 
   /** The live compaction budget (test seam + HUD parity). */
   budget(): number {
     return this.opts.contextBudget;
+  }
+
+  policy(): ContextOptions {
+    return { ...this.opts };
   }
 
   /**
@@ -139,7 +159,14 @@ export class Context {
     /** ESC must be able to stop a compaction — it is a full provider round trip (D3). */
     signal?: AbortSignal,
     /** The live system prompt + tool schemas, so the count matches the REAL request (D4). */
-    countCtx?: { system?: string; tools?: unknown[] },
+    countCtx?: {
+      system?: string;
+      tools?: unknown[];
+      /** Goal/todo/plan state that lives outside message history but must shape the handoff. */
+      continuity?: string;
+      /** Invoked only once compaction is definitely going to call the summarizer. */
+      beforeCompact?: () => void;
+    },
   ): Promise<boolean> {
     if (signal?.aborted) return false;
     const trigger = this.opts.contextBudget * this.opts.triggerRatio;
@@ -207,7 +234,14 @@ export class Context {
     const middleLines = harvestInstructions(toSummarize);
     const allInstructions = mergeInstructions(objectiveLines, middleLines);
 
-    const transcript = toSummarize
+    const oldTranscript = toSummarize
+      .map((m) => `${m.role}: ${m.content.map(blockText).join(' ')}`)
+      .join('\n');
+    // CURRENT WORK lives overwhelmingly in the tail we keep. The old implementation hid this
+    // from the summarizer while demanding CURRENT WORK/NEXT STEP, forcing it to invent a stale
+    // continuation from the oldest slice. Show the tail with an explicit "retained" label.
+    const recentTranscript = this.msgs
+      .slice(end)
       .map((m) => `${m.role}: ${m.content.map(blockText).join(' ')}`)
       .join('\n');
 
@@ -215,9 +249,13 @@ export class Context {
       allInstructions.length > 0
         ? `SESSION OBJECTIVE (must preserve verbatim in TASK):\n${allInstructions.map((l) => `• ${l}`).join('\n')}\n\n`
         : '';
+    const continuityBlock = countCtx?.continuity?.trim()
+      ? `LIVE SESSION STATE (authoritative; preserve it):\n${countCtx.continuity.trim()}\n\n`
+      : '';
 
     let summary = '';
     try {
+      countCtx?.beforeCompact?.();
       for await (const ev of provider.send({
         signal, // D3: compaction is a full round trip; without this ESC left the composer locked
                 // for 30-60s on a slow local model AFTER "interrupted" had already printed.
@@ -231,8 +269,9 @@ export class Context {
           '2. ALREADY DONE — concrete progress (files changed, decisions made). Critical: this ' +
           'is what stops the model redoing finished work.\n' +
           '3. DECISIONS & FACTS — constraints and choices that still apply.\n' +
-          '4. CURRENT WORK — precisely what was underway at the moment of this summary.\n' +
+          '4. CURRENT WORK — derive this from the RECENT RETAINED TAIL, not the older slice.\n' +
           '5. NEXT STEP — the single concrete next action. Do not list "start over" or "re-read the prompt".\n' +
+          'The recent tail remains verbatim after this note. If old and recent state conflict, recent wins.\n' +
           'No preamble, no meta-commentary, no sign-off.',
         messages: [
           {
@@ -240,7 +279,10 @@ export class Context {
             content: [
               {
                 type: 'text',
-                text: `${objectiveBlock}TRANSCRIPT TO COMPACT:\n${transcript}`,
+                text:
+                  `${objectiveBlock}${continuityBlock}` +
+                  `OLDER HISTORY TO REPLACE:\n${oldTranscript}\n\n` +
+                  `RECENT RETAINED TAIL (authoritative current state; this remains verbatim):\n${recentTranscript}`,
               },
             ],
           },
@@ -286,7 +328,8 @@ export class Context {
           type: 'text',
           text:
             `[System note: earlier turns were compacted to free context. The SESSION OBJECTIVE above is ` +
-            `still the goal. Progress so far and the next action are below. Continue directly from NEXT STEP — ` +
+            `still the goal. Progress so far and the next action are below. The verbatim recent tail follows ` +
+            `this note and wins if it conflicts with the digest. Continue directly from NEXT STEP — ` +
             `do NOT greet, ask what to help with, restate the whole plan, or start over.]` +
             `\n\n${SUMMARY_HEADER}\n${summary.trim()}`,
         },
@@ -315,8 +358,6 @@ export class Context {
 const INSTR_HEADER =
   '── TASK & INSTRUCTIONS (verbatim — the source of truth; follow these, the summary below is only a progress digest) ──';
 const SUMMARY_HEADER = '── PROGRESS SUMMARY ──';
-const INSTR_MAX_EACH = 1500;
-const INSTR_MAX_TOTAL = 8000;
 /** Cap tool_result bodies kept after compact so the kept tail does not re-fill the window. */
 const KEPT_TOOL_RESULT_CAP = 2_500;
 
@@ -330,11 +371,11 @@ function harvestInstructions(turns: Message[]): string[] {
   const add = (raw: string): void => {
     const t = raw.trim();
     if (!t) return;
-    const capped = t.length > INSTR_MAX_EACH ? `${t.slice(0, INSTR_MAX_EACH)} …[truncated]` : t;
-    const key = capped.slice(0, 200);
-    if (seen.has(key)) return;
-    seen.add(key);
-    out.push(capped);
+    // User instructions are the source of truth. Never silently truncate them and then depend on
+    // a stochastic summary to recreate the missing half.
+    if (seen.has(t)) return;
+    seen.add(t);
+    out.push(t);
   };
   for (const m of turns) {
     if (m.role !== 'user') continue;
@@ -369,21 +410,14 @@ function harvestInstructions(turns: Message[]): string[] {
   return out;
 }
 
-/** Merge two instruction lists (objective first), deduped, budgeted. */
+/** Merge two instruction lists (objective first), losslessly deduped. */
 function mergeInstructions(primary: string[], secondary: string[]): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
-  let total = 0;
   for (const it of [...primary, ...secondary]) {
-    const key = it.slice(0, 200);
-    if (seen.has(key)) continue;
-    if (total + it.length > INSTR_MAX_TOTAL) {
-      out.push('…[further instructions elided to save space]');
-      break;
-    }
-    seen.add(key);
+    if (seen.has(it)) continue;
+    seen.add(it);
     out.push(it);
-    total += it.length;
   }
   return out;
 }

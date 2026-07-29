@@ -7,13 +7,13 @@ import { classifyToolCall } from '../safety/classifier.js';
 import { resolvePermissionRule, type PermissionRule } from '../safety/rules.js';
 import type { ShadowConfig } from '../config.js';
 import { runHooks, runHookPhase } from '../hooks/runner.js';
-import { isFallbackEligible, resolveFallbackModel } from '../provider/fallback.js';
+import { isFallbackEligible, resolveFallbackEntry } from '../provider/fallback.js';
 import { looksLikeTokenOverflow } from '../provider/stream.js';
 import type { UserQuestion } from './approval.js';
 import { askUserInputSchema } from '../tools/askUser.js';
 import type { ModelEntry } from '../config.js';
 import type { ApprovalGate, ApprovalRequest, ApprovalDecision } from './approval.js';
-import { settleWithAbort, nextApprovalId } from './approval.js';
+import { settleWithAbort, nextApprovalId, SessionApprovals } from './approval.js';
 import type { EventBus, StopReasonExt } from './events.js';
 import type { Budget } from './budget.js';
 import type { Context } from './context.js';
@@ -68,11 +68,21 @@ export interface LoopDeps {
   hooks?: ShadowConfig['hooks']; // full set; only some phases are invoked from the loop today
   models?: ModelEntry[];
   fallbackModel?: string;
+  /** Activate a fallback's complete entry (provider, endpoint and credentials), not just its id. */
+  resolveFallback?: (entry: ModelEntry) => Promise<{ provider: Provider; model: string }>;
   parallelTools?: boolean;
   streamShell?: boolean;
   now?: () => number;
   /** When set, a context snapshot is written after each assistant turn. */
   sessionLog?: SessionLogType;
+  /**
+   * SESSION-scoped "approve for session / for prefix" grants. Optional: a loop without one keeps
+   * its grants to itself (tests, one-shot runs). Callers that construct a loop PER USER MESSAGE
+   * must pass a shared instance, or every grant expires the moment the user types again.
+   */
+  approvals?: SessionApprovals;
+  /** Goal or other durable UI state held outside Context message history. */
+  continuityState?: string;
 }
 
 export interface LoopResult {
@@ -112,14 +122,19 @@ export class AgentLoop {
    */
   private toolTurn = 0;
   private seededTurnIndex = false;
-  private readonly sessionToolApprovals = new Set<string>();
-  private readonly sessionPrefixApprovals: string[] = [];
+  /**
+   * Session-scoped approval grants. Falls back to a private instance when `deps.approvals` is
+   * absent (standalone loops, tests) so behaviour is unchanged there; the TUI/web/REPL pass one
+   * shared instance so a grant outlives the per-message loop that recorded it.
+   */
+  private readonly approvals: SessionApprovals;
 
   constructor(
     private readonly deps: LoopDeps,
     autonomy: AutonomyLevel,
   ) {
     this.autonomy = autonomy;
+    this.approvals = deps.approvals ?? new SessionApprovals();
     this.effort = deps.effort ?? DEFAULT_EFFORT;
     this.now = deps.now ?? Date.now;
     // Continue this SESSION's numbering rather than restarting at 0 for every user message.
@@ -168,8 +183,32 @@ export class AgentLoop {
     this.deps.permissionRules = rules;
   }
 
+  private async maybeCompact(provider: Provider, model: string, system: string, force = false): Promise<boolean> {
+    const did = await this.deps.context.maybeSummarize(provider, model, force, this.deps.signal, {
+      system,
+      tools: this.deps.registry.toSchemas(),
+      continuity: [
+        this.deps.continuityState ?? '',
+        this.deps.planMode?.block() ?? '',
+        this.deps.todoList?.block() ?? '',
+      ].filter((s) => s.trim()).join('\n\n'),
+      beforeCompact: () => {
+        if (this.deps.hooks?.pre_compact?.length) {
+          runHookPhase('pre_compact', this.deps.hooks.pre_compact, { workspaceRoot: this.deps.workspaceRoot });
+        }
+      },
+    });
+    if (did) {
+      this.deps.bus.emit({ type: 'compaction', trigger: 'auto' });
+      if (this.deps.hooks?.post_compact?.length) {
+        runHookPhase('post_compact', this.deps.hooks.post_compact, { workspaceRoot: this.deps.workspaceRoot });
+      }
+    }
+    return did;
+  }
+
   async run(): Promise<LoopResult> {
-    const { provider, bus, budget, context } = this.deps;
+    const { bus, budget, context } = this.deps;
     let finalAnswer = '';
 
     for (;;) {
@@ -195,6 +234,13 @@ export class AgentLoop {
       ]
         .filter((s) => s && s.trim())
         .join('\n\n');
+      // Check immediately before EVERY provider request. Doing this only after tool execution made
+      // text-only sessions skip proactive compaction and depend on a server overflow to recover.
+      try {
+        await this.maybeCompact(this.deps.provider, this.deps.model, sys);
+      } catch {
+        // Compaction is an optimization; a failed summary must not tear down the turn.
+      }
       const req: CompletionRequest = {
         model: this.deps.model,
         system: sys,
@@ -210,7 +256,7 @@ export class AgentLoop {
         signal: this.deps.signal, // so ESC cancels the in-flight request immediately
       };
 
-      const turn = await this.runProviderTurnWithFallback(provider, req);
+      const turn = await this.runProviderTurnWithFallback(this.deps.provider, req);
       budget.tick();
 
       // Recover tool calls a weaker model emitted as TEXT (e.g. <tool_call>{…}</tool_call>,
@@ -449,25 +495,6 @@ export class AgentLoop {
       const stop2 = budget.check(this.now());
       if (stop2) return this.stop(stop2, finalAnswer);
 
-      try {
-        if (this.deps.hooks?.pre_compact?.length) {
-          runHookPhase('pre_compact', this.deps.hooks.pre_compact, { workspaceRoot: this.deps.workspaceRoot });
-        }
-        const didCompact = await context.maybeSummarize(provider, this.deps.model, false, this.deps.signal, {
-          system: this.deps.system,
-          tools: this.deps.registry.toSchemas(),
-        });
-        if (didCompact) {
-          // Surface auto-compaction: the TUI shows it live, and the eval harness can
-          // confirm the compaction task ACTUALLY summarized (not merely got the sum right).
-          this.deps.bus.emit({ type: 'compaction', trigger: 'auto' });
-        }
-        if (this.deps.hooks?.post_compact?.length) {
-          runHookPhase('post_compact', this.deps.hooks.post_compact, { workspaceRoot: this.deps.workspaceRoot });
-        }
-      } catch {
-        // non-fatal
-      }
     }
   }
 
@@ -486,12 +513,13 @@ export class AgentLoop {
     providerError?: { code: string; message: string };
   }> {
     let model = this.deps.model;
+    let activeProvider = provider;
     let overflowCompactTried = false;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         // Always send LIVE context (after a compact retry it shrinks), still healing any
         // dangling tool_use pairs so a corrupt snapshot can't 400 the retry.
-        const turn = await this.runProviderTurn(provider, {
+        const turn = await this.runProviderTurn(activeProvider, {
           ...req,
           model,
           messages: this.healDanglingToolUses(this.deps.context.messages()),
@@ -508,12 +536,8 @@ export class AgentLoop {
         ) {
           overflowCompactTried = true;
           try {
-            const did = await this.deps.context.maybeSummarize(provider, model, true, this.deps.signal, {
-              system: this.deps.system,
-              tools: this.deps.registry.toSchemas(),
-            });
+            const did = await this.maybeCompact(activeProvider, model, this.deps.system, true);
             if (did) {
-              this.deps.bus.emit({ type: 'compaction', trigger: 'auto' });
               this.deps.bus.emit({
                 type: 'retry',
                 attempt: 1,
@@ -537,13 +561,24 @@ export class AgentLoop {
           !turn.badJsonMsg &&
           isFallbackEligible(err.code, err.message, parseHttpStatus(err.code))
         ) {
-          const fb = resolveFallbackModel(model, this.deps.models ?? [], this.deps.fallbackModel);
-          if (fb && fb !== model) {
+          const fb = resolveFallbackEntry(model, this.deps.models ?? [], this.deps.fallbackModel);
+          if (
+            !this.fallbackUsed &&
+            fb &&
+            fb.model !== model &&
+            (this.deps.resolveFallback || canReuseProviderForFallback(model, fb, this.deps.models ?? []))
+          ) {
+            const activated = this.deps.resolveFallback
+              ? await this.deps.resolveFallback(fb)
+              : { provider: activeProvider, model: fb.model };
             this.fallbackUsed = true;
             const from = model;
-            model = fb;
-            this.deps.model = fb;
-            this.deps.bus.emit({ type: 'model_fallback', from, to: fb, reason: err.message });
+            model = activated.model;
+            activeProvider = activated.provider;
+            this.deps.provider = activeProvider;
+            this.deps.model = model;
+            this.deps.budget.setModel(model);
+            this.deps.bus.emit({ type: 'model_fallback', from, to: model, reason: err.message });
             continue;
           }
         }
@@ -551,24 +586,32 @@ export class AgentLoop {
       } catch (err) {
         const e = err as Error;
         const code = e.message.split(':')[0]?.trim() ?? 'error';
-        const fb = resolveFallbackModel(model, this.deps.models ?? [], this.deps.fallbackModel);
+        const fb = resolveFallbackEntry(model, this.deps.models ?? [], this.deps.fallbackModel);
         if (
           attempt === 0 &&
+          !this.fallbackUsed &&
           fb &&
-          fb !== model &&
+          fb.model !== model &&
+          (this.deps.resolveFallback || canReuseProviderForFallback(model, fb, this.deps.models ?? [])) &&
           isFallbackEligible(code, e.message, parseHttpStatus(code))
         ) {
+          const activated = this.deps.resolveFallback
+            ? await this.deps.resolveFallback(fb)
+            : { provider: activeProvider, model: fb.model };
           this.fallbackUsed = true;
           const from = model;
-          model = fb;
-          this.deps.model = fb;
-          this.deps.bus.emit({ type: 'model_fallback', from, to: fb, reason: e.message });
+          model = activated.model;
+          activeProvider = activated.provider;
+          this.deps.provider = activeProvider;
+          this.deps.model = model;
+          this.deps.budget.setModel(model);
+          this.deps.bus.emit({ type: 'model_fallback', from, to: model, reason: e.message });
           continue;
         }
         throw err;
       }
     }
-    return this.runProviderTurn(provider, { ...req, model });
+    return this.runProviderTurn(activeProvider, { ...req, model });
   }
 
   /** Consume one provider stream into accumulated text, tool calls, and stop reason. */
@@ -629,7 +672,7 @@ export class AgentLoop {
             );
             const snap = this.deps.budget.snapshot(this.now());
             const pct =
-              this.deps.context.estimateTokens(provider) / Math.max(1, this.deps.contextBudget);
+              this.deps.context.estimateTokens(provider) / Math.max(1, this.deps.context.budget());
             this.deps.bus.emit({
               type: 'usage',
               inputTokens: snap.inputTokens,
@@ -904,9 +947,9 @@ export class AgentLoop {
       if (typeof decision === 'object' && 'setAutonomy' in decision) {
         this.setAutonomy(decision.setAutonomy);
       } else if (typeof decision === 'object' && 'approveForSession' in decision) {
-        this.sessionToolApprovals.add(call.name);
+        this.approvals.approveTool(call.name);
       } else if (typeof decision === 'object' && 'approveForPrefix' in decision) {
-        this.sessionPrefixApprovals.push(decision.approveForPrefix);
+        this.approvals.approvePrefix(decision.approveForPrefix);
       } else if (decision === 'deny') {
         bus.emit({ type: 'tool_denied', call, reason: 'denied by user' });
         return {
@@ -963,7 +1006,15 @@ export class AgentLoop {
 
     let result: ToolResult;
     try {
-      result = await tool.run(parsed.data, ctx);
+      // Race the tool against the interrupt. `ctx.signal` is passed to every tool, but honouring it
+      // is voluntary — and MCP tools (whose implementations we do not own), plus any tool doing a
+      // blocking await, simply ignore it. Esc was therefore DEAD for the entire duration of such a
+      // call: the user pressed it, the abort fired, and nothing happened until the tool finished on
+      // its own. Racing here makes the interrupt take effect at the LOOP level regardless.
+      //
+      // The tool keeps running in the background — we cannot kill code we do not control — so its
+      // promise is given a no-op catch to avoid an unhandled rejection after we have moved on.
+      result = await raceAbort(tool.run(parsed.data, ctx), ctx.signal, call.name);
     } catch (err) {
       result = {
         ok: false,
@@ -1129,10 +1180,10 @@ export class AgentLoop {
   }
 
   private isSessionApproved(call: ToolCall, preview: string): boolean {
-    if (this.sessionToolApprovals.has(call.name)) return true;
+    if (this.approvals.hasTool(call.name)) return true;
     if (call.name === 'run_shell') {
       const cmd = shellCommandOf(call.input) ?? preview;
-      for (const prefix of this.sessionPrefixApprovals) {
+      for (const prefix of this.approvals.listPrefixes()) {
         if (!cmd.startsWith(prefix)) continue;
         const tail = cmd.slice(prefix.length);
         // Honor a session prefix approval ONLY if the remainder is a plain continuation of the SAME
@@ -1149,14 +1200,33 @@ export class AgentLoop {
   }
 
   /** True when executeCall would reach the permission gate (used to avoid parallel races). */
+  /**
+   * Could this call open an approval dialog? Used ONLY to decide whether a turn's tool calls may
+   * run in PARALLEL — two concurrent dialogs cannot be shown, and the second request would sit
+   * behind the first.
+   *
+   * It used to test the autonomy floor alone, which is one of FOUR paths that gate. `forceConfirm`
+   * (the catastrophic denylist), a permission rule's `ask`, and the classifier all prompt too — so
+   * a turn containing two denylisted calls was judged parallel-safe, fired both, and the second
+   * approval request landed while the first was still pending. Deliberately conservative: a false
+   * positive only costs serial execution, a false negative wedges the turn.
+   */
   private mayNeedPermissionPrompt(call: ToolCall): boolean {
     const normalized = normalizeForeignTool({ name: call.name, input: call.input });
     const tool = this.deps.registry.get(normalized.name);
     if (!tool) return false;
     const canonical = tool.name;
     const preview = previewOf({ ...call, name: canonical, input: normalized.input });
+    // The denylist does not bend for anything, so check it before the session-approval shortcut.
+    if (this.deps.forceConfirm?.({ ...call, name: canonical, input: normalized.input }, tool.risk)) return true;
     if (this.isSessionApproved({ ...call, name: canonical }, preview)) return false;
     if (needsApproval(tool.risk, this.autonomy)) return true;
+    // A permission rule may demand confirmation regardless of level.
+    const rule = resolvePermissionRule({ ...call, name: canonical, input: normalized.input }, preview, this.deps.permissionRules ?? []);
+    if (rule === 'ask') return true;
+    // The classifier can only RAISE the bar, and it runs on every non-read call when enabled — so
+    // any such call must be treated as potentially prompting.
+    if (this.deps.autoClassifier && tool.risk !== 'read') return true;
     return false;
   }
 
@@ -1194,24 +1264,118 @@ function shellCommandOf(input: unknown): string | null {
  *
  * The description is not discarded — it rides along behind the command, clearly subordinate.
  */
+/**
+ * Input fields that ARE the action, most decision-relevant first. Anything named here outranks
+ * `description`.
+ *
+ * The original fix covered only command/path/url, which left the two highest-privilege tools in the
+ * app spoofable: `agent` carries its instructions in `prompt`, and `apply_patch` in `patch`. Neither
+ * key was listed, so both fell through to the description-only branch and the dialog showed
+ * "agent: Summarize the README" for a sub-agent prompt that read the user's ssh keys and posted
+ * them. MCP tools have arbitrary schemas and fell through the same hole.
+ */
+const OPERATIVE_KEYS = [
+  'command', // run_shell
+  'patch', // apply_patch
+  'prompt', // agent  ← a full sub-agent instruction, previously hidden behind `description`
+  'path', // read/write/edit/multi_edit/view_image
+  'url', // web_fetch
+  'task', // schedule_wakeup (its `reason` is the description-shaped field)
+  'query', // web_search
+  'pattern', // grep / glob
+  'content', // write_file, when no path is present
+  'name', // skill
+] as const;
+
 export function previewOf(call: ToolCall): string {
   const input = call.input as Record<string, unknown> | undefined;
   if (input && typeof input === 'object') {
     const desc = typeof input.description === 'string' && input.description.trim() ? input.description.trim() : '';
     const tail = desc ? ` — ${desc}` : '';
-    if (typeof input.command === 'string') return `$ ${input.command}${tail}`;
-    if (typeof input.path === 'string') return `${call.name} ${input.path}${tail}`;
-    if (typeof input.url === 'string') return `${call.name} ${input.url}${tail}`;
-    // No operative argument (e.g. an MCP tool that only takes a description) — the free text is
-    // all there is, but label it so it never reads as a verified action.
-    if (desc) return `${call.name}: ${desc}`;
+    if (typeof input.command === 'string') return `$ ${collapseForPreview(input.command)}${tail}`;
+    for (const key of OPERATIVE_KEYS) {
+      const v = input[key];
+      if (typeof v === 'string' && v.trim()) return `${call.name} ${collapseForPreview(v)}${tail}`;
+    }
+    // No RECOGNISED operative argument — an MCP tool with a bespoke schema, or a new tool whose key
+    // isn't listed above. Show the actual payload; `description` may never be the whole preview,
+    // because that is precisely the field the model controls.
+    const { description: _drop, ...rest } = input;
+    const payload = Object.keys(rest).length ? (safeJson(rest) ?? '') : '';
+    if (payload) return `${call.name} ${collapseForPreview(payload)}${tail}`;
+    if (desc) return `${call.name}: ${desc}`; // genuinely nothing but free text
   }
   return `${call.name} ${safeJson(call.input) ?? ''}`;
+}
+
+/**
+ * Flatten a preview to one line so it cannot hide its own tail.
+ *
+ * A run of whitespace is display padding, and the preview row is width-truncated: a model could send
+ * `git status` + 200 spaces + `; rm -rf ~/Documents` and the dialog would read "$ git status" with
+ * the destructive half pushed past the right edge. Newlines and tabs do the same thing. Collapsing
+ * runs to a single space keeps the whole command in the row's budget where truncation is at least
+ * visible and marked.
+ */
+function collapseForPreview(s: string): string {
+  return s.replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Resolve as soon as EITHER the tool finishes or the signal aborts.
+ *
+ * On abort the returned result is a non-fatal, recoverable failure so the turn unwinds the normal
+ * way (the orphaned tool_use still gets a synthetic tool_result, which is what keeps the next
+ * request from 400ing).
+ */
+function raceAbort(p: Promise<ToolResult>, signal: AbortSignal | undefined, toolName: string): Promise<ToolResult> {
+  if (!signal) return p;
+  const interrupted = (): ToolResult => ({
+    ok: false,
+    summary: `tool ${toolName} interrupted`,
+    error: { code: 'interrupted', message: INTERRUPTED_RESULT, recoverable: true },
+    meta: { tool: toolName, durationMs: 0, risk: 'read' },
+  });
+  if (signal.aborted) {
+    void p.catch(() => {});
+    return Promise.resolve(interrupted());
+  }
+  return new Promise<ToolResult>((resolve) => {
+    const onAbort = (): void => {
+      void p.catch(() => {}); // it may still reject later; we are no longer listening
+      resolve(interrupted());
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    void p
+      .then(resolve, (err: unknown) => {
+        resolve({
+          ok: false,
+          summary: `tool ${toolName} threw: ${(err as Error).message}`,
+          error: { code: 'tool_exception', message: (err as Error).message, recoverable: true },
+          meta: { tool: toolName, durationMs: 0, risk: 'read' },
+        });
+      })
+      .finally(() => signal.removeEventListener('abort', onAbort));
+  });
 }
 
 function parseHttpStatus(code: string): number | undefined {
   const m = /^http_(\d+)$/.exec(code);
   return m ? Number(m[1]) : undefined;
+}
+
+/** Reusing one provider object is safe only when the destination entry has the same connection
+ * identity. Cross-provider/base URL/credential fallbacks require the production resolver. */
+function canReuseProviderForFallback(currentModel: string, next: ModelEntry, entries: ModelEntry[]): boolean {
+  const current = entries.find((entry) => entry.model === currentModel);
+  if (!current || current.provider !== next.provider) return false;
+  const clean = (value: string | undefined): string => (value ?? '').replace(/\/+$/, '');
+  return (
+    clean(current.baseUrl) === clean(next.baseUrl) &&
+    current.credRef === next.credRef &&
+    current.apiKey === next.apiKey &&
+    current.authToken === next.authToken
+  );
 }
 
 function formatZodError(tool: string, error: { issues: Array<{ path: (string | number)[]; message: string }> }): string {

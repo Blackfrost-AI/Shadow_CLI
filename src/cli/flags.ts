@@ -36,10 +36,31 @@ export interface Flags {
 export function parseArgs(argv: string[]): Flags {
   const f: Flags = {};
   for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    const next = () => argv[++i];
+    const raw = argv[i]!;
+    if (raw === '--') {
+      const rest = argv.slice(i + 1);
+      if (!rest.length) break;
+      if (f.task !== undefined) throw new Error('arguments after -- conflict with --task');
+      f.task = rest.join(' ');
+      break;
+    }
+    const eq = raw.startsWith('--') ? raw.indexOf('=') : -1;
+    const a = eq > 2 ? raw.slice(0, eq) : raw;
+    let inline = eq > 2 ? raw.slice(eq + 1) : undefined;
+    const next = (): string => {
+      const value = inline !== undefined ? inline : argv[++i];
+      inline = undefined;
+      if (value === undefined || value === '' || /^-{1,2}[A-Za-z]/.test(value)) {
+        throw new Error(`${a} requires a value`);
+      }
+      return value;
+    };
+    const noInlineValue = (): void => {
+      if (inline !== undefined) throw new Error(`${a} does not take a value`);
+    };
     switch (a) {
       case '--web':
+        noInlineValue();
         f.web = true;
         break;
       case '--web-port':
@@ -85,47 +106,56 @@ export function parseArgs(argv: string[]): Flags {
         break;
       }
       case '--fast':
+        noInlineValue();
         f.fast = true;
         break;
       case '--log-level':
         f.logLevel = next();
         break;
       case '--dry-run':
+        noInlineValue();
         f.dryRun = true;
         break;
       case '--task':
         f.task = next();
         break;
       case '--repl':
+        noInlineValue();
         f.repl = true;
         break;
       case '--offline':
+        noInlineValue();
         f.offline = true;
         break;
       case '--no-sandbox':
+        noInlineValue();
         f.noSandbox = true;
         break;
       case '--style':
         f.style = next() as OutputStyle;
         break;
       case '--plan-mode':
+        noInlineValue();
         f.planMode = true;
         break;
       case '--yolo':
       case '--nuke':
       case '--dangerously-skip-permissions':
+        noInlineValue();
         f.yolo = true;
         break;
       case '-v':
       case '--version':
+        noInlineValue();
         f.version = true;
         break;
       case '-h':
       case '--help':
+        noInlineValue();
         f.help = true;
         break;
       default:
-        break;
+        throw new Error(`unknown option: ${raw}`);
     }
   }
   return f;

@@ -41,7 +41,7 @@ const COALESCE_MS = 50;
  */
 const COALESCE_MAX_BYTES = 64 * 1024;
 
-/** Per-client outbound buffer. Past this the client is a slow consumer and frames are dropped. */
+/** Per-client outbound buffer. Past this, disconnect and let EventSource replay the ring. */
 const CLIENT_QUEUE_MAX_BYTES = 4_000_000;
 
 /** Reconnect backoff advertised to EventSource. */
@@ -84,8 +84,6 @@ interface Client {
   res: ServerResponse;
   /** Bytes handed to res.write() that the socket has not yet flushed. */
   queued: number;
-  /** Frames dropped while over the queue cap; surfaced once as a gap marker. */
-  dropped: number;
 }
 
 export function createSessionStream(opts: SessionStreamOptions): SessionStream {
@@ -107,24 +105,24 @@ export function createSessionStream(opts: SessionStreamOptions): SessionStream {
 
   /** Write one frame to one client, respecting its backpressure budget. */
   const writeTo = (c: Client, frame: string): void => {
-    if (c.queued > CLIENT_QUEUE_MAX_BYTES) {
-      c.dropped++;
+    const bytes = Buffer.byteLength(frame);
+    if (c.queued + bytes > CLIENT_QUEUE_MAX_BYTES) {
+      // Dropping indefinitely strands the browser in a permanent loading state because even the
+      // terminal stop frame is discarded. Closing is recoverable: EventSource reconnects with its
+      // last id and the replay ring supplies every missed frame, including stop.
+      clients.delete(c.id);
+      try { c.res.destroy(); } catch { /* already closed */ }
       return;
     }
-    if (c.dropped > 0) {
-      // Tell the client its view has a hole rather than letting it silently diverge.
-      const notice = `data: ${JSON.stringify({ type: 'stream_gap', dropped: c.dropped })}\n\n`;
-      c.dropped = 0;
-      c.queued += notice.length;
-      c.res.write(notice, () => {
-        c.queued -= notice.length;
-      });
-    }
-    const bytes = Buffer.byteLength(frame);
     c.queued += bytes;
-    c.res.write(frame, () => {
-      c.queued -= bytes;
-    });
+    try {
+      c.res.write(frame, () => {
+        c.queued = Math.max(0, c.queued - bytes);
+      });
+    } catch {
+      clients.delete(c.id);
+      try { c.res.destroy(); } catch { /* already closed */ }
+    }
   };
 
   const push = (event: LoopEvent): void => {
@@ -192,7 +190,7 @@ export function createSessionStream(opts: SessionStreamOptions): SessionStream {
       }
 
       const id = opts.allocClientId();
-      clients.set(id, { id, res, queued: 0, dropped: 0 });
+      clients.set(id, { id, res, queued: 0 });
       let detached = false;
       return () => {
         if (detached) return;

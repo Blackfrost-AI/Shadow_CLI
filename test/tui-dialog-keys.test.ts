@@ -27,6 +27,14 @@ import type { ProviderEvent, Provider } from '../src/provider/provider.js';
 import type { Tool } from '../src/tools/types.js';
 import { ok } from '../src/tools/types.js';
 
+// The type-ahead guard (DIALOG_ARM_MS) ignores keys pressed in the first ~275 ms a dialog is up,
+// because those were already in flight when it opened — that is B2, the blocker where typing a
+// sentence mid-turn approved `rm -rf` for the whole session. A test driver presses in the SAME TICK
+// the dialog opens, which no human can do, so the guard would swallow every keystroke below. Zero
+// it here so these tests keep asserting what they are about (resolver routing); the guard has its
+// own dedicated coverage in tui-typeahead-guard.test.ts.
+process.env.SHADOW_DIALOG_ARM_MS = '0';
+
 const tick = (ms = 90) => new Promise((r) => setTimeout(r, ms));
 const ANSI = new RegExp(String.fromCharCode(27) + '\\[[0-9;]*m', 'g');
 const strip = (s: string | undefined) => (s ?? '').replace(ANSI, '');
@@ -68,7 +76,6 @@ function baseOpts(over: Partial<TuiOpts> & { workspaceRoot: string }): TuiOpts {
     context: new Context({ contextBudget: cfg.contextBudget, triggerRatio: cfg.summarizeTriggerRatio, keepLastTurns: cfg.keepLastTurns }),
     sessionLog: { record() {}, recordSnapshot() {}, path: undefined } as unknown as TuiOpts['sessionLog'],
     system: 'test',
-    workspaceRoot: over.workspaceRoot,
     cfg,
     autonomy: 'manual',
     bypass: false,

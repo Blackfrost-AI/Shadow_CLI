@@ -21,7 +21,7 @@ import {
   repeatStep,
   leadsWithBlock,
 } from './tui/streamCommit.js';
-import { computeLayout, formatStatusStrip, pinnedMaxItems, fitHud } from './tui/layout.js';
+import { computeLayout, formatStatusStrip, pinnedMaxItems, composerMaxRows, fitHud } from './tui/layout.js';
 import { PendingOverlay, ModelPickerOverlay } from './tui/overlays.js';
 import { buildSeats, resolveTableEntries, parseTableInput, seatTag, MIN_SEATS, MAX_SEATS, type Seat, type SpeakerTag } from './tui/roundTable.js';
 import { execFileSync, spawn } from 'node:child_process';
@@ -74,7 +74,7 @@ import {
   buildAutoAnswers,
   type QuestionSelection,
 } from './tui/questions.js';
-import { imageMediaType } from './util/image.js';
+import { fetchRemoteImage, imageMediaType, MAX_IMAGE_BYTES } from './util/image.js';
 import { highlight, type CodeRole } from './util/highlight.js';
 import { Context } from './agent/context.js';
 import type { TodoItem, TodoList } from './agent/todo.js';
@@ -87,11 +87,12 @@ import {
   type ApprovalGate,
   type ApprovalRequest,
   AutoApproveGate,
+  SessionApprovals,
 } from './agent/approval.js';
-import { cycleAutonomy, type AutonomyLevel } from './safety/permissions.js';
+import { cycleAutonomy, raiseAutonomy, type AutonomyLevel } from './safety/permissions.js';
 import { applyPermissionCommand } from './safety/permissionCmd.js';
 import { isLocalBaseUrl, isLocalModelTarget } from './safety/offline.js';
-import { clampLocalContextBudget } from './util/contextBudget.js';
+import { clampLocalContextBudget, keepLastTurnsForBudget, triggerRatioForBudget } from './util/contextBudget.js';
 import { familyProfile } from './config/familyProfiles.js';
 import { SessionLog } from './state/session.js';
 import { createProvider, type ProviderName } from './provider/index.js';
@@ -104,7 +105,7 @@ import {
   saveGlobalMcpServers,
   type McpServers,
 } from './mcp/manage.js';
-import { ensureLocalServer, isLocalServedEntry, mlxOfflineReady } from './gguf.js';
+import { configuredContextWindow, detectServerContextWindow, ensureLocalServer, isLocalServedEntry, mlxOfflineReady } from './gguf.js';
 import { runModelCheck } from './doctor/modelCheck.js';
 import {
   resolveApiKey,
@@ -162,10 +163,13 @@ import {
 } from './agent/effort.js';
 import { categorizeContext, contextSuggestions } from './tui/contextViz.js';
 import { copyToClipboard, hasClipboard, readClipboard } from './util/clipboard.js';
-import { redactString } from './util/redact.js';
+import { redactString, redactConfig, isSecretKey, maskSecret } from './util/redact.js';
 import { useKeybindings } from './tui/keybindings/useKeybinding.js';
 import { bindingsForDisplay, initKeybindingsFile } from './tui/keybindings/loader.js';
 import type { ContextName } from './tui/keybindings/types.js';
+import { claimMode, releaseMode, updateReset, restoreTerminal, installRestoreHandlers } from './tui/terminalState.js';
+import { scrubForDisplay } from './util/scrub.js';
+import { scrubbedEnv } from './util/safeEnv.js';
 import { stripCtl, formatUsage, formatCount, shellCommandOf, agentAttr, oneLine, formatDiffStats, shortPath } from './tui/format.js';
 import {
   THEMES,
@@ -219,7 +223,7 @@ export function runStatusLine(cmd: string, ctx: StatusLineCtx, cb: (line: string
     const child = spawn('sh', ['-c', cmd], {
       stdio: ['pipe', 'pipe', 'ignore'],
       env: {
-        ...process.env,
+        ...scrubbedEnv(),
         SHADOW_MODEL: ctx.model,
         SHADOW_PROVIDER: ctx.provider,
         SHADOW_CWD: ctx.cwd,
@@ -380,7 +384,15 @@ export interface ArgContext {
   workspaceRoot: string;
   /** Prior sessions, newest first (for /resume). */
   sessions: { id: string; label: string }[];
-  /** How many user turns this session has (for /rewind). */
+  /**
+   * How many rewindable SNAPSHOT turns this session has (for /rewind).
+   *
+   * NOT the composer-history length. `rewindToTurn` addresses context snapshots written by the
+   * loop, and the picker was fed `historyRef.current.length` — the count of submissions, which
+   * counts slash commands that never ran a turn and misses injected (wakeup) turns. The two
+   * numbers drift apart within minutes of normal use, so "Turn 3" in the menu reverted WORKSPACE
+   * FILES to a different point than the label named.
+   */
   turns: number;
   /** Extra directories granted this session (for /add-dir remove). */
   extraRoots: string[];
@@ -770,6 +782,26 @@ const AUTO_ANSWER_SECS = (() => {
 })();
 const AUTO_ANSWER_ENABLED = process.env.SHADOW_NO_AUTO_ANSWER !== '1';
 
+/**
+ * How long a freshly-opened approval dialog ignores keystrokes as decisions (onKey §1).
+ *
+ * Sized to swallow only IN-FLIGHT input. Sustained fast typing is ~125 ms/key, so this covers the
+ * couple of keys already travelling when the gate opens; a deliberate answer requires reading the
+ * dialog first, which is several hundred milliseconds of human reaction time on top. Raising it
+ * much further would start eating real answers, and lowering it reopens the leak.
+ *
+ * `SHADOW_DIALOG_ARM_MS` overrides it. Tests set 0 because a driver presses the key in the same
+ * tick the dialog opens — a timing no human can produce, and the one case where "was this key
+ * already in flight?" has no meaningful answer. Setting it to 0 in a real session re-opens the
+ * type-ahead approval hole, so it is a test seam, not a preference.
+ */
+// Read per-use, not once at module load: ESM hoists imports above a test file's env assignment, so
+// a module-level constant would always capture the default and the seam would silently not work.
+function dialogArmMs(): number {
+  const n = Number(process.env.SHADOW_DIALOG_ARM_MS);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 275;
+}
+
 // ── Interactive approval gate ────────────────────────────────────────────────
 /**
  * Bridges the headless loop's `ApprovalGate` contract to the React UI: `request`
@@ -779,26 +811,45 @@ const AUTO_ANSWER_ENABLED = process.env.SHADOW_NO_AUTO_ANSWER !== '1';
  * the Promise the running loop is awaiting.
  */
 class InteractiveGate implements ApprovalGate {
-  private resolver: ((d: ApprovalDecision) => void) | null = null;
+  /**
+   * Pending requests, oldest first. A single `resolver` field could only ever hold ONE — a second
+   * concurrent request overwrote it and the first promise was orphaned, so the loop awaited a
+   * decision that could no longer arrive and the turn hung until Esc. Reachable whenever two gated
+   * calls land in one turn (parallel tools, or the `ask_user_question` tool racing a permission
+   * gate), which `mayNeedPermissionPrompt` no longer under-reports either.
+   */
+  private queue: Array<{ req: ApprovalRequest; resolve: (d: ApprovalDecision) => void }> = [];
   /** Wired by the component to set/clear the pending-approval state. */
   show: (req: ApprovalRequest | null) => void = () => {};
 
   request(req: ApprovalRequest): Promise<ApprovalDecision> {
     return new Promise<ApprovalDecision>((resolve) => {
-      this.resolver = resolve;
-      this.show(req);
+      const entry = { req, resolve };
+      this.queue.push(entry);
+      // An aborted request (Esc/Ctrl-C) is settled by settleWithAbort, not by us — but its queue
+      // slot must go, or it would surface as a dialog for a call that is already dead.
+      req.signal?.addEventListener('abort', () => this.drop(entry), { once: true });
+      if (this.queue.length === 1) this.show(req); // nothing ahead of it: show now
     });
   }
 
   respond(d: ApprovalDecision): void {
-    const r = this.resolver;
-    this.resolver = null;
-    this.show(null);
-    r?.(d);
+    const head = this.queue.shift();
+    if (!head) return;
+    this.show(this.queue[0]?.req ?? null); // surface the next one, or clear the dialog
+    head.resolve(d);
+  }
+
+  private drop(entry: { req: ApprovalRequest }): void {
+    const i = this.queue.findIndex((e) => e === entry);
+    if (i < 0) return;
+    const wasHead = i === 0;
+    this.queue.splice(i, 1);
+    if (wasHead) this.show(this.queue[0]?.req ?? null);
   }
 
   get awaiting(): boolean {
-    return this.resolver !== null;
+    return this.queue.length > 0;
   }
 }
 
@@ -812,6 +863,7 @@ export interface TuiOpts {
   system: string;
   workspaceRoot: string;
   cfg: ShadowConfig;
+  baseContextPolicy?: { contextBudget: number; triggerRatio: number; keepLastTurns: number };
   autonomy: AutonomyLevel;
   bypass: boolean; // --yolo
   offline?: boolean; // --offline (Offline Shadow Mode)
@@ -1477,6 +1529,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const [input, setInput] = useState('');
   const [status, setStatus] = useState('0 tokens');
   const [pending, setPending] = useState<ApprovalRequest | null>(null);
+  /** When the current dialog became visible — the type-ahead guard's reference point (onKey §1). */
+  const dialogShownAtRef = useRef(0);
+  /** Once dialog-opening interrupts typed text, printable keys stay with the composer until the
+   * user explicitly re-focuses the dialog with a non-printable key. */
+  const dialogTypeaheadRef = useRef(false);
+  /** Session-lifetime "approve for session/prefix" grants, shared by every per-message AgentLoop. */
+  const sessionApprovalsRef = useRef(new SessionApprovals());
   const [questionIndex, setQuestionIndexState] = useState(0);
   const [questionSelections, setQuestionSelectionsState] = useState<QuestionSelection>({});
   const [questionCursor, setQuestionCursorState] = useState<Record<number, number>>({}); // highlighted option per question
@@ -1498,7 +1557,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const tableRef = useRef<{ seats: Seat[] } | null>(null);
   tableRef.current = table;
   const speakerRef = useRef<SpeakerTag | null>(null); // seat that currently holds the baton (tags its turns)
-  const preTableRef = useRef<{ client: Provider; provider: ProviderName; model: string } | null>(null);
+  const preTableRef = useRef<{ client: Provider; provider: ProviderName; model: string; policy: ReturnType<Context['policy']> } | null>(null);
   const routeInFlightRef = useRef(false); // a seat route is building/running — block a second concurrent route
   const [pickerOpen, setPickerOpen] = useState(false); // model-picker has focus
   const [pickerIndex, setPickerIndex] = useState(0); // selected row in the model picker
@@ -1567,10 +1626,46 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const repeatPosRef = useRef(0);
   /** Feed an assistant block through the repeat detector; returns true if it's a verbatim repeat to
    *  SUPPRESS. Mutates the run/pos refs. */
+  /**
+   * Manual /compact in flight. Compaction REWRITES the shared Context, and the composer stayed
+   * live throughout — so a message submitted mid-compaction started a turn that read the context
+   * while it was being rebuilt. The lock closes that window; the controller makes Esc mean
+   * something (context.maybeSummarize has always accepted a signal — the TUI just never passed
+   * one, so its own comment "ESC must be able to stop a compaction" was untrue here).
+   */
+  const compactingRef = useRef(false);
+  const compactAbortRef = useRef<AbortController | null>(null);
+
+  /**
+   * Rewindable snapshot turns, refreshed when a turn ends. Read from the session log rather than
+   * counted in the UI, so the /rewind menu is always in the same unit rewindToTurn consumes.
+   */
+  const rewindableTurnsRef = useRef(0);
+
+  /**
+   * Repaint the visible transcript from the loaded context.
+   *
+   * `/resume` and `/rewind` replaced the model's context but left the SCREEN showing the previous
+   * conversation, so the transcript and the model disagreed about what had been said — with no
+   * indication which one was real. This replays the context that is actually in force: user and
+   * assistant text, with tool traffic summarized (the tool results are in context, but re-rendering
+   * their full output would flood the screen and is not what the user is checking).
+   */
+  const repaintFromContextRef = useRef<(() => void) | null>(null);
+
+  /** Forward reference to pushLine, which is defined below this hook. */
+  const pushLineRef = useRef<((l: Omit<TranscriptItem, 'id' | 'kind'> & { kind?: TranscriptItem['kind'] }) => void) | null>(null);
   const absorbAssistant = useCallback((text: string): boolean => {
     const r = repeatStep(answerRunRef.current, repeatPosRef.current, dupKey(text));
     answerRunRef.current = r.run;
     repeatPosRef.current = r.pos;
+    // A suppressed block leaves a mark. The detector cannot distinguish "the model restarted its
+    // answer" from "this paragraph legitimately appears twice", so dropping one without a trace
+    // meant the transcript quietly disagreed with what the model actually said. One dim line per
+    // RUN (pos <= 1 is the run's start) keeps it honest without narrating every collapsed block.
+    if (r.suppress && r.pos <= 1) {
+      pushLineRef.current?.({ text: '  ⋮ identical block repeated — collapsed', dimColor: true });
+    }
     return r.suppress;
   }, []);
   const autonomyRef = useRef(autonomy);
@@ -1581,6 +1676,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const questionSelectionsRef = useRef<QuestionSelection>({});
   const questionCursorRef = useRef<Record<number, number>>({});
   const autoAnswerSecsRef = useRef<number | null>(null);
+  /**
+   * Latched the moment the user touches a question dialog. The countdown used to RESTART on every
+   * key, which is not the same thing: a user who engaged and then stepped away mid-decision still
+   * had an answer submitted for them, overwriting selections they were in the middle of making.
+   * Engagement means "a human is handling this" — the idle timer's whole premise is gone.
+   */
+  const autoAnswerEngagedRef = useRef(false);
   const inputRef = useRef(input);
   const firstRef = useRef(true);
   const controllerRef = useRef<AbortController | null>(null);
@@ -1625,13 +1727,21 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const currentRef = useRef(current);
   // The session's ORIGINAL context budget — /model switches to a gguf clamp under its window,
   // and switching back to a cloud model restores this (see selectModel).
-  const baseBudgetRef = useRef<number | null>(null);
+  const baseContextPolicyRef = useRef(
+    opts.baseContextPolicy ?? {
+      contextBudget: opts.cfg.contextBudget,
+      triggerRatio: opts.cfg.summarizeTriggerRatio,
+      keepLastTurns: opts.cfg.keepLastTurns,
+    },
+  );
+  const modelSwitchSeqRef = useRef(0);
+  const modelSwitchingRef = useRef(false);
   const pickerOpenRef = useRef(false);
   const pickerIndexRef = useRef(0);
   const styleRef = useRef(style);
   const runOneRef = useRef<((task: string) => void) | null>(null);
   const selectModelRef = useRef<((entry: ModelEntry) => Promise<void>) | null>(null);
-  const buildProviderRef = useRef<((entry: ModelEntry, opts?: { clampBudget?: boolean }) => Promise<{ ok: true; client: Provider; provider: ProviderName; model: string } | { ok: false; error: string; fatal?: boolean }>) | null>(null);
+  const buildProviderRef = useRef<((entry: ModelEntry, opts?: { clampBudget?: boolean; applyPolicy?: () => boolean }) => Promise<{ ok: true; client: Provider; provider: ProviderName; model: string } | { ok: false; error: string; fatal?: boolean }>) | null>(null);
   const handleTableInputRef = useRef<((raw: string) => void) | null>(null);
   const startTableRef = useRef<((arg: string) => void) | null>(null);
   const flushQueueRef = useRef<(() => void) | null>(null);
@@ -1643,6 +1753,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const [, setThemeTick] = useState(0);
   // Custom footer line from /statusline: the shell command (ref) and its latest output (state).
   const statusLineRef = useRef<string>(typeof opts.cfg.statusLine === 'string' ? opts.cfg.statusLine : '');
+  const statusLineGenerationRef = useRef(0);
   const [customStatus, setCustomStatus] = useState('');
   // Vim modal editing (/vim). Refs drive the key handler; state drives the footer indicator.
   const vimEnabledRef = useRef<boolean>(opts.cfg.vimMode === true);
@@ -1857,7 +1968,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // anything smaller inserts verbatim and stays editable. Newlines are already normalized
   // (\r\n and bare \r → \n) by every caller — macOS terminals paste line ends as \r, which
   // used to defeat the chip's line count and render as invisible garbage in the composer.
-  const insertPastable = useCallback((text: string) => {
+  const insertPastable = useCallback((rawText: string) => {
+    // Strip escapes and stray C0 bytes, matching what the TYPED path already does. Bracketed paste
+    // delivers whatever the clipboard holds verbatim: pasting terminal output (or a crafted blob)
+    // put raw CSI/OSC bytes straight into the draft, where they corrupted the rendered composer,
+    // broke width measurement, and were then sent to the provider. Tabs and newlines survive —
+    // they are legitimate content in a paste.
+    const text = stripCtl(rawText);
     const c = cursorRef.current;
     const s = inputRef.current;
     if (isBigPaste(text)) {
@@ -1924,8 +2041,14 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     const q = qs[idx];
     if (!q) return;
     const cursor = questionCursorRef.current[idx] ?? recommendedIndex(q);
-    // Single-select: commit the highlighted option if nothing is chosen yet.
-    if (!q.multiSelect && !questionSelectionsRef.current[idx]?.length) chooseAtQuestion(idx, cursor);
+    // Commit the highlighted option if nothing is chosen yet — for BOTH kinds.
+    //
+    // Multi-select was excluded, so Enter with nothing ticked committed an empty answer `[]` while
+    // the dialog was visibly highlighting a row (and marking one "★ recommended"). The user saw a
+    // choice on screen, pressed Enter, and the model received "nothing selected". Taking the
+    // highlighted row matches what the frame shows; a genuinely empty answer is still reachable
+    // with Esc, which denies.
+    if (!questionSelectionsRef.current[idx]?.length) chooseAtQuestion(idx, cursor);
     if (idx < qs.length - 1) {
       setQuestionIndex(idx + 1);
       return;
@@ -1964,12 +2087,43 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     // is opt-in (SHADOW_FETCH_REMOTE_IMAGES=1); local paths + data: URIs always load. Fire-and-forget.
     if (kind === 'assistant' && typeof l.text === 'string') enqueueMdImagesRef.current(l.text);
   }, []);
+  pushLineRef.current = pushLine;
+
+  const repaintFromContext = useCallback(() => {
+    setCommitted([]);
+    committedRef.current = [];
+    setStaticEpoch((n) => n + 1); // remount <Static> so it forgets the previous conversation
+    const msgs = context.messages();
+    let tools = 0;
+    for (const m of msgs) {
+      const text = m.content
+        .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+        .map((b) => b.text)
+        .join('\n')
+        .trim();
+      tools += m.content.filter((b) => b.type === 'tool_use').length;
+      if (!text) continue;
+      if (m.role === 'user') {
+        pushLine({ kind: 'user', text: `❯ ${text}`, color: C.green, bold: true, meta: 'you' });
+      } else if (m.role === 'assistant') {
+        pushLine({ kind: 'assistant', text: scrubForDisplay(text), color: C.fg, meta: 'assistant' });
+      }
+    }
+    if (tools > 0) {
+      pushLine({ text: `  ⋮ ${tools} tool call${tools === 1 ? '' : 's'} in the restored context (output not replayed)`, dimColor: true });
+    }
+  }, [context, pushLine]);
+  repaintFromContextRef.current = repaintFromContext;
 
   /** Push an inline-image item to the transcript and handle the display fallback. On a terminal
    *  that renders inline images, flatten paints the pixels + a durable placeholder. On any other
    *  terminal, the placeholder still shows AND we auto-open the OS viewer (Preview.app / xdg-open)
    *  — the grok-cli approach — so the image is always seen. */
   const pushImage = useCallback((bytes: string, mediaType: string, alt: string, source: string) => {
+    if (Buffer.byteLength(bytes, 'base64') > MAX_IMAGE_BYTES) {
+      pushLine({ kind: 'error', text: `Image skipped: ${alt} exceeds 20 MiB.`, color: C.yellow });
+      return;
+    }
     // `text` is the plain-text fallback (export / headless / stock Ink path); the styled flatten
     // render uses `image` for the placeholder + inline pixels.
     pushLine({ kind: 'image', text: `🖼 ${alt}`, image: { bytes, mediaType, alt, source } });
@@ -1991,8 +2145,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     while ((m = re.exec(text)) !== null) {
       const alt = m[1] || 'image';
       const url = m[2]!;
-      const dataUri = url.match(/^data:(image\/[a-z+]+);base64,(.*)$/i);
+      const dataUri = url.match(/^data:(image\/(?:png|jpeg|gif|webp));base64,(.*)$/i);
       if (dataUri) {
+        if (Buffer.byteLength(dataUri[2]!, 'base64') > MAX_IMAGE_BYTES) continue;
         pushImage(dataUri[2]!, dataUri[1]!, alt, 'markdown');
         continue;
       }
@@ -2000,11 +2155,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         if (process.env.SHADOW_FETCH_REMOTE_IMAGES !== '1') continue; // opt-in privacy gate
         void (async () => {
           try {
-            const res = await fetch(url);
-            if (!res.ok) return;
-            const buf = Buffer.from(await res.arrayBuffer());
-            const mt = (res.headers.get('content-type') ?? 'image/png').split(';')[0]!.trim();
-            pushImage(buf.toString('base64'), mt, alt, 'markdown');
+            const image = await fetchRemoteImage(url);
+            pushImage(image.bytes.toString('base64'), image.mediaType, alt, 'markdown');
           } catch {
             /* network failure — skip silently */
           }
@@ -2017,6 +2169,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           const abs = isAbsolute(url) ? url : resolve(opts.workspaceRoot, url);
           const mt = imageMediaType(abs);
           if (!mt) return;
+          if (statSync(abs).size > MAX_IMAGE_BYTES) return;
           pushImage(readFileSync(abs).toString('base64'), mt, alt, 'markdown');
         } catch {
           /* not found / unreadable — skip */
@@ -2139,6 +2292,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
 
   // Re-run the /statusline command (if any) and stash its output for the footer.
   const refreshStatusLine = useCallback(() => {
+    const generation = ++statusLineGenerationRef.current;
     const cmd = statusLineRef.current;
     if (!cmd) {
       setCustomStatus('');
@@ -2147,7 +2301,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     runStatusLine(
       cmd,
       { model: currentRef.current.model, provider: currentRef.current.provider, cwd: opts.workspaceRoot, autonomy: autonomyRef.current },
-      (line) => setCustomStatus(line),
+      (line) => {
+        if (generation === statusLineGenerationRef.current) setCustomStatus(line);
+      },
     );
   }, [opts.workspaceRoot]);
 
@@ -2238,7 +2394,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   useEffect(() => kbRegister('confirm:always', () => {
     const p = pendingRef.current;
     if (p && p.kind !== 'plan_enter') {
-      const next = cycleAutonomy(autonomyRef.current);
+      // raiseAutonomy, not cycleAutonomy — see the inline handler for why (full→manual wrap).
+      const next = raiseAutonomy(autonomyRef.current);
       setAutonomy(next);
       igateRef.current?.respond({ setAutonomy: next });
     }
@@ -2312,7 +2469,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         }
         case '/new':
         case '/clear':
-          process.stdout.write('\x1b[2J\x1b[3J\x1b[H'); // wipe screen + scrollback (Static already emitted)
+          // isTTY-gated like every sibling escape site (reflow, theme, paste, mouse, startupSequence
+          // all are). This one was not, so it leaked 2J/3J into pipes and files — and since several
+          // tests drive /clear, `npm test` could wipe the developer's own scrollback.
+          if (process.stdout.isTTY) process.stdout.write('\x1b[2J\x1b[3J\x1b[H'); // wipe screen + scrollback
           context.reset();
           firstRef.current = true;
           answerOpenRef.current = false;
@@ -2468,6 +2628,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
                     text: `${entry.label}: vault slot "${testCred.slot}" is ${testCred.reason === 'locked' ? 'locked' : 'empty'} — cannot test.`,
                     color: C.red,
                   });
+                  return;
                 }
                 if (isLocalServedEntry(entry)) {
                   try {
@@ -2480,7 +2641,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
                     return;
                   }
                 }
-                prov = createProvider({ provider: p, model: entry.model, apiKey, authToken: entry.authToken ?? resolveAuthToken(entry.provider), baseUrl });
+                prov = createProvider({ provider: p, model: entry.model, apiKey, authToken: testCred.authToken, baseUrl });
               }
               if (!prov) {
                 pushLine({ text: 'No active provider to test.', color: C.red });
@@ -2555,6 +2716,15 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
               text: 'local',
               lines: formatLocalList(allEntries).map((text) => ({ text, dimColor: true })),
             });
+            break;
+          }
+          // `/local test` is advertised in the argument menu ("Launch it and check it answers") but
+          // was never handled — it fell through to the unknown-action branch. `/model test` already
+          // does exactly this (including ensureLocalServer for a local-served preset), so route to
+          // it rather than growing a second copy that would drift.
+          if (action === 'test') {
+            const target = parts.slice(1).join(' ').trim();
+            runSlash(findSlashCommand('/model')!, `/model test${target ? ` ${target}` : ''}`);
             break;
           }
           if (action === 'add') {
@@ -2684,7 +2854,14 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           break;
         }
         case '/fast': {
-          const next = !opts.cfg.fastMode;
+          // `/fast on` / `/fast off` are documented and were silently ignored — the handler always
+          // toggled, so a user scripting "make sure fast is on" turned it OFF half the time.
+          const want = arg.trim().toLowerCase();
+          if (want && want !== 'on' && want !== 'off') {
+            pushLine({ text: 'Usage: /fast [on|off] — no argument toggles.', dimColor: true });
+            break;
+          }
+          const next = want === 'on' ? true : want === 'off' ? false : !opts.cfg.fastMode;
           opts.cfg.fastMode = next;
           void saveGlobalConfig({ fastMode: next });
           pushLine({
@@ -2695,7 +2872,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         }
         case '/effort': {
           // No arg: cycle. With arg: set (validated). Live-applies next turn + persists.
+          // A garbage argument used to fall through to the CYCLE, so `/effort hgih` silently set
+          // some unrelated level and reported success. Only a bare /effort cycles.
           const parsed = normalizeEffort(arg);
+          if (arg.trim() && !parsed) {
+            pushLine({ text: `Unknown effort "${arg.trim()}". Use: low, medium, high, xhigh, max — or /effort alone to cycle.`, color: C.red });
+            break;
+          }
           const next = parsed ?? cycleEffort(effortRef.current);
           setEffort(next);
           pushLine({
@@ -2709,17 +2892,43 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             pushLine({ text: 'Finish the current turn before compacting.', dimColor: true });
             break;
           }
-          pushLine({ text: 'Compacting context…', dimColor: true });
+          if (compactingRef.current) {
+            pushLine({ text: 'Already compacting — Esc to cancel.', dimColor: true });
+            break;
+          }
+          pushLine({ text: 'Compacting context… (Esc cancels)', dimColor: true });
+          compactingRef.current = true;
+          compactAbortRef.current = new AbortController();
           void (async () => {
+            const ctl = compactAbortRef.current;
             try {
-              const did = await context.maybeSummarize(providerRef.current, currentRef.current.model, true);
-              pushLine(
-                did
-                  ? { text: 'Context compacted — earlier turns summarized.', color: C.cyan }
-                  : { text: 'Nothing to compact yet.', dimColor: true },
+              const did = await context.maybeSummarize(
+                providerRef.current,
+                currentRef.current.model,
+                true,
+                ctl?.signal,
               );
+              if (ctl?.signal.aborted) {
+                pushLine({ text: 'Compaction cancelled — context unchanged.', dimColor: true });
+              } else {
+                pushLine(
+                  did
+                    ? { text: 'Context compacted — earlier turns summarized.', color: C.cyan }
+                    : { text: 'Nothing to compact yet.', dimColor: true },
+                );
+              }
             } catch (e) {
-              pushLine({ text: `Compact failed: ${(e as Error).message}`, color: C.red });
+              pushLine(
+                ctl?.signal.aborted
+                  ? { text: 'Compaction cancelled — context unchanged.', dimColor: true }
+                  : { text: `Compact failed: ${(e as Error).message}`, color: C.red },
+              );
+            } finally {
+              compactingRef.current = false;
+              compactAbortRef.current = null;
+              // Anything typed while the lock was held is queued but has no turn-end to flush it —
+              // compaction finishing IS that moment.
+              flushQueueRef.current?.();
             }
           })();
           break;
@@ -2770,10 +2979,26 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             });
             context.loadState(resumed.exportState());
             firstRef.current = context.messages().length === 0;
+            // Repaint BEFORE the confirmation line, so the notice sits at the bottom of the
+            // conversation it is describing rather than above a stale one.
+            repaintFromContextRef.current?.();
+            // Seed THIS session's log with the restored context. `/export` reads the CURRENT log
+            // file, which is brand new after a resume — so exporting a resumed session produced a
+            // file containing nothing but frontmatter, silently losing the very conversation the
+            // user had just restored in order to keep working on it.
+            try {
+              sessionLog.recordSnapshot(context, 0);
+              sessionLog.record({ kind: 'resumed_from', sessionId: pick.id, path: pick.path });
+            } catch {
+              /* a log that cannot be written must not fail the resume itself */
+            }
             pushLine({
               text: `Resumed ${pick.id} (${context.messages().length} messages).`,
               color: C.cyan,
             });
+            // A different session is a different grant scope: "approve run_shell for this session"
+            // must not silently carry into the one just loaded.
+            sessionApprovalsRef.current.clear();
           } catch (e) {
             pushLine({ text: `Resume failed: ${(e as Error).message}`, color: C.red });
           }
@@ -2803,6 +3028,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             );
             context.loadState(rewound.exportState());
             firstRef.current = context.messages().length === 0;
+            repaintFromContextRef.current?.();
             pushLine({
               kind: 'system',
               text: 'rewind',
@@ -2833,8 +3059,15 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           const seed =
             'You are Shadow working in this project.\n\n' +
             'Add project-specific conventions, build commands, and hard rules here.\n';
-          writeFileSync(target, seed, 'utf8');
-          pushLine({ text: `Created ${target}`, color: C.cyan });
+          // An unwritable workspace (read-only mount, permissions, a full disk) threw straight out
+          // of the slash dispatcher and took the whole TUI down — losing the session over a failed
+          // file write. Report it like every other command failure instead.
+          try {
+            writeFileSync(target, seed, 'utf8');
+            pushLine({ text: `Created ${target}`, color: C.cyan });
+          } catch (e) {
+            pushLine({ text: `Could not create ${shortPath(target)}: ${(e as Error).message}`, color: C.red });
+          }
           break;
         }
         case '/agents': {
@@ -3028,6 +3261,18 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           break;
         }
         case '/doctor': {
+          // `/doctor model` is advertised in the argument menu ("Probe the active model: tools,
+          // vision, context window") and its argument was silently ignored — you got the generic
+          // environment report and no indication the probe had not run. The real implementation is
+          // `/model test`, so route to it rather than shipping a second copy.
+          if (arg.trim().toLowerCase() === 'model') {
+            runSlash(findSlashCommand('/model')!, '/model test');
+            break;
+          }
+          if (arg.trim()) {
+            pushLine({ text: `Unknown /doctor argument "${arg.trim()}". Use /doctor or /doctor model.`, color: C.red });
+            break;
+          }
           const report = runDoctor(opts.workspaceRoot);
           pushLine({
             kind: 'system',
@@ -3057,7 +3302,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         }
         case '/diff': {
           try {
-            const out = execFileSync('git', ['-C', opts.workspaceRoot, 'diff', '--stat'], { encoding: 'utf8', timeout: 5000 }).trim();
+            const out = execFileSync('git', ['-C', opts.workspaceRoot, 'diff', '--stat'], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
             pushLine({
               kind: 'system',
               text: 'diff',
@@ -3070,7 +3315,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         }
         case '/files': {
           try {
-            const out = execFileSync('git', ['-C', opts.workspaceRoot, 'status', '--short'], { encoding: 'utf8', timeout: 5000 }).trim();
+            const out = execFileSync('git', ['-C', opts.workspaceRoot, 'status', '--short'], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
             pushLine({
               kind: 'system',
               text: 'files',
@@ -3085,8 +3330,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         }
         case '/branch': {
           try {
-            const branch = execFileSync('git', ['-C', opts.workspaceRoot, 'branch', '--show-current'], { encoding: 'utf8', timeout: 5000 }).trim();
-            const status = execFileSync('git', ['-C', opts.workspaceRoot, 'status', '--short', '--branch'], { encoding: 'utf8', timeout: 5000 }).trim();
+            const branch = execFileSync('git', ['-C', opts.workspaceRoot, 'branch', '--show-current'], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+            const status = execFileSync('git', ['-C', opts.workspaceRoot, 'status', '--short', '--branch'], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
             pushLine({
               kind: 'system',
               text: 'branch',
@@ -3127,7 +3372,15 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
               break;
             }
             const value = (opts.cfg as unknown as Record<string, unknown>)[key];
-            pushLine({ text: `${key}: ${value === undefined ? '(unset)' : JSON.stringify(value)}`, dimColor: true });
+            // The command advertises "API keys hidden", and it did not hide them: `/config get
+            // models` printed every inline apiKey/authToken verbatim onto a screen that gets
+            // screen-shared and recorded. Mask by KEY NAME (deep, so nested models[] and
+            // mcpServers[].env are covered) — a locally-served key has no recognisable SHAPE, so
+            // the pattern scrubber alone returned it untouched.
+            const shown = isSecretKey(key) && value != null && value !== ''
+              ? maskSecret(value)
+              : JSON.stringify(redactConfig(value));
+            pushLine({ text: `${key}: ${value === undefined ? '(unset)' : shown}`, dimColor: true });
             break;
           }
           if (parts.length && parts[0] !== 'show') {
@@ -3373,7 +3626,14 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           // Push (or release) the terminal background the theme asserts. Switching AWAY from a
           // background theme resets to the user's own — the palette is swapped in place, so this
           // has to fire on every switch, not just when the new theme has a bg.
-          if (process.stdout.isTTY) process.stdout.write(backgroundSequence(THEMES[next].bg, true));
+          if (process.stdout.isTTY) {
+            process.stdout.write(backgroundSequence(THEMES[next].bg, true));
+            // Keep the EXIT reset in step with the live theme. runTui captured the launch theme in
+            // a const, so `/theme shadow` mid-session pushed OSC 11 with no matching OSC 111 — a
+            // clean exit then left the terminal permanently black, while the confirmation line
+            // promised it would be "restored on exit".
+            updateReset('theme-bg', THEMES[next].bg ? backgroundSequence(null, true) : null);
+          }
           opts.cfg.lastTheme = next; // keep the in-memory cfg in sync for the next cycle
           saveGlobalConfig({ lastTheme: next });
           setThemeTick((t) => t + 1); // repaint with the new palette
@@ -3437,8 +3697,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             break;
           }
           try {
-            if (!statSync(abs).isFile()) {
+            const info = statSync(abs);
+            if (!info.isFile()) {
               pushLine({ text: `Not a file: ${abs}`, color: C.red });
+              break;
+            }
+            if (info.size > MAX_IMAGE_BYTES) {
+              pushLine({ text: `Image is too large: ${arg} (${(info.size / 1024 / 1024).toFixed(1)} MiB; max 20 MiB).`, color: C.red });
               break;
             }
             const data = readFileSync(abs).toString('base64');
@@ -3552,10 +3817,11 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const buildProvider = useCallback(
     async (
       entry: ModelEntry,
-      opts2: { clampBudget?: boolean } = {},
+      opts2: { clampBudget?: boolean; applyPolicy?: () => boolean } = {},
     ): Promise<{ ok: true; client: Provider; provider: ProviderName; model: string } | { ok: false; error: string; fatal?: boolean }> => {
       let provider = entry.provider;
       let baseUrl = resolveBaseUrl(entry.provider, entry.baseUrl);
+      let detectedWindow: number | undefined;
       const cred = resolveEntryCredential(entry, { vaultIsLocked: vaultExists() && !vaultUnlocked() });
       if (!cred.ok) {
         // Soft failure: the session survives on the current model rather than dying. Falling
@@ -3580,41 +3846,47 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           provider = 'openai';
           baseUrl = r.baseUrl;
           apiKey = entry.apiKey ?? 'sk-local';
+          detectedWindow = await detectServerContextWindow(r.baseUrl);
         } catch (e) {
           // A hard failure (red) — the local server couldn't start, so nothing can route here.
           return { ok: false, error: `Local model failed: ${(e as Error).message}`, fatal: true };
         }
       }
-      // Context budget tracks the ACTIVE model's window (cosmetic — the live Context snapshots its
-      // budget at construction; this drives the HUD/status readout). The round-table passes
-      // clampBudget:false so a mixed-window table doesn't bounce/print this line every route.
-      if (opts2.clampBudget !== false) {
-        if (baseBudgetRef.current == null) baseBudgetRef.current = opts.cfg.contextBudget;
-        // Match bootstrap: soft budget under the real server window so compact fires before 400.
-        const localish = !!(
-          entry.gguf ||
-          entry.mlx ||
-          entry.vllm ||
-          (entry.baseUrl && isLocalBaseUrl(resolveBaseUrl(entry.baseUrl, entry.provider)))
-        );
-        const nextBudget = localish
-          ? clampLocalContextBudget(baseBudgetRef.current, entry.ctx)
-          : baseBudgetRef.current;
-        if (nextBudget !== opts.cfg.contextBudget) {
-          opts.cfg.contextBudget = nextBudget;
-          // …and tell the LIVE Context, not just the HUD. Without this the clamp was cosmetic:
-          // maybeSummarize kept comparing against the budget captured at construction, so a
-          // 200k session moved onto a 32k serve showed a red bar, never auto-compacted, and
-          // 400'd once per turn until looksLikeTokenOverflow force-compacted after the fact.
-          context.setBudget(nextBudget);
-          pushLine({ text: `  context budget → ${nextBudget.toLocaleString()} tokens (fits the model's window)`, dimColor: true });
+      // Derive a complete policy for THIS provider/model. Query local servers after startup;
+      // explicit contextWindow metadata covers cloud/custom presets. Resetting actual tokens is
+      // essential because the old provider's usage is not a valid floor for the new request.
+      if (opts2.clampBudget !== false && (opts2.applyPolicy?.() ?? true)) {
+        const localish = isLocalBaseUrl(baseUrl);
+        if (localish && baseUrl && !detectedWindow) detectedWindow = await detectServerContextWindow(baseUrl);
+        const hardWindow = detectedWindow ?? configuredContextWindow(entry);
+        const base = baseContextPolicyRef.current;
+        const nextBudget = hardWindow
+          ? clampLocalContextBudget(base.contextBudget, hardWindow)
+          : base.contextBudget;
+        const nextPolicy = {
+          contextBudget: nextBudget,
+          triggerRatio: triggerRatioForBudget(nextBudget, base.triggerRatio),
+          keepLastTurns: keepLastTurnsForBudget(nextBudget, base.keepLastTurns),
+        };
+        const previous = context.policy();
+        opts.cfg.contextBudget = nextPolicy.contextBudget;
+        opts.cfg.summarizeTriggerRatio = nextPolicy.triggerRatio;
+        opts.cfg.keepLastTurns = nextPolicy.keepLastTurns;
+        context.setPolicy(nextPolicy, true);
+        if (
+          previous.contextBudget !== nextPolicy.contextBudget ||
+          previous.triggerRatio !== nextPolicy.triggerRatio ||
+          previous.keepLastTurns !== nextPolicy.keepLastTurns
+        ) {
+          const source = hardWindow ? ` for ${hardWindow.toLocaleString()} server/model window` : '';
+          pushLine({ text: `  context policy → ${nextBudget.toLocaleString()} tokens${source}`, dimColor: true });
         }
       }
       const client = createProvider({
         provider,
         model: entry.model,
         apiKey,
-        authToken: entry.authToken ?? resolveAuthToken(entry.provider),
+        authToken: cred.authToken,
         baseUrl,
       });
       return { ok: true, client, provider, model: entry.model };
@@ -3626,29 +3898,39 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const selectModel = useCallback(
     async (entry: ModelEntry) => {
       setPickerOpen(false);
+      if (runningRef.current) {
+        pushLine({ text: 'Wait for the current turn to finish before switching models.', color: C.yellow });
+        return;
+      }
+      const generation = ++modelSwitchSeqRef.current;
+      modelSwitchingRef.current = true;
       // Context budget must track the ACTIVE model's window across mid-session switches: a session
       // started on a 128k cloud model that switches to a 32k llama-server would otherwise compact
       // at ~109k — long past the server window — and die on a 400. Switching back to a cloud model
       // restores the session's original budget. (Mirrors the startup clamp in index.ts.)
-      const built = await buildProvider(entry);
-      if (!built.ok) {
-        pushLine({ text: built.error, color: built.fatal ? C.red : C.yellow });
-        return;
-      }
-      providerRef.current = built.client;
-      loopRef.current?.setProvider(built.client, built.model);
-      opts.onModelSwitch?.(built.client, built.model); // keep the agent tool's sub-agents on the live model
-      setCurrent({ provider: built.provider, model: built.model });
       try {
-        saveGlobalConfig({ lastModel: entry.label });
-      } catch {
-        // best-effort persistence; the live switch already applies this session
+        const built = await buildProvider(entry, { applyPolicy: () => generation === modelSwitchSeqRef.current });
+        if (generation !== modelSwitchSeqRef.current) return;
+        if (!built.ok) {
+          pushLine({ text: built.error, color: built.fatal ? C.red : C.yellow });
+          return;
+        }
+        providerRef.current = built.client;
+        currentRef.current = { provider: built.provider, model: built.model };
+        loopRef.current?.setProvider(built.client, built.model);
+        opts.onModelSwitch?.(built.client, built.model); // keep the agent tool's sub-agents on the live model
+        setCurrent({ provider: built.provider, model: built.model });
+        try {
+          saveGlobalConfig({ lastModel: entry.label });
+        } catch {
+          // best-effort persistence; the live switch already applies this session
+        }
+        pushLine({ text: `Model → ${entry.label} (${built.provider}/${built.model})`, color: C.cyan });
+        const prof = familyProfile(entry.model);
+        if (prof?.note) pushLine({ text: `  ${prof.family}: ${prof.note}`, dimColor: true });
+      } finally {
+        if (generation === modelSwitchSeqRef.current) modelSwitchingRef.current = false;
       }
-      pushLine({ text: `Model → ${entry.label} (${built.provider}/${built.model})`, color: C.cyan });
-      // Family-profile knowledge surfaces at the moment of selection — matrix verdicts and
-      // adapter floors are useless in a README table nobody reads mid-session.
-      const prof = familyProfile(entry.model);
-      if (prof?.note) pushLine({ text: `  ${prof.family}: ${prof.note}`, dimColor: true });
     },
     [pushLine, buildProvider, opts],
   );
@@ -3671,12 +3953,24 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     if (igateRef.current) {
       igateRef.current.show = (req) => {
         resetQuestionDialog();
+        dialogTypeaheadRef.current = false;
+        dialogShownAtRef.current = Date.now(); // arm the type-ahead guard — see onKey §1
         setPending(req);
       };
     }
     if (opts.wakeupHandler) {
       opts.wakeupHandler.fire = (task, reason) => {
         const line = `[wakeup: ${reason}] ${task}`;
+        // A wakeup can fire MID-TURN. Calling runOne directly then started a second turn on the
+        // shared Context while the first was still streaming: the two clobbered controllerRef and
+        // `running`, so Ctrl-C/Esc aborted only whichever controller happened to be installed last
+        // and the other turn became un-interruptible. Queue it instead — the same FIFO a typed
+        // message uses — and it runs when the current turn ends.
+        if (runningRef.current) {
+          setQueued([...queuedTasksRef.current, line]); // setQueued keeps the ref in step
+          pushLine({ text: `  ⏰ wakeup queued (${reason}) — runs when this turn ends`, dimColor: true });
+          return;
+        }
         answerRunRef.current = []; // new (injected) turn → fresh repeat detector
         repeatPosRef.current = 0;
         pushLine({ kind: 'user', text: `❯ ${line}`, color: C.green, bold: true, meta: 'wakeup' });
@@ -3693,10 +3987,15 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     const p = pendingRef.current;
     if (!g || !g.awaiting || p?.kind !== 'user_question' || !p.questions?.length) return;
     const answers = buildAutoAnswers(p.questions, questionSelectionsRef.current);
-    pushLine({
-      text: `  ⏱ no response in ${AUTO_ANSWER_SECS}s — auto-selected the recommended answer${p.questions.length > 1 ? 's' : ''}`,
-      color: C.dim,
-    });
+    // Say what actually happened. buildAutoAnswers keeps any selection the user already made and
+    // only fills the REST with the recommendation, so the flat "auto-selected the recommended
+    // answer" line misreported a mixed submission as a wholly automatic one.
+    const picked = Object.keys(questionSelectionsRef.current).length;
+    const how =
+      picked > 0
+        ? `kept your ${picked} selection${picked > 1 ? 's' : ''} and filled the rest with the recommended answer`
+        : `auto-selected the recommended answer${p.questions.length > 1 ? 's' : ''}`;
+    pushLine({ text: `  ⏱ no response in ${AUTO_ANSWER_SECS}s — ${how}`, color: C.dim });
     g.respond({ answers });
   }, [pushLine]);
 
@@ -3706,9 +4005,14 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       setAutoAnswerSecs(null);
       return;
     }
+    autoAnswerEngagedRef.current = false; // a NEW dialog re-arms the idle timer
     autoAnswerSecsRef.current = AUTO_ANSWER_SECS;
     setAutoAnswerSecs(AUTO_ANSWER_SECS);
     const id = setInterval(() => {
+      if (autoAnswerEngagedRef.current) {
+        clearInterval(id); // the user showed up — this dialog is theirs now
+        return;
+      }
       const n = (autoAnswerSecsRef.current ?? 0) - 1;
       if (n <= 0) {
         autoAnswerSecsRef.current = null;
@@ -3789,7 +4093,11 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           // full e.text. Gating on `streamed` avoids re-committing the whole answer when
           // the stream happened to end exactly on a block boundary (rest === '').
           const streamed = answerOpenRef.current || streamBufRef.current.length > 0;
-          const finalText = streamed ? streamBufRef.current : (e.text ?? '');
+          // Scrub the DISPLAY text. sniffToolCalls only strips a `<tool_call>` envelope when it
+          // successfully RECOVERS a call, which requires the named tool to be registered — so a
+          // weak local model naming a tool that doesn't exist, or emitting a malformed envelope,
+          // left the raw XML in the committed answer, where markdown then mangled it further.
+          const finalText = scrubForDisplay(streamed ? streamBufRef.current : (e.text ?? ''));
           setStreamNow('');
           setThinkNow('');
           // (Reasoning is folded by default now — no per-item collapse needed; Ctrl-O reveals all.)
@@ -3986,6 +4294,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             });
           }
           break;
+        case 'subagent_usage':
+          // A finished sub-agent's TOTAL spend, reported once. Deliberately does NOT touch
+          // `setStatus` or `prevTurnCostRef`: sub-agents run on their own Budget, and letting their
+          // per-turn usage through was what overwrote the HUD with a foreign context % and made the
+          // parent's next cost delta meaningless. Session cost still accrues, so /cost stays honest.
+          if (e.costUSD > 0) sessionCostRef.current += e.costUSD;
+          break;
         case 'todo':
           setTodoItems(e.items);
           break;
@@ -4029,6 +4344,12 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           });
           break;
         case 'stop':
+          // Keep the /rewind menu honest: a turn just produced (or failed to produce) a snapshot.
+          try {
+            rewindableTurnsRef.current = sessionLog.path ? SessionLog.countSnapshots(sessionLog.path) : 0;
+          } catch {
+            /* an unreadable log must never break the turn-end path */
+          }
           // Interrupted mid-answer (Esc/Ctrl-C) before assistant_done? Commit whatever
           // streamed so the partial reply lands in scrollback instead of vanishing. On a
           // clean turn the buffer is already empty here, so this is a no-op.
@@ -4166,6 +4487,24 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         planMode: opts.planMode,
         streamShell: true,
         sessionLog,
+        // One instance for the whole SESSION. A new AgentLoop is built for every user message, so
+        // grants held on the loop itself expired as soon as the user typed again — "(s) approve for
+        // session" re-prompted one message later.
+        approvals: sessionApprovalsRef.current,
+        continuityState: goalRef.current ? `Standing goal:\n${goalRef.current}` : undefined,
+        resolveFallback: async (entry) => {
+          const build = buildProviderRef.current;
+          if (!build) throw new Error('fallback provider builder is unavailable');
+          const built = await build(entry);
+          if (!built.ok) throw new Error(built.error);
+          providerRef.current = built.client;
+          currentRef.current = { provider: built.provider, model: built.model };
+          opts.cfg.provider = built.provider;
+          opts.cfg.model = built.model;
+          setCurrent({ provider: built.provider, model: built.model });
+          opts.onModelSwitch?.(built.client, built.model);
+          return { provider: built.client, model: built.model };
+        },
       });
       const loop = new AgentLoop(deps, autonomyRef.current);
       loopRef.current = loop;
@@ -4253,7 +4592,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       try {
         const build = buildProviderRef.current;
         if (!build) return;
-        const built = await build(seat.entry, { clampBudget: false }); // no per-route budget bounce/noise
+        const built = await build(seat.entry);
         if (!built.ok) {
           pushLine({ text: `  @${seat.handle}: ${built.error}`, color: built.fatal ? C.red : C.yellow });
           return;
@@ -4277,13 +4616,17 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       providerRef.current = pre.client;
       currentRef.current = { provider: pre.provider, model: pre.model };
       loopRef.current?.setProvider(pre.client, pre.model);
+      context.setPolicy(pre.policy, true);
+      opts.cfg.contextBudget = pre.policy.contextBudget;
+      opts.cfg.summarizeTriggerRatio = pre.policy.triggerRatio;
+      opts.cfg.keepLastTurns = pre.policy.keepLastTurns;
       setCurrent({ provider: pre.provider, model: pre.model });
       preTableRef.current = null;
     }
     speakerRef.current = null;
     setTable(null);
     pushLine({ text: 'Round-table ended — back to your single model.', color: C.cyan });
-  }, [pushLine]);
+  }, [pushLine, context, opts.cfg]);
 
   const startTable = useCallback(
     (arg: string) => {
@@ -4325,6 +4668,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         client: providerRef.current,
         provider: currentRef.current.provider as ProviderName,
         model: currentRef.current.model,
+        policy: context.policy(),
       };
       setTable({ seats });
       pushLine({
@@ -4336,16 +4680,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           { text: `  @${seats[0]!.handle} <question> to route · /pass @handle forwards · /table done ends`, dimColor: true },
         ],
       });
-      // Honest M1 caveat: the seats share ONE context bounded by the session budget, which is NOT
-      // clamped to the smallest seat. A long mixed cloud+local conversation can exceed a small local
-      // window and 400 that seat. Surface it rather than fail silently (proper clamp is a later step).
-      const hasLocal = seats.some((s) => s.entry.gguf || s.entry.mlx);
-      const hasCloud = seats.some((s) => !s.entry.gguf && !s.entry.mlx);
-      if (hasLocal && hasCloud) {
-        pushLine({ text: `  note: mixed cloud + local seats share one context — a long session may exceed a small local window.`, dimColor: true });
-      }
     },
-    [pushLine, opts],
+    [pushLine, opts, context],
   );
 
   startTableRef.current = startTable;
@@ -4428,17 +4764,71 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       // Any key other than a second Ctrl-C disarms the "press again to quit" latch, so an old
       // Ctrl-C never lingers to make a later one quit unexpectedly.
       if (ctrlCArmedRef.current && !(key.ctrl && ch === 'c')) ctrlCArmedRef.current = false;
+
+      // 0) RESERVED CHORD — Ctrl-C is dispatched before ANY focus owner claims the keystream.
+      //
+      // It used to sit below the dialog and picker branches, both of which `return` on every key,
+      // so Ctrl-C was dead for the entire life of an approval dialog, a question dialog, or the
+      // model picker — on frames whose own hint row still advertises "Ctrl-C ×2 quits". A modal
+      // you cannot escape is the worst possible place to lose the escape hatch, and the type-ahead
+      // guard added directly below would otherwise widen the dead zone rather than narrow it.
+      //
+      // Two-stage always, so a stray press can never kill the session: the first press arms (and,
+      // if a turn is running, interrupts it and drops the queue); a second quits. Esc remains the
+      // dedicated interrupt that KEEPS the session.
+      if (key.ctrl && ch === 'c') {
+        if (ctrlCArmedRef.current) {
+          exit();
+          return;
+        }
+        ctrlCArmedRef.current = true;
+        if (runningRef.current) {
+          controllerRef.current?.abort();
+          if (queuedTasksRef.current.length > 0) setQueued([]);
+        }
+        pushLine({ text: '  ^C — press Ctrl-C again to quit (Esc just interrupts)', dimColor: true });
+        return;
+      }
       // 1) Approval dialog has focus.
       if (pendingRef.current) {
         const g = igateRef.current;
         if (!g) return;
         const kind = pendingRef.current.kind;
-        // Any key during a question dialog means the user is present → restart the idle auto-answer
-        // countdown. Done BEFORE the resolver routing so bound keys (enter/arrows/escape) reset it
-        // too — the old inline handler reset it on every keypress unconditionally.
-        if (kind === 'user_question' && AUTO_ANSWER_ENABLED) {
-          autoAnswerSecsRef.current = AUTO_ANSWER_SECS;
-          setAutoAnswerSecs(AUTO_ANSWER_SECS);
+        // ── Type-ahead guard ──────────────────────────────────────────────────────────────────
+        // "Type your next message while the agent works" is an advertised workflow, and the gate
+        // can open MID-SENTENCE. Every keystroke already in flight was then routed straight into
+        // the dialog as a decision: typing "also fix the failing test" while a run_shell gate
+        // opened hit (f)=approve-for-prefix on `rm -rf` — a session-wide grant — and (a)=raise
+        // autonomy, with the tool running and the dialog gone before the user saw it.
+        //
+        // A key can only be a decision if it was pressed AFTER the dialog was on screen. Anything
+        // sooner is text the user was already typing, so it goes to the composer where they aimed
+        // it. The window only has to cover in-flight input: reading a dialog and reacting takes far
+        // longer than this, so no deliberate keypress is ever swallowed.
+        const printable = Boolean(ch && !key.ctrl && !key.meta && !key.escape && !key.return && ch >= ' ');
+        if (Date.now() - dialogShownAtRef.current < dialogArmMs()) {
+          if (printable) {
+            dialogTypeaheadRef.current = true;
+            insertPastable(ch); // keep the user's sentence intact
+          }
+          return;
+        }
+        // Latch the diversion for the whole burst. A fixed time window alone failed whenever the
+        // gate appeared near the start of a sentence: the early letters went to the composer and
+        // a later `y`/`a`/`f` became a privilege decision. Printable input can no longer decide
+        // until a non-printable key explicitly re-focuses the dialog; that first key is consumed.
+        if (dialogTypeaheadRef.current) {
+          if (printable) insertPastable(ch);
+          else dialogTypeaheadRef.current = false;
+          return;
+        }
+        // Any key during a question dialog means a human is handling it → CANCEL the idle
+        // auto-answer for good (not merely restart it). Done BEFORE the resolver routing so bound
+        // keys (enter/arrows/escape) count as engagement too.
+        if (kind === 'user_question' && AUTO_ANSWER_ENABLED && !autoAnswerEngagedRef.current) {
+          autoAnswerEngagedRef.current = true;
+          autoAnswerSecsRef.current = null;
+          setAutoAnswerSecs(null);
         }
         // Route bound approval/question keys through the keybinding resolver FIRST, so
         // ~/.shadow/keybindings.json can rebind y/n/s/f/a (Confirmation) and question-dialog
@@ -4503,7 +4893,11 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           const prefix = cmd.split(/\s+/).slice(0, 2).join(' ');
           g.respond({ approveForPrefix: prefix || cmd.slice(0, 24) });
         } else if (ch === 'a' && kind !== 'plan_enter') {
-          const next = cycleAutonomy(autonomyRef.current);
+          // raiseAutonomy, NOT cycleAutonomy: the cycle WRAPS full→manual, so pressing "(a)lways"
+          // on the one dialog a full-autonomy session ever sees (a denylisted call) both ran the
+          // catastrophic call AND flipped the session to ask-about-everything. replGate.ts:33 got
+          // this right; the TUI kept the cycling version. Shift+Tab is still the cycle.
+          const next = raiseAutonomy(autonomyRef.current);
           setAutonomy(next);
           g.respond({ setAutonomy: next });
         }
@@ -4534,23 +4928,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       // scroll viewport detached native scrollback, which broke once the pinned task
       // list claimed rows from the fixed-height layout.)
 
-      // 2) Ctrl-C — QUIT, always two-stage so a stray press can't kill the session. The first
-      // press arms (and, if a turn is running, also interrupts it + drops the queue); a second
-      // Ctrl-C quits. Any other key disarms (handled at the top of this handler). Esc is the
-      // dedicated interrupt that keeps the session.
-      if (key.ctrl && ch === 'c') {
-        if (ctrlCArmedRef.current) {
-          exit();
-          return;
-        }
-        ctrlCArmedRef.current = true;
-        if (runningRef.current) {
-          controllerRef.current?.abort();
-          if (queuedTasksRef.current.length > 0) setQueued([]);
-        }
-        pushLine({ text: '  ^C — press Ctrl-C again to quit (Esc just interrupts)', dimColor: true });
-        return;
-      }
+      // 2) Ctrl-C is handled as a RESERVED CHORD at the top of this handler (§0), above every
+      // focus owner, so it works while a dialog or the picker holds the keystream.
 
       // 2.8) Bracketed paste (mode 2004, enabled at mount). Everything between the
       // \x1b[200~ … \x1b[201~ markers is buffered and inserted as ONE atomic paste:
@@ -4602,7 +4981,48 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         return;
       }
 
-      // 2.9) Vim modal editing (when enabled via /vim). ESC enters NORMAL mode; in
+      // 2.9) Reverse history search (Ctrl+R). While open it OWNS typing, backspace, Enter and Esc.
+      //
+      // Ordered ABOVE vim deliberately. Vim's block claims `key.escape` and returns, so with /vim
+      // enabled Esc could never close an open search: the only exit was gone, and every subsequent
+      // keystroke was then eaten by NORMAL mode as a motion instead of extending the query, which
+      // corrupted the composer. A focus owner has to be consulted before a MODE that merely
+      // reinterprets keys.
+      if (searchRef.current) {
+        const st = searchRef.current;
+        if (key.escape) {
+          const saved = st.saved;
+          applySearch(null);
+          setLine(saved); // Esc restores exactly what was there before the search opened
+          return;
+        }
+        if (key.return) {
+          applySearch(null); // accept the hit that is already in the composer
+          return;
+        }
+        if (key.ctrl && ch === 'r') {
+          const next = searchHistoryBack(historyRef.current, st.query, st.index - 1);
+          applySearch({ ...st, index: next >= 0 ? next : st.index }); // stick at the oldest hit
+          return;
+        }
+        if (key.backspace || key.delete) {
+          const query = st.query.slice(0, -1);
+          applySearch({ ...st, query, index: searchHistoryBack(historyRef.current, query, historyRef.current.length - 1) });
+          return;
+        }
+        if (!key.ctrl && !key.meta && ch && !hasSgrMouse(ch)) {
+          const query = st.query + ch;
+          applySearch({ ...st, query, index: searchHistoryBack(historyRef.current, query, historyRef.current.length - 1) });
+          return;
+        }
+        return; // swallow everything else while the search owns the line
+      }
+      if (key.ctrl && ch === 'r' && historyRef.current.length > 0) {
+        applySearch({ query: '', index: -1, saved: inputRef.current });
+        return;
+      }
+
+      // 2.92) Vim modal editing (when enabled via /vim). ESC enters NORMAL mode; in
       // NORMAL, keys are motions/operators (never text). INSERT is the default composer.
       if (vimEnabledRef.current && !runningRef.current) {
         if (key.escape) {
@@ -4655,52 +5075,43 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         }
       }
 
-      // 2.95) Reverse history search (Ctrl+R). While open it owns typing, backspace, Enter and Esc.
-      if (searchRef.current) {
-        const st = searchRef.current;
-        if (key.escape) {
-          const saved = st.saved;
-          applySearch(null);
-          setLine(saved); // Esc restores exactly what was there before the search opened
-          return;
-        }
-        if (key.return) {
-          applySearch(null); // accept the hit that is already in the composer
-          return;
-        }
-        if (key.ctrl && ch === 'r') {
-          const next = searchHistoryBack(historyRef.current, st.query, st.index - 1);
-          applySearch({ ...st, index: next >= 0 ? next : st.index }); // stick at the oldest hit
-          return;
-        }
-        if (key.backspace || key.delete) {
-          const query = st.query.slice(0, -1);
-          applySearch({ ...st, query, index: searchHistoryBack(historyRef.current, query, historyRef.current.length - 1) });
-          return;
-        }
-        if (!key.ctrl && !key.meta && ch && !hasSgrMouse(ch)) {
-          const query = st.query + ch;
-          applySearch({ ...st, query, index: searchHistoryBack(historyRef.current, query, historyRef.current.length - 1) });
-          return;
-        }
-        return; // swallow everything else while the search owns the line
-      }
-      if (key.ctrl && ch === 'r' && historyRef.current.length > 0) {
-        applySearch({ query: '', index: -1, saved: inputRef.current });
-        return;
-      }
-
       // 3) Esc — the interrupt key. While a turn runs, Esc stops it (and the type-ahead queue
       // then flushes, so a queued message runs next). When idle, Esc cancels a pending queue,
       // else clears the composer. Session always survives — only Ctrl-C quits.
       if (key.escape) {
+        if (compactingRef.current) {
+          compactAbortRef.current?.abort();
+          return;
+        }
         if (runningRef.current) {
           controllerRef.current?.abort();
+          // Commit the streamed tail BEFORE the interrupt notice. The `stop` handler also commits
+          // it, but `stop` arrives after this line has already been printed — so the partial answer
+          // landed BELOW "⎋ interrupted" and read as a second, post-interrupt reply. Clearing the
+          // buffer here makes this the sole commit; `stop` then finds it empty and no-ops.
+          if (streamBufRef.current.trim()) {
+            pushLine({
+              kind: 'assistant',
+              text: stripTrailingNewlines(scrubForDisplay(streamBufRef.current)),
+              color: C.fg,
+              meta: 'assistant',
+              tight: answerOpenRef.current && !padCarryRef.current && !leadsWithBlock(streamBufRef.current),
+            });
+            streamBufRef.current = '';
+            answerOpenRef.current = false;
+            padCarryRef.current = false;
+          }
           pushLine({ text: '  ⎋ interrupted', dimColor: true });
         } else if (queuedTasksRef.current.length > 0) {
           setQueued([]);
           pushLine({ text: '  queued input cleared', dimColor: true });
-        } else setLine('');
+        } else if (inputRef.current !== '') {
+          // Snapshot first: Esc-to-clear was the ONLY kill in the composer that Ctrl+Z could not
+          // undo, so a mis-aimed Esc destroyed a long draft outright. Every other kill (word, line,
+          // to-end) already pushes undo; this one silently did not.
+          pushUndo();
+          setLine('');
+        }
         return;
       }
 
@@ -4719,7 +5130,16 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
 
       // 3.5) Slash-command menu: while "/word" has matches it captures ↑/↓/Tab/Enter — including
       // mid-turn, so you can still pick a command while the model works.
-      const menu = slashMatches(inputRef.current, undefined, argCtxRef.current ?? undefined);
+      //
+      // Suppressed while a round-table is active: the composer belongs to the TABLE then (it routes
+      // to seats), and the menu claiming Enter made the feature inescapable — typing the documented
+      // exit `/table done` matched the menu, so Enter re-dispatched `/table` through runSlash
+      // instead of reaching handleTableInput, which answered with instructions to type the very
+      // thing that had just been swallowed. Suppressing the menu lets Enter fall through to the
+      // submit path, where the table router already parses `/table done` correctly.
+      const menu = tableRef.current
+        ? []
+        : slashMatches(inputRef.current, undefined, argCtxRef.current ?? undefined);
       if (menu.length > 0) {
         const sel = Math.min(menuIndexRef.current, menu.length - 1);
         if (key.upArrow) {
@@ -4730,7 +5150,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           setMenuIndex(Math.min(menu.length - 1, sel + 1));
           return;
         }
-        if (key.tab) {
+        // Tab autocompletes; Shift+Tab must NOT. Without the guard the slash menu swallowed
+        // Shift+Tab and autocompleted instead, so the autonomy ring was unreachable for as long as
+        // the menu was open — the one moment a user is most likely to reach for it.
+        if (key.tab && !key.shift) {
           if (menu[sel]!.hint) return; // informational row — nothing to complete to
           setLine(menu[sel]!.name); // autocomplete to the selected command
           setMenuIndex(0);
@@ -4959,6 +5382,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         }
         const task = inputRef.current.trim();
         if (!task && !attachmentsRef.current.length) return; // allow an image-only message
+        if (modelSwitchingRef.current) {
+          pushLine({ text: 'Model switch is still initializing — your draft is preserved.', dimColor: true });
+          return;
+        }
         // Collaboration Mode: while a round-table is active, the composer routes to seats instead of
         // starting a normal turn. `/table` START (no table yet) falls through to the slash dispatch below.
         if (tableRef.current) {
@@ -4973,6 +5400,16 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           setLine('');
           if (vimEnabledRef.current) setVimMode('insert');
           handleTableInputRef.current?.(task);
+          return;
+        }
+        // Compaction is REWRITING the shared context — a turn started now would read it mid-rebuild.
+        // Queue instead of racing; the queue flushes when compaction finishes.
+        if (compactingRef.current) {
+          setQueued([...queuedTasksRef.current, task]);
+          historyRef.current.push(task);
+          histIdxRef.current = historyRef.current.length;
+          setLine('');
+          pushLine({ text: '  queued — compaction in progress (Esc cancels it)', dimColor: true });
           return;
         }
         if (runningRef.current) {
@@ -5048,12 +5485,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // in \x1b[200~ … \x1b[201~ so the key handler can insert it atomically (see step 2.8);
   // terminals that don't simply ignore the mode and pastes take the legacy per-chunk path.
   // Unlike mouse reporting this takes nothing away from the terminal, so it needs no opt-in.
+  // Claimed through the terminal owner (tui/terminalState.ts) rather than written directly: a
+  // React destructor does not run when the process dies on a signal, so `2004l` was never sent on
+  // a kill/crash and the user's shell was left showing literal `200~` markers around every paste.
   useEffect(() => {
     if (!process.stdout.isTTY) return;
-    process.stdout.write('\x1b[?2004h');
-    return () => {
-      process.stdout.write('\x1b[?2004l');
-    };
+    claimMode('bracketed-paste', '\x1b[?2004h', '\x1b[?2004l');
+    return () => releaseMode('bracketed-paste');
   }, []);
 
   // Mouse reporting (DECSET 1000 + SGR 1006) for click-to-place-caret. OPT-IN ONLY.
@@ -5067,23 +5505,12 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   useEffect(() => {
     if (!process.stdout.isTTY) return;
     if (!mouseEnabled) return;
-    const enable = '\x1b[?1000h\x1b[?1006h';
-    const disable = '\x1b[?1000l\x1b[?1006l';
-    process.stdout.write(enable);
-    const off = (): void => {
-      try {
-        process.stdout.write(disable);
-      } catch {
-        /* stream already torn down */
-      }
-    };
-    process.once('exit', off);
-    for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) process.once(sig, off);
-    return () => {
-      off();
-      process.off('exit', off);
-      for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) process.off(sig, off);
-    };
+    // The owner installs ONE re-raising signal handler for every mode. The version here used
+    // `process.once(sig, off)`, which overrides Node's default disposition — so with mouse
+    // reporting on, the process SURVIVED SIGINT and SIGHUP and orphaned itself when the terminal
+    // closed. Cleaning up must not cost killability.
+    claimMode('mouse', '\x1b[?1000h\x1b[?1006h', '\x1b[?1000l\x1b[?1006l');
+    return () => releaseMode('mouse');
   }, [mouseEnabled]);
 
   const spinner = SPINNER[tick % SPINNER.length];
@@ -5143,7 +5570,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     cfg: opts.cfg,
     workspaceRoot: opts.workspaceRoot,
     sessions: resumableRef.current ?? [],
-    turns: historyRef.current.length,
+    // Snapshot turns, in the SAME unit rewindToTurn consumes — see ArgContext.turns.
+    turns: rewindableTurnsRef.current,
     extraRoots: additionalRootsRef.current,
   };
   // The slash menu shows whenever "/word" has matches — including while a turn runs, so you can
@@ -5210,12 +5638,18 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // trips its whole-screen wipe on a short/split-pane terminal. Drives which optional rows render.
   const wantPinnedLine = hudPinnedLine !== '' && !menuOpen && (running || !showFullPinned);
   // Multi-row composer: budget real input height so the live frame stays under Ink's wipe line.
-  // The visible input is capped by BOTH the 8-row max AND what the terminal can hold: the mandatory
-  // composer chrome is 2 rules + N input rows, and that alone must stay < terminal height or Ink
-  // wipes the screen on every keystroke. terminalSize.rows - 3 keeps (2 + input) <= rows - 1.
+  // The visible input is capped by what the WHOLE frame can hold, not just the composer's own 2
+  // rules. The old `rows - 3` ignored the pinned task list and the status strip, so a tall draft
+  // overflowed even when the task list had already shrunk itself to zero items.
   const composerInnerW = Math.max(8, terminalSize.cols - COMPOSER_GUTTER - PAGE_MARGIN * 2);
   const composerLineCount = layoutComposer(input, composerInnerW).lines.length;
-  const maxComposerRows = Math.max(1, Math.min(COMPOSER_MAX_VISIBLE_ROWS, terminalSize.rows - 3));
+  const maxComposerRows = composerMaxRows(
+    terminalSize.rows,
+    showTodo,
+    !!goal,
+    !!(showPlan && planMode.path),
+    !!customStatus,
+  );
   const composerInputRows = Math.min(maxComposerRows, Math.max(1, composerLineCount));
   const hudFit = fitHud(terminalSize.rows, {
     liveWant,
@@ -5267,7 +5701,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   if (pickerRows[pickerSel]?.kind !== 'model') pickerSel = firstSelectableRow(pickerRows);
   // The model picker is WINDOWED exactly like the slash menu (it used to render every row unclipped —
   // a long model list made the overlay taller than the screen).
-  const PICKER_MAX = 10;
+  // Derived from terminal height, not a hardcoded 10: a fixed 10-row window plus the picker's own
+  // chrome exceeded the frame budget on terminals of ~19 rows and below, tripping Ink's
+  // clearTerminal fallback and wiping scrollback every time the picker repainted.
+  const PICKER_MAX = Math.max(3, Math.min(10, terminalSize.rows - 9));
   const pickStart = Math.min(Math.max(0, pickerSel - PICKER_MAX + 1), Math.max(0, pickerRows.length - PICKER_MAX));
   const pendingQuestions = pending?.kind === 'user_question' ? (pending.questions ?? []) : [];
   const activeQuestionIndex = Math.min(questionIndex, Math.max(0, pendingQuestions.length - 1));
@@ -5510,7 +5947,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           showTodo={showTodo}
           collapsed={todoCollapsed}
           cols={layout.cols}
-          maxItems={pinnedMaxItems(terminalSize.rows, !!goal, !!(showPlan && planMode.path), !!customStatus)}
+          maxItems={pinnedMaxItems(terminalSize.rows, !!goal, !!(showPlan && planMode.path), !!customStatus, composerInputRows)}
         />
       ) : hudFit.pinned ? (
         // Single-row summary — used while running, and idle on a terminal too short for the full block.
@@ -5643,18 +6080,24 @@ export function runTui(opts: TuiOpts): Promise<void> {
   // Launch-time privacy: title → "Shadow" (hide cwd) + wipe scrollback (hide pre-launch shell
   // history from scroll-up). See startupSequence. Title is popped on exit via cleanup.
   const ownsTitle = !!process.stdout.isTTY;
-  if (ownsTitle) process.stdout.write(startupSequence(true));
+  // Bind restore to exit AND to the fatal signals BEFORE anything is turned on, so even a crash
+  // during startup cannot strand the terminal.
+  if (ownsTitle) installRestoreHandlers();
+  if (ownsTitle) {
+    process.stdout.write(startupSequence(true));
+    claimMode('title', '', '\x1b[23;2t'); // startupSequence already pushed with 22;2t
+  }
   // A theme that asserts a background (currently only `shadow`) pushes it to the TERMINAL here,
   // before the first frame, so the session opens on the intended field instead of flashing the
   // user's own background first. Restored on exit beside the window title — same lifecycle, same
   // exposure if the process is hard-killed.
   const startBg = themeBackground(opts.cfg.lastTheme as string | undefined);
-  if (startBg) process.stdout.write(backgroundSequence(startBg, ownsTitle));
-  const cleanup = (): void => {
-    if (ownsTitle) process.stdout.write('\x1b[23;2t');
-    // Only reset what we set — a user whose terminal is already black keeps it.
-    if (startBg) process.stdout.write(backgroundSequence(null, ownsTitle));
-  };
+  if (startBg && ownsTitle) {
+    claimMode('theme-bg', backgroundSequence(startBg, ownsTitle), backgroundSequence(null, ownsTitle));
+  }
+  // Only reset what we set — a user whose terminal is already black keeps it. `restoreTerminal` is
+  // idempotent, so running it here AND from the exit/signal handlers is harmless.
+  const cleanup = restoreTerminal;
   // Atomic frames (synchronized output, DEC mode 2026) — kills the tmux/terminal repaint flicker; a
   // silent no-op on terminals that don't support it. Only for a real TTY (piped/CI writes stay clean).
   const stdout = ownsTitle ? withSynchronizedOutput(process.stdout) : process.stdout;
@@ -5663,13 +6106,21 @@ export function runTui(opts: TuiOpts): Promise<void> {
 }
 
 // ── Headless renderer (one-shot / piped) — raw ANSI straight to stdout ───────
+//
+// Colour is emitted only for a real terminal that has not asked for plain output. This path is
+// taken by `--task` and `--repl` as well as by piped runs (index.ts: `headless = !!flags.task ||
+// !!flags.repl || !interactive`), so gating on "headless" would wrongly strip colour from an
+// interactive `--task` in a terminal — the gate has to be isTTY + NO_COLOR, like every other CLI.
+// Without it, `shadow --task ... > out.txt` wrote raw SGR into the file.
+const COLOR = !!process.stdout.isTTY && !process.env.NO_COLOR;
+const c = (seq: string): string => (COLOR ? seq : '');
 const A = {
-  reset: '\x1b[0m',
-  dim: '\x1b[2m',
-  green: '\x1b[38;2;16;185;129m',
-  red: '\x1b[38;2;239;68;68m',
-  yellow: '\x1b[38;2;245;158;11m',
-  cyan: '\x1b[36m',
+  reset: c('\x1b[0m'),
+  dim: c('\x1b[2m'),
+  green: c('\x1b[38;2;16;185;129m'),
+  red: c('\x1b[38;2;239;68;68m'),
+  yellow: c('\x1b[38;2;245;158;11m'),
+  cyan: c('\x1b[36m'),
 };
 
 

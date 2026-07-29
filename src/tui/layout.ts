@@ -75,14 +75,54 @@ export function computeLayout(
  * marginTop 1 + composer box 4 + status strip 1 = 11, plus one row each for goal / plan-path /
  * custom-statusline when present, plus 1 row headroom. Every row is wrap="truncate" (single-line),
  * so bounding the COUNT bounds the physical height exactly.
+ *
+ * `composerInputRows` is the draft's CURRENT visual height (1 when empty). The baseline 11 assumes
+ * a single-line composer; the composer actually grows to COMPOSER_MAX_VISIBLE_ROWS (8), and those
+ * extra rows were unbudgeted — an expanded task list plus a multi-line draft pushed the frame to
+ * terminal height and wiped the user's scrollback on every keystroke.
  */
+/**
+ * Rows of draft the composer may show without the live frame reaching terminal height.
+ *
+ * The counterpart to `pinnedMaxItems`, and deliberately in the same file: the scrollback-wipe bug
+ * survived because these two budgets were computed independently, from different assumptions, in
+ * different modules. The composer's own cap only counted its 2 rules (`rows - 3`) and knew nothing
+ * about the pinned block or the status strip, so `pinnedMaxItems` could correctly return 0 items
+ * and the frame STILL overflowed on the draft alone.
+ *
+ * Chrome accounted for: composer marginTop 1 + composer box 4 + status strip 1 = 6, plus 1 row of
+ * headroom, plus the pinned block's own fixed chrome (marginTop 1 + rules 2 + header 1 + '+N more'
+ * 1 = 5) when it is visible, plus one row each for goal / plan-path / custom statusline.
+ */
+export function composerMaxRows(
+  rows: number,
+  hasPinnedBlock: boolean,
+  hasGoal = false,
+  hasPlanPath = false,
+  hasCustomStatus = false,
+): number {
+  const chrome =
+    7 +
+    (hasPinnedBlock ? 5 : 0) +
+    (hasGoal ? 1 : 0) +
+    (hasPlanPath ? 1 : 0) +
+    (hasCustomStatus ? 1 : 0);
+  return Math.max(1, Math.min(COMPOSER_VISIBLE_ROW_CAP, rows - chrome));
+}
+
+/** Hard ceiling on composer draft rows, mirroring COMPOSER_MAX_VISIBLE_ROWS in tui/composer.ts. */
+export const COMPOSER_VISIBLE_ROW_CAP = 8;
+
 export function pinnedMaxItems(
   rows: number,
   hasGoal: boolean,
   hasPlanPath: boolean,
   hasCustomStatus: boolean,
+  composerInputRows = 1,
 ): number {
-  const chrome = 11 + (hasGoal ? 1 : 0) + (hasPlanPath ? 1 : 0) + (hasCustomStatus ? 1 : 0);
+  const extraComposer = Math.max(0, composerInputRows - 1);
+  const chrome =
+    11 + extraComposer + (hasGoal ? 1 : 0) + (hasPlanPath ? 1 : 0) + (hasCustomStatus ? 1 : 0);
   // Floor at 0, not 1: at 15 rows with all three extras present, chrome alone fills the budget —
   // forcing one item row pushed the frame to exactly terminal height (the fallback threshold).
   // With 0 items the '+N more' row still communicates the list's existence.

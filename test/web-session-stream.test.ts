@@ -21,6 +21,7 @@ function fakeRes(holdCbs = false) {
   const cbs: Array<() => void> = [];
   const res = {
     frames,
+    destroyed: false,
     write(s: string, cb?: () => void): boolean {
       frames.push(s);
       if (cb) {
@@ -30,6 +31,9 @@ function fakeRes(holdCbs = false) {
       return true;
     },
     end(): void {},
+    destroy(): void {
+      this.destroyed = true;
+    },
     flushCbs(): void {
       cbs.splice(0).forEach((f) => f());
     },
@@ -103,25 +107,25 @@ test('truncated is a counted eviction, not the replay[0].id > 1 inference', () =
   s.close();
 });
 
-test('the stream_gap notice carries no id: line, so it cannot clobber the client cursor', () => {
+test('a slow client is disconnected and reconnect replay includes the terminal frame', () => {
   const bus = new EventBus();
   const s = createSessionStream({ bus, allocClientId });
   const res = fakeRes(true); // hold write callbacks so `queued` accumulates past the cap
   s.attach(res);
 
-  // CLIENT_QUEUE_MAX_BYTES is 4MB. Push ~4.8MB of un-acked frames so later frames are dropped.
+  // CLIENT_QUEUE_MAX_BYTES is 4MB. Push ~4.8MB of un-acked frames so the socket is closed.
   // Separator-rich content (spaces break word runs) keeps redact() linear — a long single-char
   // run is a pathological backtracking input, which real event payloads never are.
   const chunk = 'ab '.repeat(80_000); // ~240KB
   for (let i = 0; i < 20; i++) bus.emit({ type: 'text', delta: chunk });
-  // Now let the socket "catch up" so queued drains, then push one more: the gap notice fires.
-  res.flushCbs();
-  bus.emit({ type: 'mode', mode: 'idle' });
+  assert.equal(s.clientCount(), 0, 'slow client was removed instead of dropping forever');
+  assert.equal(res.destroyed, true, 'dead socket is closed so EventSource reconnects');
 
-  const gap = res.frames.find((f) => f.includes('stream_gap'));
-  assert.ok(gap, 'a gap notice was emitted after frames were dropped');
-  assert.ok(!gap!.includes('id:'), 'the gap notice has no id: line');
-  assert.match(gap!, /^data: /, 'the gap notice is a bare data frame');
+  const beforeTerminal = s.transcript().lastEventId;
+  bus.emit({ type: 'mode', mode: 'idle' });
+  const reconnect = fakeRes();
+  s.attach(reconnect, beforeTerminal);
+  assert.match(reconnect.text(), /"type":"mode","mode":"idle"/, 'replay restores the terminal frame');
   s.close();
 });
 

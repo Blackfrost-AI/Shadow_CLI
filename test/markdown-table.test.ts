@@ -7,7 +7,7 @@ test('parses a simple GFM table into header + rows', () => {
   const blocks = parseMarkdown(md);
   const t = blocks.find((b) => b.type === 'table');
   assert.ok(t, 'expected a table block');
-  if (t!.type === 'table') {
+  if (t?.type === 'table') {
     assert.deepEqual(t.header.map(spanText), ['Name', 'Age']);
     assert.equal(t.rows.length, 2);
     assert.deepEqual(t.rows[0]!.map(spanText), ['Ada', '36']);
@@ -19,7 +19,7 @@ test('parses a simple GFM table into header + rows', () => {
 test('parses alignment from the separator row', () => {
   const md = ['| L | C | R |', '| :--- | :---: | ---: |', '| a | b | c |'].join('\n');
   const t = parseMarkdown(md).find((b) => b.type === 'table');
-  if (t!.type === 'table') assert.deepEqual(t.align, ['left', 'center', 'right']);
+  if (t?.type === 'table') assert.deepEqual(t.align, ['left', 'center', 'right']);
 });
 
 test('renders a horizontal box-drawing table that fits the width', () => {

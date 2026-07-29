@@ -11,6 +11,7 @@ import { resolveAgentDef } from '../agent/defs.js';
 import { ToolRegistry } from './registry.js';
 import { createWorktree, removeWorktree } from './worktree.js';
 import { runHookPhase } from '../hooks/runner.js';
+import { SubagentBus } from '../agent/events.js';
 
 const inputSchema = z.object({
   prompt: z.string().min(1).describe('Task for the sub-agent.'),
@@ -97,8 +98,14 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         registry = filtered;
       }
 
+      // A sub-agent gets its OWN bus that forwards only a whitelist to the parent. It used to be
+      // handed `base.bus`, so its streamed answer, per-turn usage and `stop` were indistinguishable
+      // from the parent's — the answer printed up to three times, the HUD flipped to the
+      // sub-agent's context %, and /cost went to nonsense. See SUBAGENT_FORWARDED_EVENTS.
+      const subBus = new SubagentBus(base.bus);
       const loopDeps: LoopDeps = {
         ...base,
+        bus: subBus,
         registry,
         context: subContext,
         budget,
@@ -124,6 +131,7 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
             if (base.hooks?.subagent_stop?.length) {
               runHookPhase('subagent_stop', base.hooks.subagent_stop, { workspaceRoot: subWorkspaceRoot, extra: { agentType, taskId, result: 'bg_done' } });
             }
+            base.bus.emit({ type: 'subagent_usage', costUSD: budget.currentCostUSD, subagent: agentType });
             base.bus.emit({ type: 'task_notification', taskId: taskId!, answer: res.finalAnswer || '', fromSubagent: agentType });
           } catch (e) {
             if (base.hooks?.subagent_stop?.length) {
@@ -148,6 +156,9 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         if (base.hooks?.subagent_stop?.length) {
           runHookPhase('subagent_stop', base.hooks.subagent_stop, { workspaceRoot: subWorkspaceRoot, extra: { agentType, result: 'done' } });
         }
+        // The sub-agent's per-turn `usage` events are (correctly) not forwarded, so report its
+        // TOTAL spend once — otherwise sub-agent tokens would silently vanish from /cost.
+        base.bus.emit({ type: 'subagent_usage', costUSD: budget.currentCostUSD, subagent: agentType });
         const data = { answer: result.finalAnswer };
         if (worktreeCleanupPath) {
           try { removeWorktree(ctx.workspaceRoot, worktreeCleanupPath); } catch {}

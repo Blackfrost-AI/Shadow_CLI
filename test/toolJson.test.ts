@@ -53,13 +53,13 @@ test('parseToolArgs: escapes literal newlines inside a string value', () => {
   const raw = '{"content":"line1\nline2\nline3"}';
   const r = parseToolArgs(raw);
   assert.ok(r.ok && r.repaired, 'should repair, not strict-parse');
-  assert.equal(r.value.content, 'line1\nline2\nline3');
+  assert.equal((r.value as { content: string }).content, 'line1\nline2\nline3');
 });
 
 test('parseToolArgs: escapes literal tabs inside a string value', () => {
   const r = parseToolArgs('{"content":"col1\tcol2"}');
   assert.ok(r.ok && r.repaired);
-  assert.equal(r.value.content, 'col1\tcol2');
+  assert.equal((r.value as { content: string }).content, 'col1\tcol2');
 });
 
 test('parseToolArgs: a write_file with a multi-line JSON document as content', () => {
@@ -67,13 +67,13 @@ test('parseToolArgs: a write_file with a multi-line JSON document as content', (
   const raw = '{"path":"ds.json","content":"{\n  \\"batch\\": 4,\n  \\"lr\\": 0.001\n}"}';
   const r = parseToolArgs(raw);
   assert.ok(r.ok && r.repaired);
-  assert.equal(r.value.path, 'ds.json');
-  assert.equal(r.value.content, '{\n  "batch": 4,\n  "lr": 0.001\n}');
+  assert.equal((r.value as { path: string }).path, 'ds.json');
+  assert.equal((r.value as { content: string }).content, '{\n  "batch": 4,\n  "lr": 0.001\n}');
 });
 
 test('parseToolArgs: properly-escaped newlines parse strictly, untouched', () => {
   const r = parseToolArgs('{"content":"a\\nb"}');
   assert.ok(r.ok);
   assert.equal(r.repaired, undefined, 'strict parse, no repair');
-  assert.equal(r.value.content, 'a\nb');
+  assert.equal((r.value as { content: string }).content, 'a\nb');
 });

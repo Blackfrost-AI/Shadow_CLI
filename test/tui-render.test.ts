@@ -160,7 +160,7 @@ test('TuiApp auto-collapses reasoning on tool_start (polish: collapse when done)
   // After reasoning, before action it may be visible or collapsed by default
   let frame = lastFrame() ?? '';
   // Now trigger action
-  bus.emit({ type: 'tool_start', call: { id: 't1', name: 'read_file', input: { path: 'x' } } });
+  bus.emit({ type: 'tool_start', call: { id: 't1', name: 'read_file', input: { path: 'x' } }, risk: 'read' });
   await new Promise((r) => setTimeout(r, 20));
 
   frame = lastFrame() ?? '';

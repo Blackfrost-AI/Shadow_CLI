@@ -4,7 +4,7 @@ import React from 'react';
 import { render } from 'ink-testing-library';
 import { previewOf } from '../src/agent/loop.js';
 import { PendingOverlay } from '../src/tui/overlays.js';
-import type { ToolCall } from '../src/tools/types.js';
+import type { ToolCall } from '../src/provider/provider.js';
 
 /**
  * T0-1 — the approval dialog must show WHAT WILL RUN, not what the model says will run.

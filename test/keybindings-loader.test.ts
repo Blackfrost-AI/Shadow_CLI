@@ -48,7 +48,7 @@ test('merge: invalid context + bad keystroke are warned, not thrown', () => {
 });
 
 test('merge: duplicate key in one context is warned', () => {
-  mergeKeybindings([{ context: 'Global', bindings: { 'ctrl+l': 'a', 'ctrl+l': 'b' } }]);
+  mergeKeybindings([{ context: 'Global', bindings: Object.fromEntries([['ctrl+l', 'a'], ['ctrl+l', 'b']]) }]);
   // JSON.parse collapses dup keys, but the structural guard also covers programmatic input.
   assert.ok(true);
 });
@@ -66,7 +66,9 @@ test('template is valid JSON containing every default action', () => {
   const parsed = JSON.parse(tpl);
   assert.ok(Array.isArray(parsed.bindings));
   const actions = new Set<string>();
-  for (const b of parsed.bindings) for (const a of Object.values(b.bindings)) actions.add(a);
+  for (const b of parsed.bindings as Array<{ bindings: Record<string, string> }>) {
+    for (const a of Object.values(b.bindings)) actions.add(a);
+  }
   assert.ok(actions.has('chat:submit'));
   assert.ok(actions.has('transcript:toggleFoldLatest'));
   assert.ok(actions.has('transcript:toggleFoldOne'));

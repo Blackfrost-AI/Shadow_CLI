@@ -23,12 +23,12 @@ test('D1: Context.setBudget moves the compaction threshold for a live session', 
 
 test('D1: the /model clamp actually tells the Context, not just the HUD', () => {
   const src = readFileSync(new URL('../src/tui.tsx', import.meta.url), 'utf8');
-  const i = src.indexOf('opts.cfg.contextBudget = nextBudget;');
+  const i = src.indexOf('opts.cfg.contextBudget = nextPolicy.contextBudget;');
   assert.ok(i > 0, 'the clamp site exists');
   assert.match(
     src.slice(i, i + 900),
-    /context\.setBudget\(nextBudget\)/,
-    'without this the clamp is cosmetic — maybeSummarize keeps using the construction-time budget',
+    /context\.setPolicy\(nextPolicy, true\)/,
+    'without this the complete live policy stays frozen at construction (including stale provider usage)',
   );
 });
 
@@ -57,17 +57,17 @@ test('D2: PlanModeState.exit really deactivates it', () => {
 test('D5: Budget.setModel re-prices for the model actually in use', () => {
   const b = new Budget({ maxIterations: 10 }, 'cheap', PRICES as never, 0);
   b.recordUsage({ inputTokens: 1_000_000, outputTokens: 0 }, 0);
-  const afterCheap = b.snapshot().costUSD;
+  const afterCheap = b.snapshot(0).costUSD;
   assert.ok(Math.abs(afterCheap - 1) < 1e-9, `1M tokens at $1/M = $1, got ${afterCheap}`);
   // A /model switch or an automatic fallback mid-run.
   b.setModel('dear');
   b.recordUsage({ inputTokens: 1_000_000, outputTokens: 0 }, 0);
-  const afterDear = b.snapshot().costUSD;
+  const afterDear = b.snapshot(0).costUSD;
   assert.ok(afterDear - afterCheap > 900, `the second million must cost the DEAR rate, delta was ${afterDear - afterCheap}`);
   // An empty model id is ignored rather than silently zeroing the price table lookup.
   b.setModel('');
   b.recordUsage({ inputTokens: 1_000_000, outputTokens: 0 }, 0);
-  assert.ok(b.snapshot().costUSD - afterDear > 900, 'still priced as dear');
+  assert.ok(b.snapshot(0).costUSD - afterDear > 900, 'still priced as dear');
 });
 
 test('D3/D4: compaction and its token count are interruptible and bounded', () => {

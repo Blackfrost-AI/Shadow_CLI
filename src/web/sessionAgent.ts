@@ -1,5 +1,5 @@
 import { createAgentSession } from '../agent/bootstrap.js';
-import { ensureLocalServer, isLocalServedEntry } from '../gguf.js';
+import { configuredContextWindow, detectServerContextWindow, ensureLocalServer, isLocalServedEntry } from '../gguf.js';
 import { redactString } from '../util/redact.js';
 import { stripAnsi } from '../util/lc.js';
 import type { ShadowConfig } from '../config.js';
@@ -69,7 +69,8 @@ export function makeAgentBuilder(deps: { bootConfig: ShadowConfig; installDir: s
           provider: 'openai',
           baseUrl: r.baseUrl,
           apiKey: entry!.apiKey ?? 'sk-local',
-          ctxWindow: entry!.ctx ?? 32_768,
+          ctxWindow:
+            (await detectServerContextWindow(r.baseUrl)) ?? configuredContextWindow(entry!) ?? 32_768,
         };
       },
     });

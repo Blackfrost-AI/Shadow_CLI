@@ -72,7 +72,7 @@ test('assistant ⏺ turn bullet: on the first block, indent-only on continuation
   // block draws the orange ⏺ on line 0; a continuation block (same turn) gets the 2-col indent so it
   // aligns under the first block's text — never a second dot.
   const DOT = process.platform === 'darwin' ? '⏺' : '●';
-  const nonBlank = (rows: { spans: { text: string }[] }[]) => rows.filter((r) => r.spans.some((s) => s.text.trim() !== ''));
+  const nonBlank = (rows: { spans: { text: string; color?: string }[] }[]) => rows.filter((r) => r.spans.some((s) => s.text.trim() !== ''));
 
   const first = nonBlank(flattenItem({ id: 1, kind: 'assistant', text: 'first line\nsecond line' }, 60, false, T));
   assert.equal(first[0]!.spans[0]!.text, `${DOT} `, 'first block: ⏺ on the first content line');

@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { resolve } from 'node:path';
+import { scrubbedEnv } from '../util/safeEnv.js';
 
 export type HookPhase =
   | 'pre_tool_use'
@@ -46,6 +47,7 @@ export function runHookPhase(
       cwd: ctx.workspaceRoot,
       timeout: 30_000,
       shell: true,
+      env: scrubbedEnv(),
     });
     if (r.status !== 0) {
       const msg = (r.stderr || r.stdout || `hook exited ${r.status}`).trim();

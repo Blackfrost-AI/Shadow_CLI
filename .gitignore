@@ -18,3 +18,16 @@ eval/RESULTS-*.md
 eval/FINDINGS-*.md
 research/
 dist/
+
+# other tools' session scratch
+.zcode/
+
+# Secrets that must never be committed by broad mirror staging.
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+.shadow-signing/
+*.bundle

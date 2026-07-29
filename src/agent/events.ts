@@ -37,6 +37,10 @@ export type LoopEvent =
   | { type: 'model_fallback'; from: string; to: string; reason: string }
   | { type: 'task_notification'; taskId: string; answer: string; fromSubagent?: string } // bg agent result delivered as user-role message (Claude parity)
   | { type: 'bg_agent_launched'; taskId: string; prompt: string; subagentType?: string } // launch metadata recorded to main ctx for snapshot/recovery
+  // A finished sub-agent's TOTAL spend, emitted once by the `agent` tool. Sub-agents run on their
+  // own Budget, so their per-turn `usage` events must NOT reach the parent HUD (see SubagentBus);
+  // this carries the one number the session cost readout genuinely needs.
+  | { type: 'subagent_usage'; costUSD: number; subagent?: string }
 
 export type StopReasonExt =
   | StopReason
@@ -64,5 +68,45 @@ export class EventBus {
         // a listener must never break the loop
       }
     }
+  }
+}
+
+/**
+ * Events a sub-agent is allowed to put on the PARENT bus.
+ *
+ * Sub-agents were handed `base.bus` directly, so every event they emitted was indistinguishable
+ * from the parent's own. Three verified defects fell out of that one wiring:
+ *   - `text`/`assistant_done` streamed the sub-agent's answer into the parent transcript, where it
+ *     rendered up to three times (live stream, commit, and again in the tool result);
+ *   - `usage` overwrote the HUD with the SUB-AGENT's context percentage mid-tool, and reset the
+ *     parent's per-turn cost baseline, so `/cost` reported nonsense;
+ *   - `stop`/`mode` made the parent look finished while it was still working.
+ *
+ * The whitelist is what a user genuinely wants to see from a sub-agent: what it is DOING (tools),
+ * whether it failed, and its result when it completes.
+ */
+export const SUBAGENT_FORWARDED_EVENTS: ReadonlySet<LoopEvent['type']> = new Set([
+  'tool_start',
+  'tool_end',
+  'tool_denied',
+  'task_notification',
+  'subagent_usage',
+  'error',
+] as const);
+
+/**
+ * A bus for a sub-agent loop: local subscribers see everything, the parent sees only the whitelist.
+ */
+export class SubagentBus extends EventBus {
+  constructor(
+    private readonly parent: EventBus,
+    private readonly forward: ReadonlySet<LoopEvent['type']> = SUBAGENT_FORWARDED_EVENTS,
+  ) {
+    super();
+  }
+
+  override emit(e: LoopEvent): void {
+    super.emit(e);
+    if (this.forward.has(e.type)) this.parent.emit(e);
   }
 }

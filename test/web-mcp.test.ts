@@ -21,9 +21,10 @@ assertStoreIsolated(store.GLOBAL_DIR, HOME);
 const CONFIG = join(SHADOW, 'config.json');
 
 test.after(() => rmSync(HOME, { recursive: true, force: true }));
+type HttpResult = { status: number; body: string };
 
-function raw(port, method, path, headers, body?) {
-  return new Promise((resolve, reject) => {
+function raw(port: number, method: string, path: string, headers: Record<string, string>, body?: string): Promise<HttpResult> {
+  return new Promise<HttpResult>((resolve, reject) => {
     const req = request({ host: '127.0.0.1', port, path, method, headers }, (res) => {
       let b = '';
       res.on('data', (c) => (b += c));
@@ -35,7 +36,7 @@ function raw(port, method, path, headers, body?) {
   });
 }
 
-async function withServer(fn) {
+async function withServer(fn: (handle: WebServerHandle) => Promise<void>): Promise<void> {
   const bus = new EventBus();
   const h = await startWebServer({ bus });
   try {
@@ -45,8 +46,8 @@ async function withServer(fn) {
   }
 }
 
-const auth = (h, ct?) => {
-  const hdrs = { host: `127.0.0.1:${h.port}`, authorization: `Bearer ${h.token}` };
+const auth = (h: WebServerHandle, ct?: string): Record<string, string> => {
+  const hdrs: Record<string, string> = { host: `127.0.0.1:${h.port}`, authorization: `Bearer ${h.token}` };
   if (ct) hdrs['content-type'] = ct;
   return hdrs;
 };

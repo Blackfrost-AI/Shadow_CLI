@@ -17,11 +17,13 @@ const { startWebServer } = await import('../src/web/server.js');
 import type { WebServerHandle } from '../src/web/server.js';
 
 const AGENTS_DIR = join(SHADOW, 'agents');
+type HttpResult = { status: number; body: string };
+type AgentView = { name: string; description: string; tools: string[]; systemPrompt: string; builtin?: boolean };
 
 test.after(() => rmSync(HOME, { recursive: true, force: true }));
 
-function raw(port, method, path, headers, body?) {
-  return new Promise((resolve, reject) => {
+function raw(port: number, method: string, path: string, headers: Record<string, string>, body?: string): Promise<HttpResult> {
+  return new Promise<HttpResult>((resolve, reject) => {
     const req = request({ host: '127.0.0.1', port, path, method, headers }, (res) => {
       let b = '';
       res.on('data', (c) => (b += c));
@@ -33,7 +35,7 @@ function raw(port, method, path, headers, body?) {
   });
 }
 
-async function withServer(fn) {
+async function withServer(fn: (handle: WebServerHandle) => Promise<void>): Promise<void> {
   const bus = new EventBus();
   const h = await startWebServer({ bus });
   try {
@@ -43,8 +45,8 @@ async function withServer(fn) {
   }
 }
 
-const auth = (h, ct?) => {
-  const hdrs = { host: `127.0.0.1:${h.port}`, authorization: `Bearer ${h.token}` };
+const auth = (h: WebServerHandle, ct?: string): Record<string, string> => {
+  const hdrs: Record<string, string> = { host: `127.0.0.1:${h.port}`, authorization: `Bearer ${h.token}` };
   if (ct) hdrs['content-type'] = ct;
   return hdrs;
 };
@@ -53,11 +55,11 @@ test('GET /api/agents lists built-ins plus any custom', async () => {
   await withServer(async (h) => {
     const r = await raw(h.port, 'GET', '/api/agents', auth(h));
     assert.equal(r.status, 200);
-    const agents = JSON.parse(r.body).agents;
+    const agents = (JSON.parse(r.body) as { agents: AgentView[] }).agents;
     const names = agents.map((a) => a.name);
     assert.ok(names.includes('explore'));
     assert.ok(names.includes('reviewer'));
-    assert.equal(agents.find((a) => a.name === 'explore').builtin, true);
+    assert.equal(agents.find((a) => a.name === 'explore')?.builtin, true);
   });
 });
 
@@ -75,7 +77,7 @@ test('GET returns systemPrompt, so an edit can round-trip without destroying it'
       JSON.stringify({ name: 'round-trip', description: 'v1', tools: ['read_file'], systemPrompt: PROMPT }),
     );
 
-    const list = JSON.parse((await raw(h.port, 'GET', '/api/agents', auth(h))).body).agents;
+    const list = (JSON.parse((await raw(h.port, 'GET', '/api/agents', auth(h))).body) as { agents: AgentView[] }).agents;
     const found = list.find((a) => a.name === 'round-trip');
     assert.ok(found, 'the custom agent is listed');
     assert.equal(found.systemPrompt, PROMPT, 'systemPrompt survives the read side');
@@ -90,9 +92,10 @@ test('GET returns systemPrompt, so an edit can round-trip without destroying it'
     );
     assert.equal(put.status, 200);
 
-    const after = JSON.parse((await raw(h.port, 'GET', '/api/agents', auth(h))).body).agents.find(
+    const after = (JSON.parse((await raw(h.port, 'GET', '/api/agents', auth(h))).body) as { agents: AgentView[] }).agents.find(
       (a) => a.name === 'round-trip',
     );
+    assert.ok(after);
     assert.equal(after.description, 'v2', 'the intended change landed');
     assert.equal(after.systemPrompt, PROMPT, 'the prompt was NOT clobbered by the edit');
     assert.notEqual(after.systemPrompt, 'undefined', 'never the literal string "undefined"');
@@ -117,9 +120,10 @@ test('PUT rejects a body missing systemPrompt instead of blanking the prompt', a
     );
     assert.equal(bad.status, 400, 'PUT validates like POST');
 
-    const after = JSON.parse((await raw(h.port, 'GET', '/api/agents', auth(h))).body).agents.find(
+    const after = (JSON.parse((await raw(h.port, 'GET', '/api/agents', auth(h))).body) as { agents: AgentView[] }).agents.find(
       (a) => a.name === 'keep-prompt',
     );
+    assert.ok(after);
     assert.equal(after.systemPrompt, 'original', 'the rejected write left the prompt intact');
   });
 });
@@ -198,8 +202,9 @@ test('PUT replaces an existing agent', async () => {
       JSON.stringify({ name: 'replace-me', description: 'v2', tools: ['read_file', 'grep'], systemPrompt: 'second' }),
     );
     assert.equal(r.status, 200);
-    const list = JSON.parse((await raw(h.port, 'GET', '/api/agents', auth(h))).body).agents;
+    const list = (JSON.parse((await raw(h.port, 'GET', '/api/agents', auth(h))).body) as { agents: AgentView[] }).agents;
     const got = list.find((a) => a.name === 'replace-me');
+    assert.ok(got);
     assert.equal(got.description, 'v2');
     assert.deepEqual(got.tools, ['read_file', 'grep']);
   });

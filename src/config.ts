@@ -113,6 +113,10 @@ export const ModelEntrySchema = z.object({
     .regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$/)
     .optional(),
   fallback: z.string().optional(),
+  // Advertised hard context window for this exact preset. This is provider/model specific;
+  // `contextBudget` remains the session's soft ceiling. Local servers are queried at runtime
+  // when possible, with this value as the trusted fallback.
+  contextWindow: z.number().int().positive().optional(),
   disabled: z.boolean().optional(),
   // Optional /model-picker category override. When unset, the group is derived:
   // a local endpoint → "Local", otherwise the model's company (Anthropic/OpenAI/xAI/…).
@@ -123,6 +127,14 @@ export const ModelEntrySchema = z.object({
   // Local MLX auto-serve (Apple Silicon): a model DIRECTORY or an mlx-community/... repo id;
   // shadow launches `mlx_lm.server` for it on activation (see src/gguf.ts ensureMlxServer).
   mlx: z.string().optional(),
+  // Which MLX server to launch: 'lm' (mlx_lm.server), 'vlm' (mlx_vlm.server), 'auto' (default).
+  //
+  // Auto prefers mlx-lm whenever the INSTALLED mlx-lm implements the architecture, even when
+  // config.json declares a vision_config — an any-to-any model like Gemma-4
+  // (Gemma4ForConditionalGeneration) has one but is converted with, and loadable only by, mlx-lm.
+  // Sending it to mlx-vlm made that server die matching `vision_tower.*` weights it does not have.
+  // Set this to pin the choice; a server that fails to start is also retried with the other one.
+  mlxServer: z.enum(['auto', 'lm', 'vlm']).optional(),
   // Local vLLM auto-serve (Linux + CUDA): a model DIRECTORY or a HuggingFace repo id — shadow launches
   // vLLM (native `vllm serve`, else the vllm/vllm-openai Docker image) and talks to its OpenAI endpoint.
   // The engine that covers the common GPU formats: safetensors, FP8, AWQ, GPTQ, and NVFP4 on Blackwell.
@@ -354,7 +366,7 @@ export function loadConfig(cwd: string, cliOverrides: Record<string, unknown> = 
   // `credRef` is in this list for the same reason as `apiKey`: a project file that could name a
   // vault slot would let a cloned repo aim YOUR sealed credential at ITS `baseUrl`. The pointer is
   // not secret, but the ability to choose which secret gets sent is exactly the capability we deny.
-  const PRESET_UNTRUSTED_FIELDS = ['baseUrl', 'apiKey', 'authToken', 'credRef', 'gguf', 'ggufServer', 'ggufArgs', 'ggufPort', 'mlx', 'vllm', 'vllmArgs', 'vllmImage'];
+  const PRESET_UNTRUSTED_FIELDS = ['baseUrl', 'apiKey', 'authToken', 'credRef', 'gguf', 'ggufServer', 'ggufArgs', 'ggufPort', 'mlx', 'mlxServer', 'vllm', 'vllmArgs', 'vllmImage'];
   if (Array.isArray(fromFile.models)) {
     let redacted = 0;
     for (const m of fromFile.models as Array<Record<string, unknown>>) {

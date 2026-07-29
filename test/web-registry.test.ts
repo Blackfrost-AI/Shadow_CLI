@@ -177,6 +177,29 @@ test('close() stops mcp children, kills bg shells and clears wakeups exactly onc
   assert.equal(registry.get(s.id), undefined, 'removed from the map');
 });
 
+test('close() during a lazy build disposes the result when it eventually resolves', async () => {
+  let releaseBuild!: () => void;
+  const gate = new Promise<void>((resolve) => (releaseBuild = resolve));
+  const { agent, counts } = makeAgent();
+  const mcp = makeMcp();
+  const { registry } = makeRegistry({
+    builder: async () => {
+      await gate;
+      return { agent, mcp: [mcp.handle], jail: JAIL };
+    },
+  });
+  const s = registry.create({ projectRoot: '/tmp/ws' });
+  await registry.submit(s.id, 'go');
+  await until(() => registry.get(s.id)?.status === 'initializing');
+
+  assert.equal(await registry.remove(s.id), true);
+  releaseBuild();
+  await until(() => mcp.stopped() === 1);
+  assert.equal(counts.bgKill, 1, 'late agent background children disposed');
+  assert.equal(counts.wakeupClear, 1, 'late wakeups disposed');
+  assert.equal(registry.get(s.id), undefined);
+});
+
 test('the reserved mirror cannot be prompted, and the reserved id is not client-claimable', async () => {
   const { registry } = makeRegistry();
   registry.attachReserved({ bus: new EventBus(), displayPath: '/tmp/ws', origin: 'mirror' });

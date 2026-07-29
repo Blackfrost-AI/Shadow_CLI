@@ -1,6 +1,6 @@
 {
   "name": "shadow",
-  "version": "3.8.0",
+  "version": "4.0.0",
   "description": "Shadow — a high-performance, agentic CLI runtime that lets an LLM operate as a coding/sysadmin agent over a local workspace.",
   "type": "module",
   "private": true,
@@ -25,14 +25,15 @@
     "eval": "tsx eval/harness-eval.ts",
     "lint": "eslint .",
     "format": "prettier --write .",
-    "test": "node --import tsx/esm --test test/**/*.test.ts",
+    "test": "node --import tsx/esm --test --test-timeout=60000 \"test/**/*.test.ts\"",
     "verify:plan": "bash scripts/verify-plan.sh",
     "check:release-gate": "bash scripts/check-release-gate.sh",
     "prepublishOnly": "bash scripts/check-release-gate.sh",
     "release:dev": "npm version prerelease --preid=dev -m \"release: %s\" && git push --follow-tags",
     "release:patch": "npm version patch -m \"release: %s\" && git push --follow-tags",
     "release:minor": "npm version minor -m \"release: %s\" && git push --follow-tags",
-    "setup:hooks": "git config core.hooksPath .githooks"
+    "setup:hooks": "git config core.hooksPath .githooks",
+    "prepare": "git config core.hooksPath .githooks || true"
   },
   "license": "MIT",
   "dependencies": {
@@ -45,7 +46,7 @@
   "devDependencies": {
     "@eslint/js": "^9.17.0",
     "@types/node": "^22.10.0",
-    "@types/react": "^19.2.17",
+    "@types/react": "^18.3.12",
     "eslint": "^9.17.0",
     "ink-testing-library": "^4.0.0",
     "prettier": "^3.4.2",

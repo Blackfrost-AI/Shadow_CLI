@@ -28,3 +28,27 @@ export function scrubControlTokens(text: string): string {
     .replace(/^[ \t\n]+/, '') // a removed leading token often leaves whitespace
     .replace(/[ \t]{2,}/g, ' ');
 }
+
+/**
+ * Tool-call envelopes a model printed as prose, for the DISPLAY path.
+ *
+ * `sniffToolCalls` already strips these — but only when it RECOVERS a call, which requires the
+ * named tool to be registered. A weak local model that invents a tool name, or emits a malformed
+ * envelope, produced no recovery, so the raw XML stayed in `turn.text` and was committed verbatim
+ * to the transcript. Markdown then mangled it further (`<tool_call>` reads as an HTML tag), which
+ * is exactly what users of Qwen/GLM-class local models saw — Shadow's core audience.
+ *
+ * Display-only and deliberately blunt: it removes the SCAFFOLDING, never surrounding prose, and is
+ * applied where an answer is committed for viewing rather than where it is parsed for calls.
+ */
+const TOOL_CALL_ENVELOPE =
+  /<tool_call>[\s\S]*?<\/tool_call>|<tool_call>[\s\S]*$|<function(?:=|\s+name\s*=)[\s\S]*?<\/function\s*>|<[｜|]tool[▁_]calls?[▁_]begin[｜|][\s\S]*?<[｜|]tool[▁_]calls?[▁_]end[｜|]>/gi;
+
+/**
+ * Scrub an answer for DISPLAY: control tokens plus any leftover tool-call scaffolding.
+ * Never used for parsing — recovery still goes through sniffToolCalls, which must see the raw text.
+ */
+export function scrubForDisplay(text: string): string {
+  if (!text) return text;
+  return scrubControlTokens(text.replace(TOOL_CALL_ENVELOPE, '')).replace(/\n{3,}/g, '\n\n').trim();
+}

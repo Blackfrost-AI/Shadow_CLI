@@ -1,5 +1,11 @@
 // Pure composer-input helpers, split out of tui.tsx so they can be unit-tested without booting Ink.
 import { existsSync } from 'node:fs';
+import { displayWidth, nextCluster } from './width.js';
+
+// Re-exported: the composer was the first caller of displayWidth and every existing import points
+// here. The implementation now lives in width.ts so the transcript flattener measures identically —
+// two independent width tables is exactly how the CJK truncation bug survived.
+export { displayWidth };
 
 /** True if a path exists on disk — lets us tell a real dir/file (/tmp, /etc/hosts) a user pasted or
  *  typed from a genuinely mistyped slash command. Never throws. */
@@ -38,61 +44,11 @@ export function expandPastes(text: string, pastes: ReadonlyArray<{ id: number; c
   });
 }
 
-// ── Display width ────────────────────────────────────────────────────────────
+// ── Multi-row layout / caret ─────────────────────────────────────────────────
 //
 // Wrapping by UTF-16 code unit made every CJK/emoji row overrun the box: `layoutComposer('你好…', 10)`
 // returned rows of 10 CHARACTERS = 20 terminal columns, so Ink truncated them and the caret drifted
-// by up to 2× across the row. A local implementation rather than `string-width`: that package is
-// only a TRANSITIVE dependency of ink, and the release artifact is a Bun single-file binary — an
-// undeclared dep is exactly the kind of thing that survives `npm test` and dies in the binary.
-
-/** Ranges that occupy TWO terminal columns (East Asian Wide/Fullwidth + emoji presentation). */
-const WIDE_RANGES: ReadonlyArray<readonly [number, number]> = [
-  [0x1100, 0x115f], [0x2e80, 0x303e], [0x3041, 0x33ff], [0x3400, 0x4dbf], [0x4e00, 0x9fff],
-  [0xa000, 0xa4cf], [0xa960, 0xa97f], [0xac00, 0xd7a3], [0xf900, 0xfaff], [0xfe10, 0xfe19],
-  [0xfe30, 0xfe6f], [0xff00, 0xff60], [0xffe0, 0xffe6], [0x1f300, 0x1f64f], [0x1f900, 0x1f9ff],
-  [0x1fa70, 0x1faff], [0x20000, 0x3fffd],
-];
-
-/** Combining marks and other zero-width code points. */
-function isZeroWidth(cp: number): boolean {
-  return (
-    (cp >= 0x0300 && cp <= 0x036f) || // combining diacriticals
-    (cp >= 0x200b && cp <= 0x200f) || // ZWSP/ZWNJ/ZWJ + bidi marks
-    cp === 0xfe0f || cp === 0xfe0e || // variation selectors
-    (cp >= 0xe0100 && cp <= 0xe01ef)
-  );
-}
-
-/** Terminal columns occupied by one code point. */
-function codePointWidth(cp: number): number {
-  if (isZeroWidth(cp)) return 0;
-  if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0)) return 0; // control
-  for (const [lo, hi] of WIDE_RANGES) if (cp >= lo && cp <= hi) return 2;
-  return 1;
-}
-
-/**
- * Terminal columns a string occupies. A grapheme CLUSTER is measured by its widest code point, so
- * an emoji built from a ZWJ sequence counts once, not once per component.
- */
-export function displayWidth(s: string): number {
-  let w = 0;
-  for (const g of graphemes(s)) {
-    let gw = 0;
-    for (const ch of g) gw = Math.max(gw, codePointWidth(ch.codePointAt(0) ?? 0));
-    w += gw;
-  }
-  return w;
-}
-
-/** Split into grapheme clusters (Intl.Segmenter when present, else code points). */
-function graphemes(s: string): string[] {
-  if (segmenter) return Array.from(segmenter.segment(s), (g) => g.segment);
-  return Array.from(s);
-}
-
-// ── Multi-row layout / caret ─────────────────────────────────────────────────
+// by up to 2× across the row. Measurement lives in `./width.js`.
 
 /** Max visual rows the composer shows before scrolling the window around the caret. */
 export const COMPOSER_MAX_VISIBLE_ROWS = 8;
@@ -150,16 +106,6 @@ export function layoutComposer(text: string, innerWidth: number): ComposerLayout
   }
   starts.push(n); // sentinel
   return { lines, starts };
-}
-
-/** The grapheme cluster beginning at `i` (never empty for a valid index). */
-function nextCluster(text: string, i: number): string {
-  if (!segmenter) {
-    const cp = text.codePointAt(i);
-    return cp === undefined ? text[i] ?? '' : String.fromCodePoint(cp);
-  }
-  for (const g of segmenter.segment(text.slice(i))) return g.segment;
-  return text[i] ?? '';
 }
 
 /** Map a source cursor index to a visual (row, col) within the layout. */

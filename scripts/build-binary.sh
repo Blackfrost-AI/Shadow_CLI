@@ -13,6 +13,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# The release gate runs HERE, on the thing that produces shippable artifacts. It used to be
+# referenced only by `prepublishOnly`, which "private": true makes unreachable — so neither real
+# release channel ever invoked it. Skip with SHADOW_SKIP_GATE=1 for a local scratch build.
+if [ "${SHADOW_SKIP_GATE:-}" != "1" ] && [ -f scripts/check-release-gate.sh ]; then
+  bash scripts/check-release-gate.sh || { echo "build-binary: release gate FAILED — refusing to build" >&2; exit 1; }
+fi
+
 BUN="${BUN:-bun}"
 if ! command -v "$BUN" >/dev/null 2>&1; then
   # fall back to the default install location
@@ -27,6 +34,12 @@ mkdir -p "$(dirname "$OUT")"
 
 echo "→ embedding prompts (binary has no prompts/ dir on disk)…"
 node scripts/embed-prompts.mjs
+
+echo "→ building web UI vendor modules (markdown/highlight/diff → browser ESM)…"
+npx tsc -p tsconfig.web.json
+
+echo "→ embedding web UI (binary has no src/web/ui/ on disk)…"
+node scripts/embed-webui.mjs
 
 # Ink's reconciler only `import('./devtools.js')` when DEV=true (never in production), but the
 # bundler must still resolve the static `import 'react-devtools-core'` inside it. Drop in an empty

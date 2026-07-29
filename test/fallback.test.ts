@@ -64,7 +64,10 @@ test('loop swaps model on fallback-eligible provider error', async () => {
       dryRun: false,
       maxToolResultChars: 16_384,
       contextBudget: 1_000_000,
-      models: [{ label: 'p', provider: 'mock', model: 'primary', fallback: 'backup' }],
+      models: [
+        { label: 'p', provider: 'mock', model: 'primary', fallback: 'backup' },
+        { label: 'b', provider: 'mock', model: 'backup' },
+      ],
       fallbackModel: 'backup',
     };
     await new AgentLoop(deps, 'full').run();

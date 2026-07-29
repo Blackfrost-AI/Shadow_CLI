@@ -270,7 +270,7 @@ test('/model list and /provider show provider/model management state', async () 
   await tick();
   out = strip(frames.join('\n'));
   assert.match(out, /openai\/local-reasoner/);
-  assert.match(out, /endpoint: http:\/\/10\.80\.10\.24:8001\/v1/);
+  assert.match(out, /endpoint: http:\/\/127\.0\.0\.1:8001\/v1/);
   assert.match(out, /presets: 2 configured · 1 disabled/);
   unmount();
 });
@@ -354,7 +354,7 @@ test('accessible themes: colorblind (Okabe–Ito) + high-contrast, with aliases;
   assert.equal(paletteSnapshot().yellow, '#ffff00', 'hc alias maps to high-contrast');
   // Role-token contract: every theme must define every token — a theme missing `user`/`accent`/
   // `body`/`codeBg` would silently freeze part of the UI in the previous theme's colors.
-  const TOKENS = ['fg', 'body', 'bright', 'dim', 'cyan', 'green', 'red', 'yellow', 'purple', 'user', 'accent', 'codeBg'];
+  const TOKENS: Array<keyof ReturnType<typeof paletteSnapshot>> = ['fg', 'body', 'bright', 'dim', 'cyan', 'green', 'red', 'yellow', 'purple', 'user', 'accent', 'codeBg'];
   for (const name of ['og', 'pipboy', 'cyberpunk', 'coder-chick', 'matrix', 'mono', 'light', 'colorblind', 'high-contrast']) {
     applyTheme(name);
     const snap = paletteSnapshot();

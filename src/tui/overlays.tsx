@@ -9,6 +9,7 @@ import type { UserQuestion } from '../agent/approval.js';
 import { recommendedIndex } from './questions.js';
 import type { QuestionSelection } from './questions.js';
 import type { PickerRow } from '../util/modelGroups.js';
+import { displayWidth, takeByWidth, nextCluster } from './width.js';
 
 /** Faint slate panel behind menus/overlays — the OG default. Themes override via `menuBg`;
  *  these remain as the fallback for any palette that predates the field. */
@@ -34,7 +35,54 @@ function barWidth(cols: number, pageMargin: number): number {
 }
 
 function padBar(s: string, width: number): string {
-  return s.length >= width ? s.slice(0, width) : s + ' '.repeat(width - s.length);
+  // Measured in COLUMNS: `.length` padded a CJK label to half its visual width, so the shaded bar
+  // ended mid-row and the clip cut a fullwidth glyph in half.
+  const w = displayWidth(s);
+  if (w >= width) return takeByWidth(s, width).head;
+  return s + ' '.repeat(width - w);
+}
+
+/**
+ * Lay the approval preview across up to `maxRows` rows, keeping BOTH ends visible.
+ *
+ * One `wrap="truncate"` row let a command hide its own tail: `git status` + padding +
+ * `; rm -rf ~/Documents` rendered as "$ git status" with the destructive half past the right edge.
+ * `previewOf` now collapses whitespace runs, but a genuinely long command still has to be shown
+ * honestly — so when it will not fit we print the head, then the TAIL (where an appended clause
+ * lives), and state how much is hidden. Bounded rows because the dialog shares the frame budget
+ * with the transcript; an unbounded preview would trip Ink's scrollback-wiping clearTerminal.
+ */
+function previewRows(
+  text: string,
+  firstWidth: number,
+  contWidth: number,
+  maxRows: number,
+): { rows: string[]; hidden: number } {
+  const rows: string[] = [];
+  let rest = text;
+  for (let r = 0; r < maxRows && rest !== ''; r++) {
+    const width = Math.max(1, r === 0 ? firstWidth : contWidth);
+    if (r < maxRows - 1) {
+      const { head, rest: tail } = takeByWidth(rest, width);
+      const chunk = head === '' ? (nextCluster(rest, 0) || rest.slice(0, 1)) : head;
+      rows.push(chunk);
+      rest = head === '' ? rest.slice(chunk.length) : tail;
+      continue;
+    }
+    // Final row: if the remainder fits, print it; otherwise keep the END and mark the gap.
+    if (displayWidth(rest) <= width) {
+      rows.push(rest);
+      return { rows, hidden: 0 };
+    }
+    const budget = Math.max(1, width - 1); // room for the leading ellipsis
+    let tail = rest;
+    while (tail !== '' && displayWidth(tail) > budget) {
+      tail = tail.slice((nextCluster(tail, 0) || tail.slice(0, 1)).length);
+    }
+    rows.push(`…${tail}`);
+    return { rows, hidden: rest.length - tail.length };
+  }
+  return { rows, hidden: 0 };
 }
 
 export function PendingOverlay({
@@ -79,18 +127,46 @@ export function PendingOverlay({
       <Text wrap="truncate" backgroundColor={C.menuBg ?? MENU_BG} color={titleColor} bold>
         {bar(` ${title}`)}
       </Text>
-      <Text wrap="truncate" backgroundColor={C.menuBg ?? MENU_BG}>
-        <Text color={C.yellow} bold>
-          {pending.kind === 'user_question'
+      {(() => {
+        const label =
+          pending.kind === 'user_question'
             ? ` question${pendingQuestionsLength > 1 ? ` ${activeQuestionIndex + 1}/${pendingQuestionsLength}` : ''}: `
-            : ' approve? '}
-        </Text>
-        <Text color={C.fg}>
-          {pending.kind === 'user_question'
+            : ' approve? ';
+        const body =
+          pending.kind === 'user_question'
             ? (activeQuestion?.question ?? pending.preview)
-            : pending.preview}
-        </Text>
-      </Text>
+            : pending.preview;
+        // Scaled to terminal height the same way the option list is, so a short terminal never
+        // grows the dialog into the frame-budget wipe.
+        const maxRows = Math.max(1, Math.min(3, rows - 16));
+        const labelW = displayWidth(label);
+        const { rows: preview, hidden } = previewRows(
+          body,
+          Math.max(8, BAR_W - labelW),
+          Math.max(8, BAR_W - 2),
+          maxRows,
+        );
+        return (
+          <>
+            <Text wrap="truncate" backgroundColor={C.menuBg ?? MENU_BG}>
+              <Text color={C.yellow} bold>
+                {label}
+              </Text>
+              <Text color={C.fg}>{padBar(preview[0] ?? '', BAR_W - labelW)}</Text>
+            </Text>
+            {preview.slice(1).map((line, i) => (
+              <Text key={`pv${i}`} wrap="truncate" backgroundColor={C.menuBg ?? MENU_BG} color={C.fg}>
+                {padBar(`  ${line}`, BAR_W)}
+              </Text>
+            ))}
+            {hidden > 0 ? (
+              <Text wrap="truncate" backgroundColor={C.menuBg ?? MENU_BG} color={C.yellow}>
+                {padBar(`  ⚠ ${hidden} more characters not shown — deny and inspect if unsure`, BAR_W)}
+              </Text>
+            ) : null}
+          </>
+        );
+      })()}
       {pending.kind === 'user_question' && activeQuestion ? (
         // Window the option list around the cursor; force each row to ONE truncated line so a long
         // dialog can't trip Ink's clearTerminal fallback on a short terminal.
@@ -110,7 +186,10 @@ export function PendingOverlay({
                 const isRec = i === rec;
                 const mark = activeQuestion.multiSelect ? (selected ? '✓ ' : '  ') : '';
                 return (
-                  <Text key={o.label} wrap="truncate" color={selected ? C.green : isCursor ? C.fg : C.dim} bold={isCursor}>
+                  // Keyed by INDEX, not label: a question with two identically-labelled options
+                  // (models routinely emit "Yes"/"Yes") produced duplicate React keys, and the two
+                  // rows then shared selection state — clicking one highlighted the other.
+                  <Text key={`opt${i}`} wrap="truncate" color={selected ? C.green : isCursor ? C.fg : C.dim} bold={isCursor}>
                     {`${isCursor ? '❯' : ' '} ${i + 1}. ${mark}${o.label}`}
                     {isRec ? <Text color={C.yellow}>{'  ★ recommended'}</Text> : ''}
                     {o.description ? <Text color={C.dim}>{`  — ${o.description}`}</Text> : ''}
@@ -131,7 +210,10 @@ export function PendingOverlay({
           {`  ⏳ auto-picking the recommended answer in ${autoAnswerSecs}s · any key to take over`}
         </Text>
       ) : null}
-      <Text>
+      {/* The ONE unbudgeted line in the dialog: without wrap="truncate" this legend wrapped to a
+          second row on a narrow terminal, which is exactly the unaccounted-for row that pushes the
+          frame to terminal height and trips Ink's scrollback-wiping clearTerminal. */}
+      <Text wrap="truncate">
         {pending.kind === 'user_question' ? (
           <>
             <Text color={C.green}>↑/↓</Text> move{' '}

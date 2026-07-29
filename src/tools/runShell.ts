@@ -5,6 +5,7 @@ import { fail } from './types.js';
 import { clamp } from './util.js';
 import { wrapCommand } from '../safety/sandbox.js';
 import type { BgRegistry } from './bgShell.js';
+import { scrubbedEnv, UNIX_SAFE_ENV } from '../util/safeEnv.js';
 
 const DEFAULT_TIMEOUT_MS = 60_000;
 const MAX_TIMEOUT_MS = 30 * 60 * 1000; // 30 min hard ceiling
@@ -21,29 +22,6 @@ const IS_WIN = process.platform === 'win32';
  * runs cannot exfiltrate the keys that power the agent. Per-platform: Windows
  * shells need SYSTEMROOT/PATHEXT/etc. or they fail to start.
  */
-const UNIX_ALLOWLIST = ['PATH', 'HOME', 'USER', 'LANG', 'LC_ALL', 'TERM', 'TMPDIR', 'SHELL'];
-const WIN_ALLOWLIST = [
-  'PATH', 'PATHEXT', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'TEMP', 'TMP', 'USERPROFILE',
-  'USERNAME', 'HOMEDRIVE', 'HOMEPATH', 'APPDATA', 'LOCALAPPDATA', 'PROGRAMFILES',
-  'PROGRAMDATA', 'PSMODULEPATH',
-];
-
-function scrubbedEnv(allowlist: readonly string[]): NodeJS.ProcessEnv {
-  // On Windows always union in the shell-essential vars (SYSTEMROOT/PATHEXT/…) or
-  // PowerShell can't even start, regardless of how the user trimmed the allowlist.
-  const keys = IS_WIN ? unique([...WIN_ALLOWLIST, ...allowlist]) : allowlist;
-  const out: NodeJS.ProcessEnv = {};
-  for (const key of keys) {
-    const v = process.env[key]; // process.env is case-insensitive on Windows
-    if (v !== undefined) out[key] = v;
-  }
-  return out;
-}
-
-function unique(xs: readonly string[]): string[] {
-  return [...new Set(xs)];
-}
-
 /** Kill the child's whole process group (POSIX) so grandchildren can't orphan. */
 function killTree(child: ChildProcess, signal: NodeJS.Signals): void {
   try {
@@ -147,7 +125,7 @@ export function makeRunShell(
     bg?: BgRegistry;
   } = {},
 ): Tool<RunShellInput, RunShellData> {
-  const allowlist = opts.envAllowlist ?? UNIX_ALLOWLIST;
+  const allowlist = opts.envAllowlist ?? UNIX_SAFE_ENV;
   const defaultTimeoutMs = opts.defaultTimeoutMs ?? DEFAULT_TIMEOUT_MS;
   const sandboxEnabled = (opts.sandbox ?? 'auto') !== 'off';
   const allowNetwork = opts.allowNetwork ?? true;

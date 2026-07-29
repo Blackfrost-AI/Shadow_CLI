@@ -23,7 +23,7 @@ import {
   registerBuiltinTools,
 } from '../tools/index.js';
 import { registerMcpServers } from '../mcp/client.js';
-import { mlxOfflineReady } from '../gguf.js';
+import { configuredContextWindow, detectServerContextWindow, mlxOfflineReady } from '../gguf.js';
 import { discoverSkills, skillsIndexBlock, type SkillEntry } from '../skills/loader.js';
 import { WakeupScheduler } from './wakeup.js';
 import { Context } from './context.js';
@@ -103,6 +103,8 @@ export interface CreateAgentSessionOptions {
 export interface AgentSession {
   /** Possibly adjusted from the input — the local-model and gguf paths lower contextBudget. */
   cfg: ShadowConfig;
+  /** Unclamped user policy, retained so switching models can derive a fresh per-model policy. */
+  baseContextPolicy: { contextBudget: number; triggerRatio: number; keepLastTurns: number };
   provider: ReturnType<typeof createProvider>;
   registry: ToolRegistry;
   bg: BgRegistry;
@@ -133,6 +135,8 @@ export interface AgentSession {
    * swallows piped task lines. Returns the clients so the caller can stop them on shutdown.
    */
   connectMcp: () => Promise<Array<{ stop(): void }>>;
+  /** Build and activate a complete model entry for automatic fallback. */
+  activateModel: (entry: ModelEntry) => Promise<{ provider: ReturnType<typeof createProvider>; model: string }>;
 }
 
 /**
@@ -204,6 +208,11 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   // callee's type is written out, which destructuring loses.
   const fail: (message: string) => never = opts.fail;
   let cfg = opts.cfg;
+  const baseContextPolicy = {
+    contextBudget: cfg.contextBudget,
+    triggerRatio: cfg.summarizeTriggerRatio,
+    keepLastTurns: cfg.keepLastTurns,
+  };
 
   const skills = discoverSkills(workspaceRoot);
   const skillsBlock = skillsIndexBlock(skills);
@@ -293,8 +302,18 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
       summarizeTriggerRatio: triggerRatioForBudget(budget, cfg.summarizeTriggerRatio),
     };
   } else if (isLocalBaseUrl(resolvedBaseUrl)) {
-    // OpenAI-compatible local URL without a managed launcher — assume 32k if unknown.
-    const budget = clampLocalContextBudget(cfg.contextBudget, activeModelEntry?.ctx);
+    // OpenAI-compatible local URL without a managed launcher: ask the running server instead of
+    // making every model share an invented window. Explicit preset metadata is the fallback.
+    const ctxWindow =
+      (await detectServerContextWindow(resolvedBaseUrl!)) ?? configuredContextWindow(activeModelEntry);
+    cfg = {
+      ...cfg,
+      contextBudget: clampLocalContextBudget(cfg.contextBudget, ctxWindow),
+    };
+    cfg.keepLastTurns = keepLastTurnsForBudget(cfg.contextBudget, cfg.keepLastTurns);
+    cfg.summarizeTriggerRatio = triggerRatioForBudget(cfg.contextBudget, cfg.summarizeTriggerRatio);
+  } else if (activeModelEntry?.contextWindow) {
+    const budget = clampLocalContextBudget(cfg.contextBudget, activeModelEntry.contextWindow);
     cfg = {
       ...cfg,
       contextBudget: budget,
@@ -393,8 +412,57 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     return await registerMcpServers(registry, cfg.mcpServers, workspaceRoot);
   };
 
+  const activateModel = async (entry: ModelEntry): Promise<{ provider: ReturnType<typeof createProvider>; model: string }> => {
+    let nextProvider = entry.provider;
+    let baseUrl = resolveBaseUrl(entry.provider, entry.baseUrl);
+    const cred = resolveEntryCredential(entry, { vaultIsLocked: vaultExists() && !vaultUnlocked() });
+    if (!cred.ok) {
+      throw new Error(
+        `fallback "${entry.label}" needs vault slot "${cred.slot}", which is ${cred.reason === 'locked' ? 'locked' : 'empty'}`,
+      );
+    }
+    let apiKey = cred.apiKey;
+    let hardWindow = configuredContextWindow(entry);
+    const local = await opts.launchLocalServer(entry, offline);
+    if (local) {
+      nextProvider = local.provider;
+      baseUrl = local.baseUrl;
+      apiKey = local.apiKey;
+      hardWindow = local.ctxWindow;
+    } else if (offline && !isLocalBaseUrl(baseUrl)) {
+      throw new Error(`offline mode refused cloud fallback "${entry.label}"`);
+    } else if (isLocalBaseUrl(baseUrl) && baseUrl) {
+      hardWindow = (await detectServerContextWindow(baseUrl)) ?? hardWindow;
+    }
+
+    const budget = hardWindow
+      ? clampLocalContextBudget(baseContextPolicy.contextBudget, hardWindow)
+      : baseContextPolicy.contextBudget;
+    const policy = {
+      contextBudget: budget,
+      triggerRatio: triggerRatioForBudget(budget, baseContextPolicy.triggerRatio),
+      keepLastTurns: keepLastTurnsForBudget(budget, baseContextPolicy.keepLastTurns),
+    };
+    context.setPolicy(policy, true);
+    cfg.provider = nextProvider;
+    cfg.model = entry.model;
+    cfg.baseUrl = baseUrl;
+    cfg.contextBudget = policy.contextBudget;
+    cfg.summarizeTriggerRatio = policy.triggerRatio;
+    cfg.keepLastTurns = policy.keepLastTurns;
+    const next = createProvider({
+      provider: nextProvider,
+      model: entry.model,
+      apiKey,
+      authToken: cred.authToken,
+      baseUrl,
+    });
+    return { provider: next, model: entry.model };
+  };
+
   return {
     cfg,
+    baseContextPolicy,
     provider,
     registry,
     bg,
@@ -415,5 +483,6 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     workspaceRoot,
     additionalRoots,
     connectMcp,
+    activateModel,
   };
 }

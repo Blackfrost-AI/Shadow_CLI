@@ -1,6 +1,7 @@
 import type { ToolCall } from '../provider/provider.js';
 import type { ToolRisk } from '../tools/types.js';
 import type { AutonomyLevel } from '../safety/permissions.js';
+import { randomBytes } from 'node:crypto';
 
 export type ApprovalKind = 'permission' | 'plan_enter' | 'plan_exit' | 'user_question';
 
@@ -33,6 +34,44 @@ export type ApprovalDecision =
   | { answers: UserAnswer[] }
   | { approveForSession: true }
   | { approveForPrefix: string };
+
+/**
+ * "Approve for session" / "approve this prefix" grants, held for the life of the SESSION.
+ *
+ * These used to be private fields of AgentLoop — and the TUI builds a NEW AgentLoop for every user
+ * message (tui.tsx:4192), so both grants silently expired the moment the user typed again. The two
+ * advertised grant keys therefore looked broken: pressing (s) still re-prompted for the identical
+ * call one message later. That is worse than not offering them, because a user who is re-asked
+ * after granting stops reading the dialog — alarm fatigue in the one path that must never be
+ * skimmed. Owning them here lets the session hold one instance across every loop it constructs.
+ */
+export class SessionApprovals {
+  private readonly tools = new Set<string>();
+  private readonly prefixes: string[] = [];
+
+  approveTool(name: string): void {
+    this.tools.add(name);
+  }
+
+  approvePrefix(prefix: string): void {
+    if (prefix && !this.prefixes.includes(prefix)) this.prefixes.push(prefix);
+  }
+
+  hasTool(name: string): boolean {
+    return this.tools.has(name);
+  }
+
+  /** Prefix grants, in the order they were given. */
+  listPrefixes(): readonly string[] {
+    return this.prefixes;
+  }
+
+  /** Drop every grant — used when the session context is reset (/clear, /resume). */
+  clear(): void {
+    this.tools.clear();
+    this.prefixes.length = 0;
+  }
+}
 
 export interface ApprovalRequest {
   /**
@@ -87,11 +126,9 @@ export function settleWithAbort(p: Promise<ApprovalDecision>, signal?: AbortSign
   });
 }
 
-/** Mint an approval id. Unique per process; the browser only needs to match it back. */
-let approvalSeq = 0;
+/** Mint an unguessable id that cannot collide across watch/process restarts. */
 export function nextApprovalId(): string {
-  approvalSeq += 1;
-  return `ap_${approvalSeq.toString(36)}_${Math.trunc(performance.now()).toString(36)}`;
+  return `ap_${randomBytes(16).toString('base64url')}`;
 }
 
 /** Test/M0 gate: returns scripted decisions in order; defaults to a fallback. */

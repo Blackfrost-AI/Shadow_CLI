@@ -3,6 +3,7 @@ import type { ToolRegistry } from '../tools/registry.js';
 import type { Tool, ToolResult, ToolRisk } from '../tools/types.js';
 import { z } from 'zod';
 import { ok, fail } from '../tools/types.js';
+import { scrubbedEnv } from '../util/safeEnv.js';
 
 interface McpServerConfig {
   command?: string;
@@ -69,7 +70,9 @@ export class McpClient implements McpConnection {
     if (this.child) return;
     if (!this.cfg.command) throw new Error('stdio MCP server requires a `command`');
     this.child = spawn(this.cfg.command, this.cfg.args ?? [], {
-      env: { ...process.env, ...this.cfg.env },
+      // MCP config may explicitly opt individual variables in, but the child must
+      // never inherit the agent process's provider credentials by default.
+      env: scrubbedEnv(undefined, this.cfg.env),
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     // Never let a stdio MCP child keep the process alive past the work: unref the child and its

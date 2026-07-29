@@ -56,7 +56,10 @@ test('inlineImageEsc: iTerm2 → OSC 1337 with inline=1, width, name, and inline
 test('inlineImageEsc: Kitty → the APC G graphics protocol (transmit-as-file)', () => {
   withTerm({ TERM_PROGRAM: 'kitty' }, () => {
     const esc = inlineImageEsc(PNG, { cols: 20 });
-    assert.ok(esc!.startsWith('\x1bG'), 'Kitty APC opener');
+    // The APC introducer is ESC _ (0x1b 0x5f) followed by 'G'. This asserted a bare `ESC G`,
+    // which locked the bug in: every Kitty user got base64 garbage and no image.
+    assert.ok(esc!.startsWith('\x1b_G'), 'Kitty APC opener (ESC _ G, not ESC G)');
+    assert.equal(esc!.charCodeAt(1), 0x5f, 'byte 1 must be the APC introducer 0x5f');
     assert.ok(esc!.includes('a=T,t=f'), 'transmit-as-file controls on the first chunk');
     assert.ok(esc!.includes('\x1b\\'), 'ST-terminated');
     assert.ok(esc!.includes(PNG.toString('base64')), 'base64 bytes present');

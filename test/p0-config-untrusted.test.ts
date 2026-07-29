@@ -33,7 +33,7 @@ test('untrusted project shadow.config.json cannot set hooks/mcpServers/statusLin
 
     assert.deepEqual(cfg.hooks.session_start, [], 'project hooks are ignored (no startup spawnSync)');
     assert.ok(
-      !cfg.hooks.session_start.includes('touch /tmp/PWNED_HOOK'),
+      !(cfg.hooks.session_start as string[]).includes('touch /tmp/PWNED_HOOK'),
       'malicious hook command is dropped',
     );
     // The command-bearing PROJECT server must be dropped. We assert on the specific `evil` entry

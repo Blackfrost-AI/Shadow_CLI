@@ -53,6 +53,54 @@ test('maybeSummarize(force) compacts even below the trigger threshold', async ()
   }
 });
 
+test('compaction prompt sees the authoritative recent tail and live goal state', async () => {
+  const ctx = new Context({ contextBudget: 1_000_000, triggerRatio: 0.75, keepLastTurns: 2 });
+  ctx.pinTask({ role: 'user', content: [{ type: 'text', text: 'repair the release' }] });
+  ctx.append({ role: 'assistant', content: [{ type: 'text', text: 'old investigation' }] });
+  ctx.append({ role: 'user', content: [{ type: 'text', text: 'do not redo the investigation' }] });
+  ctx.append({ role: 'assistant', content: [{ type: 'text', text: 'CURRENTLY editing src/update.ts' }] });
+  ctx.append({ role: 'user', content: [{ type: 'text', text: 'NEXT run the signature tests' }] });
+  let prompt = '';
+  const provider = new MockProvider([
+    (messages) => {
+      prompt = messages.flatMap((m) => m.content).map((b) => (b.type === 'text' ? b.text : '')).join('\n');
+      return [{ type: 'text', delta: 'CURRENT WORK — update.ts.\nNEXT STEP — run signature tests.' }, { type: 'done', stopReason: 'end_turn' }];
+    },
+  ]);
+  const did = await ctx.maybeSummarize(provider, 'mock', true, undefined, {
+    continuity: 'Standing goal: finish every confirmed security fix.',
+  });
+  assert.equal(did, true);
+  assert.match(prompt, /RECENT RETAINED TAIL/);
+  assert.match(prompt, /CURRENTLY editing src\/update\.ts/);
+  assert.match(prompt, /NEXT run the signature tests/);
+  assert.match(prompt, /finish every confirmed security fix/);
+});
+
+test('pre-compact callback fires only when a summary request actually starts', async () => {
+  const ctx = new Context({ contextBudget: 1_000_000, triggerRatio: 0.9, keepLastTurns: 1 });
+  ctx.pinTask({ role: 'user', content: [{ type: 'text', text: 'task' }] });
+  ctx.append({ role: 'assistant', content: [{ type: 'text', text: 'one' }] });
+  ctx.append({ role: 'user', content: [{ type: 'text', text: 'two' }] });
+  let called = 0;
+  const provider = new MockProvider([[{ type: 'text', delta: 'NEXT STEP — continue.' }, { type: 'done', stopReason: 'end_turn' }]]);
+  assert.equal(await ctx.maybeSummarize(provider, 'mock', false, undefined, { beforeCompact: () => called++ }), false);
+  assert.equal(called, 0);
+  assert.equal(await ctx.maybeSummarize(provider, 'mock', true, undefined, { beforeCompact: () => called++ }), true);
+  assert.equal(called, 1);
+});
+
+test('switching model policy clears the previous provider usage floor', () => {
+  const ctx = new Context({ contextBudget: 200_000, triggerRatio: 0.9, keepLastTurns: 12 });
+  const provider = new MockProvider();
+  ctx.pinTask({ role: 'user', content: [{ type: 'text', text: 'small task' }] });
+  ctx.recordActualTokens(150_000);
+  assert.equal(ctx.estimateTokens(provider), 150_000);
+  ctx.setPolicy({ contextBudget: 24_000, triggerRatio: 0.8, keepLastTurns: 4 }, true);
+  assert.ok(ctx.estimateTokens(provider) < 1_000, 'old model usage cannot poison the new model session count');
+  assert.deepEqual(ctx.policy(), { contextBudget: 24_000, triggerRatio: 0.8, keepLastTurns: 4 });
+});
+
 // The original task must survive compaction even when the summarizer model is weak and drops its
 // TASK line — the real-world failure ("continue with remaining files, but I don't have the original
 // instructions"). Only the first turn is pinned, so a task stated in a LATER turn would otherwise

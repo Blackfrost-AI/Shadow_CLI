@@ -2,7 +2,7 @@ import type { LoopDeps } from './loop.js';
 import type { ShadowConfig } from '../config.js';
 import type { Provider, ToolCall } from '../provider/provider.js';
 import type { ToolRegistry } from '../tools/registry.js';
-import type { ApprovalGate } from './approval.js';
+import type { ApprovalGate, SessionApprovals } from './approval.js';
 import type { EventBus } from './events.js';
 import type { Budget } from './budget.js';
 import type { Context } from './context.js';
@@ -41,6 +41,13 @@ export interface LoopDepsInput {
   /** TUI streams shell output; headless and sub-agents do not. */
   streamShell: boolean;
   sessionLog?: SessionLogType;
+  /**
+   * SESSION-lifetime "approve for session/prefix" grants. Call sites that build a loop PER USER
+   * MESSAGE must pass one shared instance — grants stored on the loop itself die with it.
+   */
+  approvals?: SessionApprovals;
+  continuityState?: string;
+  resolveFallback?: LoopDeps['resolveFallback'];
 }
 
 /**
@@ -67,6 +74,9 @@ export function buildLoopDeps(input: LoopDepsInput): LoopDeps {
     planMode: input.planMode,
     streamShell: input.streamShell,
     sessionLog: input.sessionLog,
+    approvals: input.approvals,
+    continuityState: input.continuityState,
+    resolveFallback: input.resolveFallback,
 
     // --- derived from cfg; identical at every call site ---
     maxOutputTokens: cfg.maxOutputTokens,

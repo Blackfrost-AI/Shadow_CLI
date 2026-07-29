@@ -11,6 +11,7 @@
  * Counts, registers, marks, visual mode, and multiline ops are intentionally out
  * of scope — the composer is a single editable line.
  */
+import { nextGrapheme, prevGrapheme } from './composer.js';
 
 export type VimMode = 'normal' | 'insert';
 
@@ -86,8 +87,10 @@ export function vimNormalKey(input: string, cursor: number, pendingOp: string, c
       case 'b': from = prevWordStart(input, cursor); break;
       case '$': to = n; break;
       case '0': from = 0; break;
-      case 'l': to = clamp(cursor + 1); break;
-      case 'h': from = clamp(cursor - 1); break;
+      // Grapheme-aware: `cursor ± 1` walks UTF-16 code units, so `dl` on an emoji deleted HALF a
+      // surrogate pair and sent a lone surrogate to the provider.
+      case 'l': to = clamp(nextGrapheme(input, cursor)); break;
+      case 'h': from = clamp(prevGrapheme(input, cursor)); break;
       default:
         return ok({ pendingOp: '' }); // unknown motion cancels the operator
     }
@@ -103,16 +106,17 @@ export function vimNormalKey(input: string, cursor: number, pendingOp: string, c
     case 'I': return ok({ mode: 'insert', cursor: 0 });
     case 'A': return ok({ mode: 'insert', cursor: n });
     // Motions.
-    case 'h': return ok({ cursor: clamp(cursor - 1) });
-    case 'l': return ok({ cursor: clamp(cursor + 1) });
+    case 'h': return ok({ cursor: clamp(prevGrapheme(input, cursor)) });
+    case 'l': return ok({ cursor: clamp(nextGrapheme(input, cursor)) });
     case '0': return ok({ cursor: 0 });
     case '$': return ok({ cursor: Math.max(0, n - 1) });
     case 'w': return ok({ cursor: nextWordStart(input, cursor) });
     case 'b': return ok({ cursor: prevWordStart(input, cursor) });
     case 'e': return ok({ cursor: wordEnd(input, cursor) });
     // Edits.
-    case 'x': return ok({ input: input.slice(0, cursor) + input.slice(cursor + 1) });
-    case 's': return ok({ input: input.slice(0, cursor) + input.slice(cursor + 1), mode: 'insert' });
+    // Delete a whole CLUSTER, never one code unit of it.
+    case 'x': return ok({ input: input.slice(0, cursor) + input.slice(nextGrapheme(input, cursor)) });
+    case 's': return ok({ input: input.slice(0, cursor) + input.slice(nextGrapheme(input, cursor)), mode: 'insert' });
     case 'D': return ok({ input: input.slice(0, cursor) });
     case 'C': return ok({ input: input.slice(0, cursor), mode: 'insert' });
     // Operators (await a motion).

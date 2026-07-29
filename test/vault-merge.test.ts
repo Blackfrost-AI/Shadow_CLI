@@ -18,6 +18,9 @@ const { GLOBAL_DIR } = await import('../src/state/globalStore.js');
 assertStoreIsolated(GLOBAL_DIR, HOME);
 
 const PW = 'correct horse battery';
+type StoredCred = { apiKey?: string };
+const stored = (data: Record<string, unknown>, provider: string): StoredCred | undefined =>
+  data[provider] as StoredCred | undefined;
 
 test('creating a fresh vault rejects a weak master password (no vault yet)', () => {
   assert.equal(vaultExists(), false, 'precondition: no vault');
@@ -29,15 +32,15 @@ test('first onboard creates the vault (merged=false)', () => {
   const r = persistOnboardSecret({ provider: 'anthropic', apiKey: 'sk-ANTHROPIC', password: PW });
   assert.equal(r.merged, false, 'a fresh vault is created, not merged');
   assert.ok(vaultExists());
-  assert.equal(unlockWithPassword(PW).data.anthropic?.apiKey, 'sk-ANTHROPIC');
+  assert.equal(stored(unlockWithPassword(PW).data, 'anthropic')?.apiKey, 'sk-ANTHROPIC');
 });
 
 test('second onboard MERGES into the existing vault, keeping the first key', () => {
   const r = persistOnboardSecret({ provider: 'openai', apiKey: 'sk-OPENAI', password: PW });
   assert.equal(r.merged, true, 'adds to the existing vault');
   const data = unlockWithPassword(PW).data;
-  assert.equal(data.anthropic?.apiKey, 'sk-ANTHROPIC', 'the pre-existing key survives (no overwrite)');
-  assert.equal(data.openai?.apiKey, 'sk-OPENAI', 'the new key is present');
+  assert.equal(stored(data, 'anthropic')?.apiKey, 'sk-ANTHROPIC', 'the pre-existing key survives (no overwrite)');
+  assert.equal(stored(data, 'openai')?.apiKey, 'sk-OPENAI', 'the new key is present');
 });
 
 test('merge with the WRONG master password is rejected (bad-password), vault untouched', () => {
@@ -45,7 +48,7 @@ test('merge with the WRONG master password is rejected (bad-password), vault unt
     () => persistOnboardSecret({ provider: 'openai', apiKey: 'sk-EVIL', password: 'wrong password' }),
     /bad-password/,
   );
-  assert.equal(unlockWithPassword(PW).data.openai?.apiKey, 'sk-OPENAI', 'the real key is unchanged');
+  assert.equal(stored(unlockWithPassword(PW).data, 'openai')?.apiKey, 'sk-OPENAI', 'the real key is unchanged');
 });
 
 test('merge with NO password (and no keychain) asks for one (need-password)', () => {

@@ -240,6 +240,11 @@ export function createStore() {
       case 'todo':
       case 'plan_mode':
         break;
+      // A finished sub-agent's total spend. The terminal folds it into session cost; this mirror
+      // reports the PARENT turn's usage only, so there is no surface for it here — but it must be
+      // named explicitly, or the default branch would print "unhandled event" on every sub-agent.
+      case 'subagent_usage':
+        break;
       default:
         push({ kind: 'status', text: `unhandled event: ${e.type}`, tone: 'muted' });
         break;

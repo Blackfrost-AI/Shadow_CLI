@@ -26,10 +26,17 @@ export function dupKey(text: string): string {
  * inside a detected repeat (0 = not in one). Given the next block's dupKey, returns whether to
  * SUPPRESS it and the new (run, pos).
  *
- * Only WHOLE-block exact (normalized) matches count — no prefix fuzz — so legitimate content is
- * never silently dropped, and the scope is the current turn only, so an identical short answer
- * in a LATER turn ("Done.") still commits. Blocks shorter than 12 normalized chars are never
- * deduped.
+ * Only WHOLE-block exact (normalized) matches count — no prefix fuzz — and the scope is the
+ * current turn only, so an identical short answer in a LATER turn ("Done.") still commits. Blocks
+ * shorter than 12 normalized chars are never deduped.
+ *
+ * HONEST LIMITATION: for a single-block answer, "the model restarted its whole answer" and "the
+ * user legitimately received the same paragraph twice" are the same observation, and this cannot
+ * tell them apart. It suppresses, because on the weak local models Shadow exists for the former is
+ * overwhelmingly the common case. The docstring used to claim legitimate content is "never
+ * silently dropped"; that was not true, so callers must make a suppression VISIBLE rather than
+ * discard the block without trace. The TUI renders a dim collapsed-repeat marker for exactly this
+ * reason.
  */
 export function repeatStep(
   run: string[],

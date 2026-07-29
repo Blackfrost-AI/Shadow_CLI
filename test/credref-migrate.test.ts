@@ -107,9 +107,10 @@ test('the migrated keys still resolve after a fresh unlock from disk', () => {
   
 
   const models = JSON.parse(readFileSync(CONFIG, 'utf8')).models as Array<Record<string, unknown>>;
-  assert.equal(resolveEntryCredential(models[0]).ok && resolveEntryCredential(models[0]).apiKey, S_ZAI);
-  assert.equal(resolveEntryCredential(models[1]).ok && resolveEntryCredential(models[1]).apiKey, S_ANT);
-  assert.equal(resolveEntryCredential(models[2]).ok && resolveEntryCredential(models[2]).apiKey, S_GEM);
+  const resolved = models.slice(0, 3).map((model) => resolveEntryCredential(model));
+  assert.equal(resolved[0]!.ok && resolved[0].apiKey, S_ZAI);
+  assert.equal(resolved[1]!.ok && resolved[1].apiKey, S_ANT);
+  assert.equal(resolved[2]!.ok && resolved[2].apiKey, S_GEM);
 });
 
 test('a pre-migration backup of config.json is left behind', () => {

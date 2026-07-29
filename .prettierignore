@@ -1,0 +1,19 @@
+# Build output and dependencies
+dist/
+dist-bin/
+node_modules/
+.tmp/
+
+# Generated and vendored files
+src/web/bundledAssets.ts
+src/system/bundledPrompts.ts
+src/web/ui/vendor/
+
+# Lockfiles, generated data, and hand-formatted documentation
+package-lock.json
+eval/results/
+research/
+*.md
+!README.md
+prompts/
+eval/

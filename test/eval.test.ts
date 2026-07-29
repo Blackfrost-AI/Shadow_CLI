@@ -26,6 +26,7 @@ function run(over: Partial<RunResult> = {}): RunResult {
     stopReason: 'end_turn',
     inputTokens: 0,
     outputTokens: 0,
+    compactions: 0,
     ...over,
   };
 }
