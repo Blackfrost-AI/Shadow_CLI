@@ -27,7 +27,7 @@ export { makeToolSearch } from './toolSearch.js';
 
 export { readFile } from './readFile.js';
 export { viewImage } from './viewImage.js';
-export { makeDescribeMediaTool, buildDescribeGraph, extractText, readHistory, type ComfyConfig, type VisionConfig, type DescribeConfig } from './comfy.js';
+export { makeDescribeMediaTool, type VisionConfig } from './vision.js';
 export { writeFile } from './writeFile.js';
 export { editFile } from './editFile.js';
 export { multiEdit } from './multiEdit.js';

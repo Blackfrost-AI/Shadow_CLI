@@ -44,7 +44,6 @@ import {
   makeScheduleWakeupTool,
   makeSkillTool,
   makeToolSearch,
-  makeDescribeMediaTool,
   registerBuiltinTools,
 } from './tools/index.js';
 import { registerMcpServers } from './mcp/client.js';

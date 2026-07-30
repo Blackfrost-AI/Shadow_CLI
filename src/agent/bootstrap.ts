@@ -347,11 +347,11 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     network: !offline,
   }); // M1 tools + M5 web tools (web tools gated off when offline)
 
-  // Shadow's "eyes": register describe_media only when the user configured a vision backend (~/.shadow) —
-  // an OpenAI-compatible vision endpoint (preferred) or a ComfyUI. Absent config → the tool isn't offered.
+  // Shadow's "eyes": register describe_media only when the user configured an OpenAI-compatible
+  // vision endpoint in ~/.shadow. Absent config → the tool isn't offered.
   // Gated off when offline (it's a network call to the user's own endpoint).
-  if ((cfg.vision?.baseUrl || cfg.comfy?.baseUrl) && !offline) {
-    registry.register(makeDescribeMediaTool({ vision: cfg.vision, comfy: cfg.comfy }));
+  if (cfg.vision?.baseUrl && !offline) {
+    registry.register(makeDescribeMediaTool(cfg.vision));
   }
 
   // M4: project memory (known facts) — load, expose as a tool, inject into the prompt.

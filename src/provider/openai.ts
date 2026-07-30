@@ -75,9 +75,28 @@ type OAIMessage =
     }
   | { role: 'tool'; tool_call_id: string; content: string };
 
+/**
+ * Keep ordinary text from being reinterpreted as a multimodal control token by a model's chat
+ * processor. This matters for agentic workloads because tool output routinely contains model
+ * configs and templates. For example, Kimi K3's config.json contains the literal token
+ * `<|kimi_image_placeholder|>`; replaying that line alongside two real image_url parts makes its
+ * server count three placeholders for two images and reject the request.
+ *
+ * Shadow never needs to place these tokens itself: real media is represented structurally by an
+ * image_url part and the server inserts its own placeholders. Escaping only the opening `<` keeps
+ * the text readable to the model while preventing exact special-token matching. The neutral
+ * history remains byte-for-byte unchanged.
+ */
+const MEDIA_CONTROL_TOKEN = /<\|[^<>\r\n]{0,128}(?:image|video|audio|media|vision)[^<>\r\n]{0,128}\|>|<(?:image|video|audio)(?:[_ -]?placeholder)?\s*>/gi;
+
+export function escapeMultimodalControlTokens(text: string): string {
+  return text.replace(MEDIA_CONTROL_TOKEN, (token) => `&lt;${token.slice(1)}`);
+}
+
 /** Map the provider-neutral Message[] into OpenAI chat messages. */
 export function toOpenAIMessages(req: CompletionRequest): OAIMessage[] {
-  const out: OAIMessage[] = [{ role: 'system', content: req.system }];
+  const clean = escapeMultimodalControlTokens;
+  const out: OAIMessage[] = [{ role: 'system', content: clean(req.system) }];
 
   for (const m of req.messages) {
     if (m.role === 'system') continue; // system is prepended above; ignore embedded
@@ -90,12 +109,12 @@ export function toOpenAIMessages(req: CompletionRequest): OAIMessage[] {
         extra_content?: { google: { thought_signature: string } };
       }[] = [];
       for (const b of m.content) {
-        if (b.type === 'text') text += b.text;
+        if (b.type === 'text') text += clean(b.text);
         else if (b.type === 'tool_use') {
           toolCalls.push({
             id: b.id,
             type: 'function',
-            function: { name: b.name, arguments: JSON.stringify(b.input ?? {}) },
+            function: { name: b.name, arguments: clean(JSON.stringify(b.input ?? {})) },
             // Echo Gemini's thought_signature back, or multi-turn tool use 400s.
             ...(b.signature ? { extra_content: { google: { thought_signature: b.signature } } } : {}),
           });
@@ -109,8 +128,8 @@ export function toOpenAIMessages(req: CompletionRequest): OAIMessage[] {
       let text = '';
       const images: OAIContentPart[] = [];
       for (const b of m.content) {
-        if (b.type === 'tool_result') out.push({ role: 'tool', tool_call_id: b.toolCallId, content: b.content });
-        else if (b.type === 'text') text += b.text;
+        if (b.type === 'tool_result') out.push({ role: 'tool', tool_call_id: b.toolCallId, content: clean(b.content) });
+        else if (b.type === 'text') text += clean(b.text);
         else if (b.type === 'image') images.push({ type: 'image_url', image_url: { url: `data:${b.mediaType};base64,${b.data}` } });
       }
       if (images.length > 0) {

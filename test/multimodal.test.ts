@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { toOpenAIMessages } from '../src/provider/openai.js';
+import { escapeMultimodalControlTokens, toOpenAIMessages } from '../src/provider/openai.js';
 import { toAnthropicMessages } from '../src/provider/anthropic.js';
 import type { CompletionRequest, Message } from '../src/provider/provider.js';
 
@@ -41,6 +41,44 @@ test('OpenAI adapter keeps a text-only user turn as a plain string', () => {
   const messages: Message[] = [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }];
   const user = toOpenAIMessages(req(messages)).find((m) => m.role === 'user')!;
   assert.equal(user.content, 'hi', 'no image → plain string content (unchanged behavior)');
+});
+
+test('OpenAI adapter escapes model-reserved media tokens found in ordinary tool output', () => {
+  const reserved = '<|kimi_image_placeholder|>';
+  const messages: Message[] = [
+    {
+      role: 'assistant',
+      content: [{ type: 'tool_use', id: 'cfg', name: 'run_shell', input: { command: `printf '${reserved}'` } }],
+    },
+    {
+      role: 'user',
+      content: [
+        { type: 'tool_result', toolCallId: 'cfg', ok: true, content: `"image_placeholder": "${reserved}"` },
+        { type: 'image', mediaType: 'image/jpeg', data: B64 },
+        { type: 'image', mediaType: 'image/jpeg', data: B64 },
+      ],
+    },
+  ];
+
+  const wire = toOpenAIMessages(req(messages));
+  const encoded = JSON.stringify(wire);
+  assert.doesNotMatch(encoded, /<\|kimi_image_placeholder\|>/, 'raw special token never reaches the chat processor');
+  assert.match(encoded, /&lt;\|kimi_image_placeholder\|>/, 'the model can still read which token appeared');
+
+  const imageCount = wire.reduce((count, message) => {
+    if (message.role !== 'user' || !Array.isArray(message.content)) return count;
+    return count + message.content.filter((part) => part.type === 'image_url').length;
+  }, 0);
+  assert.equal(imageCount, 2, 'both real images remain structural image prompts');
+});
+
+test('media control-token escaping covers common image, video, and vision placeholder forms', () => {
+  const input = '<image> <video_placeholder> <|image_pad|> <|vision_start|> ordinary <tag>';
+  const escaped = escapeMultimodalControlTokens(input);
+  for (const token of ['<image>', '<video_placeholder>', '<|image_pad|>', '<|vision_start|>']) {
+    assert.ok(!escaped.includes(token), `escaped ${token}`);
+  }
+  assert.match(escaped, /ordinary <tag>/, 'ordinary markup is untouched');
 });
 
 test('Anthropic adapter renders an image as a base64 source block in the user turn', () => {

@@ -185,24 +185,13 @@ const ConfigSchema = z.object({
   mcpServers: z.record(McpServerSchema).default({}),
   // Shadow's pluggable "eyes" — describe an image via a vision model YOU run, so any driving model
   // (even a text-only one) can reason about pictures. The endpoint lives in ~/.shadow or env ONLY
-  // (both are in PROJECT_UNTRUSTED_KEYS), so a cloned repo can never redirect where your media uploads.
-  //
-  // `vision` (RECOMMENDED): any OpenAI-compatible vision endpoint — Ollama, vLLM, llama.cpp, etc.
-  // serving a VLM (Qwen-VL, LLaVA, …). This is the reproducible path; describe_media prefers it.
+  // (`vision` is in PROJECT_UNTRUSTED_KEYS), so a cloned repo can never redirect where your media uploads.
+  // Any OpenAI-compatible vision endpoint works — Ollama, vLLM, llama.cpp, etc. serving a VLM.
   vision: z
     .object({
       baseUrl: z.string(), // your endpoint, e.g. http://<host>:8001/v1 — user-provided, never hardcoded
       model: z.string(), // served model name, e.g. a qwen3-vl
       prompt: z.string().default('Describe this image in detail. What is shown?'),
-    })
-    .optional(),
-  // `comfy` (alternative): a local ComfyUI, for describe via a caption node and (later) generation.
-  comfy: z
-    .object({
-      baseUrl: z.string(), // e.g. http://<your-comfyui-host>:8188 — user-provided, never hardcoded
-      visionModel: z.string().optional(),
-      visionType: z.string().default('qwen_image'),
-      describePrompt: z.string().default('Describe this image in detail. What is shown?'),
     })
     .optional(),
   parallelTools: z.boolean().default(true),
@@ -317,7 +306,7 @@ const CONFIG_FILE = 'shadow.config.json';
 // it is currently resolved from flags.offline (not a ConfigSchema key, so zod already strips it
 // from a project file), but if it ever becomes config-settable this keeps a project file from
 // re-enabling egress + MCP for a session. One word now avoids a silent hole later.
-const PROJECT_UNTRUSTED_KEYS = ['baseUrl', 'shellEnvAllowlist', 'autonomy', 'denylistExtra', 'systemPromptPath', 'sandbox', 'sandboxNetwork', 'additionalDirectories', 'projects', 'offline', 'hooks', 'statusLine', 'comfy', 'vision'];
+const PROJECT_UNTRUSTED_KEYS = ['baseUrl', 'shellEnvAllowlist', 'autonomy', 'denylistExtra', 'systemPromptPath', 'sandbox', 'sandboxNetwork', 'additionalDirectories', 'projects', 'offline', 'hooks', 'statusLine', 'vision'];
 
 /** Layered precedence: CLI flags > env > project config file (de-fanged) > global > defaults. */
 export function loadConfig(cwd: string, cliOverrides: Record<string, unknown> = {}): ShadowConfig {
