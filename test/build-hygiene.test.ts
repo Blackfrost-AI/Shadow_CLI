@@ -53,11 +53,12 @@ test('@types/react matches the React actually installed', () => {
     'React 19 types over React 18 let `<Ctx value={x}>` typecheck and break at runtime');
 });
 
-test('private mirror tooling is not shipped in the public source tree', () => {
-  // These producer-side scripts encode private redaction patterns and belong only in the
-  // internal repository. The public artifact should contain the scrubbed result, not the recipe.
-  assert.equal(existsSync(new URL('scripts/scrub-mirror.py', root)), false);
-  assert.equal(existsSync(new URL('scripts/scan-mirror.py', root)), false);
+test('the mirror scrub and scan are committed scripts, not doc snippets', () => {
+  assert.ok(existsSync(new URL('scripts/scrub-mirror.py', root)));
+  assert.ok(existsSync(new URL('scripts/scan-mirror.py', root)));
+  const scan = read('scripts/scan-mirror.py');
+  assert.match(scan, /ls-files", "--others"|ls-files', '--others'|--others/, 'must scan UNTRACKED files too — a brand-new test file is exactly the risk');
+  assert.match(scan, /return 1 if total else 0/, 'and exit non-zero so it can gate a script');
 });
 
 test('.gitignore closes the secret holes', () => {

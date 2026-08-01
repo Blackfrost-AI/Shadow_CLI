@@ -98,11 +98,18 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         registry = filtered;
       }
 
+      const isBg = !!input.run_in_background;
+      // Every sub-agent (sync OR bg) gets a unique taskId. It keys the sub-agent registry the TUI
+      // surfaces in the HUD (BUG 3) and tags the forwarded tool events (SubagentBus.meta) so the UI
+      // can tell a delegated agent's activity from the parent's own instead of clobbering the
+      // parent's single live-tool row.
+      const taskId = `agent_${Date.now()}_${Math.random().toString(36).slice(2,8)}${isBg ? '' : '_sync'}`;
+
       // A sub-agent gets its OWN bus that forwards only a whitelist to the parent. It used to be
       // handed `base.bus`, so its streamed answer, per-turn usage and `stop` were indistinguishable
       // from the parent's — the answer printed up to three times, the HUD flipped to the
       // sub-agent's context %, and /cost went to nonsense. See SUBAGENT_FORWARDED_EVENTS.
-      const subBus = new SubagentBus(base.bus);
+      const subBus = new SubagentBus(base.bus, undefined, { subagent: taskId });
       const loopDeps: LoopDeps = {
         ...base,
         bus: subBus,
@@ -117,12 +124,11 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
       };
       const loop = new AgentLoop(loopDeps, deps.getAutonomy());
 
-      const isBg = !!input.run_in_background;
-      const taskId = isBg ? `agent_${Date.now()}_${Math.random().toString(36).slice(2,8)}` : undefined;
-
       if (isBg) {
         // record launch metadata via bus to main context (the real persisted one in outer scope); base.context here is throwaway from makeLoopDeps
         base.bus.emit({ type: 'bg_agent_launched' as any, taskId: taskId!, prompt: input.prompt, subagentType: agentType });
+        // surface the sub-agent in the TUI HUD immediately (BUG 3)
+        base.bus.emit({ type: 'subagent_start', taskId, subagentType: agentType, description: input.description });
 
         // fire and forget; deliver via bus as task_notification (main context listener will turn into user msg)
         (async () => {
@@ -132,11 +138,13 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
               runHookPhase('subagent_stop', base.hooks.subagent_stop, { workspaceRoot: subWorkspaceRoot, extra: { agentType, taskId, result: 'bg_done' } });
             }
             base.bus.emit({ type: 'subagent_usage', costUSD: budget.currentCostUSD, subagent: agentType });
+            base.bus.emit({ type: 'subagent_end', taskId, ok: true, subagentType: agentType });
             base.bus.emit({ type: 'task_notification', taskId: taskId!, answer: res.finalAnswer || '', fromSubagent: agentType });
           } catch (e) {
             if (base.hooks?.subagent_stop?.length) {
               runHookPhase('subagent_stop', base.hooks.subagent_stop, { workspaceRoot: subWorkspaceRoot, extra: { agentType, taskId, error: (e as Error).message } });
             }
+            base.bus.emit({ type: 'subagent_end', taskId, ok: false, subagentType: agentType });
             base.bus.emit({ type: 'task_notification', taskId: taskId!, answer: `agent bg error: ${(e as Error).message}`, fromSubagent: agentType });
           } finally {
             if (worktreeCleanupPath) {
@@ -151,6 +159,8 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
       }
 
       // sync path (default)
+      // surface the sub-agent in the TUI HUD immediately (BUG 3)
+      base.bus.emit({ type: 'subagent_start', taskId, subagentType: agentType, description: input.description });
       try {
         const result = await loop.run();
         if (base.hooks?.subagent_stop?.length) {
@@ -159,6 +169,7 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         // The sub-agent's per-turn `usage` events are (correctly) not forwarded, so report its
         // TOTAL spend once — otherwise sub-agent tokens would silently vanish from /cost.
         base.bus.emit({ type: 'subagent_usage', costUSD: budget.currentCostUSD, subagent: agentType });
+        base.bus.emit({ type: 'subagent_end', taskId, ok: true, subagentType: agentType });
         const data = { answer: result.finalAnswer };
         if (worktreeCleanupPath) {
           try { removeWorktree(ctx.workspaceRoot, worktreeCleanupPath); } catch {}
@@ -168,6 +179,7 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         if (base.hooks?.subagent_stop?.length) {
           runHookPhase('subagent_stop', base.hooks.subagent_stop, { workspaceRoot: subWorkspaceRoot, extra: { agentType, error: (e as Error).message } });
         }
+        base.bus.emit({ type: 'subagent_end', taskId, ok: false, subagentType: agentType });
         if (worktreeCleanupPath) {
           try { removeWorktree(ctx.workspaceRoot, worktreeCleanupPath); } catch {}
         }

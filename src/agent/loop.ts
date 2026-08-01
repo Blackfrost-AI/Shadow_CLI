@@ -690,7 +690,13 @@ export class AgentLoop {
               badJsonMsg = ev.message;
               badCalls.push(ev.message); // every malformed call, so a mixed turn can feed them all back
             } else providerError = { code: ev.code, message: ev.message };
-            if (!ev.recoverable) throw new Error(`${ev.code}: ${ev.message}`);
+            // The bus 'error' event above is the SINGLE user-facing render for provider errors.
+            // We deliberately do NOT throw here (it used to double-render: the TUI runOne catch
+            // and the headless REPL catch both printed the thrown message AGAIN after the bus
+            // event already rendered it, and a --task/--web run with no catch would reject).
+            // Instead we let the turn return with `providerError` set, so requestTurn's normal
+            // path can attempt a FALLBACK (loop.ts:547) and, if none is available, run() stops
+            // cleanly with the provider_error reason (loop.ts:399-401) — never via an exception.
             break;
           case 'done':
             stopReason = ev.stopReason;

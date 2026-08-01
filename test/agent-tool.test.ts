@@ -223,6 +223,76 @@ test('bg agent full listener path: main context receives task-notification appen
   }
 });
 
+// BUG 3 — sub-agent visibility. The `agent` tool must emit SUBAGENT_START/SUBAGENT_END lifecycle
+// events (so the TUI can surface a Running-N-agents panel) AND the forwarded tool lifecycle must be
+// TAGGED with the sub-agent's taskId so the TUI routes it to the panel instead of clobbering the
+// parent's single live-tool row.
+test('BUG 3: agent tool emits subagent_start/end lifecycle + tags forwarded tool events with the taskId', async () => {
+  const ws = mkdtempSync(join(tmpdir(), 'agent-bug3-'));
+  try {
+    writeFileSync(join(ws, 'a.ts'), 'export const x = 1;\n');
+    const registry = new ToolRegistry();
+    registerBuiltinTools(registry);
+    // sub-agent: reads a file (one tool), then the provider has no more turns → loop ends.
+    const provider = new MockProvider([
+      [
+        { type: 'tool_call', call: { id: 'r1', name: 'read_file', input: { path: 'a.ts' } } },
+        { type: 'done', stopReason: 'tool_use' },
+      ],
+    ]);
+    const bus = new EventBus();
+    const seen: Array<{ type: string; [k: string]: unknown }> = [];
+    bus.on((e) => seen.push(e as { type: string; [k: string]: unknown }));
+
+    const makeLoopDeps = (): LoopDeps => ({
+      provider,
+      registry,
+      gate: new ScriptedApprovalGate([], 'approve'),
+      bus,
+      budget: new Budget({ maxIterations: 5 }, 'mock', PRICE, Date.now()),
+      context: new Context({ contextBudget: 1_000_000, triggerRatio: 0.75, keepLastTurns: 6 }),
+      signal: new AbortController().signal,
+      model: 'mock',
+      system: 'test',
+      maxOutputTokens: 1024,
+      workspaceRoot: ws,
+      dryRun: false,
+      maxToolResultChars: 16_000,
+      contextBudget: 1_000_000,
+    });
+    const tool = makeAgentTool({
+      makeLoopDeps,
+      getAutonomy: () => 'full',
+      contextBudget: 1_000_000,
+      triggerRatio: 0.75,
+      keepLastTurns: 6,
+      maxIterations: 5,
+      priceTable: PRICE,
+    });
+    const ctx: ToolContext = { workspaceRoot: ws, signal: new AbortController().signal, log: () => {}, dryRun: false };
+    const res = await tool.run({ prompt: 'read a.ts', subagent_type: 'explore', description: 'explore a' }, ctx);
+    assert.ok(res.ok, 'sub-agent should succeed');
+
+    const starts = seen.filter((e) => e.type === 'subagent_start');
+    const ends = seen.filter((e) => e.type === 'subagent_end');
+    assert.equal(starts.length, 1, 'exactly one subagent_start');
+    assert.equal(ends.length, 1, 'exactly one subagent_end');
+    const tid = starts[0].taskId as string;
+    assert.ok(tid && tid.length > 0, 'subagent_start must carry a non-empty taskId');
+    assert.equal(starts[0].subagentType, 'explore', 'subagent_start must carry the resolved subagent type');
+    assert.equal(ends[0].taskId, tid, 'subagent_end must reference the same taskId');
+    assert.equal(ends[0].ok, true, 'successful sub-agent must end with ok:true');
+
+    // forwarded tool events (the tool the sub-agent ran) must be TAGGED so the parent UI routes them
+    // to the sub-agent panel — NOT the parent's live row (the original clobbering bug).
+    const toolStart = seen.find((e) => e.type === 'tool_start' && e.call && (e.call as { name: string }).name === 'read_file');
+    assert.ok(toolStart, 'the sub-agent read_file tool_start must reach the parent');
+    assert.equal((toolStart as { subagent?: string }).subagent, tid, 'sub-agent tool_start must be tagged with the taskId');
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
 // Direct test of listWorktrees porcelain path (creates real git worktree in temp repo to exercise git porcelain output).
 test('listWorktrees exercises real git porcelain output for managed worktrees', async () => {
   const base = mkdtempSync(join(tmpdir(), 'wt-porcelain-'));

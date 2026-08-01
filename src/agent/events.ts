@@ -20,9 +20,9 @@ export type LoopEvent =
   | { type: 'reasoning_done'; text: string } // committed collapsible reasoning block
   | { type: 'assistant_done'; text: string } // a full assistant turn committed
   | { type: 'finding'; title: string; body: string; severity?: 'info' | 'warn' | 'error' }
-  | { type: 'tool_start'; call: ToolCall; risk: ToolRisk }
-  | { type: 'tool_end'; call: ToolCall; result: ToolResult }
-  | { type: 'tool_denied'; call: ToolCall; reason: string }
+  | { type: 'tool_start'; call: ToolCall; risk: ToolRisk; subagent?: string }
+  | { type: 'tool_end'; call: ToolCall; result: ToolResult; subagent?: string }
+  | { type: 'tool_denied'; call: ToolCall; reason: string; subagent?: string }
   | { type: 'usage'; inputTokens: number; outputTokens: number; costUSD: number; contextPct: number }
   | { type: 'latency'; ms: number }
   | { type: 'compaction'; trigger: 'auto' | 'manual' } // earlier turns summarized to reclaim context (surfaced for TUI + eval verification)
@@ -41,6 +41,13 @@ export type LoopEvent =
   // own Budget, so their per-turn `usage` events must NOT reach the parent HUD (see SubagentBus);
   // this carries the one number the session cost readout genuinely needs.
   | { type: 'subagent_usage'; costUSD: number; subagent?: string }
+  // Sub-agent visibility (BUG 3). Emitted by the `agent` tool directly on the PARENT bus so the
+  // TUI/REPL can surface what delegated agents are doing WITHOUT folding them into the parent's
+  // single live-tool row. `subagent_start`/`subagent_end` bracket a sub-agent's run; live activity
+  // arrives on the forwarded `tool_start`/`tool_end` events, which the SubagentBus tags with the
+  // same `subagent` taskId so the UI can route them to the sub-agent panel instead of the parent.
+  | { type: 'subagent_start'; taskId: string; subagentType: string; description?: string }
+  | { type: 'subagent_end'; taskId: string; ok: boolean; subagentType?: string }
 
 export type StopReasonExt =
   | StopReason
@@ -96,17 +103,27 @@ export const SUBAGENT_FORWARDED_EVENTS: ReadonlySet<LoopEvent['type']> = new Set
 
 /**
  * A bus for a sub-agent loop: local subscribers see everything, the parent sees only the whitelist.
+ * When constructed with `meta`, forwarded tool events are tagged with `subagent: <taskId>` so the
+ * parent UI can tell a delegated agent's tool activity from the parent's own (BUG 3) — the UI routes
+ * tagged events to the sub-agent panel instead of the parent's single live-tool row.
  */
 export class SubagentBus extends EventBus {
   constructor(
     private readonly parent: EventBus,
     private readonly forward: ReadonlySet<LoopEvent['type']> = SUBAGENT_FORWARDED_EVENTS,
+    private readonly meta: { subagent: string } | null = null,
   ) {
     super();
   }
 
   override emit(e: LoopEvent): void {
     super.emit(e);
-    if (this.forward.has(e.type)) this.parent.emit(e);
+    if (this.forward.has(e.type)) {
+      if (this.meta && (e.type === 'tool_start' || e.type === 'tool_end' || e.type === 'tool_denied')) {
+        this.parent.emit({ ...e, subagent: this.meta.subagent } as LoopEvent);
+      } else {
+        this.parent.emit(e);
+      }
+    }
   }
 }

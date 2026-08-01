@@ -270,7 +270,7 @@ test('/model list and /provider show provider/model management state', async () 
   await tick();
   out = strip(frames.join('\n'));
   assert.match(out, /openai\/local-reasoner/);
-  assert.match(out, /endpoint: http:\/\/127\.0\.0\.1:8001\/v1/);
+  assert.match(out, /endpoint: http:\/\/10\.80\.10\.24:8001\/v1/);
   assert.match(out, /presets: 2 configured · 1 disabled/);
   unmount();
 });

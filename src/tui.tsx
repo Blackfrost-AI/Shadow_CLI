@@ -1306,7 +1306,7 @@ const COMPOSER_PLACEHOLDER = 'Send a message…  ( / for commands · Option+Ente
  * Multi-row composer: soft-wraps long lines, keeps a real caret on any row, scrolls a window when
  * the draft is taller than COMPOSER_MAX_VISIBLE_ROWS. Open-sided rules (no L/R border).
  */
-function Composer({
+export function Composer({
   input,
   cursor,
   hint,
@@ -1519,6 +1519,12 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // The tool currently executing — rendered as a persistent live ⏺ Name(args) row that appears the
   // instant the call starts and resolves in place (into the committed green/red ⏺ row) on tool_end.
   const [activeTool, setActiveTool] = useState<{ name: string; arg: string; agent?: { subagentType?: string; description?: string } } | null>(null);
+  // Sub-agent visibility (BUG 3): live delegated agents keyed by taskId. Populated from
+  // SUBAGENT_START/SUBAGENT_END lifecycle events emitted by the agent tool, and from the TAGGED
+  // tool_start/tool_end forwarded events (SubagentBus.meta) for each agent's current activity.
+  // Rendered as a distinct "Running N agents" panel so a sub-agent never hijacks the parent's own
+  // activeTool row. Map stays immutable (every update returns a fresh Map) so Ink re-renders.
+  const [subAgents, setSubAgents] = useState<Map<string, { taskId: string; subagentType: string; description?: string; tool?: string; argPreview?: string }>>(new Map());
   // Mid-turn recon burst (read/grep/glob…): counts accumulate so the live row reads
   // "Reading 3 files, Grepping 1 pattern · path" instead of flashing every single call.
   // Cleared when a signal tool (edit/shell/…) starts or the turn ends.
@@ -4124,6 +4130,18 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           break;
         case 'tool_start':
           setThinkNow(''); // reasoning for this step is over once it acts (folded by default now)
+          if (e.subagent) {
+            // A sub-agent started a tool → route it to the sub-agent panel, NEVER the parent's live
+            // row. Tagged (forwarded) sub-agent tool_start used to clobber the parent's own
+            // activeTool, so a busy child hid what the top-level agent was actually doing.
+            setSubAgents((prev) => {
+              const m = new Map(prev);
+              const cur = m.get(e.subagent!);
+              if (cur) m.set(e.subagent!, { ...cur, tool: e.call.name, argPreview: previewOf(e.call.input) });
+              return m;
+            });
+            break;
+          }
           // Live row (activeTool) already shows name(args) — don't also mirror it into toolLine
           // (that used to double-print `↳ run_shell …` in the status tail under the same call).
           {
@@ -4145,6 +4163,21 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           setToolLine(null);
           break;
         case 'tool_end': {
+          if (e.subagent) {
+            // Sub-agent tool finished → clear its live current-tool line in the panel. Don't touch
+            // the parent's activeTool/shell (the parent is still on its own call — possibly the very
+            // `agent` call that launched this sub-agent), and don't spam the parent transcript with
+            // one row per child tool: sub-agent internals are surfaced in the panel, and the
+            // sub-agent's FINAL answer commits as the `agent` tool result body, not as N one-liners.
+            setSubAgents((prev) => {
+              const cur = prev.get(e.subagent!);
+              if (!cur || !cur.tool) return prev;
+              const m = new Map(prev);
+              m.set(e.subagent!, { ...cur, tool: undefined, argPreview: undefined });
+              return m;
+            });
+            break;
+          }
           setToolLine(null);
           setActiveTool(null);
           setShellPid(null);
@@ -4243,6 +4276,17 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           break;
         }
         case 'tool_denied':
+          if (e.subagent) {
+            // Sub-agent tool denied → clear its current-tool line; never touch the parent's live row.
+            setSubAgents((prev) => {
+              const cur = prev.get(e.subagent!);
+              if (!cur || !cur.tool) return prev;
+              const m = new Map(prev);
+              m.set(e.subagent!, { ...cur, tool: undefined, argPreview: undefined });
+              return m;
+            });
+            break;
+          }
           setToolLine(null);
           setActiveTool(null);
           pushLine({ kind: 'blocked', text: `  blocked ${friendlyDeniedReason(e.reason)}`, color: C.yellow, meta: e.call.name });
@@ -4293,6 +4337,23 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
               color: C.yellow,
             });
           }
+          break;
+        case 'subagent_start':
+          // A sub-agent came alive (sync or bg) — register it in the Running-N-agents panel (BUG 3).
+          setSubAgents((prev) => {
+            const m = new Map(prev);
+            m.set(e.taskId, { taskId: e.taskId, subagentType: e.subagentType, description: e.description });
+            return m;
+          });
+          break;
+        case 'subagent_end':
+          // The sub-agent finished — deregister it so the panel only ever reflects ACTIVE agents.
+          setSubAgents((prev) => {
+            if (!prev.has(e.taskId)) return prev;
+            const m = new Map(prev);
+            m.delete(e.taskId);
+            return m;
+          });
           break;
         case 'subagent_usage':
           // A finished sub-agent's TOTAL spend, reported once. Deliberately does NOT touch
@@ -5809,7 +5870,32 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         <>
           {!menuOpen && hudFit.liveRows > 0 ? (
             <Box flexDirection="column" height={hudFit.liveRows} overflow="hidden" justifyContent="flex-end">
-              {activeTool && !previewStream ? (
+            {(subAgents.size > 0 && !previewStream) ? (() => {
+              // Running-N-agents panel (BUG 3): live delegated agents, each showing its current
+              // tool. Rendered ABOVE the activeTool/think/stream rows and bottom-aligned, so if
+              // the terminal is short the panel clips first and the primary live row is never
+              // hidden. Capped at 3 visible + "+N more" so it can never blow the live region.
+              const list = Array.from(subAgents.values());
+              const visible = list.slice(0, 3);
+              const more = list.length - visible.length;
+              return (
+                <Box flexDirection="column" paddingLeft={PAGE_MARGIN}>
+                  {visible.map((s) => (
+                    <Text key={s.taskId} wrap="truncate">
+                      <Text color={C.cyan}>▸ </Text>
+                      <Text>{s.subagentType}</Text>
+                      {s.tool ? (
+                        <Text color={C.dim}>{` · ${s.tool}${s.argPreview ? ` ${s.argPreview}` : ''}`}</Text>
+                      ) : (
+                        <Text color={C.dim}>{' · running…'}</Text>
+                      )}
+                    </Text>
+                  ))}
+                  {more > 0 ? <Text color={C.dim}>{`  +${more} more`}</Text> : null}
+                </Box>
+              );
+            })() : null}
+            {activeTool && !previewStream ? (
                 // Persistent live tool row: the ⏺ is orange while the call runs (matches the spinner),
                 // then tool_end commits the resolved green/red ⏺ row to <Static> in its place.
                 // Recon bursts (≥2 read/grep/…) show a progressive Claude-style group line so the

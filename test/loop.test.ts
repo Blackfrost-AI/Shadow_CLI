@@ -222,6 +222,28 @@ test('a recoverable provider error is surfaced EXACTLY ONCE (regression: it prin
   assert.equal(res.stopReason, 'provider_error', 'the turn still stops with the provider_error reason');
 });
 
+test('a NON-recoverable provider error is surfaced EXACTLY ONCE and stops cleanly (regression: it used to throw + double-render)', async () => {
+  // Before: the `case 'error'` handler emitted an `'error'` bus event AND threw for a
+  // non-recoverable error. The bus event rendered it once; the throw escaped loop.run() into
+  // runOne's catch (TUI) / the REPL catch (headless) and rendered the SAME message a SECOND
+  // time, and crashed --task/--web runs that had no catch. Now the error is rendered ONLY by the
+  // bus event; the loop run() RESOLVES with the provider_error stop reason.
+  const provider = new MockProvider([
+    [
+      { type: 'error', recoverable: false, code: 'http_502', message: 'upstream blew up' },
+      { type: 'done', stopReason: 'end_turn' }, // empty turn → providerError cleanup branch fires
+    ],
+  ]);
+  const { loop, events } = buildLoop(provider, [], new AutoApproveGate());
+  // Must RESOLVE, not reject — the whole point: a non-recoverable provider error must never throw.
+  const res = await loop.run();
+
+  const errs = events.filter((e) => e.type === 'error');
+  assert.equal(errs.length, 1, 'the provider error is emitted ONCE, not twice');
+  assert.match((errs[0] as { message: string }).message, /http_502/, 'it is the provider error');
+  assert.equal(res.stopReason, 'provider_error', 'stops cleanly with the provider_error reason');
+});
+
 test('repeated unrepairable tool JSON terminates (bounded repair attempts, no infinite loop)', async () => {
   const alwaysBad: Provider = {
     name: 'badjson',

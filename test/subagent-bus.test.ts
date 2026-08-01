@@ -96,3 +96,36 @@ test('the forward list is a deliberate whitelist, not an accidental blacklist', 
     ['error', 'subagent_usage', 'task_notification', 'tool_denied', 'tool_end', 'tool_start'],
   );
 });
+
+test('BUG 3: sub-agent tool events are tagged with the taskId so the parent UI can route them to the panel, never the parent live row', () => {
+  // Provenance is the mechanism that stops a delegated agent's tool activity from clobbering the
+  // parent's single activeTool slot (the original bug). When SubagentBus is built with meta, the
+  // forwarded tool lifecycle carries `subagent: <taskId>`; the UI must not treat it as the parent's.
+  const parent = new EventBus();
+  const seen = collect(parent);
+  const sub = new SubagentBus(parent, undefined, { subagent: 'agent_123_sync' });
+  const call = { id: 'c1', name: 'read_file', input: { path: 'a.ts' } };
+
+  sub.emit({ type: 'tool_start', call, risk: 'read' });
+  sub.emit({ type: 'tool_end', call, result: { ok: true, summary: 'ok', tool: 'read_file', risk: 'read' } as never });
+  sub.emit({ type: 'tool_denied', call, reason: 'denied' });
+  // non-tool forwarded events must NOT gain a stray subagent tag (they don't route to the panel)
+  sub.emit({ type: 'error', message: 'boom' });
+  sub.emit({ type: 'subagent_usage', costUSD: 0.1, subagent: 'explore' });
+
+  assert.equal(seen.length, 5);
+  assert.equal((seen[0] as { subagent?: string }).subagent, 'agent_123_sync', 'tool_start tagged');
+  assert.equal((seen[1] as { subagent?: string }).subagent, 'agent_123_sync', 'tool_end tagged');
+  assert.equal((seen[2] as { subagent?: string }).subagent, 'agent_123_sync', 'tool_denied tagged');
+  assert.equal('subagent' in seen[3], false, 'error carries no panel tag');
+  assert.deepEqual(seen[4], { type: 'subagent_usage', costUSD: 0.1, subagent: 'explore' });
+});
+
+test('BUG 3: a SubagentBus without meta forwards tool events untagged (backward compatible)', () => {
+  const parent = new EventBus();
+  const seen = collect(parent);
+  const sub = new SubagentBus(parent); // no meta — existing call sites unaffected
+  const call = { id: 'c1', name: 'read_file', input: { path: 'a.ts' } };
+  sub.emit({ type: 'tool_start', call, risk: 'read' });
+  assert.equal('subagent' in seen[0], false, 'no meta → no provenance tag');
+});
