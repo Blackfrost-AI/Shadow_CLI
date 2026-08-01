@@ -6,7 +6,7 @@
 
 > **A true gift of freedom and privacy.**
 > Zero-telemetry · provider-neutral · phone home to no one.
-> Current build: **`v4.0.0`** — trusted approvals, durable agent continuity, and verified updates.
+> Current build: **`v4.1.0`** — sub-agent visibility, transcript & composer correctness.
 
 **Shadow is a zero-telemetry, provider-neutral coding agent that runs on your terms.** Point it at any model — Anthropic, any OpenAI-compatible endpoint, Gemini, or a local model on your own box — and it works as a coding / sysadmin agent over your workspace. **No Shadow account, no signup, no phone-home:** the only outbound traffic is the provider *you* chose and the web tools the agent explicitly invokes. Your config stays local and readable (`~/.shadow/config.json`), your keys never leave your machine, and you can switch models mid-session **without losing context**.
 
@@ -16,11 +16,12 @@ Under the hood it's a **tool-calling agentic runtime**: the model reasons, emits
 
 This is **not a chat app** — it is a tool-calling runtime.
 
-## 🔥 What's new in v3.0.4
+## 🔥 What's new in v4.1.0
 
-V3 is the "make it beautiful and make it *see*" release. Highlights:
+- **👁 See your sub-agents live.** Running sub-agents now surface in a real-time Turn-HUD (`▸ type · current tool`) so you can follow delegated work instead of guessing whether it's still running.
+- **🔧 Transcript + composer correctness.** Non-recoverable provider errors render once (not twice), and text entry wraps cleanly by terminal column.
 
-- **👁 Give any model eyes.** Point Shadow at a vision model you host (Ollama / vLLM / llama.cpp) and *every* model you drive can see — even a text-only local coder. It delegates through the `describe_media` tool; the image goes only to *your* endpoint. → [Vision](#vision--give-any-model-eyes)
+Earlier highlights:
 - **🎭 Collaboration Mode — a live model round-table.** `/table gpt glm` seats 2–4 models in **one shared conversation**; you hold the baton and route each turn with `@handle`. Compare reasoning side by side, or let a strong model check a fast one.
 - **📊 Charts, tables & a genuinely beautiful TUI.** Fenced `chart` blocks render as real unicode **bar / line / sparkline** graphs; GFM tables get rounded grids with ledger-aligned numbers; markdown, code, and diffs are calm and readable.
 - **♿ Accessibility, first-class.** A `colorblind` (Okabe–Ito) palette and a `high-contrast` (WCAG-AAA) theme; your prompts carry a `▌` bar and failed tools a `✗` glyph, so meaning never rides on color alone.
