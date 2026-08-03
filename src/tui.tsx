@@ -170,12 +170,12 @@ import type { ContextName } from './tui/keybindings/types.js';
 import { claimMode, releaseMode, updateReset, restoreTerminal, installRestoreHandlers } from './tui/terminalState.js';
 import { scrubForDisplay } from './util/scrub.js';
 import { scrubbedEnv } from './util/safeEnv.js';
-import { stripCtl, formatUsage, formatCount, shellCommandOf, agentAttr, oneLine, formatDiffStats, shortPath } from './tui/format.js';
+import { displayWidth, takeByWidth } from './tui/width.js';
+import { stripCtl, formatUsage, shellCommandOf, agentAttr, oneLine, formatDiffStats, shortPath } from './tui/format.js';
 import {
   THEMES,
   THEME_NAMES,
   THEME_DESCRIPTIONS,
-  THEME_ALIASES,
   C,
   normalizeThemeName,
   applyTheme,
@@ -401,6 +401,11 @@ export interface ArgContext {
 type ArgProvider = ArgCompletion[] | ((ctx: ArgContext) => ArgCompletion[]);
 
 const SLASH_ARG_COMPLETIONS: Record<string, ArgProvider> = {
+  '/help': [
+    { value: 'overview', desc: 'Quick start, everyday commands, and essential keys' },
+    { value: 'keys', desc: 'Keyboard shortcuts and approval controls' },
+    { value: 'all', desc: 'Complete slash-command catalog' },
+  ],
   '/theme': [
     ...THEME_NAMES.map((n) => ({ value: n, desc: THEME_DESCRIPTIONS[n] })),
     { value: 'preview', desc: 'Try a theme without saving it (/theme preview <name>)' },
@@ -411,7 +416,7 @@ const SLASH_ARG_COMPLETIONS: Record<string, ArgProvider> = {
     { value: 'manual', desc: 'Approve every tool call' },
     { value: 'auto-read', desc: 'Reads are automatic; writes and commands ask' },
     { value: 'auto-edit', desc: 'Reads and edits are automatic; commands ask' },
-    { value: 'full', desc: 'Everything runs without asking (inside the sandbox/jail)' },
+    { value: 'full', desc: 'Routine tools run without asking; this session keeps its current filesystem boundary' },
   ],
   '/style': [
     { value: 'proactive', desc: 'Lead with the result; act, then report' },
@@ -421,14 +426,25 @@ const SLASH_ARG_COMPLETIONS: Record<string, ArgProvider> = {
   ],
   '/copy': [{ value: 'code', desc: 'Copy only the last fenced code block' }],
   '/config': [
-    { value: 'fastMode', desc: 'on/off — Anthropic fast mode' },
-    { value: 'effort', desc: 'low | medium | high | xhigh | max' },
-    { value: 'cacheTtl', desc: '5m or 1h — prompt-cache TTL' },
-    { value: 'maxIterations', desc: 'agent loop cap (non-negative integer)' },
-    { value: 'maxOutputTokens', desc: 'per-call output cap (integer ≥ 256)' },
-    { value: 'autoClassifier', desc: 'on/off — automatic safety classifier' },
-    { value: 'parallelTools', desc: 'on/off — run independent tools in parallel' },
-    { value: 'costWarnUSD', desc: 'warn when session cost passes this (USD)' },
+    { value: 'show', desc: 'Show safe runtime settings (secrets hidden)' },
+    { value: 'get temperature', desc: 'Show self-hosted sampling temperature' },
+    { value: 'set temperature', desc: 'Append a value from 0..2 (default 1.0)' },
+    { value: 'get fastMode', desc: 'Show Anthropic fast mode' },
+    { value: 'set fastMode', desc: 'Append on/off' },
+    { value: 'get effort', desc: 'Show reasoning effort' },
+    { value: 'set effort', desc: 'Append low | medium | high | xhigh | max' },
+    { value: 'get cacheTtl', desc: 'Show prompt-cache TTL' },
+    { value: 'set cacheTtl', desc: 'Append 5m or 1h' },
+    { value: 'get maxIterations', desc: 'Show the agent loop cap' },
+    { value: 'set maxIterations', desc: 'Append a non-negative integer' },
+    { value: 'get maxOutputTokens', desc: 'Show the per-call output cap' },
+    { value: 'set maxOutputTokens', desc: 'Append an integer ≥ 256' },
+    { value: 'get autoClassifier', desc: 'Show automatic safety classification' },
+    { value: 'set autoClassifier', desc: 'Append on/off' },
+    { value: 'get parallelTools', desc: 'Show parallel tool execution' },
+    { value: 'set parallelTools', desc: 'Append on/off' },
+    { value: 'get costWarnUSD', desc: 'Show the session cost warning threshold' },
+    { value: 'set costWarnUSD', desc: 'Append a positive USD amount' },
   ],
   '/mcp': [
     { value: 'list', desc: 'List configured MCP servers' },
@@ -613,6 +629,7 @@ function classifySlash(task: string): { cmd?: SlashCommand; kind: 'command' | 't
 }
 
 const SAFE_CONFIG_KEYS = [
+  'temperature',
   'fastMode',
   'effort',
   'cacheTtl',
@@ -631,7 +648,7 @@ function parseBool(value: string): boolean | null {
   return null;
 }
 
-function parseSafeConfig(key: string, raw: string): { ok: true; key: SafeConfigKey; value: unknown } | { ok: false; message: string } {
+export function parseSafeConfig(key: string, raw: string): { ok: true; key: SafeConfigKey; value: unknown } | { ok: false; message: string } {
   if (!(SAFE_CONFIG_KEYS as readonly string[]).includes(key)) {
     return { ok: false, message: `Config key "${key}" is not editable here. Editable: ${SAFE_CONFIG_KEYS.join(', ')}` };
   }
@@ -652,6 +669,12 @@ function parseSafeConfig(key: string, raw: string): { ok: true; key: SafeConfigK
     return Number.isFinite(value) && value > 0
       ? { ok: true, key: safeKey, value }
       : { ok: false, message: 'costWarnUSD must be a positive number (e.g. 5).' };
+  }
+  if (safeKey === 'temperature') {
+    const value = Number(raw);
+    return Number.isFinite(value) && value >= 0 && value <= 2
+      ? { ok: true, key: safeKey, value }
+      : { ok: false, message: 'temperature must be a number from 0 to 2 (default 1.0).' };
   }
   if (safeKey === 'maxOutputTokens') {
     const value = Number(raw);
@@ -679,8 +702,59 @@ function modelEntries(cfg: ShadowConfig): ModelEntry[] {
   const entries =
     cfg.models && cfg.models.length > 0
       ? cfg.models.filter((m) => !m.disabled)
-      : [{ label: cfg.model, provider: cfg.provider, model: cfg.model, baseUrl: cfg.baseUrl }];
+      : [
+          {
+            label: cfg.model,
+            provider: cfg.provider,
+            model: cfg.model,
+            baseUrl: cfg.baseUrl,
+            selfHosted: cfg.selfHosted,
+          },
+        ];
   return entries;
+}
+
+/** Resolve the active model's effective endpoint and whether it is a self-hosted target. */
+function activeModelTarget(
+  cfg: ShadowConfig,
+  current: { provider: string; model: string },
+  runtimeBaseUrl?: string,
+  runtimeSelfHosted?: boolean,
+): { baseUrl: string | undefined; selfHosted: boolean } {
+  const entry = (cfg.models ?? []).find(
+    (m) => !m.disabled && m.provider === current.provider && m.model === current.model,
+  );
+  const baseUrl =
+    runtimeBaseUrl ??
+    resolveBaseUrl(
+      current.provider,
+      entry?.baseUrl ?? (cfg.provider === current.provider ? cfg.baseUrl : undefined),
+    );
+  return {
+    baseUrl,
+    selfHosted:
+      current.provider === 'openai' &&
+      (runtimeSelfHosted ??
+        ((runtimeBaseUrl === undefined &&
+          (entry?.selfHosted === true ||
+            (cfg.provider === current.provider &&
+              cfg.model === current.model &&
+              cfg.selfHosted === true))) ||
+          isLocalModelTarget({
+            // A generated/runtime URL identifies the provider object that is actually live. Do not
+            // borrow local-file flags from the first same-name preset: duplicate provider/model
+            // pairs can legitimately point at different endpoints.
+            gguf: runtimeBaseUrl === undefined ? entry?.gguf : undefined,
+            mlx: runtimeBaseUrl === undefined ? entry?.mlx : undefined,
+            vllm: runtimeBaseUrl === undefined ? entry?.vllm : undefined,
+            baseUrl,
+          }))),
+  };
+}
+
+/** Keep the documented default visibly `1.0` while preserving useful fractional precision. */
+function formatTemperature(value: number): string {
+  return Number.isInteger(value) ? value.toFixed(1) : String(value);
 }
 
 /** Grouped picker rows for a config: a category header per company/"Local", then its models. */
@@ -689,13 +763,18 @@ function modelRows(cfg: ShadowConfig): PickerRow[] {
 }
 
 function modelPresetLines(entries: ModelEntry[], current: { provider: string; model: string }): string[] {
-  if (!entries.length) return ['No model presets configured. Use /model add <label> <provider> <model> [baseUrl].'];
+  if (!entries.length) {
+    return [
+      'No model presets configured. Use /model add <label> <provider> <model> [baseUrl] [--self-hosted].',
+    ];
+  }
   return entries.map((entry) => {
     const active = entry.provider === current.provider && entry.model === current.model;
     const baseUrl = entry.baseUrl ? ` · ${entry.baseUrl}` : '';
+    const selfHosted = entry.selfHosted ? ' · self-hosted' : '';
     const disabled = entry.disabled ? ' [disabled]' : '';
     const marker = active ? '* ' : '  ';
-    return `${marker}${entry.label}${disabled} — ${entry.provider}/${entry.model}${baseUrl}`;
+    return `${marker}${entry.label}${disabled} — ${entry.provider}/${entry.model}${baseUrl}${selfHosted}`;
   });
 }
 
@@ -771,6 +850,55 @@ interface TranscriptBase {
   speaker?: SpeakerTag;
 }
 type TranscriptItem = TranscriptBase;
+
+type HelpTopic = 'overview' | 'keys' | 'all';
+
+/** Progressive help: keep the default useful at a glance; put exhaustive reference one level down. */
+function helpLines(topic: HelpTopic): BannerLine[] {
+  if (topic === 'all') {
+    return [
+      { text: 'All commands', color: C.cyan, bold: true },
+      { text: 'Type / and a few letters to search this list interactively.', dimColor: true },
+      ...SLASH_COMMANDS.map((c) => ({
+        text: `  ${c.name.padEnd(SLASH_NAME_WIDTH)} ${c.desc}`,
+        dimColor: true,
+      })),
+      { text: 'Shortcuts: /help keys  ·  quick start: /help overview', dimColor: true },
+    ];
+  }
+
+  if (topic === 'keys') {
+    return [
+      { text: 'Keyboard shortcuts', color: C.cyan, bold: true },
+      { text: 'Compose', color: C.purple, bold: true },
+      { text: '  Enter send  ·  Option+Enter newline  ·  Ctrl+V paste  ·  Ctrl+R search history', dimColor: true },
+      { text: '  ↑/↓ move through a multi-line draft; at its edges they browse history.', dimColor: true },
+      { text: 'Navigate', color: C.purple, bold: true },
+      { text: '  / opens commands  ·  ↑/↓ select  ·  Tab completes  ·  Esc closes', dimColor: true },
+      { text: '  Shift+Tab changes mode  ·  Ctrl+O folds details  ·  Ctrl+T expands tasks', dimColor: true },
+      { text: 'While Shadow works', color: C.purple, bold: true },
+      { text: '  Keep typing and press Enter to queue the next request  ·  Esc interrupts', dimColor: true },
+      { text: 'Approvals: y once · n deny · s session · f shell prefix · a raise autonomy', dimColor: true },
+      { text: 'Exit: Ctrl+C twice (or Ctrl+D on an empty composer)', dimColor: true },
+      { text: 'Customize bindings with /keybindings init.', dimColor: true },
+    ];
+  }
+
+  return [
+    { text: 'Shadow help', color: C.cyan, bold: true },
+    { text: 'Start here', color: C.purple, bold: true },
+    { text: '  Type what you want done, then press Enter. You can keep typing while Shadow works.', dimColor: true },
+    { text: '  /model switches models  ·  /doctor checks setup  ·  /status explains the current session', dimColor: true },
+    { text: 'Everyday commands', color: C.purple, bold: true },
+    { text: '  Session    /clear  /resume  /rewind  /export', dimColor: true },
+    { text: '  Model      /model  /local  /provider  /effort', dimColor: true },
+    { text: '  Agent      /goal  /autonomy  /permissions  /tasks', dimColor: true },
+    { text: '  Workspace  /diff  /files  /branch  /review', dimColor: true },
+    { text: 'Keys: Enter send · Option+Enter newline · Shift+Tab mode · Esc interrupt · Ctrl+C twice to quit', dimColor: true },
+    { text: 'Approvals: y once · n deny · s session · f shell prefix · a raise autonomy', dimColor: true },
+    { text: 'More: /help keys for shortcuts · /help all for every command · type / to search', dimColor: true },
+  ];
+}
 // Idle-countdown config: when the model asks a question and the user is away, auto-pick the
 // recommended answer after this many seconds — like every other TUI's "(default in Ns)" prompt.
 // `SHADOW_AUTO_ANSWER_SECS` overrides the delay; `SHADOW_NO_AUTO_ANSWER=1` turns it off (the
@@ -855,6 +983,10 @@ class InteractiveGate implements ApprovalGate {
 
 export interface TuiOpts {
   provider: Provider;
+  /** Effective endpoint backing `provider` (including a managed local server's generated port). */
+  activeBaseUrl?: string;
+  /** Runtime classification for `provider`; needed for explicitly self-hosted public endpoints. */
+  activeSelfHosted?: boolean;
   registry: ToolRegistry;
   bus: EventBus;
   context: Context;
@@ -988,8 +1120,6 @@ const FORWARD_DELETE = /^\x1b\[3(;\d+)?~$/;
  * sends `ESC [ 13 ; 2 u`; xterm's modifyOtherKeys sends `ESC [ 27 ; 2 ; 13 ~`.
  */
 const SHIFT_ENTER = /^\x1b\[(?:13;(\d+)u|27;(\d+);13~)$/;
-/** Alt/Option+Enter — the one that DOES work everywhere today, and Ctrl+J (0x0a). */
-const ALT_ENTER = /^\x1b\r?$|^\x1b\n$/;
 /** Collaboration Mode: the baton is always this warm orange (Shadow's brand ⏺ color) — never a seat color. */
 const BATON_ORANGE = '#d97757';
 const MARGIN_PAD = ' '.repeat(PAGE_MARGIN);
@@ -1294,6 +1424,26 @@ function StatusStrip({ text, marker }: { text: string; marker?: { text: string; 
   );
 }
 
+interface ChromeMarker {
+  text: string;
+  color: string;
+  bold?: boolean;
+}
+
+/** High-priority state badges used in the composer/status chrome (privacy and guardrail state). */
+function ChromeMarkers({ markers, trailing }: { markers: ChromeMarker[]; trailing?: boolean }) {
+  return (
+    <>
+      {markers.map((marker, i) => (
+        <React.Fragment key={`${marker.text}-${i}`}>
+          <Text color={marker.color} bold={marker.bold}>{marker.text}</Text>
+          {i < markers.length - 1 || trailing ? <Text color={C.dim}>{' · '}</Text> : null}
+        </React.Fragment>
+      ))}
+    </>
+  );
+}
+
 /** Small chrome rows (confirmations, errors, denials) — one block when they arrive back to back. */
 function isChatter(kind: string | undefined): boolean {
   return kind === 'system' || kind === 'error' || kind === 'blocked';
@@ -1310,6 +1460,7 @@ export function Composer({
   input,
   cursor,
   hint,
+  markers = [],
   cols,
   maxRows = COMPOSER_MAX_VISIBLE_ROWS,
   showHint = true,
@@ -1319,6 +1470,8 @@ export function Composer({
   input: string;
   cursor: number;
   hint: string;
+  /** Priority badges painted before the quiet hint so warnings survive right-edge truncation. */
+  markers?: ChromeMarker[];
   /** Terminal width — drives soft-wrap for caret math + paint. */
   cols: number;
   /** Max visible input rows — clamped by the caller to what the terminal height allows. */
@@ -1385,6 +1538,7 @@ export function Composer({
       </Box>
       {showHint ? (
         <Text wrap="truncate" color={C.dim}>
+          <ChromeMarkers markers={markers} trailing={markers.length > 0 && hint.length > 0} />
           {hint}
         </Text>
       ) : null}
@@ -1563,7 +1717,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const tableRef = useRef<{ seats: Seat[] } | null>(null);
   tableRef.current = table;
   const speakerRef = useRef<SpeakerTag | null>(null); // seat that currently holds the baton (tags its turns)
-  const preTableRef = useRef<{ client: Provider; provider: ProviderName; model: string; policy: ReturnType<Context['policy']> } | null>(null);
+  const preTableRef = useRef<{
+    client: Provider;
+    provider: ProviderName;
+    model: string;
+    target: { baseUrl?: string; selfHosted: boolean };
+    policy: ReturnType<Context['policy']>;
+  } | null>(null);
   const routeInFlightRef = useRef(false); // a seat route is building/running — block a second concurrent route
   const [pickerOpen, setPickerOpen] = useState(false); // model-picker has focus
   const [pickerIndex, setPickerIndex] = useState(0); // selected row in the model picker
@@ -1731,6 +1891,19 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // `currentRef` mirrors the displayed {provider, model} NAMES for the key handler.
   const providerRef = useRef(opts.provider);
   const currentRef = useRef(current);
+  // Runtime endpoint truth. A managed gguf/MLX/vLLM server chooses its loopback URL/port while
+  // launching; the model preset often has no baseUrl at all, so re-resolving config in /provider
+  // would misleadingly show OPENAI_BASE_URL or "provider default". Model builds update this ref.
+  const initialTarget = activeModelTarget(
+    opts.cfg,
+    current,
+    opts.activeBaseUrl,
+    opts.activeSelfHosted,
+  );
+  const activeTargetRef = useRef<{ baseUrl?: string; selfHosted: boolean }>({
+    baseUrl: initialTarget.baseUrl,
+    selfHosted: initialTarget.selfHosted,
+  });
   // The session's ORIGINAL context budget — /model switches to a gguf clamp under its window,
   // and switching back to a cloud model restores this (see selectModel).
   const baseContextPolicyRef = useRef(
@@ -1747,7 +1920,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const styleRef = useRef(style);
   const runOneRef = useRef<((task: string) => void) | null>(null);
   const selectModelRef = useRef<((entry: ModelEntry) => Promise<void>) | null>(null);
-  const buildProviderRef = useRef<((entry: ModelEntry, opts?: { clampBudget?: boolean; applyPolicy?: () => boolean }) => Promise<{ ok: true; client: Provider; provider: ProviderName; model: string } | { ok: false; error: string; fatal?: boolean }>) | null>(null);
+  const buildProviderRef = useRef<((entry: ModelEntry, opts?: { clampBudget?: boolean; applyPolicy?: () => boolean }) => Promise<
+    | { ok: true; client: Provider; provider: ProviderName; model: string; baseUrl?: string; selfHosted: boolean }
+    | { ok: false; error: string; fatal?: boolean }
+  >) | null>(null);
   const handleTableInputRef = useRef<((raw: string) => void) | null>(null);
   const startTableRef = useRef<((arg: string) => void) | null>(null);
   const flushQueueRef = useRef<(() => void) | null>(null);
@@ -2425,21 +2601,18 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       const dispatch = slashDispatchName(cmd);
       const arg = (rawLine ?? '').slice(cmd.name.length).trim();
       switch (dispatch) {
-        case '/help':
-          pushLine({
-            kind: 'system',
-            text: 'help',
-            lines: [
-              { text: 'Commands:', bold: true },
-              ...SLASH_COMMANDS.map((c) => ({ text: `  ${c.name.padEnd(SLASH_NAME_WIDTH)} ${c.desc}`, dimColor: true })),
-              {
-                text: 'Keys: Shift+Tab mode · Option+Enter newline (/terminal-setup enables Shift+Enter) · ↑/↓ edit multi-line (history at edges) · Ctrl-O fold · Ctrl-T tasks · Ctrl-V paste · Alt-C copy answer · Esc interrupt · Ctrl-C quit',
-                dimColor: true,
-              },
-              { text: 'Approvals: y/n · s session · f prefix (shell) · a always', dimColor: true },
-            ],
-          });
+        case '/help': {
+          const topic = (arg || 'overview').toLowerCase();
+          if (topic !== 'overview' && topic !== 'keys' && topic !== 'all') {
+            pushLine({
+              text: `Unknown help topic "${arg}". Use /help overview, /help keys, or /help all.`,
+              color: C.red,
+            });
+            break;
+          }
+          pushLine({ kind: 'system', text: 'help', lines: helpLines(topic) });
           break;
+        }
         case '/keybindings': {
           const loaded = kbLoadedRef.current;
           if (arg === 'init') {
@@ -2591,6 +2764,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             opts.cfg.provider = entry.provider;
             opts.cfg.model = entry.model;
             opts.cfg.baseUrl = entry.baseUrl;
+            opts.cfg.selfHosted = entry.selfHosted;
             opts.cfg.lastModel = entry.label;
             saveGlobalConfig(patch);
             pushLine({ text: `Default model saved: ${entry.label}`, color: C.cyan });
@@ -2647,7 +2821,14 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
                     return;
                   }
                 }
-                prov = createProvider({ provider: p, model: entry.model, apiKey, authToken: testCred.authToken, baseUrl });
+                prov = createProvider({
+                  provider: p,
+                  model: entry.model,
+                  apiKey,
+                  authToken: testCred.authToken,
+                  baseUrl,
+                  selfHosted: p === 'openai' ? entry.selfHosted : undefined,
+                });
               }
               if (!prov) {
                 pushLine({ text: 'No active provider to test.', color: C.red });
@@ -2659,6 +2840,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
                   model,
                   providerName: currentRef.current.provider,
                   isLocal,
+                  temperature: opts.cfg.temperature,
                   log: (m) => pushLine({ text: m, dimColor: true }),
                 });
                 const rows = [
@@ -2679,7 +2861,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           }
           if (action) {
             pushLine({
-              text: 'Usage: /model [list|add <label> <provider> <model> [baseUrl]|remove <label>|enable <label>|disable <label>|default <label>|use <label>|test [name]]',
+              text: 'Usage: /model [list|add <label> <provider> <model> [baseUrl] [--self-hosted]|remove <label>|enable <label>|disable <label>|default <label>|use <label>|test [name]]',
               dimColor: true,
             });
             break;
@@ -2691,7 +2873,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
               text: 'model',
               lines: [
                 { text: `${currentRef.current.provider} / ${currentRef.current.model}`, color: C.cyan },
-                { text: 'Use /model add <label> <provider> <model> [baseUrl] to add a preset.', dimColor: true },
+                { text: 'Use /model add <label> <provider> <model> [baseUrl] [--self-hosted] to add a preset.', dimColor: true },
               ],
             });
             break;
@@ -2791,13 +2973,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           break;
         }
         case '/provider': {
-          const activeEntry = (opts.cfg.models ?? []).find(
-            (m) => !m.disabled && m.provider === currentRef.current.provider && m.model === currentRef.current.model,
-          );
-          const baseUrl = resolveBaseUrl(
-            currentRef.current.provider,
-            activeEntry?.baseUrl ?? (opts.cfg.provider === currentRef.current.provider ? opts.cfg.baseUrl : undefined),
-          );
+          const target = activeTargetRef.current;
+          const baseUrl = target.baseUrl;
           const hasApiKey = Boolean(resolveApiKey(currentRef.current.provider, { model: currentRef.current.model }));
           const hasAuthToken = Boolean(resolveAuthToken(currentRef.current.provider));
           const total = opts.cfg.models?.length ?? 0;
@@ -2808,6 +2985,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             lines: [
               { text: `${currentRef.current.provider}/${currentRef.current.model}`, color: C.cyan },
               { text: `endpoint: ${baseUrl || '(provider default)'}`, dimColor: true },
+              ...(target.selfHosted
+                ? [{ text: `temperature: ${formatTemperature(opts.cfg.temperature ?? 1.0)} · self-hosted sampling`, dimColor: true }]
+                : []),
               { text: `auth: api key ${hasApiKey ? 'present' : 'missing'} · bearer ${hasAuthToken ? 'present' : 'missing'}`, dimColor: true },
               { text: `presets: ${total} configured${disabled ? ` · ${disabled} disabled` : ''}`, dimColor: true },
               { text: 'Commands: /model list · /model add · /model use <label> · /model default <label>', dimColor: true },
@@ -2913,6 +3093,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
                 currentRef.current.model,
                 true,
                 ctl?.signal,
+                { temperature: opts.cfg.temperature },
               );
               if (ctl?.signal.aborted) {
                 pushLine({ text: 'Compaction cancelled — context unchanged.', dimColor: true });
@@ -3292,6 +3473,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         case '/status': {
           const u = lastUsageRef.current;
           const pct = u ? Math.round(u.contextPct * 100) : 0;
+          const target = activeTargetRef.current;
           pushLine({
             kind: 'system',
             text: 'status',
@@ -3300,6 +3482,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
               // The `· $…` tail only when real cost accrued — local/unpriced sessions stay clean
               // (same rule as formatUsage in the status strip).
               { text: `context ${pct}% of ${opts.cfg.contextBudget.toLocaleString()} · ${u ? (u.inputTokens + u.outputTokens).toLocaleString() : 0} tokens${u && u.costUSD > 0 ? ` · $${u.costUSD.toFixed(4)}` : ''}`, dimColor: true },
+              ...(target.selfHosted
+                ? [{ text: `temperature ${formatTemperature(opts.cfg.temperature ?? 1.0)} · self-hosted only`, dimColor: true }]
+                : []),
               { text: `workspace ${opts.workspaceRoot}`, dimColor: true },
               ...(goalRef.current ? [{ text: `goal: ${goalRef.current}`, color: C.purple }] : []),
             ],
@@ -3368,7 +3553,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             }
             (opts.cfg as unknown as Record<string, unknown>)[parsed.key] = parsed.value;
             saveGlobalConfig({ [parsed.key]: parsed.value });
-            pushLine({ text: `Config saved: ${parsed.key} = ${String(parsed.value)}`, color: C.cyan });
+            pushLine({
+              text: `Config saved: ${parsed.key} = ${parsed.key === 'temperature' ? formatTemperature(parsed.value as number) : String(parsed.value)}${parsed.key === 'temperature' ? ' (self-hosted models only)' : ''}`,
+              color: C.cyan,
+            });
             break;
           }
           if (parts[0] === 'get') {
@@ -3400,6 +3588,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
               { text: `provider/model: ${c.provider}/${c.model}`, color: C.cyan },
               { text: `autonomy ${autonomyRef.current} · autoClassifier ${c.autoClassifier ? 'on' : 'off'} · fastMode ${c.fastMode ? 'on' : 'off'}`, dimColor: true },
               { text: `effort ${c.effort} · cacheTtl ${c.cacheTtl} · parallelTools ${c.parallelTools ? 'on' : 'off'}${c.costWarnUSD != null ? ` · costWarn $${c.costWarnUSD}` : ''}`, dimColor: true },
+              { text: `temperature ${formatTemperature(c.temperature ?? 1.0)} · self-hosted models only`, dimColor: true },
               { text: `maxIterations ${c.maxIterations || 'unlimited'} · contextBudget ${c.contextBudget.toLocaleString()}`, dimColor: true },
               { text: `${c.models?.length ?? 0} models configured · edit ~/.shadow/config.json (API keys hidden)`, dimColor: true },
               { text: `Editable here: ${SAFE_CONFIG_KEYS.join(', ')}`, dimColor: true },
@@ -3824,7 +4013,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     async (
       entry: ModelEntry,
       opts2: { clampBudget?: boolean; applyPolicy?: () => boolean } = {},
-    ): Promise<{ ok: true; client: Provider; provider: ProviderName; model: string } | { ok: false; error: string; fatal?: boolean }> => {
+    ): Promise<
+      | { ok: true; client: Provider; provider: ProviderName; model: string; baseUrl?: string; selfHosted: boolean }
+      | { ok: false; error: string; fatal?: boolean }
+    > => {
       let provider = entry.provider;
       let baseUrl = resolveBaseUrl(entry.provider, entry.baseUrl);
       let detectedWindow: number | undefined;
@@ -3894,8 +4086,24 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         apiKey,
         authToken: cred.authToken,
         baseUrl,
+        selfHosted:
+          provider === 'openai'
+            ? entry.selfHosted === true ||
+              isLocalModelTarget({ gguf: entry.gguf, mlx: entry.mlx, vllm: entry.vllm, baseUrl })
+            : undefined,
       });
-      return { ok: true, client, provider, model: entry.model };
+      const selfHosted =
+        provider === 'openai' &&
+        (entry.selfHosted === true ||
+          isLocalModelTarget({ gguf: entry.gguf, mlx: entry.mlx, vllm: entry.vllm, baseUrl }));
+      return {
+        ok: true,
+        client,
+        provider,
+        model: entry.model,
+        baseUrl,
+        selfHosted,
+      };
     },
     [pushLine, opts],
   );
@@ -3923,6 +4131,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         }
         providerRef.current = built.client;
         currentRef.current = { provider: built.provider, model: built.model };
+        activeTargetRef.current = { baseUrl: built.baseUrl, selfHosted: built.selfHosted };
         loopRef.current?.setProvider(built.client, built.model);
         opts.onModelSwitch?.(built.client, built.model); // keep the agent tool's sub-agents on the live model
         setCurrent({ provider: built.provider, model: built.model });
@@ -4560,6 +4769,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           if (!built.ok) throw new Error(built.error);
           providerRef.current = built.client;
           currentRef.current = { provider: built.provider, model: built.model };
+          activeTargetRef.current = { baseUrl: built.baseUrl, selfHosted: built.selfHosted };
           opts.cfg.provider = built.provider;
           opts.cfg.model = built.model;
           setCurrent({ provider: built.provider, model: built.model });
@@ -4660,6 +4870,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         }
         providerRef.current = built.client;
         currentRef.current = { provider: built.provider, model: built.model }; // set imperatively BEFORE runOne captures it
+        activeTargetRef.current = { baseUrl: built.baseUrl, selfHosted: built.selfHosted };
         setCurrent({ provider: built.provider, model: built.model }); // footer follows the active seat
         speakerRef.current = seatTag(seat);
         await runOne(question);
@@ -4676,6 +4887,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     if (pre) {
       providerRef.current = pre.client;
       currentRef.current = { provider: pre.provider, model: pre.model };
+      activeTargetRef.current = pre.target;
       loopRef.current?.setProvider(pre.client, pre.model);
       context.setPolicy(pre.policy, true);
       opts.cfg.contextBudget = pre.policy.contextBudget;
@@ -4729,6 +4941,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         client: providerRef.current,
         provider: currentRef.current.provider as ProviderName,
         model: currentRef.current.model,
+        target: { ...activeTargetRef.current },
         policy: context.policy(),
       };
       setTable({ seats });
@@ -5731,8 +5944,18 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const statusVerb = running ? `${DEFAULT_STATUS_VERB}…` : '';
   // SAFETY MARKERS ride OUTSIDE the strip so its shrink ladder can never drop them: OFFLINE is the
   // privacy contract's always-visible signal, sandbox:off is the "guardrails are OFF" warning.
-  const offlineTag = opts.offline ? 'OFFLINE · ' : '';
-  const sandboxTag = opts.bypass ? 'sandbox:off · ' : '';
+  // They render as bold color badges instead of disappearing into the same quiet gray as model
+  // metadata. The composer owns them whenever its hint row fits; the running line is the fallback
+  // on tiny terminals, so a normal frame never repeats the same warning twice.
+  const safetyMarkers: ChromeMarker[] = [
+    ...(opts.offline ? [{ text: 'OFFLINE', color: C.cyan, bold: true }] : []),
+    ...(opts.bypass ? [{ text: '⚠ sandbox:off', color: C.red, bold: true }] : []),
+  ];
+  const safetyText = safetyMarkers.map((m) => m.text).join(' · ');
+  const safetyPrefixCols = safetyText ? displayWidth(safetyText) + 3 : 0; // trailing " · "
+  const statusSafetyMarkers = hudFit.hint ? [] : safetyMarkers;
+  const statusSafetyText = statusSafetyMarkers.map((m) => m.text).join(' · ');
+  const statusSafetyPrefixCols = statusSafetyText ? displayWidth(statusSafetyText) + 3 : 0;
   // When the live slot can't render (tiny terminal / slash menu open) the activeTool row is
   // invisible — surface the running tool here instead so a long tool call is never unindicated.
   const toolTag = toolLine
@@ -5747,15 +5970,18 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const statusPrefix = running
     ? `${elapsedSec >= 1 ? ` (${formatDuration(elapsedSec)})` : ''}${toolTag}${shellPid ? ` · shell ${shellPid}` : ''}${shellPid && shellWarn ? ' · ⚠ may survive Esc' : elapsedSec >= 25 && !toolLine && !activeTool ? ' · model slow to respond' : ''}`
     : '';
-  // Phase B: status strip is merged — while running, model/mode/ctx (and OFFLINE, the privacy
-  // contract's always-visible marker) ride this same status line. The strip is formatted against
+  // Phase B: status strip is merged — while running, model/mode/ctx ride this same status line.
+  // On a tiny terminal where the composer hint cannot fit, its safety badges move here too. The strip is formatted against
   // the width actually REMAINING beside the verb/elapsed/tool prefix, so its ctx/cost tail shrinks
   // instead of being truncated off the row edge. Idle merge lives in the composer hint (below).
-  const statusTail = running
-    ? `${statusPrefix} · ${offlineTag}${sandboxTag}${formatStatusStrip(
+  const runningStrip = running
+    ? formatStatusStrip(
         stripInput,
-        Math.max(16, layout.cols - PAGE_MARGIN * 2 - statusVerb.length - statusPrefix.length - (offlineTag + sandboxTag).length - 6),
-      )}`
+        Math.max(
+          16,
+          layout.cols - PAGE_MARGIN * 2 - displayWidth(statusVerb) - displayWidth(statusPrefix) - statusSafetyPrefixCols - 6,
+        ),
+      )
     : '';
   const pickerRows = modelRows(opts.cfg);
   let pickerSel = Math.min(pickerIndex, Math.max(0, pickerRows.length - 1));
@@ -5783,10 +6009,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // v2.9.0 regression where a longer tail silently pushed provider+mode off the row. 'Shift+Enter
   // newline' is not repeated here — it already lives in the empty-composer placeholder.
   const HINT_TAIL = ' · Shift+Tab mode · / commands';
-  const idlePrefix = offlineTag + sandboxTag;
-  const idleFixed = (attachTag + vimTag + idlePrefix).length;
+  const idleFixed = displayWidth(attachTag + vimTag) + safetyPrefixCols;
   const idleStrip = formatStatusStrip(stripInput, Math.max(16, layout.cols - idleFixed - 1));
-  const idleTail = layout.cols - idleFixed - idleStrip.length - 1 >= HINT_TAIL.length ? HINT_TAIL : '';
+  const idleTail = layout.cols - idleFixed - displayWidth(idleStrip) - 1 >= displayWidth(HINT_TAIL) ? HINT_TAIL : '';
   // The RUNNING branch carries the safety tags too: while a mid-turn approval/question overlay is up
   // the HUD status row is suppressed and this hint is the only chrome left — OFFLINE/sandbox:off must
   // not vanish exactly then.
@@ -5803,12 +6028,12 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       : attachTag +
     vimTag +
     (menu.length > 0
-      ? `${idlePrefix}↑/↓ select · Tab complete · Enter ${running ? 'queues' : 'runs'} · Esc cancel`
+      ? `↑/↓ select · Tab complete · Enter ${running ? 'queues' : 'runs'} · Esc cancel`
       : running
-        ? `${idlePrefix}Type to queue · Enter queues · Option+Enter newline · Esc interrupts · Ctrl-C ×2 quits`
+        ? 'Type to queue · Enter queues · Option+Enter newline · Esc interrupts · Ctrl-C ×2 quits'
         : table
-          ? `${idlePrefix}${tableLegend}`
-          : `${idlePrefix}${idleStrip}${idleTail}`);
+          ? tableLegend
+          : `${idleStrip}${idleTail}`);
 
   // Suppress the live stream PREVIEW when the model is re-typing an answer it already committed this
   // turn (weak models repeat the final block(s) verbatim in one generation) — that's the "answer
@@ -5982,7 +6207,12 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
               <Text wrap="truncate">
                 <Text color={C.accent ?? CLAUDE_ORANGE}>{spinner}</Text>
                 <Text> {statusVerb}</Text>
-                {statusTail ? <Text color={C.dim}>{statusTail}</Text> : null}
+                <Text color={C.dim}>{`${statusPrefix} · `}</Text>
+                <ChromeMarkers
+                  markers={statusSafetyMarkers}
+                  trailing={statusSafetyMarkers.length > 0 && runningStrip.length > 0}
+                />
+                <Text color={C.dim}>{runningStrip}</Text>
               </Text>
             </Box>
           ) : null}
@@ -6063,6 +6293,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             input={input}
             cursor={cursor}
             hint={composerHint}
+            markers={safetyMarkers}
             cols={terminalSize.cols}
             maxRows={maxComposerRows}
             showHint={hudFit.hint}
@@ -6078,8 +6309,11 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           // selected row gets a brighter bar (menuSelBg). Every row is padded to a common width so
           // the panel is a clean rectangle. (No box, no reverse-video — the contrast carries it.)
           (() => {
-            const BAR_W = Math.max(24, Math.min(terminalSize.cols - PAGE_MARGIN * 2 - 1, 74));
-            const bar = (s: string) => (s.length >= BAR_W ? s.slice(0, BAR_W) : s + ' '.repeat(BAR_W - s.length));
+            const BAR_W = Math.max(8, Math.min(terminalSize.cols - PAGE_MARGIN * 2 - 1, 74));
+            const bar = (s: string) => {
+              const clipped = takeByWidth(s, BAR_W).head;
+              return clipped + ' '.repeat(Math.max(0, BAR_W - displayWidth(clipped)));
+            };
             return (
               <Box flexDirection="column" paddingLeft={PAGE_MARGIN}>
                 <Text wrap="truncate" backgroundColor={C.menuBg} color={C.cyan} bold>
@@ -6093,14 +6327,19 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
                   const cur = i === selIndex;
                   const bg = cur ? C.menuSelBg : C.menuBg;
                   const namePart = c.name.padEnd(SLASH_NAME_WIDTH);
-                  const used = 2 + namePart.length + 1 + c.desc.length; // pointer + name + space + desc
+                  const descRoom = Math.max(0, BAR_W - 2 - displayWidth(namePart) - 1);
+                  const clippedDesc = takeByWidth(c.desc, descRoom).head;
+                  const desc = displayWidth(c.desc) > descRoom && descRoom > 0
+                    ? takeByWidth(c.desc, Math.max(0, descRoom - 1)).head + '…'
+                    : clippedDesc;
+                  const used = 2 + displayWidth(namePart) + 1 + displayWidth(desc); // pointer + name + space + desc
                   const pad = used < BAR_W ? ' '.repeat(BAR_W - used) : '';
                   // wrap="truncate": a long row must never wrap to a 2nd line — it eats the frame budget.
                   return (
                     <Text key={c.name} wrap="truncate">
                       <Text backgroundColor={bg} color={cur ? C.green : C.dim} bold={cur}>{cur ? '❯ ' : '  '}</Text>
                       <Text backgroundColor={bg} color={C.fg} bold={cur}>{`${namePart} `}</Text>
-                      <Text backgroundColor={bg} color={cur ? C.fg : C.dim}>{c.desc}</Text>
+                      <Text backgroundColor={bg} color={cur ? C.fg : C.dim}>{desc}</Text>
                       {pad ? <Text backgroundColor={bg}>{pad}</Text> : null}
                     </Text>
                   );

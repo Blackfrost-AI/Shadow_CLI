@@ -12,6 +12,8 @@ export interface ProviderOptions {
   apiKey?: string;
   authToken?: string;
   baseUrl?: string;
+  /** Explicit opt-in for a remote self-hosted endpoint; local/LAN URLs are detected automatically. */
+  selfHosted?: boolean;
 }
 
 /**
@@ -35,7 +37,7 @@ export function createProvider(opts: ProviderOptions): Provider {
     case 'openai':
       // SHADOW_WIRE_API=responses selects /v1/responses (Codex-class); default is chat completions.
       return useResponsesWire()
-        ? new ResponsesProvider({ apiKey: opts.apiKey, baseUrl: opts.baseUrl, model: opts.model })
-        : new OpenAIProvider({ apiKey: opts.apiKey, baseUrl: opts.baseUrl, model: opts.model });
+        ? new ResponsesProvider({ apiKey: opts.apiKey, baseUrl: opts.baseUrl, model: opts.model, selfHosted: opts.selfHosted })
+        : new OpenAIProvider({ apiKey: opts.apiKey, baseUrl: opts.baseUrl, model: opts.model, selfHosted: opts.selfHosted });
   }
 }

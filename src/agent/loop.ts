@@ -39,6 +39,8 @@ export interface LoopDeps {
   model: string;
   system: string;
   maxOutputTokens: number;
+  /** Sampling temperature for self-hosted OpenAI-compatible endpoints (default 1.0). */
+  temperature?: number;
   /** Reasoning depth for adaptive-thinking models; ignored by providers without it. */
   effort?: Effort;
   /** Anthropic prompt-cache TTL for the stable prefix (default 5m). */
@@ -187,6 +189,7 @@ export class AgentLoop {
     const did = await this.deps.context.maybeSummarize(provider, model, force, this.deps.signal, {
       system,
       tools: this.deps.registry.toSchemas(),
+      temperature: this.deps.temperature,
       continuity: [
         this.deps.continuityState ?? '',
         this.deps.planMode?.block() ?? '',
@@ -250,6 +253,7 @@ export class AgentLoop {
         messages: this.healDanglingToolUses(context.messages()),
         tools: this.deps.registry.toSchemas(),
         maxOutputTokens: this.deps.maxOutputTokens,
+        temperature: this.deps.temperature,
         effort: this.effort,
         cacheTtl: this.deps.cacheTtl,
         fastMode: this.deps.fastMode,
@@ -876,6 +880,7 @@ export class AgentLoop {
         roots: [this.deps.workspaceRoot, ...(this.deps.additionalRoots ?? [])],
         provider: this.deps.provider,
         model: this.deps.model,
+        temperature: this.deps.temperature,
       });
       if (verdict.verdict === 'hard_deny') {
         bus.emit({ type: 'tool_denied', call, reason: verdict.reason });

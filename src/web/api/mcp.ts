@@ -57,7 +57,7 @@ export function maskConfig(cfg: McpServerConfig): Record<string, unknown> {
   return out;
 }
 
-export function registerMcpRoutes(route: RouteFn, ctx: ApiContext): void {
+export function registerMcpRoutes(route: RouteFn, _ctx: ApiContext): void {
   // ── GET /api/mcp ───────────────────────────────────────────────────────────
 
   route('GET', /^\/api\/mcp$/, async () => {

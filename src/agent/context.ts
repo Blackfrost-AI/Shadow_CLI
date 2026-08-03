@@ -164,6 +164,8 @@ export class Context {
       tools?: unknown[];
       /** Goal/todo/plan state that lives outside message history but must shape the handoff. */
       continuity?: string;
+      /** Sampling temperature for a self-hosted summarizer request. */
+      temperature?: number;
       /** Invoked only once compaction is definitely going to call the summarizer. */
       beforeCompact?: () => void;
     },
@@ -289,6 +291,7 @@ export class Context {
         ],
         tools: [],
         maxOutputTokens: 2048,
+        temperature: countCtx?.temperature,
       })) {
         if (ev.type === 'text') summary += ev.delta;
       }

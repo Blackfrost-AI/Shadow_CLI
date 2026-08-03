@@ -101,13 +101,21 @@ test('POST /api/models adds a keyless preset and persists it', async () => {
       'POST',
       '/api/models',
       auth(h, 'application/json'),
-      JSON.stringify({ label: 'My Endpoint', provider: 'openai', model: 'gpt-x', baseUrl: 'http://localhost:11434/v1' }),
+      JSON.stringify({
+        label: 'My Endpoint',
+        provider: 'openai',
+        model: 'gpt-x',
+        baseUrl: 'https://models.example.net/v1',
+        selfHosted: true,
+      }),
     );
     assert.equal(r.status, 201);
     const persisted = JSON.parse(readFileSync(CONFIG, 'utf8'));
     assert.equal(persisted.models.length, 1);
     assert.equal(persisted.models[0].label, 'My Endpoint');
     assert.equal(persisted.models[0].model, 'gpt-x');
+    assert.equal(persisted.models[0].selfHosted, true);
+    assert.equal(JSON.parse(r.body).model.selfHosted, true);
   });
 });
 
@@ -137,6 +145,26 @@ test('POST rejects an invalid provider', async () => {
       JSON.stringify({ label: 'Bad', provider: 'grok', model: 'x' }),
     );
     assert.equal(r.status, 400);
+  });
+});
+
+test('POST rejects selfHosted on native provider presets', async () => {
+  seedModels([]);
+  await withServer(async (h) => {
+    const r = await raw(
+      h.port,
+      'POST',
+      '/api/models',
+      auth(h, 'application/json'),
+      JSON.stringify({
+        label: 'Not OpenAI-compatible',
+        provider: 'anthropic',
+        model: 'claude-opus-4-8',
+        selfHosted: true,
+      }),
+    );
+    assert.equal(r.status, 400);
+    assert.match(JSON.parse(r.body).error, /OpenAI-compatible/);
   });
 });
 
@@ -188,6 +216,7 @@ test('PATCH enable/disable toggles the disabled flag and persists', async () => 
 
 test('PATCH default sets the active provider/model/baseUrl', async () => {
   seedModels([{ label: 'Default Me', provider: 'anthropic', model: 'claude-x', baseUrl: 'https://api.anthropic.com' }]);
+  store.saveGlobalConfig({ selfHosted: true });
   await withServer(async (h) => {
     const r = await raw(
       h.port,
@@ -201,6 +230,7 @@ test('PATCH default sets the active provider/model/baseUrl', async () => {
     assert.equal(persisted.provider, 'anthropic');
     assert.equal(persisted.model, 'claude-x');
     assert.equal(persisted.lastModel, 'Default Me');
+    assert.equal(persisted.selfHosted, undefined, 'a cloud default clears a stale endpoint marker');
   });
 });
 

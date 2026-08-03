@@ -65,7 +65,6 @@ test('Ctrl+R opens a live search over the real session history', async (t) => {
   await new Promise((r) => setTimeout(r, 120));
   const frame = async (): Promise<string> => {
     await new Promise((r) => setTimeout(r, 90));
-    // eslint-disable-next-line no-control-regex
     return (lastFrame() ?? '').replace(/\x1b\[[0-9;]*m/g, '');
   };
   // Build history the way a user would: type and submit.

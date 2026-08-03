@@ -76,4 +76,10 @@ test('the rendered approval overlay actually contains the command', () => {
   const frame = (lastFrame() ?? '').replace(/\x1b\[[0-9;]*m/g, '');
   unmount();
   assert.match(frame, /rm -rf \//, 'the dialog must show the command it is approving');
+  assert.match(frame, /Permission required · high/, 'the title names the risk at a glance');
+  assert.match(frame, /action:/, 'the operative preview is labelled as the action');
+  assert.match(frame, /Why: test/, 'the policy reason is explained separately from the action');
+  assert.match(frame, /y once/, 'approval scope is explicit instead of an ambiguous yes');
+  assert.match(frame, /f shell prefix/, 'shell-only prefix grant is described honestly');
+  assert.match(frame, /a raise mode \+ approve/, 'autonomy escalation is not labelled as vague “always”');
 });

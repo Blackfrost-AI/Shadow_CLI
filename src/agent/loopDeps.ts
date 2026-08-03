@@ -80,6 +80,7 @@ export function buildLoopDeps(input: LoopDepsInput): LoopDeps {
 
     // --- derived from cfg; identical at every call site ---
     maxOutputTokens: cfg.maxOutputTokens,
+    temperature: cfg.temperature,
     effort: cfg.effort,
     cacheTtl: cfg.cacheTtl,
     fastMode: cfg.fastMode,

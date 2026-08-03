@@ -35,6 +35,7 @@ export function mask(entry: ModelEntry): Record<string, unknown> {
     provider: entry.provider,
     model: entry.model,
     baseUrl: entry.baseUrl ?? null,
+    selfHosted: entry.provider === 'openai' && entry.selfHosted === true,
     fallback: entry.fallback ?? null,
     group: entry.group ?? null,
     disabled: entry.disabled === true,
@@ -59,7 +60,7 @@ function sealKeys(write: (s: string) => void): { sealed: boolean; entries: Model
  * Register the model routes. Called once from router.ts at module load. Splitting this out
  * keeps each surface in its own file while the router stays a thin dispatcher.
  */
-export function registerModelsRoutes(route: RouteFn, ctx: ApiContext): void {
+export function registerModelsRoutes(route: RouteFn, _ctx: ApiContext): void {
 
 // ── GET /api/models ──────────────────────────────────────────────────────────
 
@@ -82,11 +83,14 @@ export function registerModelsRoutes(route: RouteFn, ctx: ApiContext): void {
   });
 
   // ── POST /api/models ─────────────────────────────────────────────────────────
-  // Body: the preset fields (label/provider/model/baseUrl/fallback/group) + optional apiKey.
+  // Body: the preset fields (label/provider/model/baseUrl/selfHosted/fallback/group) + optional apiKey.
 
   route('POST', /^\/api\/models$/, async (req: IncomingMessage) => {
     const body = (await readJsonBody(req)) as Record<string, unknown> | null;
     if (!body || typeof body !== 'object') return { status: 400, body: { error: 'invalid body' } };
+    if (body.selfHosted === true && body.provider !== 'openai') {
+      return { status: 400, body: { error: 'selfHosted is only valid for OpenAI-compatible presets' } };
+    }
 
     // Validate the entry shape via the same schema config.ts uses. Strip any incoming credRef —
     // the caller never sets it; it is minted by the vault migration from the label.

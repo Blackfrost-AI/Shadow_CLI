@@ -37,7 +37,6 @@ async function mount(t: { after: (fn: () => void) => void }) {
   const send = (...c: string[]): void => { for (const x of c) stdin.write(x); };
   const frame = async (): Promise<string> => {
     await new Promise((r) => setTimeout(r, 90));
-    // eslint-disable-next-line no-control-regex
     return (lastFrame() ?? '').replace(/\x1b\[[0-9;]*m/g, '');
   };
   return { send, frame };

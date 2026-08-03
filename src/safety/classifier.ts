@@ -35,7 +35,9 @@ export function shouldUseClassifier(cfg: Pick<ShadowConfig, 'autoClassifier'>): 
  * When provider passed (from loop when autoClassifier), attempts a direct LLM classify for verdict.
  * Safeguard: LLM call uses no-tools prompt, separate from agent loop, short output, timeout.
  */
-export async function classifyToolCall(req: ClassifyRequest & { provider?: any; model?: string }): Promise<ClassifyResult> {
+export async function classifyToolCall(
+  req: ClassifyRequest & { provider?: any; model?: string; temperature?: number },
+): Promise<ClassifyResult> {
   const { call, preview, risk, permissionRules, roots } = req;
 
   if (permissionRules && permissionRules.length > 0) {
@@ -73,7 +75,7 @@ Respond with exactly one line: ALLOW or SOFT_DENY or HARD_DENY | short reason (m
       const ac = new AbortController();
       const t = setTimeout(() => ac.abort(), 8000);
       try {
-        for await (const ev of req.provider.send({ model: req.model, system: 'You are a strict permission classifier for Shadow harness. Use the bash-risk policy and general safety. Only output the classification line.', messages: [{role:'user', content:[{type:'text', text: classifyPrompt}]}], tools: [], maxOutputTokens: 32, signal: ac.signal })) {
+        for await (const ev of req.provider.send({ model: req.model, system: 'You are a strict permission classifier for Shadow harness. Use the bash-risk policy and general safety. Only output the classification line.', messages: [{role:'user', content:[{type:'text', text: classifyPrompt}]}], tools: [], maxOutputTokens: 32, temperature: req.temperature, signal: ac.signal })) {
           if (ev.type === 'text') text += ev.delta;
           if (ev.type === 'done') break;
         }

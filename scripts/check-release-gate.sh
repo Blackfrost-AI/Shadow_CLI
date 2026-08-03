@@ -41,3 +41,73 @@ if hits="$(grep -REn "$PATTERN" "${dirs[@]}" 2>/dev/null)"; then
 fi
 
 echo "release-gate OK: DEV_UNRESTRICTED defaults safe (filesystem jail + OS sandbox ON by default)."
+
+# --- web UI assets must not be stale -----------------------------------------------------
+# src/web/bundledAssets.ts is generated from src/web/ui/. In dev the server prefers the
+# on-disk tree, so a stale map is invisible locally and only shows up in the compiled binary
+# — which serves the map exclusively. Regenerate and fail if the result differs from what is
+# committed.
+if [ -f scripts/check-webui-assets.mjs ]; then
+  if ! node scripts/check-webui-assets.mjs; then
+    echo "RELEASE BLOCKED: embedded web UI assets are stale." >&2
+    exit 1
+  fi
+fi
+
+# --- the packaged Node distribution must match source -----------------------------------
+# package.json publishes dist/, not src/. A green source typecheck is therefore insufficient:
+# stale tracked JavaScript can otherwise ship even though the current TypeScript is correct.
+# The checker snapshots the current dist/, runs the real production build, and compares before
+# versus after. It does not use `git diff`, so unrelated or intentionally uncommitted work does
+# not make the gate impossible to run. The build script itself does not invoke this gate, so this
+# cannot recurse.
+if [ -f scripts/check-dist-fresh.mjs ]; then
+  if ! node scripts/check-dist-fresh.mjs; then
+    exit 1
+  fi
+fi
+
+# --- the test script must run the WHOLE suite ---------------------------------------------
+# npm runs scripts with `sh`, which has no globstar: an UNQUOTED `test/**/*.test.ts` expands to
+# `test/*/*.test.ts`. Today that matches nothing, so the literal reaches node and node's own
+# runner globs it correctly — but the moment any .test.ts lands in a test/ subdirectory, sh
+# matches it and node receives exactly ONE file. Measured: 1 test, exit 0, release looks green
+# while 1078 never ran. Quoting hands the pattern to node deliberately instead of by luck.
+# Checked as INVARIANTS, not as an exact string: the script legitimately grows flags (it gained
+# --test-timeout), and an exact-match gate turns every such change into a false "release blocked".
+if [ -f package.json ]; then
+  TEST_SCRIPT=$(node -p "require('./package.json').scripts.test || ''" 2>/dev/null || echo "")
+  case "$TEST_SCRIPT" in
+    *'"test/**/*.test.ts"'*) : ;;
+    *)
+      echo "RELEASE BLOCKED: package.json test script must QUOTE its glob." >&2
+      echo "  found:    $TEST_SCRIPT" >&2
+      echo "  required: the literal \"test/**/*.test.ts\" (with quotes) somewhere in the script" >&2
+      echo "  unquoted, sh silently collapses the run to a single file and still exits 0." >&2
+      exit 1
+      ;;
+  esac
+  case "$TEST_SCRIPT" in
+    *'"test/**/*.test.tsx"'*) : ;;
+    *)
+      echo "RELEASE BLOCKED: package.json test script omits TSX tests." >&2
+      echo "  found:    $TEST_SCRIPT" >&2
+      echo "  required: the literal \"test/**/*.test.tsx\" (with quotes) somewhere in the script" >&2
+      echo "  otherwise component tests such as composer-render.test.tsx silently never run." >&2
+      exit 1
+      ;;
+  esac
+  # A hung test must FAIL, not wedge the suite forever. Without a timeout, one TUI test awaiting a
+  # promise that can no longer settle blocks the whole run with zero output — indistinguishable
+  # from "still working", and it never reports a failure at all.
+  case "$TEST_SCRIPT" in
+    *--test-timeout=*) : ;;
+    *)
+      echo "RELEASE BLOCKED: package.json test script must set --test-timeout." >&2
+      echo "  found: $TEST_SCRIPT" >&2
+      echo "  a hung test would otherwise stall the suite indefinitely instead of failing." >&2
+      exit 1
+      ;;
+  esac
+  echo "release-gate OK: test script globs all TS + TSX tests (quoted for node, not sh) with a timeout."
+fi

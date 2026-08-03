@@ -95,6 +95,10 @@ export const ModelEntrySchema = z.object({
     .string()
     .optional()
     .transform((v) => normalizeBaseUrl(v)),
+  // Explicit trust marker for a self-hosted OpenAI-compatible endpoint whose public FQDN/IP
+  // cannot be distinguished from a hosted API by URL inspection alone. Local/LAN targets are
+  // detected automatically; this is needed only for remote self-hosted presets.
+  selfHosted: z.boolean().optional(),
   apiKey: z.string().optional(),
   authToken: z.string().optional(),
   /**
@@ -170,6 +174,9 @@ const ConfigSchema = z.object({
     .string()
     .optional()
     .transform((v) => normalizeBaseUrl(v)), // openai-compatible base (sanitized); keys come from env only
+  // Top-level equivalent of a model preset's `selfHosted` marker. Useful when provider/model/baseUrl
+  // are configured directly instead of through `models`; local/LAN endpoints need no marker.
+  selfHosted: z.boolean().optional(),
   // Extra dirs (beyond the workspace) the file tools + sandbox may read/write. Trusted
   // source only (global/env/CLI) — a cloned project must not widen your jail. See --add-dir.
   additionalDirectories: z.array(z.string()).default([]),
@@ -226,6 +233,10 @@ const ConfigSchema = z.object({
   // 400 that the stream layer catches and shrinks-and-retries (see looksLikeTokenOverflow).
   // Override per-machine in ~/.shadow/config.json or with --max-output-tokens (see USER_GUIDE.md).
   maxOutputTokens: z.number().int().positive().default(65536),
+  // Sampling temperature for self-hosted OpenAI-compatible endpoints only. Provider adapters
+  // enforce the trust boundary at send time, so this is never forwarded to Anthropic or an
+  // unmarked public endpoint (including after a live model switch or fallback).
+  temperature: z.number().min(0).max(2).default(1.0),
   // Reasoning depth for adaptive-thinking models (Claude 4.6+/Fable 5). The primary
   // intelligence/latency/cost dial; ignored by models/providers without it.
   effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).default('high'),
@@ -306,7 +317,7 @@ const CONFIG_FILE = 'shadow.config.json';
 // it is currently resolved from flags.offline (not a ConfigSchema key, so zod already strips it
 // from a project file), but if it ever becomes config-settable this keeps a project file from
 // re-enabling egress + MCP for a session. One word now avoids a silent hole later.
-const PROJECT_UNTRUSTED_KEYS = ['baseUrl', 'shellEnvAllowlist', 'autonomy', 'denylistExtra', 'systemPromptPath', 'sandbox', 'sandboxNetwork', 'additionalDirectories', 'projects', 'offline', 'hooks', 'statusLine', 'vision'];
+const PROJECT_UNTRUSTED_KEYS = ['baseUrl', 'selfHosted', 'shellEnvAllowlist', 'autonomy', 'denylistExtra', 'systemPromptPath', 'sandbox', 'sandboxNetwork', 'additionalDirectories', 'projects', 'offline', 'hooks', 'statusLine', 'vision'];
 
 /** Layered precedence: CLI flags > env > project config file (de-fanged) > global > defaults. */
 export function loadConfig(cwd: string, cliOverrides: Record<string, unknown> = {}): ShadowConfig {
@@ -355,7 +366,7 @@ export function loadConfig(cwd: string, cliOverrides: Record<string, unknown> = 
   // `credRef` is in this list for the same reason as `apiKey`: a project file that could name a
   // vault slot would let a cloned repo aim YOUR sealed credential at ITS `baseUrl`. The pointer is
   // not secret, but the ability to choose which secret gets sent is exactly the capability we deny.
-  const PRESET_UNTRUSTED_FIELDS = ['baseUrl', 'apiKey', 'authToken', 'credRef', 'gguf', 'ggufServer', 'ggufArgs', 'ggufPort', 'mlx', 'mlxServer', 'vllm', 'vllmArgs', 'vllmImage'];
+  const PRESET_UNTRUSTED_FIELDS = ['baseUrl', 'selfHosted', 'apiKey', 'authToken', 'credRef', 'gguf', 'ggufServer', 'ggufArgs', 'ggufPort', 'mlx', 'mlxServer', 'vllm', 'vllmArgs', 'vllmImage'];
   if (Array.isArray(fromFile.models)) {
     let redacted = 0;
     for (const m of fromFile.models as Array<Record<string, unknown>>) {

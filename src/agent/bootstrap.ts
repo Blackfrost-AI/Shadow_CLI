@@ -122,6 +122,8 @@ export interface AgentSession {
   activeModelEntry: ModelEntry | undefined;
   startProvider: string;
   startBaseUrl: string | undefined;
+  /** Authoritative sampling classification for the provider created at startup. */
+  startSelfHosted: boolean;
   /**
    * The jail this session was built for — the SAME value that must reach buildLoopDeps. Added so
    * "one source of truth for the jail" is typecheckable rather than conventional: a web turn reads
@@ -137,6 +139,55 @@ export interface AgentSession {
   connectMcp: () => Promise<Array<{ stop(): void }>>;
   /** Build and activate a complete model entry for automatic fallback. */
   activateModel: (entry: ModelEntry) => Promise<{ provider: ReturnType<typeof createProvider>; model: string }>;
+}
+
+/**
+ * Classify the endpoint that will back the startup provider. Local/LAN URLs prove themselves.
+ * Public endpoints require a trusted config marker, and a one-run --base-url override deliberately
+ * discards that marker because it refers to a different endpoint. An explicit preset `false`
+ * clears a stale top-level `true`; an omitted preset marker inherits the top-level declaration.
+ */
+export function resolveStartSelfHosted(input: {
+  provider: string;
+  baseUrl?: string;
+  baseUrlOverridden?: boolean;
+  entrySelfHosted?: boolean;
+  entryBaseUrl?: string;
+  entrySelected?: boolean;
+  configSelfHosted?: boolean;
+}): boolean {
+  if (input.provider !== 'openai') return false;
+  if (isLocalBaseUrl(input.baseUrl)) return true;
+  if (input.baseUrlOverridden) return false;
+
+  // A remembered/picked preset is authoritative, including an omitted marker clearing a stale
+  // top-level true. An automatically matched provider/model entry may contribute its marker only
+  // when its endpoint is the endpoint being used; matching on names alone is not enough because
+  // duplicate presets routinely share both names while targeting cloud and self-hosted servers.
+  let scopedEntryMarker: boolean | undefined;
+  if (input.entrySelected) {
+    scopedEntryMarker = input.entrySelfHosted === true;
+  } else if (sameBaseUrl(input.entryBaseUrl, input.baseUrl)) {
+    scopedEntryMarker = input.entrySelfHosted;
+  }
+  return (scopedEntryMarker ?? input.configSelfHosted) === true;
+}
+
+function sameBaseUrl(a: string | undefined, b: string | undefined): boolean {
+  if (!a || !b) return false;
+  try {
+    const normalize = (value: string): string => {
+      const url = new URL(value);
+      url.hash = '';
+      // Query parameters can select a tenant/backend on an OpenAI-compatible gateway, so they
+      // are part of endpoint identity. Only fragments are safe to ignore (they are never sent).
+      url.pathname = url.pathname.replace(/\/+$/, '') || '/';
+      return url.toString();
+    };
+    return normalize(a) === normalize(b);
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -322,12 +373,22 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     };
   }
 
+  const startSelfHosted = resolveStartSelfHosted({
+    provider: startProvider,
+    baseUrl: startBaseUrl,
+    baseUrlOverridden: flags.baseUrl != null,
+    entrySelfHosted: activeModelEntry?.selfHosted,
+    entryBaseUrl: activeModelEntry?.baseUrl,
+    entrySelected: opts.lastPicked != null,
+    configSelfHosted: cfg.selfHosted,
+  });
   const provider = createProvider({
     provider: startProvider as 'anthropic' | 'openai' | 'mock',
     model: cfg.model,
     apiKey: startApiKey,
     authToken,
     baseUrl: startBaseUrl,
+    selfHosted: startSelfHosted,
   });
 
   const registry = new ToolRegistry();
@@ -390,7 +451,6 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     ({ context } = resumeSession(opts.resumeSessionPath, contextOpts));
     write(`Resumed session ${opts.resumeSessionPath} (${context.messages().length} messages in context).\n`);
     // Background sub-agent recovery note (tasks captured via extended snapshot)
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const recoveredTasks = (context as any)._subAgentTasks || [];
     if (recoveredTasks.length) {
       write(` (recovered ${recoveredTasks.length} sub-agent bg task record(s) from prior snapshot)\n`);
@@ -456,6 +516,7 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
       apiKey,
       authToken: cred.authToken,
       baseUrl,
+      selfHosted: entry.selfHosted,
     });
     return { provider: next, model: entry.model };
   };
@@ -480,6 +541,7 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     activeModelEntry,
     startProvider,
     startBaseUrl,
+    startSelfHosted,
     workspaceRoot,
     additionalRoots,
     connectMcp,

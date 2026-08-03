@@ -6,7 +6,7 @@
 
 > **A true gift of freedom and privacy.**
 > Zero-telemetry · provider-neutral · phone home to no one.
-> Current build: **`v4.1.0`** — sub-agent visibility, transcript & composer correctness.
+> Current build: **`v5.0.0`** — self-hosted sampling controls and a friendlier, release-hardened TUI.
 
 **Shadow is a zero-telemetry, provider-neutral coding agent that runs on your terms.** Point it at any model — Anthropic, any OpenAI-compatible endpoint, Gemini, or a local model on your own box — and it works as a coding / sysadmin agent over your workspace. **No Shadow account, no signup, no phone-home:** the only outbound traffic is the provider *you* chose and the web tools the agent explicitly invokes. Your config stays local and readable (`~/.shadow/config.json`), your keys never leave your machine, and you can switch models mid-session **without losing context**.
 
@@ -16,12 +16,15 @@ Under the hood it's a **tool-calling agentic runtime**: the model reasons, emits
 
 This is **not a chat app** — it is a tool-calling runtime.
 
-## 🔥 What's new in v4.1.0
+## 🔥 What's new in v5.0.0
 
-- **👁 See your sub-agents live.** Running sub-agents now surface in a real-time Turn-HUD (`▸ type · current tool`) so you can follow delegated work instead of guessing whether it's still running.
-- **🔧 Transcript + composer correctness.** Non-recoverable provider errors render once (not twice), and text entry wraps cleanly by terminal column.
+- **🌡 Self-hosted sampling controls.** Set `"temperature"` in `~/.shadow/config.json`; Shadow applies it only to trusted self-hosted OpenAI-compatible endpoints and keeps it away from cloud/native providers.
+- **✨ Friendlier terminal UI.** Clearer provider/model status, safer live config controls, calmer navigation, and opt-in mouse handling make the interface easier to understand without taking over your terminal.
+- **🛡 Release hardening.** Fresh-distribution checks and complete TS/TSX test discovery protect the bytes shipped in every platform binary.
 
 Earlier highlights:
+
+- **v4.1:** See running sub-agents in the Turn-HUD, plus transcript and composer correctness fixes.
 - **🎭 Collaboration Mode — a live model round-table.** `/table gpt glm` seats 2–4 models in **one shared conversation**; you hold the baton and route each turn with `@handle`. Compare reasoning side by side, or let a strong model check a fast one.
 - **📊 Charts, tables & a genuinely beautiful TUI.** Fenced `chart` blocks render as real unicode **bar / line / sparkline** graphs; GFM tables get rounded grids with ledger-aligned numbers; markdown, code, and diffs are calm and readable.
 - **♿ Accessibility, first-class.** A `colorblind` (Okabe–Ito) palette and a `high-contrast` (WCAG-AAA) theme; your prompts carry a `▌` bar and failed tools a `✗` glyph, so meaning never rides on color alone.

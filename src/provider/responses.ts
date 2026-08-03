@@ -13,12 +13,18 @@ import { streamWithRetry } from './stream.js';
 import { buildOpenAIBody, toOpenAIMessages } from './openai.js';
 import { parseToolArgs } from './toolJson.js';
 import { ThinkingSplitter } from '../util/thinkingTags.js';
+import { isLocalBaseUrl } from '../safety/offline.js';
 
 const DEFAULT_BASE_URL = 'https://api.openai.com/v1';
 
 /** Build a Responses API body from a completion request. */
-export function buildResponsesBody(req: CompletionRequest, fallbackModel: string, stream = true): Record<string, unknown> {
-  const chat = buildOpenAIBody(req, fallbackModel, false);
+export function buildResponsesBody(
+  req: CompletionRequest,
+  fallbackModel: string,
+  stream = true,
+  opts: { selfHosted?: boolean } = {},
+): Record<string, unknown> {
+  const chat = buildOpenAIBody(req, fallbackModel, false, opts);
   const input = (chat.messages as unknown[]) ?? toOpenAIMessages(req);
   const body: Record<string, unknown> = {
     model: chat.model ?? fallbackModel,
@@ -39,6 +45,7 @@ export function buildResponsesBody(req: CompletionRequest, fallbackModel: string
   if (chat.max_completion_tokens) body.max_output_tokens = chat.max_completion_tokens;
   else if (chat.max_tokens) body.max_output_tokens = chat.max_tokens;
   if (chat.reasoning_effort) body.reasoning = { effort: chat.reasoning_effort };
+  if (chat.temperature !== undefined) body.temperature = chat.temperature;
   return body;
 }
 
@@ -260,11 +267,13 @@ export class ResponsesProvider implements Provider {
   private readonly apiKey: string | undefined;
   private readonly baseUrl: string;
   private readonly model: string;
+  private readonly selfHosted: boolean;
 
-  constructor(opts: { apiKey?: string; baseUrl?: string; model: string }) {
+  constructor(opts: { apiKey?: string; baseUrl?: string; model: string; selfHosted?: boolean }) {
     this.apiKey = opts.apiKey;
     this.baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
     this.model = opts.model;
+    this.selfHosted = opts.selfHosted === true || isLocalBaseUrl(this.baseUrl);
   }
 
   estimateTokens(messages: import('./provider.js').Message[]): number {
@@ -278,10 +287,10 @@ export class ResponsesProvider implements Provider {
     yield* streamWithRetry({
       url: `${this.baseUrl}/responses`,
       headers,
-      body: buildResponsesBody(req, model, true),
+      body: buildResponsesBody(req, model, true, { selfHosted: this.selfHosted }),
       parse: parseResponsesSSE,
       signal: req.signal,
-      nonStreamBody: buildResponsesBody(req, model, false),
+      nonStreamBody: buildResponsesBody(req, model, false, { selfHosted: this.selfHosted }),
       parseNonStream: eventsFromResponsesCompletion,
     });
   }

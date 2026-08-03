@@ -1,6 +1,6 @@
 import { el, mount } from '../dom.js';
 import { getJson, postJson, putJson, del } from '../api.js';
-import { viewShell, blockHead, reason } from '../parts.js';
+import { viewShell, reason } from '../parts.js';
 
 /**
  * Agents management (the "sub-agent presets" surface). Lists built-ins + custom defs from

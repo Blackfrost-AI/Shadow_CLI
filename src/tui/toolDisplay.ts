@@ -125,7 +125,6 @@ export function displayToolArg(arg: string | undefined, max = 56): string {
 
 /** Noun for a collapse kind + count (`1 file` / `3 files`). */
 export function collapseNoun(kind: CollapseKind, count: number): string {
-  const plural = count === 1 ? '' : 's';
   switch (kind) {
     case 'read':
       return count === 1 ? 'file' : 'files';

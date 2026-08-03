@@ -1,19 +1,26 @@
-# Testing Shadow — RC 0.9.0-dev.1
+# Testing Shadow
 
 Thanks for kicking the tires. Shadow is an agentic CLI: it lets a tool-calling LLM drive
 your local workspace — read/edit files, run shell, search, plan, spawn sub-agents, use MCP.
 
-## Install (current RC)
+## Install the current build
 
-Requires **Node ≥ 20**. `dist/` is prebuilt, so no compile step:
+The normal install is the signed, self-contained binary (no Node runtime required):
 
 ```sh
-npm install --omit=dev        # runtime deps only (~50 pkgs, a few seconds)
-node dist/index.js --help     # or: npm link   →   then just `shadow`
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/Blackfrost-AI/Shadow_CLI/main/install.sh | sh
 ```
 
-> A one-line `curl … | sh` installer (single self-contained binary, no Node required) is
-> planned — for this round, use the npm path above.
+For source testing, use **Node ≥ 20** and build the checkout so `dist/` matches the source under test:
+
+```sh
+npm install
+npm run build
+npm link                      # then run: shadow --help
+```
+
+Windows testers can use the signed PowerShell installer documented in `README.md`.
 
 ## First run
 
@@ -51,18 +58,16 @@ Responses). Cloud frontier models and local Ollama endpoints both work.
 - Multimodal: `/image <path>` to attach an image; or ask the model to call `view_image <path>`
   to load one itself (vision-capable models only).
 
-## Experimental / new this build
+## Suggested focus areas
 
-- **`view_image`** tool (model-loaded images) — new; unit-tested, only lightly live-tested.
-- **Full-auto dropping the sandbox** — new behavior (see Safety).
+- **`view_image`** across different vision-capable providers and image formats.
+- **Full-auto dropping the sandbox** (see Safety), especially on macOS and Linux.
 - **`apply_patch`** (OpenAI/Grok codex patch grammar) + foreign tool-name aliases
   (`shell`/`Bash`/`Read`/… → Shadow's tools).
 
 ## Known issues / caveats
 
-- `view_image` isn't broadly live-validated across vision models yet.
-- The "full autonomy disabled the sandbox" startup notice may not print under some forced
-  dev configs (cosmetic only — the jail/sandbox are still correctly dropped).
+- `view_image` behavior varies with the selected model's actual vision support.
 - Reasoning models: if a turn comes back empty, raise `--max-output-tokens` (the model may have
   spent the whole budget on hidden reasoning).
 

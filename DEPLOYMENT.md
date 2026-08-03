@@ -5,6 +5,8 @@ process — everything here runs against this repository alone, with no private 
 
 **Audience:** contributors and anyone building their own artifacts.
 
+**Current release baseline:** `v5.0.0`.
+
 > **Maintainer note:** the *official* release pipeline (binary hosting, signing keys) is private
 > and intentionally not part of this repo. This guide covers the parts that are.
 
@@ -21,8 +23,8 @@ process — everything here runs against this repository alone, with no private 
 ```bash
 git clone https://github.com/Blackfrost-AI/Shadow_CLI.git && cd Shadow_CLI
 npm ci            # reproducible install from package-lock.json
-npm test          # full suite (>1200 tests) — must be 100% green before any release
-npm run typecheck # strict typecheck
+npm test          # full suite (currently 1,298 tests) — must be 100% green before any release
+npm run typecheck:all # strict source + test typecheck
 npm run lint      # style (0 errors)
 ```
 
@@ -41,6 +43,8 @@ This refuses to proceed if, in shipped code:
 
 - `DEV_UNRESTRICTED` is hard-coded on (the workspace jail + OS sandbox would be silently off),
 - the embedded web UI assets are stale,
+- a checked-in `dist/` differs from a fresh production build (a clean mirror with no `dist/` is
+  built and validated in the same pass),
 - the test script no longer globs the whole suite with a timeout.
 
 `scripts/build-binary.sh` invokes this gate automatically for real builds
@@ -73,8 +77,8 @@ bash scripts/build-binary.sh dist-bin/shadow-windows-x64.exe bun-windows-x64
 
 ## 3. Release checklist
 
-1. Bump `package.json` + write the CHANGELOG entry for the new version.
-2. `npm test` && `npm run typecheck` && `npm run lint` — all green.
+1. Bump `package.json` and `package-lock.json`, then update the README current-build line and release notes.
+2. `npm test` && `npm run typecheck:all` && `npm run lint` — all green.
 3. `npm run check:release-gate` — green.
 4. Build the binaries you intend to distribute and smoke-test `--version` on each.
 5. Commit the release and push.

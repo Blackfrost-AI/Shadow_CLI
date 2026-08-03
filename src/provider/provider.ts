@@ -124,6 +124,8 @@ export interface CompletionRequest {
   messages: Message[];
   tools: ToolSchema[];
   maxOutputTokens: number; // per-call OUTPUT cap (distinct from the budget ceiling)
+  /** Sampling temperature; OpenAI-compatible adapters send it only to self-hosted endpoints. */
+  temperature?: number;
   effort?: Effort; // reasoning depth; providers that lack adaptive thinking ignore it
   cacheTtl?: '5m' | '1h'; // Anthropic prompt-cache TTL for the stable prefix (default 5m)
   fastMode?: boolean; // Anthropic "fast mode" (premium low-latency); ignored elsewhere

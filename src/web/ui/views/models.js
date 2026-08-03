@@ -58,7 +58,10 @@ function render(host) {
     return el('div', { class: `model-row${m.disabled ? ' disabled' : ''}` }, [
       label,
       el('span', { class: 'model-cell-mono' }, [m.model]),
-      el('span', { class: 'model-cell-mono' }, [m.baseUrl ?? '—']),
+      el('span', { class: 'model-cell-mono' }, [
+        m.baseUrl ?? '—',
+        ...(m.selfHosted ? [el('span', { class: 'badge kind-custom', style: 'margin-left:6px' }, ['self-hosted'])] : []),
+      ]),
       el('span', { class: 'muted' }, [m.group ?? '—']),
       cred,
       actions,
@@ -86,6 +89,14 @@ function openAddForm(host) {
   ]);
   const model = field({ placeholder: 'model id — e.g. qwen3-coder-30b' });
   const baseUrl = field({ placeholder: 'base url — e.g. http://127.0.0.1:8080/v1' });
+  const selfHosted = el('input', { type: 'checkbox' });
+  const syncSelfHosted = () => {
+    const supported = provider.value === 'openai';
+    selfHosted.disabled = !supported;
+    if (!supported) selfHosted.checked = false;
+  };
+  provider.onchange = syncSelfHosted;
+  syncSelfHosted();
   const apiKey = field({
     type: 'password',
     placeholder: vaultUnlocked ? 'api key (sealed into the vault, never written to config)' : 'unlock the vault to set a key',
@@ -97,7 +108,18 @@ function openAddForm(host) {
 
   const row = (labelText, control) => el('div', { class: 'row', style: 'max-width:560px' }, [el('label', {}, [labelText]), control]);
   const form = el('div', { class: 'stack', style: 'max-width:560px;gap:12px' }, [
-    row('Label', label), row('Provider', provider), row('Model', model), row('Base URL', baseUrl), row('API key', apiKey),
+    row('Label', label),
+    row('Provider', provider),
+    row('Model', model),
+    row('Base URL', baseUrl),
+    row(
+      'Remote self-host',
+      el('label', { class: 'muted', style: 'display:flex;align-items:center;gap:8px' }, [
+        selfHosted,
+        'Trust this public hostname as self-hosted (local/LAN is automatic)',
+      ]),
+    ),
+    row('API key', apiKey),
     el('div', { class: 'kit-row' }, [saveBtn, cancelBtn]),
     status,
   ]);
@@ -119,7 +141,9 @@ function openAddForm(host) {
     try {
       await postJson('/api/models', {
         label: l, provider: provider.value, model: m,
-        baseUrl: baseUrl.value.trim() || undefined, apiKey: apiKey.value.trim() || undefined,
+        baseUrl: baseUrl.value.trim() || undefined,
+        selfHosted: selfHosted.checked || undefined,
+        apiKey: apiKey.value.trim() || undefined,
       });
       refresh(host);
     } catch (e) {

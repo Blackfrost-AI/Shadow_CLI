@@ -36,6 +36,7 @@ test('parseModelAddArgs validates provider and baseUrl', () => {
     'http://127.0.0.1:8001/v1',
     '--group',
     'Local',
+    '--self-hosted',
   ]);
   assert.equal(parsed.ok, true);
   if (parsed.ok) {
@@ -45,15 +46,23 @@ test('parseModelAddArgs validates provider and baseUrl', () => {
       model: 'local-reasoner',
       baseUrl: 'http://127.0.0.1:8001/v1',
       group: 'Local',
+      selfHosted: true,
     });
   }
   assert.equal(parseModelAddArgs(['add', 'bad', 'bogus', 'm']).ok, false);
   assert.equal(parseModelAddArgs(['add', 'bad-url', 'openai', 'm', 'ftp://example.test']).ok, false);
+  assert.equal(parseModelAddArgs(['add', 'bad-marker', 'anthropic', 'm', '--self-hosted']).ok, false);
 });
 
 test('model preset helpers add, remove, enable, disable, and produce default patch', () => {
   const models: ModelEntry[] = [{ label: 'alpha', provider: 'mock', model: 'm1' }];
-  const added = addModelPreset(models, { label: 'beta', provider: 'openai', model: 'm2', baseUrl: 'https://example.test/v1' });
+  const added = addModelPreset(models, {
+    label: 'beta',
+    provider: 'openai',
+    model: 'm2',
+    baseUrl: 'https://example.test/v1',
+    selfHosted: true,
+  });
   assert.equal(added.ok, true);
   assert.equal(addModelPreset(models, { label: 'ALPHA', provider: 'mock', model: 'm3' }).ok, false);
   assert.equal(removeModelPreset(models, 'missing').ok, false);
@@ -70,6 +79,7 @@ test('model preset helpers add, remove, enable, disable, and produce default pat
     provider: 'openai',
     model: 'm2',
     baseUrl: 'https://example.test/v1',
+    selfHosted: true,
     lastModel: 'beta',
   });
 });

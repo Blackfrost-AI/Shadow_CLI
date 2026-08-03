@@ -76,8 +76,7 @@ test('the headless renderer ignores the `user` event (the terminal echoes input 
   const bus = new EventBus();
   const written: string[] = [];
   const realWrite = process.stdout.write.bind(process.stdout);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  (process.stdout as any).write = (chunk: any, ...rest: any[]) => {
+  (process.stdout as any).write = (chunk: any) => {
     written.push(String(chunk));
     return true;
   };
@@ -87,7 +86,6 @@ test('the headless renderer ignores the `user` event (the terminal echoes input 
     bus.emit({ type: 'user', text: 'this must not be echoed by the renderer' });
   } finally {
     detach();
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (process.stdout as any).write = realWrite;
   }
 

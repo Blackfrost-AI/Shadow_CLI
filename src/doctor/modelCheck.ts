@@ -50,6 +50,7 @@ export interface ModelCheckOptions {
   isLocal?: boolean; // local .gguf endpoint (adds ctx/gpu-layers hints to the recommendation)
   perTurnTimeoutMs?: number; // hard cap per model turn (default 45s — local models are slow)
   maxOutputTokens?: number; // per-turn output cap (default 2048 — room for "thinking" models)
+  temperature?: number; // self-hosted sampling temperature (provider drops it for cloud endpoints)
   maxAutonomousTurns?: number; // iteration cap for the read→edit probe (default 4)
   log?: (msg: string) => void;
 }
@@ -226,6 +227,7 @@ export async function runModelCheck(
         messages: [{ role: 'user', content: [{ type: 'text', text: 'Call the `ping` tool with the message "hello". Use the tool — do not answer in prose.' }] }],
         tools: [PING_TOOL],
         maxOutputTokens: maxTokens,
+        temperature: opts.temperature,
       },
       timeout,
     );
@@ -273,6 +275,7 @@ export async function runModelCheck(
         messages: [{ role: 'user', content: [{ type: 'text', text: 'Create a file named hello.txt containing exactly the text SHADOW_OK (and nothing else). Use the write_file tool.' }] }],
         tools: editTools,
         maxOutputTokens: maxTokens,
+        temperature: opts.temperature,
       },
       timeout,
     );
@@ -304,6 +307,7 @@ export async function runModelCheck(
         messages: [{ role: 'user', content: [{ type: 'text', text: r1prompt }] }],
         tools: [readSchema],
         maxOutputTokens: maxTokens,
+        temperature: opts.temperature,
       },
       timeout,
     );
@@ -328,6 +332,7 @@ export async function runModelCheck(
           ],
           tools: [readSchema, schemaFor(schemas, 'write_file')],
           maxOutputTokens: maxTokens,
+          temperature: opts.temperature,
         },
         timeout,
       );
@@ -355,7 +360,14 @@ export async function runModelCheck(
     for (let turn = 0; turn < maxAuto; turn++) {
       const t = await collectTurn(
         provider,
-        { model: opts.model, system: SYSTEM, messages: convo, tools: autoTools, maxOutputTokens: maxTokens },
+        {
+          model: opts.model,
+          system: SYSTEM,
+          messages: convo,
+          tools: autoTools,
+          maxOutputTokens: maxTokens,
+          temperature: opts.temperature,
+        },
         timeout,
       );
       if (t.timedOut) {

@@ -331,6 +331,7 @@ export interface LocalTestResult {
 export async function testLocalModel(
   entry: ModelEntry,
   log?: (msg: string) => void,
+  temperature = 1.0,
 ): Promise<LocalTestResult> {
   if (!entry.gguf && !entry.mlx && !entry.vllm) return { ok: false, error: `"${entry.label}" is not a locally-served model.` };
   let baseUrl: string;
@@ -363,6 +364,7 @@ export async function testLocalModel(
       messages,
       tools: [],
       maxOutputTokens: 16,
+      temperature,
     })) {
       if (ev.type === 'error') return { ok: false, endpoint: baseUrl, error: `${ev.code}: ${ev.message}` };
       if (ev.type === 'text') reply += ev.delta;

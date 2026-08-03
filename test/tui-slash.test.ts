@@ -6,7 +6,15 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { render } from 'ink-testing-library';
-import { TuiApp, type TuiOpts, applyTheme, paletteSnapshot, runStatusLine, imageMediaType } from '../src/tui.js';
+import {
+  TuiApp,
+  type TuiOpts,
+  applyTheme,
+  paletteSnapshot,
+  runStatusLine,
+  imageMediaType,
+  parseSafeConfig,
+} from '../src/tui.js';
 import { EventBus } from '../src/agent/events.js';
 import { Context } from '../src/agent/context.js';
 import { PlanModeState } from '../src/agent/planMode.js';
@@ -92,6 +100,49 @@ test('selecting a command from the menu executes it (Enter runs /help)', async (
   const out = strip(frames.join('\n'));
   assert.match(out, /Approvals:/, '/help executed and printed its output');
   unmount();
+});
+
+test('/help uses progressive disclosure: overview, keys, then the full catalog', async () => {
+  const { stdin, frames, unmount } = render(React.createElement(TuiApp, { opts: makeOpts() }));
+  await tick();
+
+  stdin.write('/help');
+  await tick();
+  stdin.write('\r');
+  await tick();
+  let out = strip(frames.join('\n'));
+  assert.match(out, /Start here/, 'default help starts with an actionable quick start');
+  assert.match(out, /\/help all/, 'default help points to the exhaustive reference');
+  assert.doesNotMatch(out, /Make Shift\+Enter insert a newline/, 'default help does not dump every command');
+
+  stdin.write('/help keys');
+  await tick();
+  stdin.write('\r');
+  await tick();
+  out = strip(frames.join('\n'));
+  assert.match(out, /Keyboard shortcuts/);
+  assert.match(out, /Ctrl\+R search history/);
+  assert.match(out, /a raise autonomy/, 'approval controls describe their real effect');
+
+  stdin.write('/help all');
+  await tick();
+  stdin.write('\r');
+  await tick();
+  out = strip(frames.join('\n'));
+  assert.match(out, /All commands/);
+  assert.match(out, /\/terminal-setup/, 'the complete catalog remains available on demand');
+  unmount();
+});
+
+test('temperature config validation accepts only the documented inclusive 0..2 range', () => {
+  assert.deepEqual(parseSafeConfig('temperature', '0'), { ok: true, key: 'temperature', value: 0 });
+  assert.deepEqual(parseSafeConfig('temperature', '0.65'), { ok: true, key: 'temperature', value: 0.65 });
+  assert.deepEqual(parseSafeConfig('temperature', '2'), { ok: true, key: 'temperature', value: 2 });
+  for (const raw of ['-0.1', '2.1', 'warm']) {
+    const parsed = parseSafeConfig('temperature', raw);
+    assert.equal(parsed.ok, false, `${raw} is outside the accepted temperature range`);
+    if (!parsed.ok) assert.match(parsed.message, /0 to 2/);
+  }
 });
 
 test('/keybindings renders the binding listing (no longer an alias for /help)', async () => {
@@ -248,6 +299,14 @@ test('/model list and /provider show provider/model management state', async () 
     provider: 'openai',
     model: 'local-reasoner',
     baseUrl: 'http://127.0.0.1:8001/v1',
+    temperature: 0.4,
+    contextBudget: 32_768,
+    effort: 'high',
+    cacheTtl: '5m',
+    maxIterations: 0,
+    autoClassifier: true,
+    fastMode: false,
+    parallelTools: false,
     models: [
       { label: 'Local RED-APEX', provider: 'openai', model: 'local-reasoner', baseUrl: 'http://127.0.0.1:8001/v1' },
       { label: 'Gemini Flash', provider: 'openai', model: 'gemini-2.5-flash', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai', disabled: true },
@@ -270,9 +329,155 @@ test('/model list and /provider show provider/model management state', async () 
   await tick();
   out = strip(frames.join('\n'));
   assert.match(out, /openai\/local-reasoner/);
-  assert.match(out, /endpoint: http:\/\/10\.80\.10\.24:8001\/v1/);
+  assert.match(out, /endpoint: http:\/\/127\.0\.0\.1:8001\/v1/);
+  assert.match(out, /temperature: 0\.4 · self-hosted sampling/);
   assert.match(out, /presets: 2 configured · 1 disabled/);
+
+  stdin.write('/status');
+  await tick();
+  stdin.write('\r');
+  await tick();
+  out = strip(frames.join('\n'));
+  assert.match(out, /temperature 0\.4 · self-hosted only/);
+
+  stdin.write('/config show');
+  await tick();
+  stdin.write('\r');
+  await tick();
+  assert.match(strip(frames.join('\n')), /temperature 0\.4 · self-hosted models only/);
   unmount();
+});
+
+test('/provider uses the runtime local endpoint and cloud status omits the self-hosted temperature', async () => {
+  const localCfg = {
+    provider: 'openai',
+    model: 'managed-local',
+    temperature: 1,
+    contextBudget: 32_768,
+    models: [{ label: 'Managed local', provider: 'openai', model: 'managed-local', gguf: '/models/local.gguf' }],
+  } as unknown as TuiOpts['cfg'];
+  const local = render(
+    React.createElement(TuiApp, {
+      opts: makeOpts({ cfg: localCfg, activeBaseUrl: 'http://127.0.0.1:49152/v1' }),
+    }),
+  );
+  await tick();
+  local.stdin.write('/provider');
+  await tick();
+  local.stdin.write('\r');
+  await tick();
+  const localOut = strip(local.frames.join('\n'));
+  assert.match(localOut, /endpoint: http:\/\/127\.0\.0\.1:49152\/v1/, 'reports the launched server, not a config fallback');
+  assert.match(localOut, /temperature: 1\.0/, 'the documented default stays visibly 1.0');
+  local.unmount();
+
+  const cloudCfg = {
+    provider: 'mock',
+    model: 'cloud-model',
+    temperature: 1.7,
+    contextBudget: 32_768,
+  } as unknown as TuiOpts['cfg'];
+  const cloud = render(React.createElement(TuiApp, { opts: makeOpts({ cfg: cloudCfg }) }));
+  await tick();
+  cloud.stdin.write('/provider');
+  await tick();
+  cloud.stdin.write('\r');
+  await tick();
+  cloud.stdin.write('/status');
+  await tick();
+  cloud.stdin.write('\r');
+  await tick();
+  assert.doesNotMatch(strip(cloud.frames.join('\n')), /temperature/, 'cloud provider/status stay quiet');
+  cloud.unmount();
+});
+
+test('/provider trusts the live endpoint when duplicate presets share a provider and model', async () => {
+  const cfg = {
+    provider: 'openai',
+    model: 'duplicate-model',
+    temperature: 0.6,
+    contextBudget: 32_768,
+    models: [
+      { label: 'Stale local preset', provider: 'openai', model: 'duplicate-model', gguf: '/models/stale.gguf' },
+      { label: 'Active cloud preset', provider: 'openai', model: 'duplicate-model', baseUrl: 'https://api.openai.com/v1' },
+    ],
+  } as unknown as TuiOpts['cfg'];
+  const { stdin, frames, unmount } = render(
+    React.createElement(TuiApp, {
+      opts: makeOpts({ cfg, activeBaseUrl: 'https://api.openai.com/v1' }),
+    }),
+  );
+  await tick();
+  stdin.write('/provider');
+  await tick();
+  stdin.write('\r');
+  await tick();
+  stdin.write('/status');
+  await tick();
+  stdin.write('\r');
+  await tick();
+
+  const out = strip(frames.join('\n'));
+  assert.match(out, /endpoint: https:\/\/api\.openai\.com\/v1/);
+  assert.doesNotMatch(out, /temperature/, 'a stale duplicate local preset cannot relabel the live cloud target');
+  unmount();
+});
+
+test('temperature status accepts an explicit remote OpenAI host but never labels native providers', async () => {
+  const remoteCfg = {
+    provider: 'openai',
+    model: 'remote-local-model',
+    temperature: 0.8,
+    contextBudget: 32_768,
+  } as unknown as TuiOpts['cfg'];
+  const remote = render(
+    React.createElement(TuiApp, {
+      opts: makeOpts({
+        cfg: remoteCfg,
+        activeBaseUrl: 'https://models.example.test/v1',
+        activeSelfHosted: true,
+      }),
+    }),
+  );
+  await tick();
+  remote.stdin.write('/provider');
+  await tick();
+  remote.stdin.write('\r');
+  await tick();
+  assert.match(strip(remote.frames.join('\n')), /temperature: 0\.8/, 'the explicit remote self-hosted marker is visible');
+  remote.unmount();
+
+  const nativeCfg = {
+    provider: 'anthropic',
+    model: 'native-model',
+    baseUrl: 'http://127.0.0.1:8080',
+    temperature: 0.8,
+    contextBudget: 32_768,
+  } as unknown as TuiOpts['cfg'];
+  const native = render(
+    React.createElement(TuiApp, {
+      opts: makeOpts({
+        cfg: nativeCfg,
+        activeBaseUrl: 'http://127.0.0.1:8080',
+        activeSelfHosted: true,
+      }),
+    }),
+  );
+  await tick();
+  native.stdin.write('/provider');
+  await tick();
+  native.stdin.write('\r');
+  await tick();
+  native.stdin.write('/status');
+  await tick();
+  native.stdin.write('\r');
+  await tick();
+  assert.doesNotMatch(
+    strip(native.frames.join('\n')),
+    /temperature/,
+    'native Anthropic never receives or advertises the OpenAI-compatible sampling option',
+  );
+  native.unmount();
 });
 
 test('/skills, /workflows, and /plugins expose extension status', async () => {
@@ -384,6 +589,18 @@ test('argument menu: "/theme " lists themes with descriptions and a ✓ current 
   assert.match(f, /colorblind/, 'theme names are offered');
   assert.match(f, /Okabe/, 'argument rows carry their descriptions');
   assert.match(f, /✓ current/, 'the active value is marked (og — no lastTheme in test cfg)');
+  unmount();
+});
+
+test('argument menu: "/config " offers executable get/set forms instead of dead bare keys', async () => {
+  const { stdin, lastFrame, unmount } = render(React.createElement(TuiApp, { opts: makeOpts() }));
+  await tick();
+  stdin.write('/config ');
+  await tick();
+  const f = strip(lastFrame());
+  assert.match(f, /\/config get temperature/, 'temperature can be inspected directly from completion');
+  assert.match(f, /\/config set temperature/, 'temperature set form is ready for the value');
+  assert.doesNotMatch(f, /^\s*\/config temperature\b/m, 'the old non-runnable bare-key completion is gone');
   unmount();
 });
 

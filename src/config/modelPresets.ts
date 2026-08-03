@@ -67,13 +67,18 @@ export function parseModelAddArgs(tokens: string[]): PresetResult<ModelEntry> {
   const provider = tokens[2] ?? '';
   const model = tokens[3] ?? '';
   if (!label || !provider || !model) {
-    return { ok: false, message: 'Usage: /model add <label> <provider> <model> [baseUrl] [--group <name>]' };
+    return {
+      ok: false,
+      message:
+        'Usage: /model add <label> <provider> <model> [baseUrl] [--group <name>] [--self-hosted]',
+    };
   }
   if (!isModelProvider(provider)) {
     return { ok: false, message: `Provider must be one of: ${PROVIDERS.join(', ')}` };
   }
   let baseUrl: string | undefined;
   let group: string | undefined;
+  let selfHosted = false;
   for (let i = 4; i < tokens.length; i++) {
     const token = tokens[i]!;
     if (token === '--base-url' || token === '--baseUrl') {
@@ -86,6 +91,10 @@ export function parseModelAddArgs(tokens: string[]): PresetResult<ModelEntry> {
       if (!group) return { ok: false, message: 'Missing value after --group.' };
       continue;
     }
+    if (token === '--self-hosted' || token === '--selfHosted') {
+      selfHosted = true;
+      continue;
+    }
     if (!baseUrl) {
       baseUrl = token;
       continue;
@@ -93,7 +102,20 @@ export function parseModelAddArgs(tokens: string[]): PresetResult<ModelEntry> {
     return { ok: false, message: `Unknown /model add argument: ${token}` };
   }
   if (baseUrl && !ensureUrl(baseUrl)) return { ok: false, message: 'baseUrl must be an http(s) URL.' };
-  return { ok: true, value: { label, provider, model, ...(baseUrl ? { baseUrl } : {}), ...(group ? { group } : {}) } };
+  if (selfHosted && provider !== 'openai') {
+    return { ok: false, message: '--self-hosted is only valid for OpenAI-compatible presets.' };
+  }
+  return {
+    ok: true,
+    value: {
+      label,
+      provider,
+      model,
+      ...(baseUrl ? { baseUrl } : {}),
+      ...(group ? { group } : {}),
+      ...(selfHosted ? { selfHosted: true } : {}),
+    },
+  };
 }
 
 export function addModelPreset(models: ModelEntry[], entry: ModelEntry): PresetResult<ModelEntry[]> {
@@ -131,6 +153,8 @@ export function defaultModelPatch(entry: ModelEntry): Record<string, unknown> {
     provider: entry.provider,
     model: entry.model,
     baseUrl: entry.baseUrl,
+    // Include undefined deliberately: choosing a cloud default clears a stale top-level marker.
+    selfHosted: entry.selfHosted,
     lastModel: entry.label,
   };
 }

@@ -22,6 +22,7 @@ import { streamWithRetry } from './stream.js';
 import { eventsFromOpenAICompletion } from './nonStream.js';
 import { parseToolArgs } from './toolJson.js';
 import { ThinkingSplitter } from '../util/thinkingTags.js';
+import { isLocalBaseUrl } from '../safety/offline.js';
 
 const DEFAULT_BASE_URL = 'https://api.openai.com/v1';
 
@@ -30,11 +31,16 @@ export class OpenAIProvider implements Provider {
   private readonly apiKey: string | undefined;
   private readonly baseUrl: string;
   private readonly model: string;
+  private readonly selfHosted: boolean;
 
-  constructor(opts: { apiKey?: string; baseUrl?: string; model: string }) {
+  constructor(opts: { apiKey?: string; baseUrl?: string; model: string; selfHosted?: boolean }) {
     this.apiKey = opts.apiKey;
     this.baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
     this.model = opts.model;
+    // Shadow's existing local-endpoint boundary covers loopback, mDNS and private/LAN IPs.
+    // Keep this decision on the provider instance: it reflects the endpoint actually receiving
+    // the request, including providers created by live model switches and fallback activation.
+    this.selfHosted = opts.selfHosted === true || isLocalBaseUrl(this.baseUrl);
   }
 
   estimateTokens(messages: Message[]): number {
@@ -48,10 +54,10 @@ export class OpenAIProvider implements Provider {
     yield* streamWithRetry({
       url: `${this.baseUrl}/chat/completions`,
       headers,
-      body: buildOpenAIBody(req, model, true),
+      body: buildOpenAIBody(req, model, true, { selfHosted: this.selfHosted }),
       parse: (lines) => parseOpenAISSE(lines, model),
       signal: req.signal,
-      nonStreamBody: buildOpenAIBody(req, model, false),
+      nonStreamBody: buildOpenAIBody(req, model, false, { selfHosted: this.selfHosted }),
       parseNonStream: eventsFromOpenAICompletion,
     });
   }
@@ -230,6 +236,7 @@ export function buildOpenAIBody(
   req: CompletionRequest,
   fallbackModel: string,
   stream = true,
+  opts: { selfHosted?: boolean } = {},
 ): Record<string, unknown> {
   const model = req.model || fallbackModel;
   const body: Record<string, unknown> = {
@@ -249,6 +256,10 @@ export function buildOpenAIBody(
     body.max_tokens = isReasoningModel(model) ? Math.max(req.maxOutputTokens, REASONING_MAX_TOKENS) : req.maxOutputTokens;
     // Grok's reasoning variants accept reasoning_effort (narrow gate — a 400 on non-reasoning grok).
     if (isGrokReasoningModel(model)) body.reasoning_effort = toReasoningEffort(req.effort);
+    // Sampling controls are intentionally a self-hosted-only feature. Public/cloud providers
+    // have model-specific parameter rules (and OpenAI reasoning models reject temperature), so
+    // provider instances must explicitly prove their endpoint is local before this is emitted.
+    if (opts.selfHosted) body.temperature = req.temperature ?? 1.0;
   }
   if (req.tools.length > 0) {
     body.tools = req.tools.map((t) => ({

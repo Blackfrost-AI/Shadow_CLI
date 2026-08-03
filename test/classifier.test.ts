@@ -96,8 +96,10 @@ test('classifyToolCall allows read risk tools', async () => {
 
 // LLM production path test (passes provider for direct classify, no recursion)
 test('classifyToolCall uses LLM path when provider provided (autoClassifier production)', async () => {
+  let seenTemperature: number | undefined;
   const mockProvider = {
-    async *send(_req: any) {
+    async *send(req: any) {
+      seenTemperature = req.temperature;
       yield { type: 'text', delta: 'ALLOW | llm allows for this test case' };
       yield { type: 'done', stopReason: 'end_turn' };
     },
@@ -108,7 +110,9 @@ test('classifyToolCall uses LLM path when provider provided (autoClassifier prod
     risk: 'read',
     provider: mockProvider,
     model: 'mock-llm',
+    temperature: 0.45,
   });
   assert.equal(res.verdict, 'allow');
   assert.match(res.reason, /llm:/);
+  assert.equal(seenTemperature, 0.45, 'local classifier requests preserve configured sampling');
 });

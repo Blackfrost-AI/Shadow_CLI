@@ -31,7 +31,9 @@ export interface OverlayPalette {
 }
 
 function barWidth(cols: number, pageMargin: number): number {
-  return Math.max(24, Math.min(cols - pageMargin * 2 - 1, 74));
+  // Never demand a 24-column panel from a 20-column split pane. The labels truncate honestly;
+  // overflowing past the terminal edge is worse than showing a compact surface.
+  return Math.max(8, Math.min(cols - pageMargin * 2 - 1, 74));
 }
 
 function padBar(s: string, width: number): string {
@@ -120,7 +122,7 @@ export function PendingOverlay({
         ? 'Enter plan mode?'
         : pending.kind === 'plan_exit'
           ? 'Approve plan?'
-          : 'Permission required';
+          : `Permission required · ${pending.risk}`;
 
   return (
     <Box flexDirection="column" paddingLeft={pageMargin} marginTop={1}>
@@ -131,7 +133,9 @@ export function PendingOverlay({
         const label =
           pending.kind === 'user_question'
             ? ` question${pendingQuestionsLength > 1 ? ` ${activeQuestionIndex + 1}/${pendingQuestionsLength}` : ''}: `
-            : ' approve? ';
+            : pending.kind === 'permission'
+              ? ' action: '
+              : ' proposal: ';
         const body =
           pending.kind === 'user_question'
             ? (activeQuestion?.question ?? pending.preview)
@@ -185,14 +189,19 @@ export function PendingOverlay({
                 const isCursor = i === cursor;
                 const isRec = i === rec;
                 const mark = activeQuestion.multiSelect ? (selected ? '✓ ' : '  ') : '';
+                const row = `${isCursor ? '❯' : ' '} ${i + 1}. ${mark}${o.label}${isRec ? '  ★ recommended' : ''}${o.description ? `  — ${o.description}` : ''}`;
                 return (
                   // Keyed by INDEX, not label: a question with two identically-labelled options
                   // (models routinely emit "Yes"/"Yes") produced duplicate React keys, and the two
                   // rows then shared selection state — clicking one highlighted the other.
-                  <Text key={`opt${i}`} wrap="truncate" color={selected ? C.green : isCursor ? C.fg : C.dim} bold={isCursor}>
-                    {`${isCursor ? '❯' : ' '} ${i + 1}. ${mark}${o.label}`}
-                    {isRec ? <Text color={C.yellow}>{'  ★ recommended'}</Text> : ''}
-                    {o.description ? <Text color={C.dim}>{`  — ${o.description}`}</Text> : ''}
+                  <Text
+                    key={`opt${i}`}
+                    wrap="truncate"
+                    backgroundColor={isCursor ? (C.menuSelBg ?? MENU_SEL_BG) : (C.menuBg ?? MENU_BG)}
+                    color={isCursor ? C.fg : selected ? C.green : isRec ? C.yellow : C.dim}
+                    bold={isCursor}
+                  >
+                    {bar(row)}
                   </Text>
                 );
               })}
@@ -203,7 +212,7 @@ export function PendingOverlay({
           );
         })()
       ) : (
-        <Text wrap="truncate" color={C.dim}>{`  [${pending.risk}] ${pending.reason}`}</Text>
+        <Text wrap="truncate" color={C.dim}>{`  Why: ${pending.reason}`}</Text>
       )}
       {pending.kind === 'user_question' && autoAnswerSecs != null ? (
         <Text wrap="truncate" color={C.yellow}>
@@ -217,6 +226,7 @@ export function PendingOverlay({
         {pending.kind === 'user_question' ? (
           <>
             <Text color={C.green}>↑/↓</Text> move{' '}
+            · <Text color={C.cyan}>1–9</Text> jump{' '}
             {activeQuestion?.multiSelect ? (
               <>
                 · <Text color={C.green}>Space</Text> toggle{' '}
@@ -235,22 +245,24 @@ export function PendingOverlay({
           </>
         ) : pending.kind === 'plan_enter' ? (
           <>
-            <Text color={C.green}>(y)</Text>es{'  '}
-            <Text color={C.red}>(n)</Text>o
+            <Text color={C.green}>y</Text> enter plan mode{'  ·  '}
+            <Text color={C.red}>n</Text> keep implementing
           </>
         ) : pending.kind === 'plan_exit' ? (
           <>
-            <Text color={C.green}>(y)</Text>es{'  '}
-            <Text color={C.red}>(n)</Text>o{'  '}
-            <Text color={C.purple}>(a)</Text>lways
+            <Text color={C.green}>y</Text> approve{'  ·  '}
+            <Text color={C.red}>n</Text> keep planning{'  ·  '}
+            <Text color={C.purple}>a</Text> approve + raise mode
           </>
         ) : (
           <>
-            <Text color={C.green}>(y)</Text>es{'  '}
-            <Text color={C.red}>(n)</Text>o{'  '}
-            <Text color={C.cyan}>(s)</Text>ession{'  '}
-            <Text color={C.cyan}>(f)</Text>prefix{'  '}
-            <Text color={C.purple}>(a)</Text>lways
+            <Text color={C.green}>y</Text> once{'  ·  '}
+            <Text color={C.red}>n</Text> deny{'  ·  '}
+            <Text color={C.cyan}>s</Text> tool/session{'  ·  '}
+            {pending.call.name === 'run_shell' ? (
+              <><Text color={C.cyan}>f</Text> shell prefix{'  ·  '}</>
+            ) : null}
+            <Text color={C.purple}>a</Text> raise mode + approve
           </>
         )}
       </Text>
@@ -305,9 +317,8 @@ export function ModelPickerOverlay({
         // Clip AND pad to the bar width (padBar used to do both): a long provider/model must not
         // spill past the shaded rectangle.
         const bodyMax = Math.max(0, BAR_W - 4); // 2 cursor + 2 marker cells
-        const raw = `${e.label.padEnd(14)} ${e.provider}/${e.model}`;
-        const body = raw.length > bodyMax ? raw.slice(0, bodyMax) : raw;
-        const pad = body.length < bodyMax ? ' '.repeat(bodyMax - body.length) : '';
+        const label = padBar(e.label, 14);
+        const body = padBar(`${label} ${e.provider}/${e.model}`, bodyMax);
         return (
           // The ● marker on the ACTIVE model stays green regardless of the cursor row — it is the
           // "this one is in use" signal, not a selection highlight.
@@ -315,7 +326,6 @@ export function ModelPickerOverlay({
             <Text backgroundColor={bg} color={cur ? C.green : C.dim}>{cur ? '❯ ' : '  '}</Text>
             <Text backgroundColor={bg} color={C.green}>{active ? '● ' : '  '}</Text>
             <Text backgroundColor={bg} color={cur ? C.fg : C.dim}>{body}</Text>
-            {pad ? <Text backgroundColor={bg}>{pad}</Text> : null}
           </Text>
         );
       })}
@@ -325,7 +335,7 @@ export function ModelPickerOverlay({
         </Text>
       ) : null}
       <Text wrap="truncate" backgroundColor={C.menuBg ?? MENU_BG} color={C.dim}>
-        {bar(' ↑/↓ select · Enter switch · Esc cancel')}
+        {bar(' ● active · ↑/↓ select · Enter switch · Esc cancel')}
       </Text>
     </Box>
   );

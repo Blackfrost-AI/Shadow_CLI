@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 import { readFileSync, existsSync, unlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { homedir } from 'node:os';
 import { resolve, parse } from 'node:path';
 import { stdout } from 'node:process';
 import {
@@ -16,7 +15,16 @@ import {
 import { vaultExists } from './auth/vault.js';
 import { vaultUnlocked } from './state/globalStore.js';
 import { createProvider } from './provider/index.js';
-import { configuredContextWindow, detectServerContextWindow, ensureLocalServer, stopGgufServers, forceStopGgufServers, ggufServerUp, isLocalServedEntry, MLX_INSTALL_HINT, mlxOfflineReady } from './gguf.js';
+import {
+  configuredContextWindow,
+  detectServerContextWindow,
+  ensureLocalServer,
+  stopGgufServers,
+  forceStopGgufServers,
+  ggufServerUp,
+  isLocalServedEntry,
+  MLX_INSTALL_HINT,
+} from './gguf.js';
 import {
   addLocalModel,
   formatLocalList,
@@ -28,24 +36,12 @@ import {
 } from './local/garage.js';
 import { defaultModelPatch, findModelPreset } from './config/modelPresets.js';
 import type { Message } from './provider/provider.js';
-import { ToolRegistry } from './tools/registry.js';
-import { BgRegistry } from './tools/bgShell.js';
 import { runWebOnboard } from './onboard/webOnboard.js';
 import { runWeb, parseWebArgs } from './web/cli.js';
 import { runLock, CLI_HOLDER } from './web/runLock.js';
 import { updateInstalledBinary } from './update/binary.js';
 import { ensureVaultReady } from './auth/unlock.js';
-import {
-  makeAgentTool,
-  makeAskUserQuestionTool,
-  makeEnterPlanModeTool,
-  makeExitPlanModeTool,
-  makePlanWriteTool,
-  makeScheduleWakeupTool,
-  makeSkillTool,
-  makeToolSearch,
-  registerBuiltinTools,
-} from './tools/index.js';
+import { makeAgentTool, makeScheduleWakeupTool } from './tools/index.js';
 import { registerMcpServers } from './mcp/client.js';
 import {
   disableMcpServer,
@@ -54,8 +50,6 @@ import {
   mcpListLines,
   saveGlobalMcpServers,
 } from './mcp/manage.js';
-import { discoverSkills, skillsIndexBlock } from './skills/loader.js';
-import { WakeupScheduler } from './agent/wakeup.js';
 import { attachBgAgentDelivery } from './agent/busListeners.js';
 import { exportSessionFile } from './state/chatExport.js';
 import { EventBus } from './agent/events.js';
@@ -66,25 +60,15 @@ import { buildLoopDeps } from './agent/loopDeps.js';
 import { createAgentSession } from './agent/bootstrap.js';
 import { raiseAutonomy, type AutonomyLevel } from './safety/permissions.js';
 import { makeDenylist } from './safety/denylist.js';
-import { osSandboxStatus } from './safety/sandbox.js';
-import { evaluateOffline, isLocalBaseUrl, OFFLINE_BANNER } from './safety/offline.js';
 import type { ToolCall } from './provider/provider.js';
 import { Logger } from './util/logger.js';
-import { registerSecret } from './util/redact.js';
 import { lc } from './util/lc.js';
 import { createInterface } from 'node:readline/promises';
 import { AutoApproveGate, AutoDenyGate, type ApprovalGate } from './agent/approval.js';
 import { ReplGate } from './replGate.js';
-import { ProjectMemory } from './state/memory.js';
-import { SessionLog } from './state/session.js';
 import { loadGlobalConfig, saveGlobalConfig, ensureShadowLayout } from './state/globalStore.js';
-import { listResumableSessions, resumeSession } from './state/resume.js';
+import { listResumableSessions } from './state/resume.js';
 import { buildCodexAuthUrl } from './auth/oauth.js';
-import { makeMemoryTool } from './tools/memory.js';
-import { TodoList } from './agent/todo.js';
-import { PlanModeState } from './agent/planMode.js';
-import { buildStyledSystem } from './agent/system.js';
-import { makeTodoTool } from './tools/todo.js';
 import { type OutputStyle } from './styles.js';
 import { runDoctor, formatDoctorReport } from './doctor.js';
 import { runModelCheck, formatModelCheckReport } from './doctor/modelCheck.js';
@@ -93,7 +77,6 @@ import { DEV_UNRESTRICTED, resolveUnrestricted } from './buildProfile.js';
 import { runTui, attachRenderer } from './tui.js';
 import { runOnboard } from './onboard/onboard.js';
 import { INSTALL_DIR } from './installDir.js';
-import { resolveSystem } from './system/resolveSystem.js';
 import { runHookPhase } from './hooks/runner.js';
 import { parseArgs } from './cli/flags.js';
 
@@ -531,7 +514,11 @@ async function runLocal(args: string[]): Promise<void> {
       return;
     }
     stdout.write(lc.gray(`Testing "${entry.label}" — starting local server…`) + '\n');
-    const res = await testLocalModel(entry, (m) => stdout.write(lc.gray(`  ${m}`) + '\n'));
+    const res = await testLocalModel(
+      entry,
+      (m) => stdout.write(lc.gray(`  ${m}`) + '\n'),
+      cfg.temperature,
+    );
     await stopGgufServers(); // tear down the server we started for the one-shot test
     if (res.ok) {
       stdout.write(lc.green(`✓ PASS — ${entry.label}`) + '\n');
@@ -620,7 +607,16 @@ async function runDoctorModel(name: string | undefined, cwd: string): Promise<vo
 
   let probeProvider;
   try {
-    probeProvider = createProvider({ provider: startProvider, model, apiKey, authToken, baseUrl });
+    probeProvider = createProvider({
+      provider: startProvider,
+      model,
+      apiKey,
+      authToken,
+      baseUrl,
+      // A named remote preset must opt in itself. The top-level marker applies only when no
+      // preset owns this diagnostic target, so testing a cloud preset cannot inherit it.
+      selfHosted: entry?.selfHosted ?? (!entry ? cfg.selfHosted : undefined),
+    });
   } catch (e) {
     process.stderr.write(lc.red(`✗ ${(e as Error).message}`) + '\n');
     process.exitCode = 1;
@@ -632,6 +628,7 @@ async function runDoctorModel(name: string | undefined, cwd: string): Promise<vo
     model,
     providerName: startProvider,
     isLocal,
+    temperature: cfg.temperature,
     log: (m) => stdout.write(lc.gray(`  ${m}`) + '\n'),
   });
   if (entry?.gguf) await stopGgufServers(); // tear down the server we spun up for the probe
@@ -823,7 +820,17 @@ async function main(): Promise<void> {
     !flags.model && !flags.provider && !process.env.SHADOW_MODEL && !process.env.SHADOW_PROVIDER && cfg.lastModel
       ? cfg.models.find((m) => m.label === cfg.lastModel)
       : undefined;
-  if (lastPicked) cfg = { ...cfg, provider: lastPicked.provider, model: lastPicked.model, baseUrl: lastPicked.baseUrl };
+  if (lastPicked) {
+    cfg = {
+      ...cfg,
+      provider: lastPicked.provider,
+      model: lastPicked.model,
+      baseUrl: lastPicked.baseUrl,
+      // Scope the top-level marker to the direct top-level target. A remembered cloud preset
+      // must not inherit `selfHosted: true` from a different endpoint.
+      selfHosted: lastPicked.selfHosted,
+    };
+  }
 
   const log = new Logger(cfg.logLevel);
 
@@ -1360,6 +1367,8 @@ async function main(): Promise<void> {
   try {
     await runTui({
       provider,
+      activeBaseUrl: session.startBaseUrl,
+      activeSelfHosted: session.startSelfHosted,
       registry,
       bus,
       context,

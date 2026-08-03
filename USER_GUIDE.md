@@ -6,6 +6,7 @@ instructions, and security model, see the [README](README.md); this guide is the
 - [Install & update](#install--update)
 - [Connect a model](#connect-a-model)
 - [Output length (`maxOutputTokens`)](#output-length-maxoutputtokens)
+- [Self-hosted model temperature](#self-hosted-model-temperature)
 - [Reasoning effort](#reasoning-effort)
 - [Autonomy & safety](#autonomy--safety)
 - [Everyday use](#everyday-use)
@@ -125,6 +126,46 @@ Check the current value any time with **`/config get maxOutputTokens`**.
 
 ---
 
+## Self-hosted model temperature
+
+Set the sampling temperature for locally hosted OpenAI-compatible models in
+`~/.shadow/config.json`:
+
+```json
+{
+  "temperature": 0.7
+}
+```
+
+The default is `1.0`; valid values are `0` through `2`. Lower values make output more
+deterministic, while higher values increase variation.
+
+Shadow sends this setting only when the resolved model endpoint is self-hosted on loopback,
+`.local`, or a private/LAN IP (including Shadow-managed GGUF, MLX, and vLLM servers). It is omitted
+from Anthropic, OpenAI, and other public cloud requests, including after a model switch or fallback.
+OpenAI GPT-5/o-series reasoning requests omit it as well because that request family rejects
+`temperature`.
+
+If your self-hosted server has a public hostname or IP, Shadow cannot safely distinguish it from a
+hosted API by URL alone. Mark that trusted endpoint explicitly alongside its `baseUrl`:
+
+```json
+{
+  "provider": "openai",
+  "model": "my-model",
+  "baseUrl": "https://models.example.net/v1",
+  "selfHosted": true,
+  "temperature": 0.7
+}
+```
+
+The same optional `"selfHosted": true` marker can be placed on an entry in `models`. Never set it
+on a public cloud preset; local/LAN endpoints are detected automatically and do not need it. The
+equivalent TUI command is `/model add <label> openai <model> <baseUrl> --self-hosted`; the web model
+form exposes the same choice as **Remote self-host**.
+
+---
+
 ## Reasoning effort
 
 `effort` controls how hard reasoning-capable models think: `low · medium · high · xhigh · max`.
@@ -151,8 +192,10 @@ Shadow gates tool calls by autonomy level (cycle live with **Shift+Tab**):
 | `full` | auto-approve everything **except** the catastrophic-command denylist |
 
 A catastrophic shell command (`rm -rf /`, `mkfs`, `dd of=/dev/…`, fork bombs, …) always triggers a
-confirmation — even at `full`. `--yolo` drops *all* checks including the denylist; use it only in a
-sandbox you don't mind losing. Outside `--yolo`/`full`, file writes stay inside the workspace (the jail).
+confirmation — even at `full`. Launching with `--autonomy full` drops the filesystem jail and OS
+sandbox but keeps that denylist; switching to `full` mid-session changes approvals without widening
+the launch sandbox. `--yolo` drops *all* checks including the denylist; use it only in a sandbox you
+don't mind losing.
 
 ---
 
@@ -160,8 +203,8 @@ sandbox you don't mind losing. Outside `--yolo`/`full`, file writes stay inside 
 
 - **`/help`** lists every slash command; **`/model`**, **`/effort`**, **`/theme`**, **`/context`**,
   **`/copy`**, **`/export`**, **`/resume`**, **`/mcp`** are the common ones.
-- **Ctrl-O** expands a collapsed reasoning / tool-output block; **PageUp/PageDown** or the mouse wheel
-  scroll the transcript.
+- **Ctrl-O** expands a collapsed reasoning / tool-output block; **PageUp/PageDown** scroll the
+  transcript. Mouse input is opt-in with `"mouse": true` or `SHADOW_MOUSE=1`.
 - **Copy & paste**: paste multi-line text straight into the composer (it inserts atomically — newlines
   never fire a send); **Ctrl-V** pastes from the system clipboard explicitly; **Alt-C** (or `/copy`)
   copies the last answer, **`/copy code`** just its last fenced code block. Huge pastes condense to a
@@ -183,11 +226,11 @@ sandbox you don't mind losing. Outside `--yolo`/`full`, file writes stay inside 
 | Key | Meaning |
 |---|---|
 | `provider` / `model` | the active provider + model id |
-| `models[]` | your `/model` picker presets (each may carry its own `baseUrl` / `apiKey`) |
+| `models[]` | your `/model` picker presets (each may carry `baseUrl`, `apiKey`, and remote `selfHosted`) |
 | `maxOutputTokens` | per-call output cap (default `65536`) |
+| `temperature` | self-hosted model sampling temperature, `0`–`2` (default `1.0`; omitted from unmarked cloud APIs) |
 | `effort` | reasoning effort (default `high`) |
 | `autonomy` | default autonomy level (default `auto-edit`) |
-| `renderer` | `stock` (native scrollback, default) or `cell` (owned viewport) |
 | `lastTheme` | color theme |
 | `mcpServers` | MCP servers to auto-connect |
 | `updateCheck` | opt-in update notice (default `false`) — see below |
@@ -232,10 +275,11 @@ still see it, run `shadow update`, or check `~/.shadow/config.json` for a `baseU
 quotes and fix or delete it.
 
 **Web search / fetch fails.** Make sure you're not in `--offline` mode (which drops the web tools by
-design), and that you're on a build ≥ `v1.0.0-rc.2`.
+design), and update to the current build before troubleshooting an older installation.
 
-**Composer jumps / can't scroll with the mouse.** Set `"renderer": "stock"` in your config (native
-scrollback). `cell` is the pinned alt-screen viewport (PageUp/PageDown only).
+**Can't scroll with the mouse.** Mouse tracking is off by default so Shadow does not take over normal
+terminal selection. Use PageUp/PageDown, or opt in with `"mouse": true` in config (or
+`SHADOW_MOUSE=1` for one run).
 
 **Text looks too dim / low-contrast.** Update — recent builds use a WCAG-AA palette with white primary
 text and a readable secondary gray.
