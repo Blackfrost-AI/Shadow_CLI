@@ -32,6 +32,7 @@ export class OpenAIProvider implements Provider {
   private readonly baseUrl: string;
   private readonly model: string;
   private readonly selfHosted: boolean;
+  private readonly dashScope: boolean;
 
   constructor(opts: { apiKey?: string; baseUrl?: string; model: string; selfHosted?: boolean }) {
     this.apiKey = opts.apiKey;
@@ -41,6 +42,7 @@ export class OpenAIProvider implements Provider {
     // Keep this decision on the provider instance: it reflects the endpoint actually receiving
     // the request, including providers created by live model switches and fallback activation.
     this.selfHosted = opts.selfHosted === true || isLocalBaseUrl(this.baseUrl);
+    this.dashScope = isDashScopeBaseUrl(this.baseUrl);
   }
 
   estimateTokens(messages: Message[]): number {
@@ -49,16 +51,17 @@ export class OpenAIProvider implements Provider {
 
   async *send(req: CompletionRequest): AsyncIterable<ProviderEvent> {
     const model = req.model || this.model;
+    const preserveQwenReasoning = this.dashScope && isQwen38MaxModel(model);
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     if (this.apiKey) headers.Authorization = `Bearer ${this.apiKey}`;
     yield* streamWithRetry({
       url: `${this.baseUrl}/chat/completions`,
       headers,
-      body: buildOpenAIBody(req, model, true, { selfHosted: this.selfHosted }),
-      parse: (lines) => parseOpenAISSE(lines, model),
+      body: buildOpenAIBody(req, model, true, { selfHosted: this.selfHosted, dashScope: this.dashScope }),
+      parse: (lines) => parseOpenAISSE(lines, model, preserveQwenReasoning),
       signal: req.signal,
-      nonStreamBody: buildOpenAIBody(req, model, false, { selfHosted: this.selfHosted }),
-      parseNonStream: eventsFromOpenAICompletion,
+      nonStreamBody: buildOpenAIBody(req, model, false, { selfHosted: this.selfHosted, dashScope: this.dashScope }),
+      parseNonStream: (obj) => eventsFromOpenAICompletion(obj, model, preserveQwenReasoning),
     });
   }
 }
@@ -72,6 +75,8 @@ type OAIMessage =
   | {
       role: 'assistant';
       content: string | null;
+      reasoning_content?: string;
+      reasoning?: string;
       tool_calls?: {
         id: string;
         type: 'function';
@@ -100,7 +105,11 @@ export function escapeMultimodalControlTokens(text: string): string {
 }
 
 /** Map the provider-neutral Message[] into OpenAI chat messages. */
-export function toOpenAIMessages(req: CompletionRequest): OAIMessage[] {
+export function toOpenAIMessages(
+  req: CompletionRequest,
+  activeModel = req.model,
+  opts: { preserveProviderReasoning?: boolean } = {},
+): OAIMessage[] {
   const clean = escapeMultimodalControlTokens;
   const out: OAIMessage[] = [{ role: 'system', content: clean(req.system) }];
 
@@ -126,8 +135,21 @@ export function toOpenAIMessages(req: CompletionRequest): OAIMessage[] {
           });
         }
       }
-      if (toolCalls.length > 0) out.push({ role: 'assistant', content: text || null, tool_calls: toolCalls });
-      else out.push({ role: 'assistant', content: text });
+      const assistant: Extract<OAIMessage, { role: 'assistant' }> =
+        toolCalls.length > 0
+          ? { role: 'assistant', content: text || null, tool_calls: toolCalls }
+          : { role: 'assistant', content: text };
+      // Qwen 3.8 preserved thinking is message-level wire state. Replay it only to the exact
+      // model that produced it AND only when the active endpoint advertises that contract. This
+      // prevents a switch to a local/proxy preset with the same model id from receiving a
+      // DashScope-only field. Do not run it through `clean`: the provider contract requires the
+      // history byte-for-byte.
+      const reasoning = m.providerReasoning;
+      if (opts.preserveProviderReasoning && reasoning?.text && reasoning.model === activeModel) {
+        if (reasoning.field === 'reasoning') assistant.reasoning = reasoning.text;
+        else assistant.reasoning_content = reasoning.text;
+      }
+      out.push(assistant);
     } else {
       // role 'user' or 'tool'. Each tool_result becomes its own tool message;
       // text + images become a single user message. (OpenAI cannot batch tool results.)
@@ -160,6 +182,9 @@ export function toOpenAIMessages(req: CompletionRequest): OAIMessage[] {
  *  stream layer catches that 400 and shrinks max_tokens on retry (see looksLikeTokenOverflow), so the
  *  floor stays generous without making small-window models fail on their first turn. */
 const REASONING_MAX_TOKENS = 64_000;
+/** Qwen 3.8 Max maps its highest reasoning tier to a 262,144-token thinking budget. A 64k cap
+ *  can therefore end before visible content; this remains a ceiling, not a generation target. */
+const QWEN38_MAX_TOKENS = 262_144;
 
 /**
  * OpenAI reasoning models (GPT-5 family, o-series) reject `max_tokens` and `temperature`
@@ -204,6 +229,35 @@ export function isQwenReasoner(model: string): boolean {
   return /\bqwq\b/i.test(model) || /qwen[\w.-]*think/i.test(model);
 }
 
+/** Any announced Qwen 3.8 id, including vendor-prefixed future open-weight variants. */
+export function isQwen38Model(model: string): boolean {
+  // A hyphen between 3 and 8 means parameter count in established ids (`Qwen3-8B`,
+  // `Qwen3-80B`), not version 3.8. Require a real minor-version separator and a boundary.
+  return /qwen[^\s]*3[._]8(?=$|[/_.-])/i.test(model);
+}
+
+/** Hosted DashScope Qwen 3.8 Max variants with a documented adaptive-reasoning contract. */
+export function isQwen38MaxModel(model: string): boolean {
+  return isQwen38Model(model) && /3[._]8[._-]?max(?:$|[/_.-])/i.test(model);
+}
+
+/** DashScope's public and workspace-scoped OpenAI-compatible endpoints. */
+export function isDashScopeBaseUrl(baseUrl: string): boolean {
+  try {
+    const u = new URL(baseUrl);
+    return u.protocol === 'https:' && (!u.port || u.port === '443') &&
+      (/^dashscope(?:-[a-z0-9-]+)?\.aliyuncs\.com$/i.test(u.hostname) || u.hostname.endsWith('.maas.aliyuncs.com')) &&
+      /\/compatible-mode\/v1\/?$/i.test(u.pathname);
+  } catch {
+    return false;
+  }
+}
+
+/** Qwen 3.8 Max accepts low/medium/xhigh; Shadow's high/max aliases map to its maximum tier. */
+export function toQwen38ReasoningEffort(effort: Effort | undefined): 'low' | 'medium' | 'xhigh' {
+  return effort === 'low' ? 'low' : effort === 'medium' ? 'medium' : 'xhigh';
+}
+
 /**
  * Models that emit their reasoning INLINE in `content` as `<think>…</think>`, rather than on a
  * separate `reasoning_content` field.
@@ -236,19 +290,30 @@ export function buildOpenAIBody(
   req: CompletionRequest,
   fallbackModel: string,
   stream = true,
-  opts: { selfHosted?: boolean } = {},
+  opts: { selfHosted?: boolean; dashScope?: boolean } = {},
 ): Record<string, unknown> {
   const model = req.model || fallbackModel;
+  // Model names alone are not capabilities: a local/proxy server may expose the same alias but
+  // support only ordinary Chat Completions. Activate this contract only on verified DashScope.
+  const dashScopeQwen38Max = opts.dashScope === true && isQwen38MaxModel(model);
   const body: Record<string, unknown> = {
     model,
-    messages: toOpenAIMessages(req),
+    messages: toOpenAIMessages(req, model, { preserveProviderReasoning: dashScopeQwen38Max }),
     stream,
   };
   if (stream) body.stream_options = { include_usage: true };
-  if (isOpenAIReasoningModel(model)) {
+  if (isOpenAIReasoningModel(model) || dashScopeQwen38Max) {
     // GPT-5/o-series reject `max_tokens` (use max_completion_tokens); the cap is reasoning+answer.
-    body.max_completion_tokens = Math.max(req.maxOutputTokens, REASONING_MAX_TOKENS);
-    body.reasoning_effort = toReasoningEffort(req.effort);
+    body.max_completion_tokens = Math.max(
+      req.maxOutputTokens,
+      dashScopeQwen38Max ? QWEN38_MAX_TOKENS : REASONING_MAX_TOKENS,
+    );
+    if (dashScopeQwen38Max) {
+      body.reasoning_effort = toQwen38ReasoningEffort(req.effort);
+      body.preserve_thinking = true;
+    } else {
+      body.reasoning_effort = toReasoningEffort(req.effort);
+    }
   } else {
     // Every other reasoning family (Gemini, Grok, DeepSeek-R1, Qwen-QwQ) takes `max_tokens` and
     // gets the SAME floor — one check, so a new reasoner can't silently run out. Non-reasoning
@@ -318,6 +383,7 @@ function findKeyById(calls: Map<string, OAICallState>, id: string): string | und
 export async function* parseOpenAISSE(
   lines: AsyncIterable<string>,
   model = '',
+  preserveQwenReasoning = false,
 ): AsyncIterable<ProviderEvent> {
   let inputTokens = 0;
   let outputTokens = 0;
@@ -345,6 +411,8 @@ export async function* parseOpenAISSE(
    * non-stream fallback could not help: it only fires when the parse THROWS, and this never throws.
    */
   let sawDataFrame = false;
+  let preservedReasoning = '';
+  let preservedReasoningField: 'reasoning_content' | 'reasoning' | undefined;
   /** Bounded copy of a non-SSE body so we can still recover the turn from it. */
   const rawBody: string[] = [];
   let rawBodyBytes = 0;
@@ -394,8 +462,19 @@ export async function* parseOpenAISSE(
     if (!choice) continue;
     const delta = choice.delta;
     // Separate reasoning field (DeepSeek `reasoning_content`, some `reasoning`) → reasoning channel.
-    const reasoning = delta?.reasoning_content ?? delta?.reasoning;
-    if (typeof reasoning === 'string' && reasoning) yield { type: 'thinking', delta: reasoning };
+    const reasoningField = typeof delta?.reasoning_content === 'string'
+      ? 'reasoning_content'
+      : typeof delta?.reasoning === 'string'
+        ? 'reasoning'
+        : undefined;
+    const reasoning = reasoningField ? delta?.[reasoningField] : undefined;
+    if (typeof reasoning === 'string' && reasoning) {
+      yield { type: 'thinking', delta: reasoning };
+      if (preserveQwenReasoning && isQwen38MaxModel(model)) {
+        preservedReasoning += reasoning;
+        preservedReasoningField ??= reasoningField;
+      }
+    }
     // Inline <think>/<thinking> spans in the content are split out to the same channel.
     if (delta?.content) {
       if (!splitInline) {
@@ -504,7 +583,7 @@ export async function* parseOpenAISSE(
         // the same generator the non-stream path uses, so the two agree exactly. It emits its own
         // usage + done, so return immediately after.
         let produced = false;
-        for (const ev of eventsFromOpenAICompletion(parsed)) {
+        for (const ev of eventsFromOpenAICompletion(parsed, model, preserveQwenReasoning)) {
           produced = true;
           yield ev;
         }
@@ -524,6 +603,10 @@ export async function* parseOpenAISSE(
     yield { type: 'usage', inputTokens, outputTokens, cacheReadTokens };
     yield { type: 'done', stopReason };
     return;
+  }
+
+  if (preservedReasoning && preservedReasoningField) {
+    yield { type: 'reasoning_block', text: preservedReasoning, field: preservedReasoningField };
   }
 
   // Some servers omit finish_reason:'tool_calls'; infer it from emitted calls.

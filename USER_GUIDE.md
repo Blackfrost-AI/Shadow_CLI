@@ -5,6 +5,7 @@ instructions, and security model, see the [README](README.md); this guide is the
 
 - [Install & update](#install--update)
 - [Connect a model](#connect-a-model)
+- [Qwen 3.8: hosted or self-hosted](#qwen-38-hosted-or-self-hosted)
 - [Output length (`maxOutputTokens`)](#output-length-maxoutputtokens)
 - [Self-hosted model temperature](#self-hosted-model-temperature)
 - [Reasoning effort](#reasoning-effort)
@@ -58,6 +59,36 @@ To add a preset without the wizard:
 Silicon an MLX folder / `mlx-community/<model>` repo id (one-time HuggingFace download, then fully
 local). Then `shadow local test <name>` and `shadow local use <name>` — Shadow launches and manages
 the server itself.
+
+---
+
+## Qwen 3.8: hosted or self-hosted
+
+For hosted Qwen, run `shadow onboard`, choose **Cloud**, then **Alibaba Qwen (DashScope)**. The
+wizard starts with `qwen3.8-max` and the official OpenAI-compatible endpoint; you can edit the model
+ID before the connection test.
+
+For the forthcoming open-weight release, use the exact served model ID published with the weights —
+Shadow does not maintain an allowlist or rewrite it:
+
+```text
+/model add "Qwen 3.8 local" openai <official-served-model-id> http://127.0.0.1:8000/v1 --self-hosted
+/model test "Qwen 3.8 local"
+/config set temperature 0.7
+```
+
+Replace the URL with your llama.cpp, vLLM, SGLang, Ollama, or other OpenAI-compatible server. A
+loopback/LAN URL is recognized as self-hosted automatically; retain `--self-hosted` for clarity, and
+use it whenever your own server has a public hostname. The global `temperature` setting defaults to
+`1.0` and is sent only to endpoints Shadow has proved or you have marked as self-hosted.
+
+Qwen model IDs pass through unchanged rather than being allowlisted. Shadow parses both
+`reasoning_content` and newer `reasoning` streams and handles native as well as Qwen/Hermes XML
+tool calls. On a verified DashScope endpoint, Qwen 3.8 Max additionally uses the documented
+`max_completion_tokens`, adaptive reasoning-effort, and preserved-thinking contract; its historical
+reasoning stays separate from visible content and is sent back on later turns. That preserved
+reasoning counts toward input tokens and billing. Unknown open-weight variants remain
+capability-neutral until their server documents its actual wire behavior.
 
 ---
 

@@ -82,6 +82,23 @@ export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 export interface Message {
   role: Role;
   content: ContentBlock[]; // never a bare string internally
+  /**
+   * Structured reasoning emitted by an OpenAI-compatible endpoint and required again on the
+   * next request by a small number of models (notably Qwen 3.8). This deliberately lives beside
+   * `content`: Qwen's wire contract says historical reasoning must remain in the original
+   * `reasoning_content`/`reasoning` field, not be concatenated into visible assistant text.
+   *
+   * The producing model is stamped so a live model switch never replays another model's private
+   * wire state. Most providers ignore this property; the OpenAI-compatible adapter renders it only
+   * when the active endpoint has the corresponding preserved-thinking capability.
+   */
+  providerReasoning?: {
+    text: string;
+    field: 'reasoning_content' | 'reasoning';
+    model: string;
+  };
+  /** A partial assistant turn retained for resume/export after interruption or stream failure. */
+  interrupted?: boolean;
 }
 
 export interface ToolCall {
@@ -104,6 +121,7 @@ export type StopReason = 'end_turn' | 'tool_use' | 'max_tokens' | 'pause_turn';
 export type ProviderEvent =
   | { type: 'text'; delta: string }
   | { type: 'thinking'; delta: string } // streamed reasoning text (display)
+  | { type: 'reasoning_block'; text: string; field: 'reasoning_content' | 'reasoning' } // complete OpenAI-compat reasoning (echo-back)
   | { type: 'thinking_block'; thinking: string; signature: string } // complete block (echo-back)
   | { type: 'redacted_thinking_block'; data: string } // encrypted reasoning to echo back verbatim
   | { type: 'tool_call_partial'; id: string; name: string; jsonDelta: string }
@@ -185,6 +203,7 @@ export function toolUsesOf(blocks: ContentBlock[]): ToolUseBlock[] {
 export function estimateTokensFromMessages(messages: Message[]): number {
   let chars = 0;
   for (const m of messages) {
+    if (m.providerReasoning) chars += m.providerReasoning.text.length;
     for (const b of m.content) {
       if (b.type === 'text') chars += b.text.length;
       else if (b.type === 'thinking') chars += b.thinking.length;

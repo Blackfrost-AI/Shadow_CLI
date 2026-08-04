@@ -14,6 +14,7 @@ import { looksAnthropicDistilled, toAnthropicBaseUrl } from '../util/transport.j
 import { normalizeBaseUrl } from '../config.js';
 import type { Message } from '../provider/provider.js';
 import { registerSecret, redactString } from '../util/redact.js';
+import { persistOnboardTarget } from './persistTarget.js';
 
 const ESC = '\x1b[';
 const c = {
@@ -101,6 +102,7 @@ type SetupStep =
   | 'provider'
   | 'ggufPath'
   | 'customCompatibility'
+  | 'customSelfHosted'
   | 'customBaseUrl'
   | 'customSecret'
   | 'localBaseUrl'
@@ -118,6 +120,26 @@ interface DraftSetup {
   apiKey?: string;
   authToken?: string;
   model?: string;
+  /** Explicit trust marker for a public remote OpenAI-compatible server. */
+  selfHosted?: boolean;
+}
+
+/** Persist the terminal wizard's target, including removal of a stale endpoint trust marker.
+ * Exported so persistence behavior can be regression-tested without driving process stdin. */
+export function persistTerminalOnboardTarget(input: {
+  adapter: ProviderName;
+  model: string;
+  baseUrl?: string;
+  customEndpoint: boolean;
+  selfHosted?: boolean;
+}): void {
+  persistOnboardTarget({
+    provider: input.adapter,
+    model: input.model,
+    baseUrl: input.baseUrl,
+    customEndpoint: input.customEndpoint,
+    selfHosted: input.selfHosted,
+  });
 }
 
 function controlAnswer(raw: string): typeof BACK | typeof QUIT | null {
@@ -362,6 +384,7 @@ export async function runOnboard(): Promise<boolean> {
           draft.apiKey = undefined;
           draft.authToken = undefined;
           draft.model = undefined;
+          draft.selfHosted = undefined;
           step = preset.kind === 'custom' ? 'customCompatibility' : preset.kind === 'local' ? 'localBaseUrl' : 'cloudSecret';
           break;
         }
@@ -379,6 +402,28 @@ export async function runOnboard(): Promise<boolean> {
             break;
           }
           draft.adapter = value === 'anthropic' ? 'anthropic' : 'openai';
+          // Native Anthropic requests never use OpenAI self-host-only sampling fields.
+          draft.selfHosted = false;
+          step = draft.adapter === 'openai' ? 'customSelfHosted' : 'customBaseUrl';
+          break;
+        }
+
+        case 'customSelfHosted': {
+          const answer = await askText(
+            rl,
+            `Is this OpenAI-compatible endpoint self-hosted? ${c.gray('(enables self-hosted sampling) [y/N]')} ${backHint()}: `,
+          );
+          if (answer === QUIT) return false;
+          if (answer === BACK) {
+            step = 'customCompatibility';
+            break;
+          }
+          const value = answer.toLowerCase();
+          if (value && value !== 'y' && value !== 'yes' && value !== 'n' && value !== 'no') {
+            stdout.write(c.red('Choose yes or no.\n'));
+            break;
+          }
+          draft.selfHosted = value === 'y' || value === 'yes';
           step = 'customBaseUrl';
           break;
         }
@@ -387,7 +432,7 @@ export async function runOnboard(): Promise<boolean> {
           const baseUrl = await askText(rl, `Base URL ${backHint()}: `);
           if (baseUrl === QUIT) return false;
           if (baseUrl === BACK) {
-            step = 'customCompatibility';
+            step = draft.adapter === 'openai' ? 'customSelfHosted' : 'customCompatibility';
             break;
           }
           if (!baseUrl) {
@@ -504,6 +549,7 @@ export async function runOnboard(): Promise<boolean> {
             const choice = sw.toLowerCase();
             if (choice === '' || choice === 'y' || choice === 'yes') {
               draft.adapter = 'anthropic';
+              draft.selfHosted = false;
               if (draft.baseUrl) draft.baseUrl = toAnthropicBaseUrl(draft.baseUrl);
               if (draft.apiKey) {
                 draft.authToken = draft.apiKey;
@@ -577,14 +623,20 @@ export async function runOnboard(): Promise<boolean> {
             stdout.write(finale);
             return true;
           }
-          const { preset, adapter, model, baseUrl, apiKey, authToken } = draft;
+          const { preset, adapter, model, baseUrl, apiKey, authToken, selfHosted } = draft;
           if (!preset || !adapter || !model) {
             step = 'provider';
             break;
           }
           // Clear lastModel so this fresh pick actually becomes active — otherwise a previously
           // `/model`-selected preset overrides the newly-onboarded provider at launch.
-          saveGlobalConfig({ provider: adapter, model, lastModel: undefined, ...(baseUrl ? { baseUrl } : {}) });
+          persistTerminalOnboardTarget({
+            adapter,
+            model,
+            baseUrl,
+            customEndpoint: preset.kind === 'custom',
+            selfHosted,
+          });
           if (apiKey) saveCredential(adapter, { apiKey, ...(baseUrl ? { baseUrl } : {}) });
           if (authToken) saveCredential(adapter, { authToken, ...(baseUrl ? { baseUrl } : {}) });
 

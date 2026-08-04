@@ -5,7 +5,8 @@
  * resources — a strict CSP blocks any outbound request, so a compromised page can't exfiltrate a key),
  * collects provider / API key / endpoint + a MASTER PASSWORD, and seals the secrets into the encrypted
  * vault (`createVault` → AES-256-GCM). The derived key is then cached in the OS keychain (where one
- * exists) so the password is typed once. Non-secret prefs (provider / model / baseUrl) go to config.json.
+ * exists) so the password is typed once. Non-secret prefs (provider / model / baseUrl / selfHosted)
+ * go to config.json.
  *
  * Security model (same as an OAuth loopback flow): bind to 127.0.0.1 ONLY, a one-time token guards
  * /save, the server dies on completion or a 5-minute idle timeout. Keys never leave the machine.
@@ -23,7 +24,9 @@ import {
   type VaultData,
 } from '../auth/vault.js';
 import { storeKey, retrieveKey, available as keychainAvailable } from '../auth/keychain.js';
-import { saveGlobalConfig, shredLegacyCredentials } from '../state/globalStore.js';
+import { shredLegacyCredentials } from '../state/globalStore.js';
+import { persistOnboardTarget } from './persistTarget.js';
+import { PROVIDERS } from './catalog.js';
 
 export interface PersistResult {
   /** true = added to an existing vault; false = a new vault was created. */
@@ -93,6 +96,18 @@ export interface WebOnboardResult {
   reason?: string;
 }
 
+/** Persist the browser wizard's target through the same trust-boundary patch as terminal onboarding.
+ * Exported so persistence can be tested without launching a browser or touching the keychain. */
+export function persistWebOnboardTarget(input: {
+  provider: 'anthropic' | 'openai';
+  model?: string;
+  baseUrl?: string;
+  customEndpoint: boolean;
+  selfHosted?: boolean;
+}): void {
+  persistOnboardTarget(input);
+}
+
 function openBrowser(url: string): void {
   try {
     if (process.platform === 'win32') execFile('cmd', ['/c', 'start', '', url], () => {});
@@ -101,6 +116,28 @@ function openBrowser(url: string): void {
   } catch {
     /* the URL is printed too — the user can paste it */
   }
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/** Keep browser and terminal onboarding on the same provider/model catalog. */
+function providerOptions(): string {
+  return PROVIDERS
+    .filter((preset) => !preset.comingSoon)
+    .map(
+      (preset) =>
+        `<option value="${escapeHtml(preset.id)}" data-p="${preset.adapter}" ` +
+        `data-url="${escapeHtml(preset.baseUrl ?? '')}" data-model="${escapeHtml(preset.defaultModel)}">` +
+        `${escapeHtml(preset.label)}</option>`,
+    )
+    .join('\n   ');
 }
 
 const SEC_HEADERS: Record<string, string> = {
@@ -133,6 +170,7 @@ export function page(token: string, hasVault = false): string {
  .msg{margin-top:14px;padding:10px;border-radius:8px;font-size:13px;display:none}
  .ok{background:#1a3326;color:#4ade80;display:block}.err{background:#3a1e1e;color:#f87171;display:block}
  .row{display:flex;gap:10px}.row>div{flex:1}
+ [hidden]{display:none!important}
 </style></head><body>
 <div class="card">
  <h1>THE <span>SHADOW</span> vault</h1>
@@ -140,25 +178,21 @@ export function page(token: string, hasVault = false): string {
  <form id="f" autocomplete="off">
   <label>Provider</label>
   <select id="provider">
-   <option value="anthropic" data-p="anthropic" data-url="">Anthropic</option>
-   <option value="openai" data-p="openai" data-url="">OpenAI</option>
-   <option value="openrouter" data-p="openai" data-url="https://openrouter.ai/api/v1">OpenRouter</option>
-   <option value="groq" data-p="openai" data-url="https://api.groq.com/openai/v1">Groq</option>
-   <option value="deepseek" data-p="openai" data-url="https://api.deepseek.com/v1">DeepSeek</option>
-   <option value="mistral" data-p="openai" data-url="https://api.mistral.ai/v1">Mistral</option>
-   <option value="xai" data-p="openai" data-url="https://api.x.ai/v1">xAI (Grok)</option>
-   <option value="together" data-p="openai" data-url="https://api.together.xyz/v1">Together</option>
-   <option value="zai" data-p="openai" data-url="https://api.z.ai/api/coding/paas/v4">Z.ai (GLM Coding Plan)</option>
-   <option value="ollama" data-p="openai" data-url="http://localhost:11434/v1">Ollama (local)</option>
-   <option value="lmstudio" data-p="openai" data-url="http://localhost:1234/v1">LM Studio (local)</option>
-   <option value="custom" data-p="openai" data-url="">Custom / self-hosted</option>
+   ${providerOptions()}
   </select>
   <label>API key <span style="color:var(--dim)">(local endpoints: any value, e.g. sk-local)</span></label>
   <input id="apiKey" type="password" placeholder="sk-..." autocomplete="off">
   <label>Base URL <span style="color:var(--dim)">(auto-filled; edit for custom)</span></label>
   <input id="baseUrl" type="text" placeholder="(provider default)">
-  <label>Model <span style="color:var(--dim)">(optional)</span></label>
-  <input id="model" type="text" placeholder="e.g. claude-opus-4-8">
+  <div id="selfHostedWrap" hidden>
+   <label>Is this endpoint self-hosted?</label>
+   <select id="selfHosted">
+    <option value="no">No — hosted service</option>
+    <option value="yes">Yes — my server</option>
+   </select>
+  </div>
+  <label>Model <span style="color:var(--dim)">(suggested automatically; editable)</span></label>
+  <input id="model" type="text" placeholder="e.g. qwen3.8-max" required>
   ${
     hasVault
       ? `<label>Master password <span style="color:var(--dim)">(to unlock — leave blank if cached in your keychain)</span></label>
@@ -176,8 +210,9 @@ export function page(token: string, hasVault = false): string {
 <script>
  var TOKEN=${JSON.stringify(token)};
  var HASVAULT=${JSON.stringify(hasVault)};
- var sel=document.getElementById('provider'),base=document.getElementById('baseUrl');
- function fill(){var o=sel.options[sel.selectedIndex];base.value=o.getAttribute('data-url')||'';}
+ var sel=document.getElementById('provider'),base=document.getElementById('baseUrl'),model=document.getElementById('model');
+ var selfHosted=document.getElementById('selfHosted'),selfHostedWrap=document.getElementById('selfHostedWrap');
+ function fill(){var o=sel.options[sel.selectedIndex];base.value=o.getAttribute('data-url')||'';model.value=o.getAttribute('data-model')||'';var custom=sel.value==='custom'&&o.getAttribute('data-p')==='openai';selfHostedWrap.hidden=!custom;if(!custom)selfHosted.value='no';}
  sel.addEventListener('change',fill);fill();
  var msg=document.getElementById('msg');
  document.getElementById('f').addEventListener('submit',function(e){
@@ -193,7 +228,8 @@ export function page(token: string, hasVault = false): string {
   var btn=document.getElementById('go');btn.disabled=true;btn.textContent=HASVAULT?'Unlocking…':'Encrypting…';
   fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
    token:TOKEN,provider:o.getAttribute('data-p'),label:sel.value,apiKey:document.getElementById('apiKey').value,
-   baseUrl:base.value.trim(),model:document.getElementById('model').value.trim(),password:pw})})
+   baseUrl:base.value.trim(),model:document.getElementById('model').value.trim(),
+   selfHosted:o.getAttribute('data-p')==='openai'&&sel.value==='custom'&&selfHosted.value==='yes',password:pw})})
   .then(function(r){return r.json()}).then(function(d){
    if(d.ok){msg.className='msg ok';msg.textContent='✓ '+(d.merged?'Key added to your vault':'Vault created')+(d.cached?' and unlocked via your keychain':'')+'. You can close this tab and return to the terminal.';btn.textContent='Done';}
    else{msg.className='msg err';msg.textContent=d.error||'Failed to save.';btn.disabled=false;btn.textContent=HASVAULT?'Unlock & add':'Encrypt & save';}
@@ -234,6 +270,7 @@ export async function runWebOnboard(write: (s: string) => void): Promise<WebOnbo
               apiKey?: string;
               baseUrl?: string;
               model?: string;
+              selfHosted?: boolean;
               password?: string;
             };
             const got = Buffer.from(d.token ?? '');
@@ -244,6 +281,12 @@ export async function runWebOnboard(write: (s: string) => void): Promise<WebOnbo
               return;
             }
             const provider = d.provider === 'anthropic' ? 'anthropic' : 'openai';
+            const model = typeof d.model === 'string' ? d.model.trim() : '';
+            if (!model) {
+              res.writeHead(400, { 'Content-Type': 'application/json', ...SEC_HEADERS });
+              res.end(JSON.stringify({ ok: false, error: 'Choose or enter a model.' }));
+              return;
+            }
             // Seal the key into the vault — MERGING into an existing vault so multiple providers coexist
             // (adding Z.ai no longer wipes an Anthropic key). Keyed by Shadow provider — the same shape
             // the credential resolver reads.
@@ -264,14 +307,17 @@ export async function runWebOnboard(write: (s: string) => void): Promise<WebOnbo
               res.end(JSON.stringify({ ok: false, error: msg }));
               return;
             }
-            // Non-secret prefs → config.json (provider / model / baseUrl). Clear lastModel: the last
-            // `/model` pick otherwise OVERRIDES this freshly-onboarded provider at launch, so onboarding
-            // would silently do nothing for anyone with saved presets.
-            saveGlobalConfig({
+            // Non-secret prefs → config.json (provider / model / baseUrl / selfHosted). Clear
+            // lastModel: the last `/model` pick otherwise OVERRIDES this freshly-onboarded provider
+            // at launch, so onboarding would silently do nothing for anyone with saved presets.
+            persistWebOnboardTarget({
               provider,
-              lastModel: undefined,
-              ...(d.model ? { model: d.model } : {}),
-              ...(d.baseUrl ? { baseUrl: d.baseUrl } : {}),
+              model,
+              baseUrl: d.baseUrl,
+              customEndpoint: d.label === 'custom',
+              // Strict boolean check prevents a crafted string such as "false" from
+              // opting a public provider into self-host-only request parameters.
+              selfHosted: d.selfHosted === true,
             });
             res.writeHead(200, { 'Content-Type': 'application/json', ...SEC_HEADERS });
             res.end(JSON.stringify({ ok: true, cached: result.cached, merged: result.merged }));

@@ -7,6 +7,14 @@ import type { ProviderEvent, StopReason } from './provider.js';
 import { parseToolArgs } from './toolJson.js';
 import { ThinkingSplitter } from '../util/thinkingTags.js';
 
+// Kept local to avoid a provider adapter ↔ fallback-parser module cycle. This mirrors the inline-
+// thinking predicate in openai.ts; model-aware tests pin both streaming and non-stream behavior.
+function nonStreamEmitsInlineThinking(model: string): boolean {
+  const qwenReasoner = /\bqwq\b/i.test(model) || /qwen[\w.-]*think/i.test(model);
+  const deepSeekReasoner = /deepseek[-_ ]?r(?:1|easoner)/i.test(model) || /(^|[-_/])r1[-_]?(distill|0528)/i.test(model);
+  return deepSeekReasoner || qwenReasoner || /minimax|glm|yi-|internlm|skywork/i.test(model);
+}
+
 interface AntContentBlock {
   type?: string;
   text?: string;
@@ -129,7 +137,11 @@ export function* eventsFromAnthropicMessage(msg: unknown): Generator<ProviderEve
 }
 
 /** Parse a complete OpenAI Chat Completions JSON body into ProviderEvents. */
-export function* eventsFromOpenAICompletion(obj: unknown): Generator<ProviderEvent> {
+export function* eventsFromOpenAICompletion(
+  obj: unknown,
+  model = '',
+  preserveQwenReasoning = false,
+): Generator<ProviderEvent> {
   const o = obj as OAICompletion;
 
   if (o.error) {
@@ -143,6 +155,9 @@ export function* eventsFromOpenAICompletion(obj: unknown): Generator<ProviderEve
   let outputTokens = 0;
   let cacheReadTokens = 0;
   let stopReason: StopReason = 'end_turn';
+  // Keep non-stream behavior aligned with the SSE path: only known inline-thinking families
+  // reinterpret literal <think> prose. Empty model remains permissive for backward compatibility.
+  const splitInline = model === '' || nonStreamEmitsInlineThinking(model);
   const splitter = new ThinkingSplitter();
 
   if (o.usage) {
@@ -155,12 +170,24 @@ export function* eventsFromOpenAICompletion(obj: unknown): Generator<ProviderEve
   const choice = o.choices?.[0];
   const message = choice?.message;
   if (message) {
-    const reasoning = message.reasoning_content ?? message.reasoning;
-    if (typeof reasoning === 'string' && reasoning) yield { type: 'thinking', delta: reasoning };
+    const reasoningField = typeof message.reasoning_content === 'string'
+      ? 'reasoning_content'
+      : typeof message.reasoning === 'string'
+        ? 'reasoning'
+        : undefined;
+    const reasoning = reasoningField ? message[reasoningField] : undefined;
+    if (typeof reasoning === 'string' && reasoning) {
+      yield { type: 'thinking', delta: reasoning };
+      if (preserveQwenReasoning) yield { type: 'reasoning_block', text: reasoning, field: reasoningField! };
+    }
 
     if (typeof message.content === 'string' && message.content) {
-      for (const span of splitter.push(message.content)) {
-        yield span.kind === 'thinking' ? { type: 'thinking', delta: span.text } : { type: 'text', delta: span.text };
+      if (!splitInline) {
+        yield { type: 'text', delta: message.content };
+      } else {
+        for (const span of splitter.push(message.content)) {
+          yield span.kind === 'thinking' ? { type: 'thinking', delta: span.text } : { type: 'text', delta: span.text };
+        }
       }
     }
 
@@ -197,8 +224,10 @@ export function* eventsFromOpenAICompletion(obj: unknown): Generator<ProviderEve
 
   if (choice?.finish_reason) stopReason = mapOpenAIFinishLocal(choice.finish_reason);
 
-  for (const span of splitter.flush()) {
-    yield span.kind === 'thinking' ? { type: 'thinking', delta: span.text } : { type: 'text', delta: span.text };
+  if (splitInline) {
+    for (const span of splitter.flush()) {
+      yield span.kind === 'thinking' ? { type: 'thinking', delta: span.text } : { type: 'text', delta: span.text };
+    }
   }
 
   yield { type: 'usage', inputTokens, outputTokens, cacheReadTokens };

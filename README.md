@@ -6,7 +6,7 @@
 
 > **A true gift of freedom and privacy.**
 > Zero-telemetry · provider-neutral · phone home to no one.
-> Current build: **`v5.0.0`** — self-hosted sampling controls and a friendlier, release-hardened TUI.
+> Current build: **`v5.5.0`** — Qwen 3.8 readiness, self-hosted sampling controls, and hardened recovery.
 
 **Shadow is a zero-telemetry, provider-neutral coding agent that runs on your terms.** Point it at any model — Anthropic, any OpenAI-compatible endpoint, Gemini, or a local model on your own box — and it works as a coding / sysadmin agent over your workspace. **No Shadow account, no signup, no phone-home:** the only outbound traffic is the provider *you* chose and the web tools the agent explicitly invokes. Your config stays local and readable (`~/.shadow/config.json`), your keys never leave your machine, and you can switch models mid-session **without losing context**.
 
@@ -16,14 +16,17 @@ Under the hood it's a **tool-calling agentic runtime**: the model reasons, emits
 
 This is **not a chat app** — it is a tool-calling runtime.
 
-## 🔥 What's new in v5.0.0
+## 🔥 What's new in v5.5.0
 
-- **🌡 Self-hosted sampling controls.** Set `"temperature"` in `~/.shadow/config.json`; Shadow applies it only to trusted self-hosted OpenAI-compatible endpoints and keeps it away from cloud/native providers.
-- **✨ Friendlier terminal UI.** Clearer provider/model status, safer live config controls, calmer navigation, and opt-in mouse handling make the interface easier to understand without taking over your terminal.
-- **🛡 Release hardening.** Fresh-distribution checks and complete TS/TSX test discovery protect the bytes shipped in every platform binary.
+- **🧠 Qwen 3.8 readiness.** Alibaba Qwen/DashScope is built into onboarding, future open-weight model IDs pass through unchanged, and both current and newer reasoning stream fields are supported.
+- **🔒 Provider-scoped reasoning.** Verified DashScope Qwen 3.8 Max requests use its documented completion, effort, and preserved-thinking controls without leaking provider-specific options or reasoning history to third-party endpoints.
+- **🛟 Honest recovery.** Blank HTTP-200 completions retry and then surface an actionable error; failed partial streams can no longer execute incomplete tool calls or masquerade as success.
+- **🌡 Reliable self-host trust.** Custom onboarding remembers when a public OpenAI-compatible endpoint is self-hosted, so its configured temperature is applied consistently without reaching cloud/native providers.
+- **🛡 Dependency hardening.** The runtime HTTP stack is locked to patched `undici` 8.10.0, with a clean production audit and a truthful Node.js source-build requirement.
 
 Earlier highlights:
 
+- **v5.0:** Self-hosted temperature controls, a friendlier TUI, and hardened release checks.
 - **v4.1:** See running sub-agents in the Turn-HUD, plus transcript and composer correctness fixes.
 - **🎭 Collaboration Mode — a live model round-table.** `/table gpt glm` seats 2–4 models in **one shared conversation**; you hold the baton and route each turn with `@handle`. Compare reasoning side by side, or let a strong model check a fast one.
 - **📊 Charts, tables & a genuinely beautiful TUI.** Fenced `chart` blocks render as real unicode **bar / line / sparkline** graphs; GFM tables get rounded grids with ledger-aligned numbers; markdown, code, and diffs are calm and readable.
@@ -72,7 +75,7 @@ Shadow is a security tool, so the installer **fails closed**. It downloads `SHAS
 
 ### Build from source (optional)
 
-Requires **Node.js ≥ 20** and **git**:
+Requires **Node.js ≥ 22.19** and **git**:
 
 ```bash
 git clone https://github.com/Blackfrost-AI/Shadow_CLI.git && cd Shadow_CLI && npm install && npm run build && npm link
@@ -93,10 +96,10 @@ On first run it opens with the **mode chooser** — the real first question:
 ```
 1. Local file    — a .gguf or MLX model on this machine (auto-served)
 2. Local server  — Ollama / LM Studio / llama.cpp already running
-3. Cloud         — Anthropic, OpenAI, Z.ai (GLM), OpenRouter, …
+3. Cloud         — Anthropic, OpenAI, Alibaba Qwen (DashScope), Z.ai (GLM), OpenRouter, …
 ```
 
-**Local file** asks for a `.gguf` path, registers + activates it, and offers a live test — no key, no cloud, done. **Local server** and **Cloud** open the provider menu filtered to what fits (Anthropic, OpenAI, OpenRouter, Groq, DeepSeek, Mistral, xAI, Gemini, Together, Z.ai (GLM), Ollama, LM Studio, or a custom endpoint), where you paste your API key (masked as you type), choose a model, and Shadow runs a **live connection test** before saving. Type `back` or `b` at any onboarding prompt to return to the previous step without restarting. Re-run it anytime to switch:
+**Local file** asks for a `.gguf` path, registers + activates it, and offers a live test — no key, no cloud, done. **Local server** and **Cloud** open the provider menu filtered to what fits (Anthropic, OpenAI, Alibaba Qwen/DashScope, OpenRouter, Groq, DeepSeek, Mistral, xAI, Gemini, Together, Z.ai (GLM), Ollama, LM Studio, or a custom endpoint), where you paste your API key (masked as you type), choose a model, and Shadow runs a **live connection test** before saving. Type `back` or `b` at any onboarding prompt to return to the previous step without restarting. Re-run it anytime to switch:
 
 ```bash
 shadow onboard          # change provider / model / key (terminal flow)

@@ -29,6 +29,14 @@ test('ONLY true reasoners get the 64k-floor note — mirrors the adapter matcher
   assert.equal(familyProfile('Qwen3-4B-Instruct-Q4_K_M'), undefined, 'local instruct gguf: no false note');
 });
 
+test('hosted Qwen 3.8 Max gets its documented adaptive/preserved-thinking profile only', () => {
+  const hosted = familyProfile('qwen3.8-max');
+  assert.equal(hosted?.family, 'qwen-3.8-max');
+  assert.equal(hosted?.minOutputTokens, 262_144);
+  assert.match(hosted?.note ?? '', /preserved thinking/i);
+  assert.equal(familyProfile('Qwen/Qwen3.8-30B-A3B-Instruct'), undefined, 'future open-weight ids stay capability-neutral');
+});
+
 test('genuine Anthropic models NEVER inherit distill defaults (parallel stays on)', () => {
   // looksAnthropicDistilled matches real Claude ids too (transport routing) — the profile must not.
   for (const m of ['claude-opus-4-8', 'claude-sonnet-5', 'claude-fable-5',

@@ -18,7 +18,7 @@ function buildLoop(
   tools: Tool[],
   gate: { request: (...a: never[]) => Promise<never> } | import('../src/agent/approval.js').ApprovalGate,
   opts: { autonomy?: AutonomyLevel; maxIterations?: number; signal?: AbortSignal } = {},
-): { loop: AgentLoop; events: LoopEvent[] } {
+): { loop: AgentLoop; events: LoopEvent[]; context: Context; budget: Budget } {
   const registry = new ToolRegistry();
   for (const t of tools) registry.register(t);
   const bus = new EventBus();
@@ -48,7 +48,7 @@ function buildLoop(
     maxToolResultChars: 16384,
     contextBudget: 1_000_000,
   };
-  return { loop: new AgentLoop(deps, opts.autonomy ?? 'full'), events };
+  return { loop: new AgentLoop(deps, opts.autonomy ?? 'full'), events, context, budget };
 }
 
 function echoTool(onRun: (msg: string) => void): Tool<{ msg: string }, { echoed: string }> {
@@ -87,6 +87,107 @@ test('runs reason→act→observe and terminates with the final answer', async (
   assert.equal(res.stopReason, 'end_turn');
   const ended = events.find((e) => e.type === 'tool_end');
   assert.ok(ended && ended.type === 'tool_end' && ended.result.ok);
+});
+
+test('a clean empty end_turn retries twice, charges every attempt, then accepts a real answer', async () => {
+  let sends = 0;
+  const provider: Provider = {
+    name: 'empty-then-answer',
+    estimateTokens: () => 0,
+    async *send(): AsyncIterable<ProviderEvent> {
+      sends += 1;
+      yield { type: 'usage', inputTokens: 5, outputTokens: sends === 3 ? 2 : 0 };
+      if (sends === 3) yield { type: 'text', delta: 'Recovered answer.' };
+      yield { type: 'done', stopReason: 'end_turn' };
+    },
+  };
+  const { loop, events, budget } = buildLoop(provider, [], new AutoApproveGate());
+  const res = await loop.run();
+
+  assert.equal(sends, 3, 'initial request plus two bounded retries');
+  assert.equal(res.stopReason, 'end_turn');
+  assert.equal(res.finalAnswer, 'Recovered answer.');
+  assert.deepEqual(
+    events
+      .filter((e) => e.type === 'retry')
+      .map((e) => (e.type === 'retry' ? [e.attempt, e.reason] : null)),
+    [
+      [1, 'empty response'],
+      [2, 'empty response'],
+    ],
+  );
+  const spent = budget.snapshot(Date.now());
+  assert.equal(spent.iterations, 3, 'empty responses consume the normal iteration budget');
+  assert.equal(spent.inputTokens, 15, 'usage from every empty attempt is retained');
+  assert.equal(spent.outputTokens, 2);
+});
+
+test('provider reasoning wire state is attached only to a successfully committed assistant turn', async () => {
+  const provider = new MockProvider([
+    [
+      { type: 'thinking', delta: 'private reasoning' },
+      { type: 'reasoning_block', text: 'private reasoning', field: 'reasoning_content' },
+      { type: 'text', delta: 'Visible answer.' },
+      { type: 'done', stopReason: 'end_turn' },
+    ],
+  ]);
+  const { loop, context } = buildLoop(provider, [], new AutoApproveGate());
+  const res = await loop.run();
+
+  assert.equal(res.stopReason, 'end_turn');
+  const assistant = context.messages().find((m) => m.role === 'assistant');
+  assert.deepEqual(assistant?.providerReasoning, {
+    text: 'private reasoning',
+    field: 'reasoning_content',
+    model: 'mock',
+  });
+});
+
+test('three consecutive clean empty end_turn responses fail actionably without committing a blank turn', async () => {
+  let sends = 0;
+  const provider: Provider = {
+    name: 'always-empty',
+    estimateTokens: () => 0,
+    async *send(): AsyncIterable<ProviderEvent> {
+      sends += 1;
+      yield { type: 'usage', inputTokens: 4, outputTokens: 0 };
+      yield { type: 'done', stopReason: 'end_turn' };
+    },
+  };
+  const { loop, events, context, budget } = buildLoop(provider, [], new AutoApproveGate());
+  const res = await loop.run();
+
+  assert.equal(sends, 3, 'empty-response recovery is bounded to three total requests');
+  assert.equal(res.stopReason, 'provider_error');
+  assert.equal(res.finalAnswer, '');
+  assert.equal(events.filter((e) => e.type === 'retry' && e.reason === 'empty response').length, 2);
+  const errors = events.filter((e) => e.type === 'error');
+  assert.equal(errors.length, 1);
+  assert.ok(errors[0]?.type === 'error');
+  assert.match(errors[0].message, /empty response after 3 attempts/i);
+  assert.match(errors[0].message, /model name and endpoint/i);
+  assert.equal(context.messages().filter((m) => m.role === 'assistant').length, 0, 'blank assistant turns are not persisted');
+  const spent = budget.snapshot(Date.now());
+  assert.equal(spent.iterations, 3);
+  assert.equal(spent.inputTokens, 12);
+});
+
+test('an empty max_tokens turn keeps max_tokens handling and is not retried as an empty response', async () => {
+  let sends = 0;
+  const provider: Provider = {
+    name: 'empty-max-tokens',
+    estimateTokens: () => 0,
+    async *send(): AsyncIterable<ProviderEvent> {
+      sends += 1;
+      yield { type: 'done', stopReason: 'max_tokens' };
+    },
+  };
+  const { loop, events } = buildLoop(provider, [], new AutoApproveGate());
+  const res = await loop.run();
+
+  assert.equal(sends, 1);
+  assert.equal(res.stopReason, 'max_tokens');
+  assert.equal(events.some((e) => e.type === 'retry' && e.reason === 'empty response'), false);
 });
 
 test('a denied tool returns a recoverable result and the loop still terminates', async () => {
@@ -242,6 +343,46 @@ test('a NON-recoverable provider error is surfaced EXACTLY ONCE and stops cleanl
   assert.equal(errs.length, 1, 'the provider error is emitted ONCE, not twice');
   assert.match((errs[0] as { message: string }).message, /http_502/, 'it is the provider error');
   assert.equal(res.stopReason, 'provider_error', 'stops cleanly with the provider_error reason');
+});
+
+test('a provider error after partial text preserves that text once and discards every tool call from the failed turn', async () => {
+  let ran = 0;
+  const provider = new MockProvider([
+    [
+      { type: 'text', delta: 'Partial answer.' },
+      { type: 'reasoning_block', text: 'incomplete private reasoning', field: 'reasoning_content' },
+      { type: 'tool_call', call: { id: 'unsafe-partial-call', name: 'echo', input: { msg: 'must not run' } } },
+      { type: 'error', recoverable: false, code: 'http_502', message: 'stream failed after partial output' },
+      { type: 'done', stopReason: 'tool_use' },
+    ],
+  ]);
+  const { loop, events, context } = buildLoop(provider, [echoTool(() => (ran += 1))], new AutoApproveGate());
+  const res = await loop.run();
+
+  assert.equal(res.stopReason, 'provider_error');
+  assert.equal(res.finalAnswer, 'Partial answer.');
+  assert.equal(ran, 0, 'a tool call from a failed stream must never execute');
+  assert.equal(events.some((e) => e.type === 'tool_start'), false);
+  assert.equal(
+    events.filter((e) => e.type === 'text').map((e) => (e.type === 'text' ? e.delta : '')).join(''),
+    'Partial answer.',
+    'stream events preserve the partial text exactly once',
+  );
+  assert.equal(
+    events.filter((e) => e.type === 'assistant_done').length,
+    0,
+    'assistant_done is suppressed because the provider error already closed the streamed row',
+  );
+  const assistantTurns = context.messages().filter((m) => m.role === 'assistant');
+  assert.equal(assistantTurns.length, 1, 'partial text is persisted as one assistant turn');
+  assert.deepEqual(assistantTurns[0]?.content, [{ type: 'text', text: 'Partial answer.' }]);
+  assert.equal(assistantTurns[0]?.interrupted, true, 'failed partial turns are explicitly marked interrupted');
+  assert.equal(assistantTurns[0]?.providerReasoning, undefined, 'incomplete provider reasoning is never replayed');
+  assert.equal(
+    context.messages().some((m) => m.content.some((b) => b.type === 'tool_use')),
+    false,
+    'no tool_use from the incomplete provider turn reaches history',
+  );
 });
 
 test('repeated unrepairable tool JSON terminates (bounded repair attempts, no infinite loop)', async () => {

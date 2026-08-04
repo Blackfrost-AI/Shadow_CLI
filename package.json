@@ -1,6 +1,6 @@
 {
   "name": "shadow",
-  "version": "5.0.0",
+  "version": "5.5.0",
   "description": "Shadow — a high-performance, agentic CLI runtime that lets an LLM operate as a coding/sysadmin agent over a local workspace.",
   "type": "module",
   "private": true,
@@ -12,7 +12,7 @@
     "shadow": "./dist/index.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.19.0"
   },
   "scripts": {
     "dev": "tsx src/index.ts",
@@ -42,7 +42,7 @@
   "dependencies": {
     "ink": "^5.1.0",
     "react": "^18.3.1",
-    "undici": "^8.5.0",
+    "undici": "^8.10.0",
     "zod": "^3.24.1",
     "zod-to-json-schema": "^3.23.0"
   },

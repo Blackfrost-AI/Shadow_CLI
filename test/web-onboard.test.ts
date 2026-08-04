@@ -5,9 +5,14 @@ import { page } from '../src/onboard/webOnboard.js';
 test('onboarding page embeds the one-time token and the form fields', () => {
   const html = page('TESTTOKEN123');
   assert.match(html, /TESTTOKEN123/, 'token is embedded for the /save handshake');
-  for (const id of ['id="provider"', 'id="apiKey"', 'id="baseUrl"', 'id="pw"', 'id="pw2"']) {
+  for (const id of ['id="provider"', 'id="apiKey"', 'id="baseUrl"', 'id="selfHosted"', 'id="pw"', 'id="pw2"']) {
     assert.ok(html.includes(id), `has ${id}`);
   }
+  assert.match(html, /Is this endpoint self-hosted\?/);
+  assert.match(html, /selfHosted:/, 'the explicit yes/no choice is included in the /save payload');
+  assert.match(html, /value="qwen"[^>]*data-url="https:\/\/dashscope\.aliyuncs\.com\/compatible-mode\/v1"/);
+  assert.match(html, /value="qwen"[^>]*data-model="qwen3\.8-max"/);
+  assert.match(html, /id="model"[^>]*required/, 'the generated provider suggestion cannot fall back to a stale model');
 });
 
 test('onboarding page loads NO external resources (CSP/offline safe — a key cannot be exfiltrated)', () => {

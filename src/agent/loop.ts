@@ -94,6 +94,8 @@ export interface LoopResult {
 
 /** Bad-tool-call-JSON corrections fed back to the model before giving up (per run). */
 const MAX_REPAIR_ATTEMPTS = 3;
+/** Total clean empty end_turn responses allowed before the provider is treated as unhealthy. */
+const MAX_EMPTY_RESPONSE_ATTEMPTS = 3;
 /** Nth CONSECUTIVE identical (tool+args) call that gets a loop-guard nudge instead of running. */
 const LOOP_GUARD_LIMIT = 3;
 /** Synthetic tool_result content for a tool_use orphaned by an interrupt (ESC/Ctrl-C). */
@@ -213,6 +215,7 @@ export class AgentLoop {
   async run(): Promise<LoopResult> {
     const { bus, budget, context } = this.deps;
     let finalAnswer = '';
+    let emptyResponseAttempts = 0;
 
     for (;;) {
       if (this.deps.signal.aborted) return this.stop('interrupted', finalAnswer);
@@ -263,6 +266,11 @@ export class AgentLoop {
       const turn = await this.runProviderTurnWithFallback(this.deps.provider, req);
       budget.tick();
 
+      // A stream error makes the entire provider turn incomplete. Keep any text that was
+      // already shown, but never recover or execute a native/textual tool call from that turn:
+      // a call assembled before the failing frame may itself be truncated.
+      const providerFailed = turn.providerError !== undefined;
+
       // Recover tool calls a weaker model emitted as TEXT (e.g. <tool_call>{…}</tool_call>,
       // call:NAME{…}, {"tool_calls":[…]}) instead of via the native channel — only when the
       // turn produced no real calls, and only for registered tool names. Scan the CONTENT
@@ -271,7 +279,7 @@ export class AgentLoop {
       // !badJsonMsg guard is intentionally absent here — a clean TEXT call must still be
       // recovered even when a *separate* native attempt was malformed; `toolCalls.length===0`
       // already prevents double-executing a real native call.
-      if (turn.toolCalls.length === 0) {
+      if (!providerFailed && turn.toolCalls.length === 0) {
         const isKnown = (n: string): boolean => this.deps.registry.get(n) !== undefined;
         const toCalls = (calls: { name: string; input: unknown }[]): ToolCall[] =>
           calls.map((c, i) => ({ id: `txt_${this.now()}_${i}`, name: c.name, input: c.input }));
@@ -308,35 +316,78 @@ export class AgentLoop {
       // Strip leaked chat-template / control tokens from the committed answer.
       turn.text = scrubControlTokens(turn.text);
 
+      // A normal end_turn with no answer and no tools is not a successful completion. Retry the
+      // unchanged conversation twice (three TOTAL attempts), with each request still charged by
+      // the ordinary usage + iteration accounting above. Do this before committing thinking-only
+      // blocks so the retry sees the same valid conversation rather than an incomplete assistant
+      // turn. Errors, tool_use, max_tokens, pause_turn and interrupts all keep their own handling.
+      const cleanEmptyEndTurn =
+        !providerFailed &&
+        !this.deps.signal.aborted &&
+        turn.stopReason === 'end_turn' &&
+        !turn.badJsonMsg &&
+        turn.toolCalls.length === 0 &&
+        turn.text.trim().length === 0;
+      if (cleanEmptyEndTurn) {
+        emptyResponseAttempts += 1;
+        if (emptyResponseAttempts < MAX_EMPTY_RESPONSE_ATTEMPTS) {
+          bus.emit({ type: 'retry', attempt: emptyResponseAttempts, delayMs: 0, reason: 'empty response' });
+          continue;
+        }
+        bus.emit({
+          type: 'error',
+          message:
+            `Model returned an empty response after ${MAX_EMPTY_RESPONSE_ATTEMPTS} attempts. ` +
+            'Check the configured model name and endpoint, then try again or choose a different model.',
+        });
+        return this.stop('provider_error', finalAnswer);
+      }
+      // Empty-response attempts are consecutive: any substantive or specially-signalled turn
+      // ends that recovery sequence (and either continues through its own path or terminates).
+      emptyResponseAttempts = 0;
+
       // Commit the assistant turn to history. Thinking blocks lead the turn (the
       // Anthropic adapter requires it) and MUST be preserved with their signatures
       // or the next request 400s when this turn carried tool_use.
       const assistantBlocks: ContentBlock[] = [];
-      for (const tb of turn.thinkingBlocks) {
-        // Stamp the producing model so a later /model switch drops these (their
-        // signatures / encrypted blobs are only valid for the model that issued them).
-        if ('redactedData' in tb) {
-          assistantBlocks.push({ type: 'redacted_thinking', data: tb.redactedData, model: this.deps.model });
-        } else if (tb.signature) {
-          assistantBlocks.push({ type: 'thinking', thinking: tb.thinking, signature: tb.signature, model: this.deps.model });
+      if (!providerFailed) {
+        for (const tb of turn.thinkingBlocks) {
+          // Stamp the producing model so a later /model switch drops these (their
+          // signatures / encrypted blobs are only valid for the model that issued them).
+          if ('redactedData' in tb) {
+            assistantBlocks.push({ type: 'redacted_thinking', data: tb.redactedData, model: this.deps.model });
+          } else if (tb.signature) {
+            assistantBlocks.push({ type: 'thinking', thinking: tb.thinking, signature: tb.signature, model: this.deps.model });
+          }
         }
       }
       if (turn.text) assistantBlocks.push({ type: 'text', text: turn.text });
-      for (const c of turn.toolCalls) {
-        assistantBlocks.push({ type: 'tool_use', id: c.id, name: c.name, input: c.input, ...(c.signature ? { signature: c.signature } : {}) });
+      if (!providerFailed) {
+        for (const c of turn.toolCalls) {
+          assistantBlocks.push({ type: 'tool_use', id: c.id, name: c.name, input: c.input, ...(c.signature ? { signature: c.signature } : {}) });
+        }
       }
       if (assistantBlocks.length) {
-        context.append({ role: 'assistant', content: assistantBlocks });
-        if (turn.thinkingText.trim()) {
+        const assistantMessage: Message = { role: 'assistant', content: assistantBlocks };
+        if (providerFailed) {
+          assistantMessage.interrupted = true;
+        } else if (turn.providerReasoning) {
+          assistantMessage.providerReasoning = { ...turn.providerReasoning, model: this.deps.model };
+        }
+        context.append(assistantMessage);
+        if (!providerFailed && turn.thinkingText.trim()) {
           bus.emit({ type: 'reasoning_done', text: turn.thinkingText });
         }
-        bus.emit({ type: 'assistant_done', text: turn.text });
+        // Provider errors are emitted while consuming the stream. Renderers close the live
+        // assistant row at that point, so emitting assistant_done afterward would print the same
+        // partial text a second time. The streamed `text` events already preserved it once.
+        if (!providerFailed) bus.emit({ type: 'assistant_done', text: turn.text });
         // An interrupt (ESC/Ctrl-C) that lands AFTER a tool_use is committed but
         // BEFORE its tool ran leaves the turn unpaired. Synthesize an {ok:false}
         // tool_result for every such tool_use BEFORE snapshotting — both so the
         // snapshot is restorable and so the next request doesn't 400 on a dangling
         // tool_use. Only snapshot once the turn is paired.
-        if (this.deps.signal.aborted && turn.toolCalls.length > 0) {
+        if (!providerFailed && this.deps.signal.aborted && turn.toolCalls.length > 0) {
           const synthetic = this.synthesizeMissingResults(turn.toolCalls, []);
           if (synthetic.length) context.append({ role: 'user', content: synthetic });
         }
@@ -350,6 +401,11 @@ export class AgentLoop {
         }
       }
       if (turn.text) finalAnswer = turn.text;
+
+      // A provider-error frame poisons the WHOLE turn even if useful-looking text or tool calls
+      // arrived first. Partial text was committed above for recovery/audit, but tool calls were
+      // deliberately excluded and must never reach executeCall.
+      if (providerFailed) return this.stop('provider_error', finalAnswer);
 
       // Interrupted mid-turn (ESC / Ctrl-C broke the stream) → report it as such,
       // not as a natural end_turn.
@@ -393,15 +449,6 @@ export class AgentLoop {
             continue;
           }
           return this.stop('fatal_tool_error', finalAnswer);
-        }
-
-        // A recoverable provider error mid-stream (e.g. an OpenAI 200 error frame) that
-        // left the turn empty — stop with the provider_error reason. The error was ALREADY
-        // emitted to the bus at the stream-event site (the `case 'error'` handler emits the
-        // moment the event arrives, then records it as `providerError`), so emitting again here
-        // printed every provider error TWICE on the HUD. Stop only; do not re-emit.
-        if (turn.providerError && !finalAnswer) {
-          return this.stop('provider_error', finalAnswer);
         }
 
         // Hit the output cap before emitting any answer (common on reasoning models that
@@ -511,6 +558,7 @@ export class AgentLoop {
     toolCalls: ToolCall[];
     thinkingBlocks: Array<{ thinking: string; signature: string } | { redactedData: string }>;
     thinkingText: string;
+    providerReasoning?: { text: string; field: 'reasoning_content' | 'reasoning' };
     stopReason?: 'end_turn' | 'tool_use' | 'max_tokens' | 'pause_turn';
     badJsonMsg?: string;
     badCalls: string[];
@@ -627,6 +675,7 @@ export class AgentLoop {
     toolCalls: ToolCall[];
     thinkingBlocks: Array<{ thinking: string; signature: string } | { redactedData: string }>;
     thinkingText: string;
+    providerReasoning?: { text: string; field: 'reasoning_content' | 'reasoning' };
     stopReason?: 'end_turn' | 'tool_use' | 'max_tokens' | 'pause_turn';
     badJsonMsg?: string;
     badCalls: string[];
@@ -637,6 +686,7 @@ export class AgentLoop {
     const toolCalls: ToolCall[] = [];
     const thinkingBlocks: Array<{ thinking: string; signature: string } | { redactedData: string }> = [];
     let thinkingText = '';
+    let providerReasoning: { text: string; field: 'reasoning_content' | 'reasoning' } | undefined;
     let stopReason: 'end_turn' | 'tool_use' | 'max_tokens' | 'pause_turn' | undefined;
     let badJsonMsg: string | undefined;
     const badCalls: string[] = [];
@@ -653,6 +703,9 @@ export class AgentLoop {
           case 'thinking':
             thinkingText += ev.delta;
             this.deps.bus.emit({ type: 'thinking', delta: ev.delta });
+            break;
+          case 'reasoning_block':
+            providerReasoning = { text: ev.text, field: ev.field };
             break;
           case 'thinking_block':
             // Stash the signed reasoning block; run() prepends it to the assistant
@@ -716,7 +769,7 @@ export class AgentLoop {
     } finally {
       this.deps.bus.emit({ type: 'latency', ms: this.now() - t0 });
     }
-    return { text, toolCalls, thinkingBlocks, thinkingText, stopReason, badJsonMsg, badCalls, providerError };
+    return { text, toolCalls, thinkingBlocks, thinkingText, providerReasoning, stopReason, badJsonMsg, badCalls, providerError };
   }
 
   /** Gate, validate, and run one tool call; return its result block. */

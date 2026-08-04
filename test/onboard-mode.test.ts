@@ -5,9 +5,18 @@ import { providersForMode, PROVIDERS } from '../src/onboard/catalog.js';
 test('mode "cloud" lists every cloud provider + custom, and NO local servers', () => {
   const list = providersForMode('cloud');
   const ids = list.map((p) => p.id);
-  assert.ok(ids.includes('anthropic') && ids.includes('openai') && ids.includes('zai'), 'clouds present');
+  assert.ok(ids.includes('anthropic') && ids.includes('openai') && ids.includes('qwen') && ids.includes('zai'), 'clouds present');
   assert.ok(ids.includes('custom'), 'custom endpoint reachable from cloud');
   assert.ok(!ids.includes('ollama') && !ids.includes('lmstudio'), 'no local servers in the cloud list');
+});
+
+test('Qwen cloud preset uses DashScope while keeping the model id user-replaceable', () => {
+  const qwen = PROVIDERS.find((p) => p.id === 'qwen');
+  assert.ok(qwen);
+  assert.equal(qwen.adapter, 'openai');
+  assert.equal(qwen.baseUrl, 'https://dashscope.aliyuncs.com/compatible-mode/v1');
+  assert.equal(qwen.defaultModel, 'qwen3.8-max');
+  assert.equal(qwen.kind, 'cloud');
 });
 
 test('mode "server" lists local servers + custom, and NO cloud vendors', () => {

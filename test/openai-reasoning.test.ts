@@ -46,6 +46,7 @@ test('isReasoningModel: one gate covering every hidden-reasoning family', () => 
   }
   assert.equal(isDeepSeekReasoner('deepseek-chat'), false);
   assert.equal(isQwenReasoner('qwen3-coder'), false);
+  assert.equal(isReasoningModel('qwen3.8-max'), false, 'Qwen 3.8 Max reasoning is an endpoint capability, not an alias-only guess');
 });
 
 test('toReasoningEffort collapses Shadow effort to OpenAI 3-level', () => {

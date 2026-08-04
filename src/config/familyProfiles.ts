@@ -14,7 +14,7 @@
  * (src/system/resolveSystem.ts + prompts/models/*.md).
  */
 import { looksAnthropicDistilled } from '../util/transport.js';
-import { isQwenReasoner, isDeepSeekReasoner } from '../provider/openai.js';
+import { isQwenReasoner, isQwen38MaxModel, isDeepSeekReasoner } from '../provider/openai.js';
 
 /** A GENUINE Anthropic model id — including vendor-prefixed forms (OpenRouter
  *  `anthropic/claude-*`, Bedrock `us.anthropic.claude-*`) and bare family aliases
@@ -54,6 +54,17 @@ const TABLE: { match: (m: string) => boolean; profile: FamilyProfile }[] = [
       transport: 'anthropic',
       parallelTools: false,
       note: 'matrix: emits Anthropic-format tool calls — runs best on the anthropic transport; parallel tool calls off by default.',
+    },
+  },
+  {
+    // Qwen 3.8 Max is an adaptive hosted reasoner even though its id contains neither QwQ nor
+    // "thinking". On a verified DashScope endpoint it also requires structured reasoning history
+    // to remain separate from content; the OpenAI-compatible adapter preserves that field there.
+    match: (m) => isQwen38MaxModel(m),
+    profile: {
+      family: 'qwen-3.8-max',
+      minOutputTokens: 262_144,
+      note: 'Qwen 3.8 adaptive reasoning: preserved thinking is round-tripped separately; DashScope gets a 262k output ceiling for xhigh reasoning.',
     },
   },
   {

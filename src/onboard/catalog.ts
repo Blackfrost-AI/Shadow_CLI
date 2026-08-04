@@ -76,6 +76,18 @@ export const PROVIDERS: ProviderPreset[] = [
     keyUrl: 'https://platform.deepseek.com/api_keys',
   },
   {
+    // Qwen's official OpenAI-compatible endpoint. The model field remains ordinary/free-form,
+    // so this preset works with qwen3.8-max today and can accept an open-weight Qwen 3.8 id
+    // unchanged when the user's own server exposes it (the local/custom onboarding paths).
+    id: 'qwen',
+    label: 'Alibaba Qwen (DashScope)',
+    adapter: 'openai',
+    baseUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1',
+    defaultModel: 'qwen3.8-max',
+    kind: 'cloud',
+    keyUrl: 'https://bailian.console.aliyun.com/?apiKey=1#/api-key',
+  },
+  {
     id: 'mistral',
     label: 'Mistral',
     adapter: 'openai',
