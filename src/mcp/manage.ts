@@ -19,6 +19,8 @@ export interface McpChange {
   servers: McpServers;
 }
 
+export const PLAYWRIGHT_MCP_PACKAGE = '@playwright/mcp@0.0.79';
+
 export function loadGlobalMcpServers(): McpServers {
   const cfg = loadGlobalConfig();
   return { ...((cfg.mcpServers as McpServers | undefined) ?? {}) };
@@ -58,6 +60,39 @@ export function enableContextCooler(servers: McpServers, pathArg?: string): McpC
   };
 }
 
+/** Add the isolated Playwright browser preset without replacing a customized existing entry. */
+export function enablePlaywrightBrowser(servers: McpServers): McpChange {
+  if ('playwright' in servers) {
+    return {
+      ok: false,
+      servers,
+      message:
+        'Playwright MCP is already configured. Inspect it with /mcp get playwright, or disable it before enabling the browser preset.',
+    };
+  }
+  return {
+    ok: true,
+    servers: {
+      ...servers,
+      playwright: {
+        command: 'npx',
+        args: [
+          '-y',
+          PLAYWRIGHT_MCP_PACKAGE,
+          '--isolated',
+          '--browser',
+          'chrome',
+          '--output-dir',
+          resolve(homedir(), '.shadow', 'playwright-output'),
+          '--output-max-size',
+          '52428800',
+        ],
+      },
+    },
+    message: 'Enabled Playwright browser MCP.',
+  };
+}
+
 export function disableMcpServer(servers: McpServers, name: string): McpChange {
   if (!name) return { ok: false, servers, message: 'usage: /mcp disable <name>' };
   if (!(name in servers)) return { ok: false, servers, message: `No MCP server "${name}" configured.` };
@@ -86,7 +121,7 @@ export function mcpServerLines(name: string, server: McpServerConfig): string[] 
 
 export function mcpListLines(servers: McpServers): string[] {
   const names = Object.keys(servers).sort();
-  if (!names.length) return ['No MCP servers configured. Try: /mcp enable context-cooler'];
+  if (!names.length) return ['No MCP servers configured. Try: /mcp enable browser or /mcp enable context-cooler'];
   return names.map((name) => {
     const server = servers[name]!;
     const transport = server.url ? 'http' : 'stdio';

@@ -46,6 +46,7 @@ import { registerMcpServers } from './mcp/client.js';
 import {
   disableMcpServer,
   enableContextCooler,
+  enablePlaywrightBrowser,
   loadGlobalMcpServers,
   mcpListLines,
   saveGlobalMcpServers,
@@ -139,7 +140,7 @@ function helpText(): string {
     '  onboard --web        secure setup in a local browser form → encrypted vault + master password',
     '  update               self-update: git checkout → pull+rebuild; binary install → re-fetch from host',
     '  export [path.md]     export session log to markdown (--session, --out)',
-    '  mcp <list|enable|disable>  manage MCP servers (e.g. `mcp enable context-cooler`)',
+    '  mcp <list|enable|disable>  manage MCP servers (e.g. `mcp enable browser`)',
     '  local <add|list|test|use|remove>  manage local models — .gguf or MLX (no Ollama/LM Studio needed)',
     '  doctor               diagnose Node, ripgrep, credentials, provider, guardrails',
     '  doctor --privacy     prove this config\'s privacy posture: egress, keys-at-rest, offline (no network)',
@@ -185,6 +186,7 @@ function helpText(): string {
     '  shadow --task "fix the failing tests"   one-shot, scriptable',
     '  shadow --yolo --task "build the app"    fully autonomous, no prompts',
     '  shadow --provider mock --task hi        no API key needed',
+    '  shadow mcp enable browser               add isolated Chrome tools (requires Node/npm+npx)',
   ].join('\n');
 }
 
@@ -288,8 +290,8 @@ function needsOnboarding(cfg: ShadowConfig): boolean {
 
 /**
  * `shadow mcp <list|enable|disable>` — manage MCP servers in ~/.shadow/config.json.
- * `enable context-cooler` wires the Context Cooler MCP server (token-efficient
- * "think in code" retrieval) so its ctx_* tools load on the next launch.
+ * `enable browser` adds isolated Chrome automation, while `enable context-cooler`
+ * wires token-efficient "think in code" retrieval. Both load on the next launch.
  */
 function runMcp(args: string[]): void {
   const sub = args[0];
@@ -297,6 +299,7 @@ function runMcp(args: string[]): void {
 
   if (sub === 'list') {
     stdout.write(`MCP servers (~/.shadow/config.json):\n${mcpListLines(servers).map((line) => `  ${line}`).join('\n')}\n`);
+    stdout.write('Commands: shadow mcp enable browser · shadow mcp enable context-cooler --path <path> · shadow mcp disable <name>\n');
     return;
   }
 
@@ -309,18 +312,27 @@ function runMcp(args: string[]): void {
   }
 
   if (sub === 'enable') {
-    if (args[1] !== 'context-cooler') {
-      return void stdout.write('usage: shadow mcp enable context-cooler [--path <dir|server.js>]\n');
+    if (args[1] === 'browser') {
+      const change = enablePlaywrightBrowser(servers);
+      if (change.ok) saveGlobalMcpServers(change.servers);
+      stdout.write(change.message + '\n');
+      if (change.ok) {
+        stdout.write('Restart Shadow to load browser tools. Uses an isolated Chrome profile; requires Node.js, npm, and npx.\n');
+      }
+      return;
     }
-    const pIdx = args.indexOf('--path');
-    const change = enableContextCooler(servers, pIdx >= 0 ? args[pIdx + 1] : undefined);
-    if (change.ok) saveGlobalMcpServers(change.servers);
-    stdout.write(change.message + '\n');
-    if (change.ok) stdout.write('Restart shadow; its ctx_* tools (token-efficient retrieval) will load.\n');
-    return;
+    if (args[1] === 'context-cooler') {
+      const pIdx = args.indexOf('--path');
+      const change = enableContextCooler(servers, pIdx >= 0 ? args[pIdx + 1] : undefined);
+      if (change.ok) saveGlobalMcpServers(change.servers);
+      stdout.write(change.message + '\n');
+      if (change.ok) stdout.write('Restart shadow; its ctx_* tools (token-efficient retrieval) will load.\n');
+      return;
+    }
+    return void stdout.write('usage: shadow mcp enable <browser | context-cooler [--path <dir|server.js>]>\n');
   }
 
-  stdout.write('usage: shadow mcp <list | enable context-cooler [--path <p>] | disable <name>>\n');
+  stdout.write('usage: shadow mcp <list | enable browser | enable context-cooler [--path <p>] | disable <name>>\n');
 }
 
 // Minimal ANSI helpers for `shadow local` output (matches the onboarding tone).

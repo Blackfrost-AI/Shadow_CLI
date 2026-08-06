@@ -99,6 +99,7 @@ import { createProvider, type ProviderName } from './provider/index.js';
 import {
   disableMcpServer,
   enableContextCooler,
+  enablePlaywrightBrowser,
   loadGlobalMcpServers,
   mcpListLines,
   mcpServerLines,
@@ -449,7 +450,8 @@ const SLASH_ARG_COMPLETIONS: Record<string, ArgProvider> = {
   '/mcp': [
     { value: 'list', desc: 'List configured MCP servers' },
     { value: 'get', desc: 'Inspect one server: /mcp get <name>' },
-    { value: 'enable', desc: 'Enable a server: /mcp enable <name>' },
+    { value: 'enable browser', desc: 'Add isolated Chrome tools (requires Node/npm+npx)' },
+    { value: 'enable context-cooler', desc: 'Add token-efficient ctx_* retrieval tools' },
     { value: 'disable', desc: 'Disable a server: /mcp disable <name>' },
   ],
   '/tasks': [{ value: 'clear', desc: 'Clear the live task list' }],
@@ -3712,20 +3714,26 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             break;
           }
           if (action === 'enable') {
-            if (parts[1] !== 'context-cooler') {
-              pushLine({ text: 'Usage: /mcp enable context-cooler [--path <dir|server.js>]', dimColor: true });
+            const preset = parts[1];
+            if (preset !== 'browser' && preset !== 'context-cooler') {
+              pushLine({ text: 'Usage: /mcp enable <browser | context-cooler [--path <dir|server.js>]>', dimColor: true });
               break;
             }
+            const servers = loadGlobalMcpServers();
             const pathIndex = parts.indexOf('--path');
             const pathArg = pathIndex >= 0 ? parts[pathIndex + 1] : undefined;
-            const servers = loadGlobalMcpServers();
-            const change = enableContextCooler(servers, pathArg);
+            const change = preset === 'browser'
+              ? enablePlaywrightBrowser(servers)
+              : enableContextCooler(servers, pathArg);
             if (change.ok) {
               saveGlobalMcpServers(change.servers);
               opts.cfg.mcpServers = change.servers;
             }
+            const restart = preset === 'browser'
+              ? ' Restart Shadow to load browser tools. Uses an isolated Chrome profile; requires Node.js, npm, and npx.'
+              : ' Restart Shadow to load new MCP tools.';
             pushLine({
-              text: `${change.message}${change.ok ? ' Restart Shadow to load new MCP tools.' : ''}`,
+              text: `${change.message}${change.ok ? restart : ''}`,
               color: change.ok ? C.cyan : C.red,
             });
             break;
@@ -3741,7 +3749,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             break;
           }
           if (action !== 'list' && action !== 'show') {
-            pushLine({ text: 'Usage: /mcp [list|get <name>|enable context-cooler [--path <path>]|disable <name>]', dimColor: true });
+            pushLine({ text: 'Usage: /mcp [list|get <name>|enable browser|enable context-cooler [--path <path>]|disable <name>]', dimColor: true });
             break;
           }
           pushLine({
@@ -3749,6 +3757,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             text: 'mcp',
             lines: [
               ...mcpListLines(effectiveServers).map((text) => ({ text, dimColor: true })),
+              { text: 'Browser: /mcp enable browser (isolated Chrome; requires Node/npm+npx)', dimColor: true },
               { text: 'Commands: /mcp get <name> · /mcp enable context-cooler --path <path> · /mcp disable <name>', dimColor: true },
             ],
           });

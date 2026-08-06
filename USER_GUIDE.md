@@ -11,6 +11,7 @@ instructions, and security model, see the [README](README.md); this guide is the
 - [Reasoning effort](#reasoning-effort)
 - [Autonomy & safety](#autonomy--safety)
 - [Everyday use](#everyday-use)
+- [Optional browser automation](#optional-browser-automation-playwright-mcp)
 - [The config file](#the-config-file)
 - [Troubleshooting](#troubleshooting)
 
@@ -247,6 +248,28 @@ don't mind losing.
   ` ```chart ` block (`label: value` lines, `type: bar|line|spark`) renders as a real unicode chart.
 - **Ctrl-C twice** quits; **Esc** interrupts the current turn.
 - Pipe a one-shot task non-interactively: `shadow --task "summarize README.md"` (scriptable, plain output).
+
+---
+
+## Optional browser automation (Playwright MCP)
+
+Browser control is **off by default**. To opt in, install Node.js 18+ with `npx`, then run either:
+
+```bash
+shadow mcp enable browser       # from your shell
+/mcp enable browser             # inside Shadow
+```
+
+Shadow pins the official `@playwright/mcp@0.0.79` server and launches a visible Chrome window with
+an isolated profile, separate from your everyday Chrome cookies and logins. Restart Shadow after
+enabling it; MCP servers connect when a session starts. Every browser tool is treated as executable:
+at the default `auto-edit` level Shadow asks before it runs, unless you approve that tool for the
+session or choose `full` autonomy.
+
+Profile isolation prevents browser state from carrying between sessions; it is **not a security
+boundary**. The MCP server and Chrome still run as your OS user and retain network access, so treat
+visited pages as untrusted and do not use this profile for sensitive accounts. Disable the opt-in with
+`shadow mcp disable playwright` (or `/mcp disable playwright`) and restart again.
 
 ---
 
