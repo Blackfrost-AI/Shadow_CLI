@@ -8,6 +8,8 @@ import {
   toReasoningEffort,
   buildOpenAIBody,
   parseOpenAISSE,
+  hasKnownReasoningMarker,
+  assessReasoningReplayAlias,
 } from '../src/provider/openai.js';
 import type { CompletionRequest, ProviderEvent } from '../src/provider/provider.js';
 
@@ -136,3 +138,64 @@ test('parseOpenAISSE surfaces an in-stream error frame on a 200 stream (not sile
   // Still terminates cleanly with a done event.
   assert.ok(events.some((e) => e.type === 'done'));
 });
+
+test('hasKnownReasoningMarker: id-classifiable reasoning families only', () => {
+  for (const m of ['gpt-5', 'o4-mini', 'gemini-2.5-pro', 'grok-3-mini', 'deepseek-reasoner', 'qwq-32b', 'qwen3-235b-think', 'qwen3.8-max', 'qwen3.5-reasoning', 'qwen3-8b-qwen3-235b-a22b-think']) {
+    assert.equal(hasKnownReasoningMarker(m), true, m);
+  }
+  for (const m of ['llama-3.3-70b', 'mistral-large', 'gpt-4o', 'phi-4', 'gemma4:12b']) {
+    assert.equal(hasKnownReasoningMarker(m), false, m);
+  }
+});
+
+test('assessReasoningReplayAlias: capability override (pre-set) always suppresses', () => {
+  const caps = { preserveThinking: true };
+  assert.equal(assessReasoningReplayAlias('my-aliased-model', { selfHosted: true, capabilities: caps }), null);
+  assert.equal(assessReasoningReplayAlias('qwen3.8-max', { selfHosted: true, capabilities: caps }), null);
+  assert.equal(
+    assessReasoningReplayAlias('my-aliased-model', { selfHosted: true, capabilities: { reasoningField: 'reasoning' } }),
+    null,
+  );
+});
+
+test('assessReasoningReplayAlias: public / canonical endpoints are always safe', () => {
+  // Public (non-self-hosted) endpoints are classified by their catalog, never alias-ambiguous.
+  assert.equal(assessReasoningReplayAlias('qwen3.8-max', { dashScope: true, selfHosted: false }), null);
+  assert.equal(assessReasoningReplayAlias('generic-gpt-flavor', { selfHosted: false }), null);
+  assert.equal(assessReasoningReplayAlias('qwen3.8-max', { dashScope: true }), null);
+});
+
+test('assessReasoningReplayAlias: id-classifiable self-hosted models are safe', () => {
+  assert.equal(assessReasoningReplayAlias('qwen3.8-max', { selfHosted: true }), null);
+  assert.equal(assessReasoningReplayAlias('qwen3.5-max', { selfHosted: true }), null);
+  assert.equal(assessReasoningReplayAlias('qwq-32b', { selfHosted: true }), null);
+  assert.equal(assessReasoningReplayAlias('deepseek-r1', { selfHosted: true }), null);
+});
+
+test('assessReasoningReplayAlias: QWEN-looking unclassifiable id warns, naming the pre-set override (P1A-10 scope)', () => {
+  // The plan scopes the warning to "a Qwen-LOOKING id that fails the replay regex" — the replay
+  // contract is a Qwen-family arc. qwen2.5 shares the arc (operator note) but has no marker.
+  const warning = assessReasoningReplayAlias('qwen2.5-72b-serve', { selfHosted: true });
+  assert.ok(warning, 'expected a warning for an unclassifiable Qwen-looking self-hosted id');
+  assert.match(warning ?? '', /qwen2\.5-72b-serve/);
+  assert.match(warning ?? '', /self-hosted/);
+  // The actionable fix must be visible AND complete: the block that unlocks the FULL contract.
+  assert.match(warning ?? '', /capabilities/);
+  assert.match(warning ?? '', /preserveThinking/i);
+  assert.match(warning ?? '', /maxOutputTokens/, 'names the field that raises the 262k floor on aliases');
+});
+
+test('assessReasoningReplayAlias: non-Qwen self-hosted ids never warn (no startup spam — P1A-10 re-scope)', () => {
+  // Warning on every unclassifiable id made llama/mistral/gemma users read a spurious
+  // reasoning-replay warning at every session start. Their models have no replay contract to lose.
+  assert.equal(assessReasoningReplayAlias('llama-3.3-70b', { selfHosted: true }), null);
+  assert.equal(assessReasoningReplayAlias('mistral-large-2411', { selfHosted: true }), null);
+  assert.equal(assessReasoningReplayAlias('gemma-3-27b-it', { selfHosted: true }), null);
+  // A fully opaque --served-model-name alias is covered by the qwen-selfhosted preset instead.
+  assert.equal(assessReasoningReplayAlias('my-served-name', { selfHosted: true }), null);
+});
+
+test('assessReasoningReplayAlias: default opts treat the model as public (no spurious warning)', () => {
+  assert.equal(assessReasoningReplayAlias('anything'), null);
+});
+

@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { ProviderEvent } from '../src/provider/provider.js';
+import { resolveFakeHosts } from './helpers/fakeHostEgress.js';
 
 /**
  * Regression: nonStreamFallback must return false after yielding
@@ -8,6 +9,7 @@ import type { ProviderEvent } from '../src/provider/provider.js';
  */
 test('failed non-stream fallback does not suppress stream_error', async () => {
   const orig = globalThis.fetch;
+  const restoreEgress = resolveFakeHosts(); // http://mock is not resolvable — let it reach the stub
   globalThis.fetch = async (_url, init) => {
     const body = init?.body ? (JSON.parse(init.body as string) as { stream?: boolean }) : {};
     if (body.stream === false) throw new Error('non-stream POST failed');
@@ -50,6 +52,7 @@ test('failed non-stream fallback does not suppress stream_error', async () => {
     assert.ok(codes.includes('non_stream_fallback_failed'), codes.join(','));
     assert.ok(codes.includes('stream_error'), codes.join(','));
   } finally {
+    restoreEgress();
     globalThis.fetch = orig;
   }
 });
@@ -61,6 +64,7 @@ test('failed non-stream fallback does not suppress stream_error', async () => {
  */
 test('mid-stream failure after partial output does not re-fetch (no duplication)', async () => {
   const orig = globalThis.fetch;
+  const restoreEgress = resolveFakeHosts(); // http://mock is not resolvable — let it reach the stub
   let nonStreamCalls = 0;
   globalThis.fetch = async (_url, init) => {
     const body = init?.body ? (JSON.parse(init.body as string) as { stream?: boolean }) : {};
@@ -107,6 +111,7 @@ test('mid-stream failure after partial output does not re-fetch (no duplication)
     assert.ok(codes.includes('stream_error'), 'surfaces stream_error directly');
     assert.equal(textCount, 1, 'the streamed text is delivered exactly once (not duplicated)');
   } finally {
+    restoreEgress();
     globalThis.fetch = orig;
   }
 });

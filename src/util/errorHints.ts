@@ -27,6 +27,12 @@ export function providerErrorHint(raw: string): string | null {
   ) {
     return 'Request exceeds the model’s context. Shadow should auto-compact mid-turn — try /compact, lower contextBudget to fit the server window (e.g. 24000 for a 32k model), or serve with a bigger -c / --max-model-len.';
   }
+  // Tool-calling not enabled on a self-hosted serve (vLLM/SGLang without the tool-parser flags).
+  // Shadow auto-retries with tool_choice:"none" (the model then emits calls as text), but if the
+  // serve rejects tools outright the run still needs the operator to enable native tool-calling.
+  if (has(/tool[_ -]?choice/) && has(/enable-auto-tool-choice|tool[- ]?call[- ]?parser|auto.*tool|not (supported|enabled)/)) {
+    return 'This self-hosted endpoint was started without tool-calling. Shadow retries with tool_choice:"none" automatically; if calls still fail, restart vLLM with `--enable-auto-tool-choice --tool-call-parser hermes` (or your model’s parser, e.g. qwen3_coder), or the SGLang equivalent.';
+  }
   // Network / connection.
   if (code === 'network_error' || has(/unable to connect|econnrefused|enotfound|eai_again|network error|fetch failed|socket hang up|connection (refused|reset|timed out)|dns/)) {
     return 'Can’t reach the endpoint. Check it’s running and the base URL is correct (try curl-ing it); /doctor lists your endpoints. For a local model, confirm the server is up.';

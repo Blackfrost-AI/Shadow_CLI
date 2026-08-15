@@ -13,6 +13,7 @@ import type { ImportedCredential } from './types.js';
 import { SPECS } from './spec.js';
 import { createPkce, randomState, type Pkce } from './pkce.js';
 import { jwtExp } from './importStore.js';
+import { shadowFetch } from '../safety/egress.js';
 
 export interface AuthUrl {
   url: string;
@@ -58,12 +59,16 @@ function intoCredential(t: TokenResponse, nowSec: number): ImportedCredential {
 }
 
 async function postForm(url: string, form: Record<string, string>, signal?: AbortSignal): Promise<TokenResponse> {
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams(form).toString(),
-    signal,
-  });
+  const res = await shadowFetch(
+    url,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams(form).toString(),
+      signal,
+    },
+    { purpose: 'oauth', origin: 'user' },
+  );
   if (!res.ok) throw new Error(`oauth token endpoint ${res.status}: ${await res.text().catch(() => '')}`);
   return (await res.json()) as TokenResponse;
 }

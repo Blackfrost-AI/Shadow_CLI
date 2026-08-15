@@ -26,7 +26,7 @@ import {
 import { storeKey, retrieveKey, available as keychainAvailable } from '../auth/keychain.js';
 import { shredLegacyCredentials } from '../state/globalStore.js';
 import { persistOnboardTarget } from './persistTarget.js';
-import { PROVIDERS } from './catalog.js';
+import { PROVIDERS, findPreset } from './catalog.js';
 
 export interface PersistResult {
   /** true = added to an existing vault; false = a new vault was created. */
@@ -104,6 +104,8 @@ export function persistWebOnboardTarget(input: {
   baseUrl?: string;
   customEndpoint: boolean;
   selfHosted?: boolean;
+  /** Contract extras from the chosen catalog preset (persisted as a ModelEntry — P1A-06 step 4). */
+  entryExtras?: import('./persistTarget.js').OnboardTargetInput['entryExtras'];
 }): void {
   persistOnboardTarget(input);
 }
@@ -310,6 +312,9 @@ export async function runWebOnboard(write: (s: string) => void): Promise<WebOnbo
             // Non-secret prefs → config.json (provider / model / baseUrl / selfHosted). Clear
             // lastModel: the last `/model` pick otherwise OVERRIDES this freshly-onboarded provider
             // at launch, so onboarding would silently do nothing for anyone with saved presets.
+            // P1A-06 step 4: same contract threading as the terminal wizard — a preset shipping
+            // entry extras persists them as a ModelEntry (keeps both onboarding doors identical).
+            const chosenPreset = findPreset(String(d.label ?? ''));
             persistWebOnboardTarget({
               provider,
               model,
@@ -318,6 +323,9 @@ export async function runWebOnboard(write: (s: string) => void): Promise<WebOnbo
               // Strict boolean check prevents a crafted string such as "false" from
               // opting a public provider into self-host-only request parameters.
               selfHosted: d.selfHosted === true,
+              entryExtras: chosenPreset?.entry
+                ? { label: chosenPreset.label, ...chosenPreset.entry }
+                : undefined,
             });
             res.writeHead(200, { 'Content-Type': 'application/json', ...SEC_HEADERS });
             res.end(JSON.stringify({ ok: true, cached: result.cached, merged: result.merged }));

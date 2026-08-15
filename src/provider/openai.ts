@@ -19,10 +19,13 @@ import {
   type StopReason,
 } from './provider.js';
 import { streamWithRetry } from './stream.js';
+import { sseEvents, parseSseData, nonEmptyParts } from './sse.js';
 import { eventsFromOpenAICompletion } from './nonStream.js';
 import { parseToolArgs } from './toolJson.js';
 import { ThinkingSplitter } from '../util/thinkingTags.js';
 import { isLocalBaseUrl } from '../safety/offline.js';
+import type { ModelCapabilities } from '../config.js';
+import { familyProfile } from '../config/familyProfiles.js';
 
 const DEFAULT_BASE_URL = 'https://api.openai.com/v1';
 
@@ -33,8 +36,39 @@ export class OpenAIProvider implements Provider {
   private readonly model: string;
   private readonly selfHosted: boolean;
   private readonly dashScope: boolean;
+  // Per-endpoint stream knobs (P1A-04). A vLLM/SGLang frontier serve sends NO SSE keepalives during
+  // prefill, so a big-context Qwen 3.8 Max first-token can exceed the 120s default; `idleTimeoutMs`
+  // (config) / `SHADOW_IDLE_MS` (env) raise the frame for exactly that serve.
+  private readonly idleTimeoutMs: number | undefined;
+  private readonly firstByteTimeoutMs: number | undefined;
+  private readonly streamRetries: number | undefined;
+  // P1A-06: declarative capability block from the ModelEntry. Consulted FIRST by the request
+  // builder — it is the user's assertion of what this exact endpoint supports, overriding any
+  // id-regex guess (a vLLM `--served-model-name` alias, an open proxy reusing a Qwen alias, etc.).
+  private readonly capabilities: ModelCapabilities | undefined;
+  // Set once a 400 proves this endpoint rejects `tool_choice: "auto"` (a vLLM/SGLang serve without
+  // the tool-parser flags). Remembered for the session so later turns build with `"none"` directly
+  // instead of eating a 400 + retry every turn. Instance-scoped: it describes THIS endpoint.
+  private toolChoiceUnsupported = false;
+  // P2-03 (F01-05): optional params this endpoint 400-rejected and the stream ladder stripped.
+  // Remembered for the session: later turns build WITHOUT them instead of eating a 400 + retry
+  // every turn (same remember-for-the-session shape as toolChoiceUnsupported above).
+  private readonly strippedParams = new Set<string>();
+  // F06-08: reasoning round-trip mode from config ('last' default, 'none' = capture+replay off).
+  private readonly reasoningRoundtrip: 'last' | 'none';
 
-  constructor(opts: { apiKey?: string; baseUrl?: string; model: string; selfHosted?: boolean }) {
+  constructor(opts: {
+    apiKey?: string;
+    baseUrl?: string;
+    model: string;
+    selfHosted?: boolean;
+    idleTimeoutMs?: number;
+    firstByteTimeoutMs?: number;
+    streamRetries?: number;
+    capabilities?: ModelCapabilities;
+    /** F06-08 cfg knob — reasoning round-trip mode ('last' default; 'none' = fully off). */
+    reasoningRoundtrip?: 'last' | 'none';
+  }) {
     this.apiKey = opts.apiKey;
     this.baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
     this.model = opts.model;
@@ -43,6 +77,11 @@ export class OpenAIProvider implements Provider {
     // the request, including providers created by live model switches and fallback activation.
     this.selfHosted = opts.selfHosted === true || isLocalBaseUrl(this.baseUrl);
     this.dashScope = isDashScopeBaseUrl(this.baseUrl);
+    this.idleTimeoutMs = opts.idleTimeoutMs;
+    this.firstByteTimeoutMs = opts.firstByteTimeoutMs;
+    this.streamRetries = opts.streamRetries;
+    this.capabilities = opts.capabilities;
+    this.reasoningRoundtrip = opts.reasoningRoundtrip ?? 'last';
   }
 
   estimateTokens(messages: Message[]): number {
@@ -51,17 +90,41 @@ export class OpenAIProvider implements Provider {
 
   async *send(req: CompletionRequest): AsyncIterable<ProviderEvent> {
     const model = req.model || this.model;
-    const preserveQwenReasoning = this.dashScope && isQwen38MaxModel(model);
+    const preserveReasoning = shouldPreserveProviderReasoning(model, {
+      selfHosted: this.selfHosted,
+      dashScope: this.dashScope,
+      capabilities: this.capabilities,
+      reasoningRoundtrip: this.reasoningRoundtrip,
+    });
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     if (this.apiKey) headers.Authorization = `Bearer ${this.apiKey}`;
+    const bodyOpts = {
+      selfHosted: this.selfHosted,
+      dashScope: this.dashScope,
+      capabilities: this.capabilities,
+      toolChoiceNone: this.toolChoiceUnsupported,
+      stripParams: this.strippedParams as ReadonlySet<string>,
+      reasoningRoundtrip: this.reasoningRoundtrip,
+    };
     yield* streamWithRetry({
       url: `${this.baseUrl}/chat/completions`,
       headers,
-      body: buildOpenAIBody(req, model, true, { selfHosted: this.selfHosted, dashScope: this.dashScope }),
-      parse: (lines) => parseOpenAISSE(lines, model, preserveQwenReasoning),
+      body: buildOpenAIBody(req, model, true, bodyOpts),
+      parse: (lines) => parseOpenAISSE(lines, model, preserveReasoning, this.capabilities),
       signal: req.signal,
-      nonStreamBody: buildOpenAIBody(req, model, false, { selfHosted: this.selfHosted, dashScope: this.dashScope }),
-      parseNonStream: (obj) => eventsFromOpenAICompletion(obj, model, preserveQwenReasoning),
+      nonStreamBody: buildOpenAIBody(req, model, false, bodyOpts),
+      parseNonStream: (obj) => eventsFromOpenAICompletion(obj, model, preserveReasoning),
+      // P1A-04: per-endpoint stream knobs. A local serve on a long prefill must never hit the 120s
+      // watchdog as a silent re-POST hazard; the bus knows it's self-hosted so the rescue suppresses.
+      idleTimeoutMs: this.idleTimeoutMs,
+      firstByteTimeoutMs: this.firstByteTimeoutMs,
+      streamRetries: this.streamRetries,
+      selfHosted: this.selfHosted,
+      // F11-01: a serve without tool-parser flags 400s on tool_choice:auto. streamWithRetry retries
+      // with "none" in-band; remember it so subsequent turns skip the 400 entirely.
+      onToolChoiceUnsupported: () => { this.toolChoiceUnsupported = true; },
+      // P2-03: remember a 400-rejected optional param for the rest of the session.
+      onParamStripped: (param) => { this.strippedParams.add(param); },
     });
   }
 }
@@ -108,12 +171,30 @@ export function escapeMultimodalControlTokens(text: string): string {
 export function toOpenAIMessages(
   req: CompletionRequest,
   activeModel = req.model,
-  opts: { preserveProviderReasoning?: boolean } = {},
+  opts: { preserveProviderReasoning?: boolean; reasoningRoundtrip?: 'last' | 'none' } = {},
 ): OAIMessage[] {
   const clean = escapeMultimodalControlTokens;
   const out: OAIMessage[] = [{ role: 'system', content: clean(req.system) }];
 
-  for (const m of req.messages) {
+  // F06-08: reasoning replay is a CONTINUATION contract — the model needs its own preserved
+  // thinking to keep the current tool-calling thread, not a replay of every turn's thinking.
+  // Replaying the whole history re-sent the entire reasoning budget of every past turn each
+  // request (unbounded growth on long sessions), so replay lands on the NEWEST assistant
+  // message that carries reasoning for this model, and nowhere else.
+  let lastReasoningIdx = -1;
+  if (opts.preserveProviderReasoning && (opts.reasoningRoundtrip ?? 'last') === 'last') {
+    for (let i = req.messages.length - 1; i >= 0; i--) {
+      const mm = req.messages[i]!;
+      const r = mm.providerReasoning;
+      if (mm.role === 'assistant' && r?.text && r.model === activeModel) {
+        lastReasoningIdx = i;
+        break;
+      }
+    }
+  }
+
+  for (let i = 0; i < req.messages.length; i++) {
+    const m = req.messages[i]!;
     if (m.role === 'system') continue; // system is prepended above; ignore embedded
     if (m.role === 'assistant') {
       let text = '';
@@ -143,9 +224,10 @@ export function toOpenAIMessages(
       // model that produced it AND only when the active endpoint advertises that contract. This
       // prevents a switch to a local/proxy preset with the same model id from receiving a
       // DashScope-only field. Do not run it through `clean`: the provider contract requires the
-      // history byte-for-byte.
+      // history byte-for-byte. lastReasoningIdx already encodes the preserve gate, the roundtrip
+      // mode, and the exact-model match — only the newest qualifying turn replays (F06-08).
       const reasoning = m.providerReasoning;
-      if (opts.preserveProviderReasoning && reasoning?.text && reasoning.model === activeModel) {
+      if (i === lastReasoningIdx && reasoning?.text) {
         if (reasoning.field === 'reasoning') assistant.reasoning = reasoning.text;
         else assistant.reasoning_content = reasoning.text;
       }
@@ -241,6 +323,116 @@ export function isQwen38MaxModel(model: string): boolean {
   return isQwen38Model(model) && /3[._]8[._-]?max(?:$|[/_.-])/i.test(model);
 }
 
+/**
+ * Whether an endpoint/model pair supports replaying assistant `reasoning_content` on later tool
+ * turns. DashScope documents this for 3.8 Max; Qwen's open-weight 3.5+ chat templates consume the
+ * same historical field. Keep the self-hosted gate: a public OpenAI-compatible proxy that happens
+ * to reuse a Qwen alias must not inherit model-private reasoning wire state by name alone.
+ */
+export function shouldPreserveQwenReasoning(
+  model: string,
+  opts: { selfHosted?: boolean; dashScope?: boolean; capabilities?: ModelCapabilities },
+): boolean {
+  // P1A-06: an explicit capability block asserting `preserveThinking` (or naming a reasoning
+  // replay field) DECLARES the contract, consulted BEFORE any id-regex — required for a
+  // `--served-model-name` alias whose id carries no Qwen marker.
+  if (opts.capabilities?.preserveThinking === true || opts.capabilities?.reasoningField != null) return true;
+  if (opts.dashScope === true && isQwen38MaxModel(model)) return true;
+  if (opts.selfHosted !== true) return false;
+  return isQwen38Model(model) || /qwen[^\s]*3[._]5(?=$|[/_.-])/i.test(model) || isQwenReasoner(model);
+}
+
+/** Moonshot's Kimi "thinking" variants (kimi-k2-thinking, kimi-k3-thinking-turbo, vendor-prefixed
+ *  forms). A deliberately separate matcher — the Kimi and Qwen families share nothing but the
+ *  word "thinking", so neither may inherit the other's wire contract by regex accident. */
+export function isKimiThinkingModel(model: string): boolean {
+  return /kimi[\w.-]*think/i.test(model);
+}
+
+/**
+ * General reasoning-replay gate — the single entry point for the adapter's capture/replay flag.
+ * Kimi thinking models carry the contract in the MODEL itself: Moonshot's tool-calling docs
+ * require echoing assistant `reasoning_content` back on later turns, and the open-weight chat
+ * template consumes the same field — so the id alone activates replay on any endpoint (hosted,
+ * OpenRouter, local). Qwen replay stays behind its endpoint gate (shouldPreserveQwenReasoning):
+ * there the field is endpoint-private, not a property of the weights.
+ */
+export function shouldPreserveProviderReasoning(
+  model: string,
+  opts: {
+    selfHosted?: boolean;
+    dashScope?: boolean;
+    capabilities?: ModelCapabilities;
+    /** F06-08 cfg knob: 'none' disables capture AND replay entirely (opt-out of the round trip). */
+    reasoningRoundtrip?: 'last' | 'none';
+  },
+): boolean {
+  if (opts.reasoningRoundtrip === 'none') return false;
+  return isKimiThinkingModel(model) || shouldPreserveQwenReasoning(model, opts);
+}
+
+/**
+ * Whether reasoning replay can be classified from the model id ALONE, using the same id-regex
+ * family detectors the request path relies on. Groups any model whose id carries a recognized
+ * reasoning marker (DeepSeek R1, Gemini, OpenAI o-series, Grok R, QwQ / Qwen*-think, Qwen 3.8,
+ * the Qwen 3.5 reasoning arc, ...) into "classifiable".
+ */
+export function hasKnownReasoningMarker(model: string): boolean {
+  return (
+    isReasoningModel(model) ||
+    isQwen38Model(model) ||
+    /qwen[^\s]*3[._]5(?=$|[/_.-])/i.test(model) ||
+    /qwq/i.test(model) ||
+    /qwen[^\s]*think/i.test(model)
+  );
+}
+
+/**
+ * ALIAS-SAFE REASONING REPLAY diagnostic (P1A-10).
+ *
+ * A self-hosted `--served-model-name` endpoint can present an arbitrary alias whose id carries NO
+ * known reasoning-family marker. Shadow cannot classify such a model by id alone, so if it IS a
+ * reasoning model its `reasoning_content` / `preserve_thinking` contract is ambiguous and would be
+ * SILENTLY dropped on tool turns — the model would neither think out loud nor see its own prior
+ * reasoning history. This is the exact hazard the user's note flags: Qwen 3.8 / 3.5 / (and per the
+ * operator, 2.5) "share the same architecture/arc" but reach Shadow through aliases.
+ *
+ * The PRE-SET OVERRIDE is a per-model `capabilities` block (P1A-06): declaring `preserveThinking:
+ * true` (or naming a `reasoningField`) pins the contract — consulting capabilities before any
+ * id-regex in `shouldPreserveQwenReasoning` — and simultaneously silences this warning.
+ *
+ * Returns a human-readable warning to surface when the contract is alias-ambiguous, or null when
+ * the contract is provably safe (a capability override is declared, the endpoint is public/canonical,
+ * or the id is id-classifiable).
+ */
+export function assessReasoningReplayAlias(
+  model: string,
+  opts: { selfHosted?: boolean; dashScope?: boolean; capabilities?: ModelCapabilities } = {},
+): string | null {
+  // Pre-set override present → contract declared, no ambiguity, no warning.
+  if (opts.capabilities?.preserveThinking === true || opts.capabilities?.reasoningField != null) return null;
+  // Public / canonical endpoints are classified by their catalog; only self-hosted aliases can hide.
+  if (opts.selfHosted !== true) return null;
+  // Id already carries a recognized reasoning marker → classification succeeds → safe.
+  if (hasKnownReasoningMarker(model)) return null;
+  // P1A-10 scope (re-audited 2026-08-09): only a QWEN-looking id warrants the warning — the replay
+  // contract is a Qwen-family arc, and warning on EVERY unclassifiable self-hosted id made llama/
+  // mistral/gemma users read a spurious reasoning-replay warning at every startup. A fully opaque
+  // `--served-model-name` alias is covered by the qwen-selfhosted preset (P1A-06 step 4) instead.
+  if (!/qwen/i.test(model)) return null;
+  // Alias-ambiguous: warn and point at the pre-set override that resolves it.
+  return (
+    `Model "${model}" is served from a self-hosted endpoint and its id matches no known ` +
+    `reasoning-family marker, so reasoning replay (preserve_thinking / reasoning_content) is ` +
+    `ambiguous and would be dropped if this model reasons. Pin the contract with a per-model ` +
+    `capabilities block on its config entry — for a Qwen 3.8 Max serve the full contract is: ` +
+    `"capabilities": { "preserveThinking": true, "reasoning": "interleaved", ` +
+    `"effortScale": ["low","medium","xhigh"], "maxOutputTokens": 262144 } ` +
+    `(preserveThinking alone activates replay + preserve_thinking; maxOutputTokens is what ` +
+    `raises the output floor to 262k on an aliased id). Declaring it also silences this warning.`
+  );
+}
+
 /** DashScope's public and workspace-scoped OpenAI-compatible endpoints. */
 export function isDashScopeBaseUrl(baseUrl: string): boolean {
   try {
@@ -286,41 +478,145 @@ export function isReasoningModel(model: string): boolean {
   );
 }
 
+/** Shadow's effort ladder, ascending. Used to clamp a request onto an endpoint's declared scale. */
+const EFFORT_LADDER: readonly Effort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+/**
+ * Map a Shadow /effort onto the endpoint's DECLARED acceptance vocabulary (ascending), so a scale
+ * that lacks a tier never receives it (P1A-06 AC4). Rounds UP to the nearest supported tier at or
+ * above the request; a request above every declared tier uses the highest. With NO /effort dial
+ * supplied, the HIGHEST declared tier is the safe default for a maximum-reasoning model. Returns
+ * undefined only when the caller supplies no declared scale (the residual decision is theirs).
+ */
+function clampToDeclaredScale(effort: Effort | undefined, scale: readonly Effort[]): Effort | undefined {
+  if (scale.length === 0) return undefined;
+  const wantIdx = effort == null
+    ? EFFORT_LADDER.length - 1
+    : Math.max(0, EFFORT_LADDER.indexOf(effort));
+  for (const tier of scale) {
+    if (EFFORT_LADDER.indexOf(tier) >= wantIdx) return tier;
+  }
+  return scale[scale.length - 1];
+}
+
+/**
+ * Resolve the wire `reasoning_effort` under P1A-06 capability rules. A DECLARED `effortScale` is
+ * the endpoint's literal acceptance vocabulary → we clamp onto it and send that exact value. With
+ * no declared scale we fall back to the legacy mappings (Qwen 3.8 Max 3-tier, or OpenAI 3-tier),
+ * preserving byte-identical DashScope behavior.
+ */
+function resolveEffortWire(
+  effort: Effort | undefined,
+  qwenMax: boolean,
+  caps: ModelCapabilities | undefined,
+  familyScale?: readonly Effort[],
+): string | undefined {
+  if (caps?.effortScale && caps.effortScale.length > 0) {
+    return clampToDeclaredScale(effort, caps.effortScale);
+  }
+  // Family knowledge (familyProfiles.ts effortScale — e.g. Kimi thinking's low/high/max) is the
+  // same vocabulary rule one rung down: a declared capability block still outranks it.
+  if (familyScale && familyScale.length > 0) {
+    return clampToDeclaredScale(effort, familyScale);
+  }
+  return qwenMax ? toQwen38ReasoningEffort(effort) : toReasoningEffort(effort);
+}
+
 export function buildOpenAIBody(
   req: CompletionRequest,
   fallbackModel: string,
   stream = true,
-  opts: { selfHosted?: boolean; dashScope?: boolean } = {},
+  opts: {
+    selfHosted?: boolean;
+    dashScope?: boolean;
+    capabilities?: ModelCapabilities;
+    toolChoiceNone?: boolean;
+    /** P2-03: params this endpoint already 400-rejected this session — stripped up-front. */
+    stripParams?: ReadonlySet<string>;
+    /** F06-08: reasoning round-trip mode ('last' default; 'none' = capture+replay off). */
+    reasoningRoundtrip?: 'last' | 'none';
+  } = {},
 ): Record<string, unknown> {
   const model = req.model || fallbackModel;
+  const caps = opts.capabilities;
   // Model names alone are not capabilities: a local/proxy server may expose the same alias but
-  // support only ordinary Chat Completions. Activate this contract only on verified DashScope.
-  const dashScopeQwen38Max = opts.dashScope === true && isQwen38MaxModel(model);
+  // support only ordinary Chat Completions. The Qwen 3.8 Max adaptive-reasoning wire contract
+  // (reasoning_effort + preserve_thinking + a 262k output floor) is activated by either a verified
+  // endpoint behind the MAX id, or an EXPLICIT capability block (P1A-06 — required for a
+  // `--served-model-name` alias, which carries no Qwen marker in its id).
+  const verifiedQwenMax = (opts.dashScope === true || opts.selfHosted === true) && isQwen38MaxModel(model);
+  // F10-06: `preserveThinking: true` ALONE declares the contract. It previously also required
+  // `reasoning != null`, an undocumented coupling that produced an inconsistent wire state: the
+  // replay gate (shouldPreserveQwenReasoning) accepted the lone field and replayed history, while
+  // this gate rejected it and never sent `preserve_thinking` — the endpoint saw replayed thinking
+  // it was never told to preserve. One declared field now yields one consistent contract.
+  const declaredQwenMax = caps?.preserveThinking === true;
+  const qwenMaxContract = verifiedQwenMax || declaredQwenMax;
+  const isQwenMaxId = isQwen38MaxModel(model);
+  const preserveReasoning = shouldPreserveProviderReasoning(model, opts);
   const body: Record<string, unknown> = {
     model,
-    messages: toOpenAIMessages(req, model, { preserveProviderReasoning: dashScopeQwen38Max }),
+    messages: toOpenAIMessages(req, model, {
+      preserveProviderReasoning: preserveReasoning,
+      reasoningRoundtrip: opts.reasoningRoundtrip,
+    }),
     stream,
   };
   if (stream) body.stream_options = { include_usage: true };
-  if (isOpenAIReasoningModel(model) || dashScopeQwen38Max) {
+
+  // Output budget floor, resolved in precedence order:
+  //   1. declared `capabilities.maxOutputTokens` (operator assertion — ALWAYS wins);
+  //   2. Qwen 3.8 Max adaptive 262k thinking budget (by id or verified endpoint);
+  //   3. family knowledge (familyProfiles.ts minOutputTokens — e.g. deepseek/qwen reasoners);
+  //   4. the generic 64k hidden-reasoner floor.
+  // This must be a CEILING, not a target: the stream layer's shrink ladder self-corrects if the
+  // server's real context window is smaller (see looksLikeTokenOverflow / stream.ts).
+  const family = familyProfile(model);
+  const reasoningFloor =
+    caps?.maxOutputTokens ??
+    (isQwenMaxId ? QWEN38_MAX_TOKENS : family?.minOutputTokens) ??
+    (isReasoningModel(model) ? REASONING_MAX_TOKENS : undefined);
+
+  if (isOpenAIReasoningModel(model)) {
     // GPT-5/o-series reject `max_tokens` (use max_completion_tokens); the cap is reasoning+answer.
-    body.max_completion_tokens = Math.max(
-      req.maxOutputTokens,
-      dashScopeQwen38Max ? QWEN38_MAX_TOKENS : REASONING_MAX_TOKENS,
-    );
-    if (dashScopeQwen38Max) {
-      body.reasoning_effort = toQwen38ReasoningEffort(req.effort);
-      body.preserve_thinking = true;
-    } else {
-      body.reasoning_effort = toReasoningEffort(req.effort);
-    }
+    body.max_completion_tokens = Math.max(req.maxOutputTokens, REASONING_MAX_TOKENS);
+    const wire = resolveEffortWire(req.effort, false, caps);
+    if (wire != null) body.reasoning_effort = wire;
+  } else if (opts.dashScope === true && isQwenMaxId) {
+    // Hosted DashScope Qwen 3.8 Max — byte-identical historical wire contract (P1A-06 AC3).
+    body.max_completion_tokens = Math.max(req.maxOutputTokens, QWEN38_MAX_TOKENS);
+    body.reasoning_effort = resolveEffortWire(req.effort, true, caps);
+    body.preserve_thinking = true;
+  } else if (qwenMaxContract) {
+    // Self-hosted Qwen 3.8 Max (AC1) or an aliased/declared Max serve (AC2). A self-hosted serve
+    // takes `max_tokens` (vLLM/SGLang budget reasoning + answer together); the floor is applied
+    // pre-shrink and the ladder self-corrects. Effort value is gated on the declared scale (AC4).
+    body.max_tokens = Math.max(req.maxOutputTokens, reasoningFloor ?? REASONING_MAX_TOKENS);
+    const wire = resolveEffortWire(req.effort, true, caps);
+    if (wire != null) body.reasoning_effort = wire;
+    body.preserve_thinking = true;
+    if (opts.selfHosted) body.temperature = req.temperature ?? 1.0;
   } else {
     // Every other reasoning family (Gemini, Grok, DeepSeek-R1, Qwen-QwQ) takes `max_tokens` and
     // gets the SAME floor — one check, so a new reasoner can't silently run out. Non-reasoning
     // models keep their exact cap.
-    body.max_tokens = isReasoningModel(model) ? Math.max(req.maxOutputTokens, REASONING_MAX_TOKENS) : req.maxOutputTokens;
-    // Grok's reasoning variants accept reasoning_effort (narrow gate — a 400 on non-reasoning grok).
-    if (isGrokReasoningModel(model)) body.reasoning_effort = toReasoningEffort(req.effort);
+    const floored = reasoningFloor != null ? Math.max(req.maxOutputTokens, reasoningFloor) : req.maxOutputTokens;
+    // A DOCUMENTED provider output cap (family knowledge — DeepSeek's 8k chat / 64k reasoner
+    // limits, F09-06) clamps the first request under it: without this the 65,536 default spends
+    // three 400-shrink round-trips EVERY turn re-discovering a published number. The ladder stays
+    // as the net for undocumented caps; a declared capabilities.maxOutputTokens is the operator's
+    // own floor and is never re-capped by family knowledge.
+    const familyCap = caps?.maxOutputTokens == null ? family?.maxOutputCap : undefined;
+    body.max_tokens = familyCap != null ? Math.min(floored, familyCap) : floored;
+    // Effort reaches the wire only where the acceptance vocabulary is KNOWN: Grok's documented
+    // reasoning variants (legacy 3-tier mapping), a DECLARED capabilities.effortScale, or family
+    // knowledge (Kimi thinking's low/high/max). The scale gates the value — a tier the endpoint
+    // never declared is never sent (P1A-06 AC4 extended to family scales).
+    const familyScale = family?.effortScale;
+    if (isGrokReasoningModel(model) || (caps?.effortScale?.length ?? 0) > 0 || (familyScale?.length ?? 0) > 0) {
+      const wire = resolveEffortWire(req.effort, false, caps, familyScale);
+      if (wire != null) body.reasoning_effort = wire;
+    }
     // Sampling controls are intentionally a self-hosted-only feature. Public/cloud providers
     // have model-specific parameter rules (and OpenAI reasoning models reject temperature), so
     // provider instances must explicitly prove their endpoint is local before this is emitted.
@@ -331,7 +627,18 @@ export function buildOpenAIBody(
       type: 'function',
       function: { name: t.name, description: t.description, parameters: t.parameters },
     }));
-    body.tool_choice = 'auto';
+    // Normally "auto". A serve proven to reject auto tool choice (F11-01 — no vLLM/SGLang
+    // tool-parser flags) gets "none": tools still render in the prompt and a tool-trained model
+    // emits calls as text that Shadow's text-tool-call recovery parses. Tools stay attached either
+    // way so the model knows what's available.
+    body.tool_choice = opts.toolChoiceNone ? 'none' : 'auto';
+  }
+  // P2-03 (F01-05): params proven rejected by this endpoint are stripped up-front — the stream
+  // ladder proved the recovery on first contact; later turns skip the 400 entirely. Applied
+  // LAST so it wins over every emitter above (including tool_choice, which the generic ladder
+  // strips outright when a server rejects the field itself rather than just the "auto" value).
+  if (opts.stripParams) {
+    for (const param of opts.stripParams) delete body[param];
   }
   return body;
 }
@@ -384,6 +691,7 @@ export async function* parseOpenAISSE(
   lines: AsyncIterable<string>,
   model = '',
   preserveQwenReasoning = false,
+  capabilities?: ModelCapabilities,
 ): AsyncIterable<ProviderEvent> {
   let inputTokens = 0;
   let outputTokens = 0;
@@ -397,10 +705,16 @@ export async function* parseOpenAISSE(
   const indexToKey = new Map<number, string>();
   let lastKey: string | null = null;
   let keySeq = 0;
-  // Only split inline <think> for the families that actually emit it (see emitsInlineThinking).
+  // Only split inline  thinking for the families that actually emit it (see emitsInlineThinking).
   // An unknown/empty model keeps the old permissive behavior — a local serve whose id we don't
   // recognize is far more likely to be a reasoner than to be writing prose ABOUT think tags.
-  const splitInline = model === '' || emitsInlineThinking(model);
+  // P1A-06: a declared `reasoning: 'inline' | 'interleaved'` capability forces inline splitting
+  // for an aliased serve whose id the regexes can't classify.
+  const splitInline =
+    model === '' ||
+    capabilities?.reasoning === 'inline' ||
+    capabilities?.reasoning === 'interleaved' ||
+    emitsInlineThinking(model);
   const splitter = new ThinkingSplitter(); // routes inline <think>/<thinking> spans to the reasoning channel
   /**
    * Did ANY `data:` frame arrive? A gateway that ignores `stream: true` (a misconfigured
@@ -418,109 +732,110 @@ export async function* parseOpenAISSE(
   let rawBodyBytes = 0;
   const RAW_BODY_CAP = 8 * 1024 * 1024; // never buffer an unbounded stream
 
-  for await (const rawLine of lines) {
-    const line = rawLine.trim();
-    if (!line.startsWith('data:')) {
+  for await (const ev of sseEvents(lines)) {
+    if (ev.kind === 'other') {
+      // Not a data frame. Until one arrives, buffer the raw body so a gateway that ignored
+      // `stream: true` (plain JSON completion) can still be recovered after the loop.
       if (!sawDataFrame && rawBodyBytes < RAW_BODY_CAP) {
-        rawBody.push(rawLine);
-        rawBodyBytes += rawLine.length + 1;
+        rawBody.push(ev.line);
+        rawBodyBytes += ev.line.length + 1;
       }
       continue;
     }
     sawDataFrame = true;
-    const payload = line.slice(5).trim();
-    if (!payload || payload === '[DONE]') continue;
+    // P2-03 (F01-08): spec-compliant SSE reassembly — one event's data field may span several
+    // `data:` lines (joined with '\n' on dispatch). '[DONE]' is filtered per part so it works as
+    // a lone terminator or the last part of a multi-line event.
+    const parts = nonEmptyParts(ev.parts).filter((x) => x.trim() !== '[DONE]');
+    if (parts.length === 0) continue;
 
-    let obj: OAISSE;
-    try {
-      obj = JSON.parse(payload) as OAISSE;
-    } catch {
-      continue;
-    }
+    for (const parsed of parseSseData(parts.join('\n'), parts)) {
+      const obj = parsed as OAISSE;
 
-    // An error frame on a 200 stream: surface it (recoverable) instead of dropping it,
-    // so the loop reports a real failure rather than a clean empty turn.
-    if (obj.error) {
-      const message = obj.error.message ?? 'provider returned an error frame';
-      const code = obj.error.code ?? obj.error.type ?? 'provider_stream_error';
-      yield { type: 'error', recoverable: true, code: String(code), message: String(message) };
-      stopReason = 'end_turn';
-      continue;
-    }
-
-    // The final usage chunk has empty `choices`; capture tokens whenever present.
-    if (obj.usage) {
-      const cached = obj.usage.prompt_tokens_details?.cached_tokens ?? 0;
-      cacheReadTokens = cached;
-      // OpenAI's prompt_tokens INCLUDES cached tokens; the rest of Shadow assumes disjoint
-      // (Anthropic) semantics, so subtract to avoid double-counting cost + context.
-      if (typeof obj.usage.prompt_tokens === 'number') inputTokens = Math.max(0, obj.usage.prompt_tokens - cached);
-      if (typeof obj.usage.completion_tokens === 'number') outputTokens = obj.usage.completion_tokens;
-    }
-
-    const choice = obj.choices?.[0];
-    if (!choice) continue;
-    const delta = choice.delta;
-    // Separate reasoning field (DeepSeek `reasoning_content`, some `reasoning`) → reasoning channel.
-    const reasoningField = typeof delta?.reasoning_content === 'string'
-      ? 'reasoning_content'
-      : typeof delta?.reasoning === 'string'
-        ? 'reasoning'
-        : undefined;
-    const reasoning = reasoningField ? delta?.[reasoningField] : undefined;
-    if (typeof reasoning === 'string' && reasoning) {
-      yield { type: 'thinking', delta: reasoning };
-      if (preserveQwenReasoning && isQwen38MaxModel(model)) {
-        preservedReasoning += reasoning;
-        preservedReasoningField ??= reasoningField;
+      // An error frame on a 200 stream: surface it (recoverable) instead of dropping it,
+      // so the loop reports a real failure rather than a clean empty turn.
+      if (obj.error) {
+        const message = obj.error.message ?? 'provider returned an error frame';
+        const code = obj.error.code ?? obj.error.type ?? 'provider_stream_error';
+        yield { type: 'error', recoverable: true, code: String(code), message: String(message) };
+        stopReason = 'end_turn';
+        continue;
       }
-    }
-    // Inline <think>/<thinking> spans in the content are split out to the same channel.
-    if (delta?.content) {
-      if (!splitInline) {
-        yield { type: 'text', delta: delta.content };
-      } else {
-        for (const span of splitter.push(delta.content)) {
-          yield span.kind === 'thinking' ? { type: 'thinking', delta: span.text } : { type: 'text', delta: span.text };
+
+      // The final usage chunk has empty `choices`; capture tokens whenever present.
+      if (obj.usage) {
+        const cached = obj.usage.prompt_tokens_details?.cached_tokens ?? 0;
+        cacheReadTokens = cached;
+        // OpenAI's prompt_tokens INCLUDES cached tokens; the rest of Shadow assumes disjoint
+        // (Anthropic) semantics, so subtract to avoid double-counting cost + context.
+        if (typeof obj.usage.prompt_tokens === 'number') inputTokens = Math.max(0, obj.usage.prompt_tokens - cached);
+        if (typeof obj.usage.completion_tokens === 'number') outputTokens = obj.usage.completion_tokens;
+      }
+
+      const choice = obj.choices?.[0];
+      if (!choice) continue;
+      const delta = choice.delta;
+      // Separate reasoning field (DeepSeek `reasoning_content`, some `reasoning`) → reasoning channel.
+      const reasoningField = typeof delta?.reasoning_content === 'string'
+        ? 'reasoning_content'
+        : typeof delta?.reasoning === 'string'
+          ? 'reasoning'
+          : undefined;
+      const reasoning = reasoningField ? delta?.[reasoningField] : undefined;
+      if (typeof reasoning === 'string' && reasoning) {
+        yield { type: 'thinking', delta: reasoning };
+        if (preserveQwenReasoning) {
+          preservedReasoning += reasoning;
+          preservedReasoningField ??= reasoningField;
         }
       }
-    }
-
-    for (const tc of delta?.tool_calls ?? []) {
-      let key: string;
-      const existingById = tc.id ? findKeyById(calls, tc.id) : undefined;
-      const idxKey = typeof tc.index === 'number' ? indexToKey.get(tc.index) : undefined;
-      if (existingById) {
-        key = existingById; // a later chunk re-stating a known id
-      } else if (idxKey !== undefined && !(tc.id && calls.get(idxKey)!.id && calls.get(idxKey)!.id !== tc.id)) {
-        // Continuation by index — INCLUDING a chunk that introduces the id late (name-first,
-        // id-later), but NOT when the index already holds a DIFFERENT id (reused index).
-        key = idxKey;
-      } else if (tc.id) {
-        key = `k${keySeq++}`; // a NEW id → a new call (even if index is absent or reused)
-        calls.set(key, { id: tc.id, name: '', args: '', signature: '' });
-        if (typeof tc.index === 'number') indexToKey.set(tc.index, key);
-      } else if (typeof tc.index === 'number') {
-        key = `k${keySeq++}`; // first chunk carried only an index
-        calls.set(key, { id: '', name: '', args: '', signature: '' });
-        indexToKey.set(tc.index, key);
-      } else {
-        key = lastKey ?? `k${keySeq++}`; // no id, no index → continue the most recent call
-        if (!calls.has(key)) calls.set(key, { id: '', name: '', args: '', signature: '' });
+      // Inline <think>/<thinking> spans in the content are split out to the same channel.
+      if (delta?.content) {
+        if (!splitInline) {
+          yield { type: 'text', delta: delta.content };
+        } else {
+          for (const span of splitter.push(delta.content)) {
+            yield span.kind === 'thinking' ? { type: 'thinking', delta: span.text } : { type: 'text', delta: span.text };
+          }
+        }
       }
-      lastKey = key;
-      const cur = calls.get(key)!;
-      if (tc.id) cur.id = tc.id;
-      if (tc.function?.name) cur.name = tc.function.name;
-      const sig = tc.extra_content?.google?.thought_signature;
-      if (typeof sig === 'string' && sig) cur.signature = sig;
-      if (typeof tc.function?.arguments === 'string') {
-        cur.args += tc.function.arguments;
-        yield { type: 'tool_call_partial', id: cur.id, name: cur.name, jsonDelta: tc.function.arguments };
-      }
-    }
 
-    if (choice.finish_reason) stopReason = mapOpenAIFinish(choice.finish_reason);
+      for (const tc of delta?.tool_calls ?? []) {
+        let key: string;
+        const existingById = tc.id ? findKeyById(calls, tc.id) : undefined;
+        const idxKey = typeof tc.index === 'number' ? indexToKey.get(tc.index) : undefined;
+        if (existingById) {
+          key = existingById; // a later chunk re-stating a known id
+        } else if (idxKey !== undefined && !(tc.id && calls.get(idxKey)!.id && calls.get(idxKey)!.id !== tc.id)) {
+          // Continuation by index — INCLUDING a chunk that introduces the id late (name-first,
+          // id-later), but NOT when the index already holds a DIFFERENT id (reused index).
+          key = idxKey;
+        } else if (tc.id) {
+          key = `k${keySeq++}`; // a NEW id → a new call (even if index is absent or reused)
+          calls.set(key, { id: tc.id, name: '', args: '', signature: '' });
+          if (typeof tc.index === 'number') indexToKey.set(tc.index, key);
+        } else if (typeof tc.index === 'number') {
+          key = `k${keySeq++}`; // first chunk carried only an index
+          calls.set(key, { id: '', name: '', args: '', signature: '' });
+          indexToKey.set(tc.index, key);
+        } else {
+          key = lastKey ?? `k${keySeq++}`; // no id, no index → continue the most recent call
+          if (!calls.has(key)) calls.set(key, { id: '', name: '', args: '', signature: '' });
+        }
+        lastKey = key;
+        const cur = calls.get(key)!;
+        if (tc.id) cur.id = tc.id;
+        if (tc.function?.name) cur.name = tc.function.name;
+        const sig = tc.extra_content?.google?.thought_signature;
+        if (typeof sig === 'string' && sig) cur.signature = sig;
+        if (typeof tc.function?.arguments === 'string') {
+          cur.args += tc.function.arguments;
+          yield { type: 'tool_call_partial', id: cur.id, name: cur.name, jsonDelta: tc.function.arguments };
+        }
+      }
+
+      if (choice.finish_reason) stopReason = mapOpenAIFinish(choice.finish_reason);
+    }
   }
 
   // Surface any held-back tail (e.g. an unclosed reasoning tag) at stream end.

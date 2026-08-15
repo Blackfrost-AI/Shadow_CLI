@@ -54,8 +54,10 @@ export function buildTurnDeps(session: WebSession): LoopDeps {
     planMode: agent.planMode,
     streamShell: true,
     sessionLog: agent.sessionLog,
-    resolveFallback: async (entry) => {
-      const activated = await agent.activateModel(entry);
+    resolveFallback: async (entry, fallbackSignal) => {
+      fallbackSignal?.throwIfAborted();
+      const activated = await agent.activateModel(entry, fallbackSignal);
+      fallbackSignal?.throwIfAborted();
       agent.provider = activated.provider;
       return activated;
     },

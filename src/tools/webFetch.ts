@@ -3,35 +3,19 @@ import type { Tool, ToolResult } from './types.js';
 import { ok, fail } from './types.js';
 import { clamp } from './util.js';
 import { assertUrlAllowed } from '../safety/netguard.js';
-import { fetch as undiciFetch, Agent } from 'undici';
+import { shadowFetch } from '../safety/egress.js';
+import { envelopUntrusted, fitPayload } from '../safety/envelope.js';
+
+/** Sanitize a server-controlled string interpolated OUTSIDE the envelope markers (header line,
+ *  data fields): no CR/LF/control chars (line-splitting = framing forgery on text providers),
+ *  bounded length. */
+function headerSafe(s: string, cap = 200): string {
+  return s.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, cap);
+}
 
 const DEFAULT_MAX_BYTES = 100_000;
 const HARD_MAX_BYTES = 2_000_000;
 const MAX_REDIRECTS = 5;
-
-/**
- * An undici Agent whose connect step resolves ONLY to the pre-validated IP — it
- * ignores the hostname, so fetch cannot re-resolve and a DNS-rebind can't flip the
- * target to a private/metadata address between the guard's check and the connect.
- * (For HTTPS the original hostname is still used for SNI/cert verification.)
- */
-export function pinnedAgent(ips: string[]): Agent {
-  const ip = ips[0]!;
-  const family = ip.includes(':') ? 6 : 4;
-  return new Agent({
-    connect: {
-      lookup(_hostname, options, callback): void {
-        if (options && (options as { all?: boolean }).all) {
-          (callback as (e: Error | null, a: { address: string; family: number }[]) => void)(null, [
-            { address: ip, family },
-          ]);
-        } else {
-          (callback as (e: Error | null, a: string, f: number) => void)(null, ip, family);
-        }
-      },
-    },
-  });
-}
 
 const inputSchema = z.object({
   url: z.string().url().describe('The http(s) URL to fetch.'),
@@ -49,7 +33,8 @@ export interface WebFetchData {
   url: string;
   status: number;
   contentType: string;
-  text: string;
+  /** P3-05: the page body lives ONLY in the enveloped summary (once, wrapped) — not duplicated here. */
+  chars: number;
 }
 
 /** Read a fetch response body as text but stop after `cap` bytes, cancelling the stream. Prevents a
@@ -79,24 +64,6 @@ export async function readCapped(res: { body?: unknown; text: () => Promise<stri
 }
 
 /** Crude HTML → text: drop scripts/markup, decode the common entities. */
-/**
- * Close a pinned agent's sockets. Node's undici Agent exposes `.close()`, but the
- * Bun-compiled binary's undici Agent does NOT — a bare `agent.close()` throws
- * "agent.close is not a function", which made web_fetch/web_search fail on EVERY
- * call in the shipped binary (they worked in `node dist/`). Guard both `.close`
- * and `.destroy` and swallow teardown errors so socket cleanup never fails a tool.
- */
-export function closeAgent(agent: Agent | undefined): void {
-  if (!agent) return;
-  const a = agent as unknown as { close?: () => unknown; destroy?: () => unknown };
-  try {
-    if (typeof a.close === 'function') void a.close();
-    else if (typeof a.destroy === 'function') void a.destroy();
-  } catch {
-    // best-effort: socket teardown must never fail the tool
-  }
-}
-
 export function htmlToText(html: string): string {
   return html
     .replace(/<script[\s\S]*?<\/script>/gi, ' ')
@@ -150,84 +117,93 @@ export const webFetch: Tool<WebFetchInput, WebFetchData> = {
         url: target.href,
         status: 0,
         contentType: '',
-        text: '',
+        chars: 0,
       });
     }
 
-    let res!: Awaited<ReturnType<typeof undiciFetch>>;
+    let res!: Response;
     let currentUrl = target.href;
-    let agent: Agent | undefined;
-    try {
-      for (let hop = 0; ; hop++) {
-        closeAgent(agent); // close the prior hop's pinned agent
-        agent = pinnedAgent(ips); // pin the socket to the IP the guard just validated
-        try {
-          res = await undiciFetch(target.href, {
+    for (let hop = 0; ; hop++) {
+      try {
+        // Routed through the egress broker (P2-01): the socket is pinned to the IP SET the
+        // guard just validated (broker-side, cached per set), and the request lands in the
+        // egress receipt. We still follow + re-validate (and re-pin) each hop ourselves.
+        res = await shadowFetch(
+          target.href,
+          {
             method: 'GET',
-            redirect: 'manual', // we follow + re-validate (and re-pin) each hop ourselves
+            redirect: 'manual',
             // ESC (ctx.signal) OR a 30s per-request deadline — a host that trickles bytes must not hold
             // a fetch open for undici's ~5min default with no per-tool timeout.
             signal: AbortSignal.any([ctx.signal, AbortSignal.timeout(30_000)]),
-            dispatcher: agent,
             headers: {
               'user-agent': 'Shadow/0.1 (+local coding agent)',
               accept: 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8',
             },
-          });
-        } catch (e) {
-          return fail('web_fetch', 'network', Date.now() - start, 'fetch_failed', `fetch failed: ${(e as Error).message}`);
-        }
-
-        const location = res.status >= 300 && res.status < 400 ? res.headers.get('location') : null;
-        if (!location) break;
-
-        if (hop >= MAX_REDIRECTS) {
-          return fail('web_fetch', 'network', Date.now() - start, 'too_many_redirects', `exceeded ${MAX_REDIRECTS} redirects`);
-        }
-        await res.body?.cancel().catch(() => undefined); // discard the redirect body WITHOUT buffering it (arrayBuffer() drained the whole — possibly huge — body into memory each hop → OOM)
-
-        let next: string;
-        try {
-          next = new URL(location, currentUrl).href; // resolve relative redirects
-        } catch {
-          return fail('web_fetch', 'network', Date.now() - start, 'bad_redirect', `invalid redirect target: ${location}`);
-        }
-        try {
-          const r = await assertUrlAllowed(next); // re-check AND re-pin every hop (anti-SSRF)
-          target = r.url;
-          ips = r.ips;
-        } catch (e) {
-          return fail('web_fetch', 'network', Date.now() - start, 'blocked_redirect', (e as Error).message);
-        }
-        currentUrl = target.href;
-      }
-
-      const status = res.status;
-      const contentType = res.headers.get('content-type') ?? '';
-      let body: string;
-      try {
-        // Read with a hard byte cap (HARD_MAX_BYTES) instead of buffering the entire response — a
-        // multi-GB or endless stream would otherwise exhaust memory before the clamp ever runs.
-        body = await readCapped(res, HARD_MAX_BYTES);
+          },
+          { purpose: 'web', pinnedIps: ips },
+        );
       } catch (e) {
-        return fail('web_fetch', 'network', Date.now() - start, 'read_failed', `could not read response body: ${(e as Error).message}`);
+        return fail('web_fetch', 'network', Date.now() - start, 'fetch_failed', `fetch failed: ${(e as Error).message}`);
       }
 
-      const text = /html/i.test(contentType) ? htmlToText(body) : body;
-      const clamped = clamp(text || '(empty response)', maxBytes);
-      const healthy = status >= 200 && status < 300;
-      const summary = healthy
-        ? `Fetched ${currentUrl} (HTTP ${status}, ${contentType || 'unknown type'}, ${clamped.length} chars).`
-        : `Fetched ${currentUrl} but server returned HTTP ${status}.`;
+      const location = res.status >= 300 && res.status < 400 ? res.headers.get('location') : null;
+      if (!location) break;
 
-      return ok('web_fetch', 'network', Date.now() - start, summary, {
-        url: currentUrl,
-        status,
-        contentType,
-        text: clamped,
-      });
-    } finally {
-      closeAgent(agent);
+      if (hop >= MAX_REDIRECTS) {
+        return fail('web_fetch', 'network', Date.now() - start, 'too_many_redirects', `exceeded ${MAX_REDIRECTS} redirects`);
+      }
+      await res.body?.cancel().catch(() => undefined); // discard the redirect body WITHOUT buffering it (arrayBuffer() drained the whole — possibly huge — body into memory each hop → OOM)
+
+      let next: string;
+      try {
+        next = new URL(location, currentUrl).href; // resolve relative redirects
+      } catch {
+        // The Location header is attacker-authored — never interpolate it raw outside an envelope.
+        return fail('web_fetch', 'network', Date.now() - start, 'bad_redirect', `invalid redirect target: ${headerSafe(location)}`);
+      }
+      try {
+        const r = await assertUrlAllowed(next); // re-check AND re-pin every hop (anti-SSRF)
+        target = r.url;
+        ips = r.ips;
+      } catch (e) {
+        return fail('web_fetch', 'network', Date.now() - start, 'blocked_redirect', (e as Error).message);
+      }
+      currentUrl = target.href;
     }
+
+    const status = res.status;
+    // Content-Type is server-authored and lands in the provenance line + data (OUTSIDE the
+    // envelope) — sanitize it like any other header text.
+    const contentType = headerSafe(res.headers.get('content-type') ?? '', 120);
+    let body: string;
+    try {
+      // Read with a hard byte cap (HARD_MAX_BYTES) instead of buffering the entire response — a
+      // multi-GB or endless stream would otherwise exhaust memory before the clamp ever runs.
+      body = await readCapped(res, HARD_MAX_BYTES);
+    } catch (e) {
+      return fail('web_fetch', 'network', Date.now() - start, 'read_failed', `could not read response body: ${(e as Error).message}`);
+    }
+
+    const text = /html/i.test(contentType) ? htmlToText(body) : body;
+    const clamped = clamp(text || '(empty response)', maxBytes);
+    // P3-05: the page bytes are untrusted content authored by whoever controls the host — even a
+    // 4xx body. They enter the context EXACTLY once, inside the containment envelope (surviving
+    // bytes untouched; the matching policy sits in the system prompt). The payload is clamped to
+    // the loop's result budget BEFORE enveloping so the END marker always survives — a downstream
+    // cut that severed it would hand a forged END inside the page its escape wedge.
+    const payload = ctx.maxToolResultChars ? fitPayload(clamped, ctx.maxToolResultChars) : clamped;
+    const healthy = status >= 200 && status < 300;
+    const provenance = healthy
+      ? `Fetched ${currentUrl} (HTTP ${status}, ${contentType || 'unknown type'}, ${payload.length} chars).`
+      : `Fetched ${currentUrl} but server returned HTTP ${status}.`;
+    const summary = `${provenance}\n${envelopUntrusted({ tool: 'web_fetch', source: currentUrl, content: payload })}`;
+
+    return ok('web_fetch', 'network', Date.now() - start, summary, {
+      url: currentUrl,
+      status,
+      contentType,
+      chars: payload.length,
+    });
   },
 };

@@ -9,6 +9,7 @@ import { join, resolve, dirname, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 import type { ModelEntry } from './config.js';
+import { shadowFetch } from './safety/egress.js';
 
 /**
  * Resolve a server binary NAME (e.g. "llama-server") to a runnable path.
@@ -115,9 +116,11 @@ function portFor(entry: ModelEntry): number {
 
 async function isUp(baseUrl: string): Promise<boolean> {
   try {
-    const r = await fetch(baseUrl.replace(/\/v1$/, '') + '/health', {
-      signal: AbortSignal.timeout(1500),
-    });
+    const r = await shadowFetch(
+      baseUrl.replace(/\/v1$/, '') + '/health',
+      { signal: AbortSignal.timeout(1500) },
+      { purpose: 'local-probe', origin: 'user' },
+    );
     return r.ok;
   } catch {
     return false;
@@ -129,7 +132,10 @@ async function isUp(baseUrl: string): Promise<boolean> {
 async function serverReady(baseUrl: string): Promise<boolean> {
   if (await isUp(baseUrl)) return true;
   try {
-    const r = await fetch(`${baseUrl}/models`, { signal: AbortSignal.timeout(1500) });
+    const r = await shadowFetch(`${baseUrl}/models`, { signal: AbortSignal.timeout(1500) }, {
+      purpose: 'local-probe',
+      origin: 'user',
+    });
     return r.ok;
   } catch {
     return false;
@@ -264,7 +270,10 @@ export async function detectServerContextWindow(baseUrl: string): Promise<number
   const root = baseUrl.replace(/\/$/, '').replace(/\/v1$/, '');
   for (const url of [`${root}/props`, `${root}/v1/models`]) {
     try {
-      const response = await fetch(url, { signal: AbortSignal.timeout(1_500), redirect: 'error' });
+      const response = await shadowFetch(url, { signal: AbortSignal.timeout(1_500), redirect: 'error' }, {
+        purpose: 'local-probe',
+        origin: 'user',
+      });
       if (!response.ok) continue;
       const found = contextValue(await response.json());
       if (found) return found;
@@ -284,7 +293,10 @@ export async function detectServerContextWindow(baseUrl: string): Promise<number
  *  the gguf path as the id). Returns the ids, or null when the endpoint is absent/unparseable. */
 async function servedModelIds(baseUrl: string): Promise<string[] | null> {
   try {
-    const r = await fetch(`${baseUrl}/models`, { signal: AbortSignal.timeout(1500) });
+    const r = await shadowFetch(`${baseUrl}/models`, { signal: AbortSignal.timeout(1500) }, {
+      purpose: 'local-probe',
+      origin: 'user',
+    });
     if (!r.ok) return null;
     const j = (await r.json()) as { data?: { id?: string }[] };
     if (!Array.isArray(j.data)) return null;
@@ -601,12 +613,16 @@ export function mlxOfflineReady(target: string, hubDir = join(homedir(), '.cache
  *  field, so a probe that answers CAN serve this session, whatever else it has loaded. */
 async function mlxProbe(baseUrl: string, model: string, timeoutMs: number): Promise<boolean> {
   try {
-    const r = await fetch(`${baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, messages: [{ role: 'user', content: 'ok' }], max_tokens: 1, stream: false }),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
+    const r = await shadowFetch(
+      `${baseUrl}/chat/completions`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ model, messages: [{ role: 'user', content: 'ok' }], max_tokens: 1, stream: false }),
+        signal: AbortSignal.timeout(timeoutMs),
+      },
+      { purpose: 'local-probe', origin: 'user' },
+    );
     return r.ok;
   } catch {
     return false;

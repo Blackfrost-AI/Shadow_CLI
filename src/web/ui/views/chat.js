@@ -144,6 +144,17 @@ function renderDiff(lines) {
   }));
 }
 
+// Enveloped results (web_fetch / web_search / MCP) can run to ~maxToolResultChars of multi-line
+// text — render those in the scrollable, max-height .tool-pre (capped), never the unconstrained
+// .tool-line. P3-05 review: an uncapped summary here was the one place a hostile page could
+// bloat/scroll-jack the console.
+const TOOL_SUMMARY_CAP = 4_000;
+function renderSummary(s) {
+  const capped = s.length > TOOL_SUMMARY_CAP ? `${s.slice(0, TOOL_SUMMARY_CAP)}\n…(truncated in console)` : s;
+  if (capped.includes('\n') || capped.length > 160) return el('pre', { class: 'tool-pre' }, [capped]);
+  return el('div', { class: 'tool-line' }, [capped]);
+}
+
 function toolBody(item) {
   const kids = [];
   if (item.status === 'denied') kids.push(el('div', { class: 'tool-denied-reason' }, [`reason: ${item.summary || 'denied'}`]));
@@ -153,7 +164,7 @@ function toolBody(item) {
     kids.push(el('pre', { class: 'tool-pre' }, [item.output]));
     if (item.truncated) kids.push(el('div', { class: 'tool-trim' }, ['earlier output trimmed']));
   } else if (item.summary && item.status === 'ok' && !item.diff?.length) {
-    kids.push(el('div', { class: 'tool-line' }, [item.summary]));
+    kids.push(renderSummary(item.summary));
   }
   for (const f of item.findings ?? []) {
     kids.push(el('div', { class: 'tool-finding' }, [el('span', { class: `badge sev-${f.severity ?? 'info'}` }, [f.severity ?? 'info']), `${f.title}: ${f.body}`]));

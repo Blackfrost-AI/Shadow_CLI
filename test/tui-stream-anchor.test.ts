@@ -43,6 +43,26 @@ test('a CLOSED code fence commits as one whole block', () => {
   assert.equal(rest, 'after');
 });
 
+test('P1A-13: a 4-tick fence holding a 3-tick line is NOT closed by that line', () => {
+  const buf = '````md\nbefore\na ```here``` line\nmore\n';
+  const { blocks, rest } = extractCompleteBlocks(buf);
+  // The interior 3-tick line (and any blank line inside) must NOT commit/split anything; the
+  // whole still-open 4-tick fence stays live until a 4-tick close appears.
+  assert.deepEqual(blocks, []);
+  assert.equal(rest, buf);
+  // extractCompleteBlocks commits a block only once a BLANK line follows it (parity with the
+  // live-region model), so the closed fence+blank triggers the single-unit commit.
+  const closed = extractCompleteBlocks(buf + '````\n\nafter');
+  assert.deepEqual(closed.blocks, ['````md\nbefore\na ```here``` line\nmore\n````']);
+  assert.equal(closed.rest, 'after');
+});
+
+test('P1A-13: a 4-tick fence is not closed by a 3-tick fence line', () => {
+  const { blocks, rest } = extractCompleteBlocks('````txt\none\n```\ntwo\n');
+  assert.deepEqual(blocks, []);
+  assert.equal(rest, '````txt\none\n```\ntwo\n');
+});
+
 test('interior single newlines (lists) stay within one block', () => {
   const { blocks, rest } = extractCompleteBlocks('1. one\n2. two\n3. three\n\nnext');
   assert.deepEqual(blocks, ['1. one\n2. two\n3. three']);
@@ -87,3 +107,14 @@ test('does NOT inject a second fence when the opener is already inside the tail'
   assert.equal(out, '```ts\nc1\nc2\nc3\nc4\nc5');
   assert.equal((out.match(/```/g) ?? []).length, 1, 'exactly one fence opener survives');
 });
+
+test('P1A-13: clamping inside a 4-tick fence re-opens at the SAME width (not 3 ticks)', () => {
+  // The kept tail contains 3-tick lines. Re-opening with the original 4-tick width means those
+  // 3-tick lines stay code, not a premature close.
+  const open = '````md';
+  const code = Array.from({ length: 40 }, (_, i) => `line ${i} \`\`\`\``);
+  const out = clampTail(open + '\n' + code.join('\n'), 5);
+  assert.ok(out.startsWith('````md\n'), `re-opened at original 4-tick width, got: ${JSON.stringify(out)}`);
+  assert.deepEqual(out, '````md\n' + code.slice(-5).join('\n'), 'no inner line cut the code styling');
+});
+

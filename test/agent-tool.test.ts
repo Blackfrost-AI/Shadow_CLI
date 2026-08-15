@@ -180,6 +180,9 @@ test('bg agent full listener path: main context receives task-notification appen
       dryRun: false,
       maxToolResultChars: 1000,
       contextBudget: 100000,
+      // The bg agent's empty scripted turn triggers the P1A-08 empty-response backoff; stub the
+      // seam so retries are instantaneous — this test pins the T0-6 buffering contract, not timing.
+      sleep: async () => {},
     });
 
     const tool = makeAgentTool({ makeLoopDeps, getAutonomy: () => 'full', contextBudget: 100000, triggerRatio: 0.75, keepLastTurns: 2, maxIterations: 2, priceTable: PRICE });

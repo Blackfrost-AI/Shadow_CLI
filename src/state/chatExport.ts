@@ -29,6 +29,9 @@ interface SessionEvent {
   ts?: string;
 }
 
+/** Display cap for a tool result's summary in exports (envelopes can run to ~maxToolResultChars). */
+const EXPORT_SUMMARY_CAP = 4_000;
+
 function previewInput(input: unknown): string {
   const o = input as Record<string, unknown> | undefined;
   if (!o || typeof o !== 'object') return '';
@@ -88,7 +91,11 @@ export function sessionToMarkdown(events: unknown[], meta: ExportMeta): string {
         const input = e.call?.input;
         const preview = previewInput(input);
         const mark = e.result?.ok ? 'ok' : 'err';
-        const summary = e.result?.summary ?? '';
+        // Cap the rendered summary — an enveloped web_fetch/MCP result can be ~maxToolResultChars
+        // (~16k) and would otherwise bloat the export with one page's whole body per tool call.
+        const rawSummary = e.result?.summary ?? '';
+        const summary =
+          rawSummary.length > EXPORT_SUMMARY_CAP ? `${rawSummary.slice(0, EXPORT_SUMMARY_CAP)}\n…(result truncated in export)` : rawSummary;
         lines.push(`## Tool · ${name}`, '');
         if (preview) lines.push(`**Input:** \`${preview}\`  `);
         lines.push(`**Result:** ${mark} — ${summary}`, '');

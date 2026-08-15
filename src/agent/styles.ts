@@ -52,3 +52,24 @@ const styles: Record<OutputStyle, StyleBlock> = {
 export { styles };
 export const outputStyles = ['proactive', 'explanatory', 'learning', 'procedural'] as const;
 export type OutputStyleValue = (typeof outputStyles)[number];
+
+// F08-12: user-defined output styles (loaded from .shadow/.claude output-styles dirs) live in a
+// session registry so the pure buildStyledSystem + the /style picker can resolve them by name
+// without widening the built-in union everywhere. Set once per session in bootstrap.
+let customStyleRegistry: Record<string, { label: string; block: string }> = {};
+export function setCustomStyles(list: ReadonlyArray<{ name: string; label: string; block: string }>): void {
+  customStyleRegistry = {};
+  for (const s of list) customStyleRegistry[s.name.toLowerCase()] = { label: s.label, block: s.block };
+}
+/** The prompt block for a custom style name, or undefined if it isn't one. */
+export function customStyleBlock(name: string): string | undefined {
+  return customStyleRegistry[name.toLowerCase()]?.block;
+}
+/** All registered custom style names (lowercased), for the /style picker. */
+export function customStyleNames(): string[] {
+  return Object.keys(customStyleRegistry);
+}
+/** True if `name` is a built-in or a registered custom style. */
+export function isKnownStyle(name: string): boolean {
+  return (outputStyles as readonly string[]).includes(name) || name.toLowerCase() in customStyleRegistry;
+}

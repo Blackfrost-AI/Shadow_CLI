@@ -40,7 +40,7 @@ export class Budget {
   private cacheReadTokens = 0;
   private cacheWriteTokens = 0;
   private costUSD = 0;
-  private readonly startMs: number;
+  private startMs: number;
 
   constructor(
     private readonly limits: BudgetLimits,
@@ -48,6 +48,16 @@ export class Budget {
     private readonly prices: PriceTable,
     now: number,
   ) {
+    this.startMs = now;
+  }
+
+  /**
+   * F06-10: queue wait is not loop time. A sub-agent that sat in the concurrency semaphore
+   * restarts its wall-clock (and reported elapsed) at ADMISSION — otherwise a long queue wait
+   * was charged against the 30-minute wall-clock budget and a late-admitted agent could be
+   * killed by `budget` seconds after it started running.
+   */
+  restartClock(now: number): void {
     this.startMs = now;
   }
 
@@ -99,6 +109,17 @@ export class Budget {
   /** Returns a stop code if any ceiling is now exceeded, else null. */
   check(now: number): BudgetStop {
     if (this.limits.maxIterations > 0 && this.iterations >= this.limits.maxIterations) return 'max_iterations';
+    return this.checkSpending(now);
+  }
+
+  /**
+   * Spending ceilings only (tokens / cost / wall clock), without the iteration cap. Used by the
+   * in-call checks (F04-10): `maxIterations` bounds PROVIDER TURNS, and the tools of the final
+   * turn are still entitled to run — the between-turns `check()` stops the loop before the NEXT
+   * turn. Tokens/cost/wall-clock are different: once crossed, no further call should be enlisted
+   * anywhere, mid-batch included.
+   */
+  checkSpending(now: number): BudgetStop {
     const total = this.inputTokens + this.outputTokens;
     if (this.limits.maxTotalTokens != null && total >= this.limits.maxTotalTokens) return 'budget';
     if (this.limits.maxCostUSD != null && this.costUSD >= this.limits.maxCostUSD) return 'budget';

@@ -14,7 +14,8 @@
  * (src/system/resolveSystem.ts + prompts/models/*.md).
  */
 import { looksAnthropicDistilled } from '../util/transport.js';
-import { isQwenReasoner, isQwen38MaxModel, isDeepSeekReasoner } from '../provider/openai.js';
+import { isQwenReasoner, isQwen38MaxModel, isDeepSeekReasoner, isKimiThinkingModel } from '../provider/openai.js';
+import type { Effort } from '../provider/provider.js';
 
 /** A GENUINE Anthropic model id — including vendor-prefixed forms (OpenRouter
  *  `anthropic/claude-*`, Bedrock `us.anthropic.claude-*`) and bare family aliases
@@ -34,6 +35,14 @@ export interface FamilyProfile {
   parallelTools?: boolean;
   /** Documented output floor the provider adapter enforces (surfaced, not applied here). */
   minOutputTokens?: number;
+  /** Documented HARD output cap of the hosted endpoint (tokens). buildOpenAIBody clamps the first
+   *  request under it, so a published limit is never re-discovered through the 400-shrink ladder
+   *  (which stays as the safety net for undocumented ones). */
+  maxOutputCap?: number;
+  /** The reasoning_effort vocabulary the endpoint accepts, ascending. An explicit
+   *  capabilities.effortScale outranks it; emission is gated on the scale, so a tier the endpoint
+   *  never declared is never sent. */
+  effortScale?: Effort[];
   /** Wire-format hint: the model emits this transport's tool-call format natively. */
   transport?: 'anthropic';
   /** One-line heads-up surfaced on selection. */
@@ -89,12 +98,40 @@ const TABLE: { match: (m: string) => boolean; profile: FamilyProfile }[] = [
     },
   },
   {
+    // Hosted DeepSeek chat (V3 line, non-thinking): platform docs cap max_tokens at 8,192
+    // (default 4K). Without the cap, Shadow's 65,536 default 400-cascades through three shrink
+    // round-trips EVERY turn before landing on 8,192 — with it the first request fits.
+    match: (m) => /(^|\/)deepseek-chat(?:$|[._-])/i.test(m.trim()),
+    profile: {
+      family: 'deepseek-chat',
+      maxOutputCap: 8_192,
+      note: 'DeepSeek caps deepseek-chat output at 8,192 tokens — requests are clamped to fit on the first try.',
+    },
+  },
+  {
     // Same rule: the adapter's matcher IS the truth (deepseek-reasoner / R1 / R1 distills).
+    // Hosted deepseek-reasoner allows a 64K completion (thinking + answer, default 32K): the cap
+    // keeps an explicit larger --max-output-tokens from 400-cascading, while the floor preserves
+    // the full documented reasoning budget. For local R1 distills the cap only binds above 64K —
+    // requests those windows reject anyway — so the shrink ladder remains their real net.
     match: (m) => isDeepSeekReasoner(m),
     profile: {
       family: 'deepseek-reasoner',
       minOutputTokens: 64_000,
+      maxOutputCap: 65_536,
       note: 'reasoning family: the provider enforces a 64k output floor (thinking + answer share it).',
+    },
+  },
+  {
+    // Kimi K2/K3 "thinking" variants: reasoning_content replay is a MODEL contract — Moonshot's
+    // tool-calling docs require echoing it back on later turns, and the open-weight chat template
+    // consumes the same field (see shouldPreserveProviderReasoning). Effort vocabulary is the
+    // Moonshot 3-tier low/high/max scale (F09-03) — emission is clamped onto it.
+    match: (m) => isKimiThinkingModel(m),
+    profile: {
+      family: 'kimi-thinking',
+      effortScale: ['low', 'high', 'max'],
+      note: 'Kimi thinking: assistant reasoning_content is replayed in tool loops; /effort maps onto the low/high/max scale.',
     },
   },
 ];

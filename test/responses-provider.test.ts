@@ -10,6 +10,7 @@ import {
 import { createProvider } from '../src/provider/index.js';
 import { OpenAIProvider } from '../src/provider/openai.js';
 import type { CompletionRequest, ProviderEvent } from '../src/provider/provider.js';
+import { resolveFakeHosts } from './helpers/fakeHostEgress.js';
 
 const BASE_REQ: CompletionRequest = {
   model: 'gpt-5',
@@ -116,6 +117,7 @@ function mockResponsesFetch(opts: {
   streamThrows?: boolean;
 }): () => void {
   const orig = globalThis.fetch;
+  const restoreEgress = resolveFakeHosts(); // http://mock is not resolvable — let it reach the stub
   globalThis.fetch = async (url, init) => {
     assert.match(String(url), /\/responses$/, 'ResponsesProvider must POST to /responses');
     const body = init?.body ? (JSON.parse(init.body as string) as { stream?: boolean }) : {};
@@ -151,6 +153,7 @@ function mockResponsesFetch(opts: {
     } as Response;
   };
   return () => {
+    restoreEgress();
     globalThis.fetch = orig;
   };
 }

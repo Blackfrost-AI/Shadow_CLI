@@ -1,11 +1,38 @@
 import { outputStyles } from './styles.js';
-import { readFileSync, existsSync, writeFileSync, renameSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { z } from 'zod';
 import { loadGlobalConfig, saveGlobalConfig, getCredential } from './state/globalStore.js';
 import type { PermissionRule } from './safety/rules.js';
 import { resolveSubscriptionAuth } from './auth/index.js';
 import { subProviderFor } from './auth/spec.js';
+import type { Effort } from './provider/provider.js';
+
+/**
+ * Declarative per-model capability block (P1A-06). Model NAMES are not capabilities — a
+ * vLLM/SGLang serve may expose the front-line id under a `--served-model-name` alias, and an open
+ * proxy may reuse a Qwen alias while supporting only ordinary Chat Completions. Where Shadow would
+ * otherwise GUESS from an id-regex, this explicit block is consulted FIRST and overrides the guess.
+ * Absent a block, the existing id-regex fallbacks are used unchanged (backward compatible).
+ */
+export interface ModelCapabilities {
+  /** Whether/how the model emits reasoning. `hidden` = separate reasoning field; `inline` =  thinking tags in content; `interleaved` = both. Presence disables id-guessing for reasoning. */
+  reasoning?: 'hidden' | 'inline' | 'interleaved';
+  /** Declaring this opts the entry into reasoning replay (same trigger as `preserveThinking`).
+   *  Replay itself is byte-for-byte exact-field: history is replayed in whichever field the model
+   *  actually emitted — this value documents the endpoint's field, it does not remap the wire. */
+  reasoningField?: 'reasoning_content' | 'reasoning';
+  /** The reasoning-depth values this exact endpoint accepts, in ascending order. When set, the
+   *  /effort dial is mapped onto ONLY these values (an endpoint that lacks `xhigh` never receives
+   *  a value its scale doesn't define). */
+  effortScale?: Effort[];
+  /** Output budget floor (tokens). Declared ALWAYS wins over the id/family-derived floor. */
+  maxOutputTokens?: number;
+  /** Model accepts images. (Documented for future use; provider media routing is unimplemented.) */
+  vision?: boolean;
+  /** The endpoint requires `preserve_thinking:true` and round-trips preserved thinking (Qwen 3.8 Max). */
+  preserveThinking?: boolean;
+}
 
 const ModelPriceSchema = z.object({
   input: z.number(),
@@ -99,6 +126,17 @@ export const ModelEntrySchema = z.object({
   // cannot be distinguished from a hosted API by URL inspection alone. Local/LAN targets are
   // detected automatically; this is needed only for remote self-hosted presets.
   selfHosted: z.boolean().optional(),
+  // P1A-04: per-endpoint stream resilience knobs. Self-hosted inference servers
+  // (llama.cpp, vLLM, MLX, SGLang) routinely pause for many seconds between SSE
+  // chunks (long generation, prompt processing, queueing) — way past Shadow's
+  // tight public-API defaults. Tune these per model entry; the session-wide
+  // SHADOW_IDLE_MS env still wins (env > config > default) as the escape hatch.
+  /** Mid-stream silence tolerated before the watchdog aborts the attempt (ms). */
+  idleTimeoutMs: z.number().int().positive().optional(),
+  /** Max wait for the FIRST byte of any response attempt (ms). */
+  firstByteTimeoutMs: z.number().int().positive().optional(),
+  /** SSE retry ceiling for transient 5xx / connection resets. */
+  streamRetries: z.number().int().min(0).optional(),
   apiKey: z.string().optional(),
   authToken: z.string().optional(),
   /**
@@ -121,6 +159,21 @@ export const ModelEntrySchema = z.object({
   // `contextBudget` remains the session's soft ceiling. Local servers are queried at runtime
   // when possible, with this value as the trusted fallback.
   contextWindow: z.number().int().positive().optional(),
+  // P1A-06: declarative capability block. Consults BEFORE id-regex guessing in the provider
+  // adapter (a `--served-model-name` alias hides the true id; an open proxy may reuse a Qwen
+  // alias without supporting the Qwen wire contract). Unlocks the self-hosted Qwen 3.8 Max
+  // contract — 262k output floor, reasoning_effort, preserve_thinking — without requiring the
+  // canonical id.
+  capabilities: z
+    .object({
+      reasoning: z.enum(['hidden', 'inline', 'interleaved']).optional(),
+      reasoningField: z.enum(['reasoning_content', 'reasoning']).optional(),
+      effortScale: z.array(z.enum(['low', 'medium', 'high', 'xhigh', 'max'])).optional(),
+      maxOutputTokens: z.number().int().positive().optional(),
+      vision: z.boolean().optional(),
+      preserveThinking: z.boolean().optional(),
+    })
+    .optional(),
   disabled: z.boolean().optional(),
   // Optional /model-picker category override. When unset, the group is derived:
   // a local endpoint → "Local", otherwise the model's company (Anthropic/OpenAI/xAI/…).
@@ -189,6 +242,12 @@ const ConfigSchema = z.object({
   lastModel: z.string().optional(), // label of the last model chosen via the picker
   permissionRules: z.array(PermissionRuleSchema).default([]),
   hooks: HooksSchema.default({ pre_tool_use: [], post_tool_use: [] }),
+  // P3-06 v0 — diagnostics feedback loop: extension → command map (e.g. { "ts": "tsc --noEmit",
+  // "py": "ruff check" }) run after a SUCCESSFUL edit_file/write_file/multi_edit, output folded
+  // into the tool result so the model self-corrects in-loop. Command-bearing → GLOBAL-ONLY
+  // (`diagnostics` is in PROJECT_UNTRUSTED_KEYS), same posture as hooks: a cloned repo must not
+  // be able to run commands on your machine. See src/agent/diagnostics.ts.
+  diagnostics: z.record(z.string()).optional(),
   mcpServers: z.record(McpServerSchema).default({}),
   // Shadow's pluggable "eyes" — describe an image via a vision model YOU run, so any driving model
   // (even a text-only one) can reason about pictures. The endpoint lives in ~/.shadow or env ONLY
@@ -214,6 +273,14 @@ const ConfigSchema = z.object({
   // scrolling for click-to-caret. Shipping it on by default was a mistake; it stranded terminals
   // in reporting mode when a session was killed before cleanup ran.
   mouse: z.boolean().default(false),
+  // Terminal notification on turn-complete / approval-waiting (P1B-04). `auto` picks the terminal's
+  // native desktop notification (iTerm2/kitty/ghostty) or the bell elsewhere; `off` disables. Local
+  // terminal escape only — nothing leaves the machine.
+  notify: z.enum(['auto', 'iterm2', 'kitty', 'ghostty', 'bell', 'off']).default('auto'),
+  // Resume recap (F08-11): on /resume, summarize the restored conversation into a "While you were
+  // away" box via the CURRENT provider (one non-streaming call — the user's own endpoint, no extra
+  // egress). OFF by default so a resume never silently spends tokens without opting in.
+  resumeRecap: z.boolean().default(false),
   planMode: z.boolean().default(false),
   systemPromptPath: z.string().optional(),
   style: z.enum(outputStyles).default('proactive'),
@@ -225,6 +292,15 @@ const ConfigSchema = z.object({
   // launch Shadow does a plain payload-free GET of the PUBLIC version and prints one line if a newer
   // release exists. Never sends anything about the user. See src/update/checkUpdate.ts.
   updateCheck: z.boolean().default(false),
+  // P3-07 — OPTIONAL plugin index. Shadow ships with NO central catalog (zero telemetry); when
+  // the user sets `pluginIndexUrl`, `shadow plugin search`/`add <name>` fetch that JSON index
+  // through the egress broker (purpose 'plugin-index'). The index is UNTRUSTED CONTENT — entries
+  // are display-only and every URL is re-validated against the git-URL allowlist before use. If
+  // `pluginIndexKey` (ECDSA P-256 public key, PEM) is also set, the index body MUST carry a valid
+  // detached signature at <url>.sig or it is refused (fail-closed). Both keys are GLOBAL-ONLY
+  // (in PROJECT_UNTRUSTED_KEYS): a cloned repo must never point plugin discovery at its own index.
+  pluginIndexUrl: z.string().optional(),
+  pluginIndexKey: z.string().optional(),
 
   maxIterations: z.number().int().nonnegative().default(200), // 0 = unlimited (dead-drop / long engagements); real backstop = tokens/cost/wall-clock
   // Generous default so reasoning models (incl. custom LOCAL reasoners that isReasoningModel
@@ -254,10 +330,36 @@ const ConfigSchema = z.object({
   contextBudget: z.number().int().positive().default(128_000),
   summarizeTriggerRatio: z.number().positive().max(1).default(0.9),
   keepLastTurns: z.number().int().positive().default(12),
+  // P1B-02 microcompaction (F08-01): clear STALE, cheaply-reproducible tool_result bodies
+  // (read_file/grep/glob/run_shell/web_fetch/web_search) in place BEFORE the summarizer round-trip
+  // — the cheapest context win for long self-hosted sessions. Fires at contextBudget *
+  // microcompactTriggerRatio (kept below summarizeTriggerRatio so it reclaims first); the summarizer
+  // remains the fallback when clearing bodies is not enough. Default ON.
+  microcompact: z.boolean().default(true),
+  microcompactTriggerRatio: z.number().positive().max(1).default(0.7),
   maxToolResultChars: z.number().int().positive().default(16_384),
+  // F06-08: how much preserved provider reasoning (Qwen/Kimi wire state) round-trips back to the
+  // endpoint on later turns. 'last' (default) replays it only on the newest qualifying assistant
+  // turn — the continuation contract needs the CURRENT thread's thinking, not every past turn's,
+  // and replaying the whole history re-sends the entire reasoning budget each request.
+  // 'none' disables capture and replay entirely.
+  reasoningRoundtrip: z.enum(['last', 'none']).default('last'),
+  // F06-10: max sub-agents running CONCURRENTLY per session. Parallel tool use can fire many
+  // `agent` calls in one turn; the semaphore queues the excess instead of streaming every loop
+  // at once (provider connections + context windows + GPU contention on local rigs). Raise it
+  // on powerful machines; 1 serializes sub-agents entirely.
+  subagentConcurrency: z.number().int().min(1).max(16).default(4),
 
   sandbox: z.enum(['auto', 'off']).default('auto'), // OS sandbox for run_shell (auto = on where supported)
   sandboxNetwork: z.boolean().default(true), // allow network inside the sandbox (installs/fetches need it)
+  // P2-12 — what happens when the OS sandbox was REQUESTED but the host has no tool to enforce it
+  // (Windows always; Linux without bwrap). The second axis of the two-layer policy (P3-04):
+  // `sandbox`/`sandboxNetwork` say what confinement is possible, this says when to ask.
+  //   auto (default) — every unconfined run_shell goes through the approval gate with a loud
+  //                    UNCONFINED notice (session/prefix approvals and allow-rules may suppress it).
+  //   fail-closed    — same gate, but it NEVER bends: every unconfined call asks, every time.
+  //   warn           — pre-P2-12 behavior: run unconfined, warning folded into the tool result.
+  sandboxFailurePolicy: z.enum(['auto', 'fail-closed', 'warn']).default('auto'),
   shellTimeoutMs: z.number().int().positive().default(60_000),
   shellEnvAllowlist: z
     .array(z.string())
@@ -317,7 +419,13 @@ const CONFIG_FILE = 'shadow.config.json';
 // it is currently resolved from flags.offline (not a ConfigSchema key, so zod already strips it
 // from a project file), but if it ever becomes config-settable this keeps a project file from
 // re-enabling egress + MCP for a session. One word now avoids a silent hole later.
-const PROJECT_UNTRUSTED_KEYS = ['baseUrl', 'selfHosted', 'shellEnvAllowlist', 'autonomy', 'denylistExtra', 'systemPromptPath', 'sandbox', 'sandboxNetwork', 'additionalDirectories', 'projects', 'offline', 'hooks', 'statusLine', 'vision'];
+// `permissionRules` MUST be global-only (F07-01): resolvePermissionRule returns 'allow' for a
+// pattern-less `{tool:'*'|name, action:'allow'}`, so a cloned repo shipping
+// `{"permissionRules":[{"tool":"run_shell","action":"allow"}]}` would silently disarm the approval
+// gate for every matching call at default autonomy — AND persistPermissionRules would write that
+// very file, so an injected model could plant the config that later discloses the gate. Strip the
+// whole key from the project file; allow/deny/ask grants belong in ~/.shadow (global) only.
+const PROJECT_UNTRUSTED_KEYS = ['baseUrl', 'selfHosted', 'shellEnvAllowlist', 'autonomy', 'denylistExtra', 'systemPromptPath', 'sandbox', 'sandboxNetwork', 'sandboxFailurePolicy', 'additionalDirectories', 'projects', 'offline', 'hooks', 'statusLine', 'vision', 'permissionRules', 'diagnostics', 'pluginIndexUrl', 'pluginIndexKey'];
 
 /** Layered precedence: CLI flags > env > project config file (de-fanged) > global > defaults. */
 export function loadConfig(cwd: string, cliOverrides: Record<string, unknown> = {}): ShadowConfig {
@@ -443,24 +551,19 @@ export function loadConfig(cwd: string, cliOverrides: Record<string, unknown> = 
 }
 
 /**
- * Persist permission rules to the effective config layer: project `shadow.config.json`
- * when present (it overrides global on reload), otherwise `~/.shadow/config.json`.
+ * Persist permission rules to the GLOBAL config layer ONLY (`~/.shadow/config.json`).
+ *
+ * F07-01 (P1A-01): this used to write into a project `shadow.config.json` when one was present.
+ * That is the persistence half of the privilege chain — an injected model that can write the
+ * project config could plant an allow-rule that disarms the approval gate on the next load, and
+ * PROJECT_UNTRUSTED_KEYS now strips `permissionRules` from project files precisely so such a file
+ * is inert. Writing the grant here instead of the workspace keeps the rule the USER just typed
+ * (which lives at global trust) rather than manufacturing the untrusted file we refuse to honor.
+ * The project-config branch is gone; `cwd` is ignored and kept only for API compatibility.
  */
 export function persistPermissionRules(cwd: string, rules: PermissionRule[]): void {
-  const path = resolve(cwd, CONFIG_FILE);
-  if (existsSync(path)) {
-    let raw: Record<string, unknown>;
-    try {
-      raw = JSON.parse(readFileSync(path, 'utf8')) as Record<string, unknown>;
-    } catch (err) {
-      throw new Error(`failed to parse ${CONFIG_FILE}: ${(err as Error).message}`);
-    }
-    const tmp = `${path}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ ...raw, permissionRules: rules }, null, 2) + '\n', 'utf8');
-    renameSync(tmp, path);
-  } else {
-    saveGlobalConfig({ permissionRules: rules });
-  }
+  void cwd;
+  saveGlobalConfig({ permissionRules: rules });
 }
 
 function readEnvOverrides(): Record<string, unknown> {

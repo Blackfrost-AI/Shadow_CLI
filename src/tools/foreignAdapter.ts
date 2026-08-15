@@ -107,6 +107,46 @@ function mapUpdatePlan(input: Record<string, unknown>): Record<string, unknown> 
   return { todos };
 }
 
+/**
+ * Detect a Claude-style `TodoWrite` argument shape. Claude's native TodoWrite sends
+ * `{ todos: [{ content, status, activeForm? }] }` — items carry `content` (the imperative)
+ * and optionally `activeForm` (the label shown while the item is the active one), and NEVER
+ * `subject`. Shadow's canonical `todo_write` requires `subject`, so this shape must be mapped; a
+ * canonical call (items all carry `subject`) must pass through untouched.
+ */
+function hasClaudeTodoShape(input: Record<string, unknown>): boolean {
+  const raw = input.todos ?? input.items;
+  if (!Array.isArray(raw) || raw.length === 0) return false;
+  return raw.some((it) => {
+    const row = asRecord(it);
+    return !!row && ('content' in row || 'activeForm' in row);
+  });
+}
+
+/** Map Claude `TodoWrite` args (`content`/`activeForm`) onto Shadow's canonical todo_write shape. */
+function mapClaudeTodoWrite(input: Record<string, unknown>): Record<string, unknown> {
+  const raw = input.todos ?? input.items;
+  if (!Array.isArray(raw)) return { todos: [] };
+  const todos = raw.map((it, i) => {
+    const row = asRecord(it) ?? {};
+    const subject = String(row.subject ?? row.content ?? row.plan ?? row.step ?? `item ${i}`);
+    const statusRaw = String(row.status ?? 'pending').toLowerCase();
+    const status =
+      statusRaw === 'completed' || statusRaw === 'done'
+        ? 'completed'
+        : statusRaw === 'in_progress' || statusRaw === 'in-progress' || statusRaw === 'doing'
+          ? 'in_progress'
+          : 'pending';
+    const out: Record<string, unknown> = { subject, status };
+    // Claude's `activeForm` is the transient label shown while the item is the active one; fold it
+    // into `description` so nothing meaningful is dropped. An explicit `description` wins.
+    const desc = typeof row.description === 'string' ? row.description : typeof row.activeForm === 'string' ? row.activeForm : undefined;
+    if (desc) out.description = desc;
+    return out;
+  });
+  return { todos };
+}
+
 /** Map foreign name + args to canonical Shadow tool call. */
 export function normalizeForeignTool(call: ForeignToolCall): NormalizedToolCall {
   const lower = call.name.toLowerCase();
@@ -131,6 +171,9 @@ export function normalizeForeignTool(call: ForeignToolCall): NormalizedToolCall 
     case 'todo_write':
       if (lower === 'update_plan' || call.name === 'update_plan') {
         return { name: 'todo_write', input: mapUpdatePlan(o) };
+      }
+      if (hasClaudeTodoShape(o)) {
+        return { name: 'todo_write', input: mapClaudeTodoWrite(o) };
       }
       return { name: canonical, input: o };
     default:

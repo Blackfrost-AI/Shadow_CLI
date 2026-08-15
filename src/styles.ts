@@ -1,4 +1,4 @@
-import { styles, outputStyles, type OutputStyle } from './agent/styles.js';
+import { styles, outputStyles, customStyleNames, type OutputStyle } from './agent/styles.js';
 
-export { styles, outputStyles, type OutputStyle };
+export { styles, outputStyles, customStyleNames, type OutputStyle };
 

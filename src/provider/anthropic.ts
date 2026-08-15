@@ -18,6 +18,9 @@ import {
   type StopReason,
 } from './provider.js';
 import { streamWithRetry } from './stream.js';
+import { sseEvents, parseSseData, nonEmptyParts } from './sse.js';
+import { shadowFetch } from '../safety/egress.js';
+import { isLocalBaseUrl } from '../safety/offline.js';
 import { eventsFromAnthropicMessage } from './nonStream.js';
 import { parseToolArgs } from './toolJson.js';
 
@@ -38,11 +41,37 @@ export class AnthropicProvider implements Provider {
    * (e.g. an Ollama server or a proxy). Auth: a bearer `authToken` (à la
    * ANTHROPIC_AUTH_TOKEN) takes precedence; otherwise `x-api-key` is used.
    */
-  constructor(opts: { apiKey?: string; authToken?: string; baseUrl?: string; model: string }) {
+  private readonly idleTimeoutMs: number | undefined;
+  private readonly firstByteTimeoutMs: number | undefined;
+  private readonly streamRetries: number | undefined;
+  /**
+   * P1A-04 explicit marker: a remote Anthropic-compatible endpoint flagged selfHosted
+   * (a proxy in front of an Anthropic Messages API). Detection covers local URLs; this
+   * marker covers remote URLs — mirrors OpenAIProvider and lets the C4 no-re-POST
+   * protection trigger for remote self-hosted Anthropic front-ends too.
+   */
+  private readonly selfHosted: boolean;
+
+  constructor(opts: {
+    apiKey?: string;
+    authToken?: string;
+    baseUrl?: string;
+    model: string;
+    selfHosted?: boolean;
+    idleTimeoutMs?: number;
+    firstByteTimeoutMs?: number;
+    streamRetries?: number;
+  }) {
     this.apiKey = opts.apiKey;
     this.authToken = opts.authToken;
     this.url = `${(opts.baseUrl ?? DEFAULT_ANTHROPIC_BASE).replace(/\/v1\/?$/, '').replace(/\/+$/, '')}/v1/messages`;
     this.model = opts.model;
+    // P1A-04 — per-endpoint stream knobs (the public Anthropic API normally needs none).
+    this.idleTimeoutMs = opts.idleTimeoutMs;
+    this.firstByteTimeoutMs = opts.firstByteTimeoutMs;
+    this.streamRetries = opts.streamRetries;
+    // P1A-04: explicit selfHosted marker mirrors OpenAIProvider — covers remote proxies.
+    this.selfHosted = opts.selfHosted === true || isLocalBaseUrl(opts.baseUrl);
   }
 
   estimateTokens(messages: Message[]): number {
@@ -90,7 +119,11 @@ export class AnthropicProvider implements Provider {
     const signal = args.signal ? AbortSignal.any([timeout, args.signal]) : timeout;
     let res: Response;
     try {
-      res = await fetch(countUrl, { method: 'POST', headers, body: JSON.stringify(body), signal });
+      res = await shadowFetch(
+        countUrl,
+        { method: 'POST', headers, body: JSON.stringify(body), signal },
+        { purpose: 'provider-count', origin: 'user' },
+      );
     } catch {
       return estimateTokensFromMessages(args.messages ?? []); // timed out / aborted → estimate
     }
@@ -125,6 +158,9 @@ export class AnthropicProvider implements Provider {
       signal: req.signal,
       nonStreamBody: buildAnthropicBody(req, model, false),
       parseNonStream: eventsFromAnthropicMessage,
+      idleTimeoutMs: this.idleTimeoutMs,
+      firstByteTimeoutMs: this.firstByteTimeoutMs,
+      streamRetries: this.streamRetries,
     });
   }
 }
@@ -379,135 +415,133 @@ export async function* parseAnthropicSSE(lines: AsyncIterable<string>): AsyncIte
     }
   }
 
-  for await (const rawLine of lines) {
-    const line = rawLine.trim();
-    if (!line.startsWith('data:')) continue;
-    const payload = line.slice(5).trim();
-    if (!payload) continue;
+  for await (const ev of sseEvents(lines)) {
+    if (ev.kind === 'other') continue; // keepalives / comments / blank separators
+    // P2-03 (F01-08): spec-compliant SSE reassembly — one event's data field may span several
+    // `data:` lines; they parse as a unit, with a per-line defensive fallback (see parseSseData).
+    const parts = nonEmptyParts(ev.parts);
+    if (parts.length === 0) continue;
 
-    let evt: AntSSE;
-    try {
-      evt = JSON.parse(payload) as AntSSE;
-    } catch {
-      continue; // ignore keepalive / malformed frames
-    }
+    for (const parsed of parseSseData(parts.join('\n'), parts)) {
+      const evt = parsed as AntSSE;
 
-    switch (evt.type) {
-      case 'message_start': {
-        const u = evt.message?.usage;
-        if (u) {
-          if (typeof u.input_tokens === 'number') inputTokens = u.input_tokens;
-          if (typeof u.cache_read_input_tokens === 'number') cacheReadTokens = u.cache_read_input_tokens;
-          if (typeof u.cache_creation_input_tokens === 'number') cacheWriteTokens = u.cache_creation_input_tokens;
-        }
-        break;
-      }
-      case 'content_block_start': {
-        if (typeof evt.index === 'number') {
-          blocks.set(evt.index, {
-            type: evt.content_block?.type ?? '',
-            id: evt.content_block?.id ?? '',
-            name: evt.content_block?.name ?? '',
-            json: '',
-            thinking: '',
-            signature: '',
-            // redacted_thinking carries its whole (encrypted) payload here — no deltas follow.
-            data: typeof evt.content_block?.data === 'string' ? evt.content_block.data : '',
-          });
-        }
-        break;
-      }
-      case 'content_block_delta': {
-        const d = evt.delta;
-        if (!d || typeof evt.index !== 'number') break;
-        // some Anthropic-compat streams omit content_block_start — lazy-create.
-        let b = blocks.get(evt.index);
-        if (!b) {
-          const inferredType =
-            d.type === 'input_json_delta'
-              ? 'tool_use'
-              : d.type === 'thinking_delta' || d.type === 'signature_delta'
-                ? 'thinking'
-                : 'text';
-          b = { type: inferredType, id: '', name: '', json: '', thinking: '', signature: '', data: '' };
-          blocks.set(evt.index, b);
-        }
-        if (d.type === 'text_delta' && typeof d.text === 'string') {
-          yield { type: 'text', delta: d.text };
-        } else if (d.type === 'input_json_delta' && typeof d.partial_json === 'string') {
-          b.json += d.partial_json;
-          yield { type: 'tool_call_partial', id: b.id, name: b.name, jsonDelta: d.partial_json };
-        } else if (d.type === 'thinking_delta' && typeof d.thinking === 'string') {
-          b.thinking += d.thinking;
-          yield { type: 'thinking', delta: d.thinking };
-        } else if (d.type === 'signature_delta' && typeof d.signature === 'string') {
-          // The signature arrives (possibly in parts) on the thinking block; it must
-          // be captured and echoed back verbatim on the next request.
-          b.signature += d.signature;
-        }
-        break;
-      }
-      case 'content_block_stop': {
-        if (typeof evt.index !== 'number') break;
-        const b = blocks.get(evt.index);
-        if (b && b.type === 'thinking') {
-          b.done = true;
-          // Emit the completed, signed thinking block for the loop to stash in
-          // history so it can be echoed back on the next turn.
-          yield { type: 'thinking_block', thinking: b.thinking, signature: b.signature };
-        } else if (b && b.type === 'redacted_thinking') {
-          b.done = true;
-          // Encrypted reasoning — preserve the blob for verbatim echo-back next turn.
-          yield { type: 'redacted_thinking_block', data: b.data };
-        } else if (b && b.type === 'tool_use') {
-          b.done = true;
-          if (!b.name) {
-            // A stream that omitted content_block_start gives us input_json_delta with no name/id — there
-            // is nothing to reconstruct the call from. Surface a recoverable error (the loop retries)
-            // instead of emitting an empty-named tool_call (→ confusing "unknown tool: ") or dropping it.
-            yield {
-              type: 'error',
-              recoverable: true,
-              code: 'nameless_tool_call',
-              message: 'tool call streamed without a name (endpoint omitted content_block_start) — resend the call',
-            };
-            break;
+      switch (evt.type) {
+        case 'message_start': {
+          const u = evt.message?.usage;
+          if (u) {
+            if (typeof u.input_tokens === 'number') inputTokens = u.input_tokens;
+            if (typeof u.cache_read_input_tokens === 'number') cacheReadTokens = u.cache_read_input_tokens;
+            if (typeof u.cache_creation_input_tokens === 'number') cacheWriteTokens = u.cache_creation_input_tokens;
           }
-          const parsed = parseToolArgs(b.json); // repair ladder before giving up
-          if (parsed.ok) {
-            yield { type: 'tool_call', call: { id: b.id, name: b.name, input: parsed.value } };
-          } else {
-            yield {
-              type: 'error',
-              recoverable: true,
-              code: 'bad_tool_json',
-              message: `tool "${b.name}" ${parsed.error}`,
-            };
-          }
+          break;
         }
-        break;
+        case 'content_block_start': {
+          if (typeof evt.index === 'number') {
+            blocks.set(evt.index, {
+              type: evt.content_block?.type ?? '',
+              id: evt.content_block?.id ?? '',
+              name: evt.content_block?.name ?? '',
+              json: '',
+              thinking: '',
+              signature: '',
+              // redacted_thinking carries its whole (encrypted) payload here — no deltas follow.
+              data: typeof evt.content_block?.data === 'string' ? evt.content_block.data : '',
+            });
+          }
+          break;
+        }
+        case 'content_block_delta': {
+          const d = evt.delta;
+          if (!d || typeof evt.index !== 'number') break;
+          // some Anthropic-compat streams omit content_block_start — lazy-create.
+          let b = blocks.get(evt.index);
+          if (!b) {
+            const inferredType =
+              d.type === 'input_json_delta'
+                ? 'tool_use'
+                : d.type === 'thinking_delta' || d.type === 'signature_delta'
+                  ? 'thinking'
+                  : 'text';
+            b = { type: inferredType, id: '', name: '', json: '', thinking: '', signature: '', data: '' };
+            blocks.set(evt.index, b);
+          }
+          if (d.type === 'text_delta' && typeof d.text === 'string') {
+            yield { type: 'text', delta: d.text };
+          } else if (d.type === 'input_json_delta' && typeof d.partial_json === 'string') {
+            b.json += d.partial_json;
+            yield { type: 'tool_call_partial', id: b.id, name: b.name, jsonDelta: d.partial_json };
+          } else if (d.type === 'thinking_delta' && typeof d.thinking === 'string') {
+            b.thinking += d.thinking;
+            yield { type: 'thinking', delta: d.thinking };
+          } else if (d.type === 'signature_delta' && typeof d.signature === 'string') {
+            // The signature arrives (possibly in parts) on the thinking block; it must
+            // be captured and echoed back verbatim on the next request.
+            b.signature += d.signature;
+          }
+          break;
+        }
+        case 'content_block_stop': {
+          if (typeof evt.index !== 'number') break;
+          const b = blocks.get(evt.index);
+          if (b && b.type === 'thinking') {
+            b.done = true;
+            // Emit the completed, signed thinking block for the loop to stash in
+            // history so it can be echoed back on the next turn.
+            yield { type: 'thinking_block', thinking: b.thinking, signature: b.signature };
+          } else if (b && b.type === 'redacted_thinking') {
+            b.done = true;
+            // Encrypted reasoning — preserve the blob for verbatim echo-back next turn.
+            yield { type: 'redacted_thinking_block', data: b.data };
+          } else if (b && b.type === 'tool_use') {
+            b.done = true;
+            if (!b.name) {
+              // A stream that omitted content_block_start gives us input_json_delta with no name/id — there
+              // is nothing to reconstruct the call from. Surface a recoverable error (the loop retries)
+              // instead of emitting an empty-named tool_call (→ confusing "unknown tool: ") or dropping it.
+              yield {
+                type: 'error',
+                recoverable: true,
+                code: 'nameless_tool_call',
+                message: 'tool call streamed without a name (endpoint omitted content_block_start) — resend the call',
+              };
+              break;
+            }
+            const parsed = parseToolArgs(b.json); // repair ladder before giving up
+            if (parsed.ok) {
+              yield { type: 'tool_call', call: { id: b.id, name: b.name, input: parsed.value } };
+            } else {
+              yield {
+                type: 'error',
+                recoverable: true,
+                code: 'bad_tool_json',
+                message: `tool "${b.name}" ${parsed.error}`,
+              };
+            }
+          }
+          break;
+        }
+        case 'message_delta': {
+          if (evt.delta?.stop_reason) stopReason = mapAnthropicStop(evt.delta.stop_reason);
+          if (typeof evt.usage?.output_tokens === 'number') outputTokens = evt.usage.output_tokens;
+          break;
+        }
+        case 'message_stop': {
+          yield* flushPendingToolUse(); // any in-flight tool_use must land BEFORE done
+          sawMessageStop = true;
+          yield { type: 'usage', inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens };
+          yield { type: 'done', stopReason };
+          break;
+        }
+        case 'error': {
+          const code = evt.error?.type ?? 'api_error';
+          // overloaded / transient api errors are retryable; the rest are terminal.
+          const recoverable = code === 'overloaded_error' || code === 'api_error';
+          yield { type: 'error', recoverable, code, message: evt.error?.message ?? 'stream error' };
+          break;
+        }
+        default:
+          break;
       }
-      case 'message_delta': {
-        if (evt.delta?.stop_reason) stopReason = mapAnthropicStop(evt.delta.stop_reason);
-        if (typeof evt.usage?.output_tokens === 'number') outputTokens = evt.usage.output_tokens;
-        break;
-      }
-      case 'message_stop': {
-        yield* flushPendingToolUse(); // any in-flight tool_use must land BEFORE done
-        sawMessageStop = true;
-        yield { type: 'usage', inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens };
-        yield { type: 'done', stopReason };
-        break;
-      }
-      case 'error': {
-        const code = evt.error?.type ?? 'api_error';
-        // overloaded / transient api errors are retryable; the rest are terminal.
-        const recoverable = code === 'overloaded_error' || code === 'api_error';
-        yield { type: 'error', recoverable, code, message: evt.error?.message ?? 'stream error' };
-        break;
-      }
-      default:
-        break;
     }
   }
 

@@ -24,6 +24,126 @@ export interface SniffResult {
   cleaned: string; // input text with the recovered call spans removed
 }
 
+/**
+ * Return the first string offset at which assistant text starts looking like one of
+ * the textual tool-call dialects recovered by {@link sniffToolCalls}.
+ *
+ * This is intentionally a display/streaming guard, not a parser: it also spots an
+ * unfinished suffix (for example `call:run_shell{"command":` or a JSON envelope
+ * whose closing braces have not arrived yet). Callers can retain that suffix while
+ * streaming instead of committing tool scaffolding to the transcript.
+ */
+export function findTextualToolIntentStart(text: string): number | null {
+  const starts: number[] = [];
+  const addMatches = (re: RegExp): void => {
+    re.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = re.exec(text)) !== null) {
+      starts.push(includeOpeningJsonFence(text, match.index));
+      if (!match[0]) re.lastIndex++;
+    }
+  };
+
+  // JSON/XML wrapper plus the bare Hermes/Qwen function form.
+  addMatches(/<tool_call\b/gi);
+  addMatches(/<function(?:=|\s+name\s*=\s*["'])/gi);
+
+  // DeepSeek R1/V3 control-token form. Either the singular call token or its
+  // plural envelope is enough to withhold the remainder of an unfinished stream.
+  addMatches(/<[｜|]tool[▁_]calls?[▁_]begin[｜|]>/g);
+
+  // `call:NAME{...}` can occur inline. Also catch a line-ending `call:NAME`
+  // while the opening brace is still in flight, without treating ordinary
+  // prose such as "make a call: tomorrow" as tool intent.
+  addMatches(/call:\s*[A-Za-z_]\w*\s*(?=\{)/g);
+  addMatches(/^[ \t]*call:\s*[A-Za-z_]\w*[ \t]*$/gm);
+
+  // Explicit JSON envelopes are recognizable before they are balanced enough
+  // for `balancedObjects`/`parseLoose`. Start at their currently-open containing
+  // object so no leading `{` or optional ```json fence leaks into the display.
+  const envelopeKey = /["'](?:tool_calls|writables)["']\s*:/g;
+  let key: RegExpExecArray | null;
+  while ((key = envelopeKey.exec(text)) !== null) {
+    const objectStart = enclosingObjectStart(text, key.index);
+    starts.push(includeOpeningJsonFence(text, objectStart ?? key.index));
+  }
+
+  return starts.length ? Math.min(...starts) : null;
+}
+
+/**
+ * Remove textual tool intent from an incomplete/interrupted assistant answer.
+ *
+ * Complete calls are stripped by the normal recovery parser with every name
+ * treated as known (nothing is executed here). If a call is truncated before it
+ * can be parsed, the remaining intent suffix is removed from its first marker.
+ * Surrounding visible prose is preserved.
+ */
+export function stripTextualToolIntent(text: string): string {
+  if (!text) return text;
+
+  let cleaned = sniffToolCalls(text, () => true).cleaned;
+  // A complete explicit JSON envelope may have been wrapped in a markdown fence;
+  // sniffToolCalls removes the object itself, so remove the now-empty wrapper too.
+  cleaned = cleaned.replace(/```(?:json)?\s*```/gi, '');
+
+  const intentStart = findTextualToolIntentStart(cleaned);
+  if (intentStart !== null) cleaned = cleaned.slice(0, intentStart);
+  return cleaned.trim();
+}
+
+/** Find the innermost still-open object before `until`, ignoring braces in strings. */
+function enclosingObjectStart(text: string, until: number): number | null {
+  const stack: number[] = [];
+  let inString = false;
+  let quote = '';
+  let escaped = false;
+  for (let i = 0; i < until; i++) {
+    const ch = text[i]!;
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (inString) {
+      if (ch === '\\') escaped = true;
+      else if (ch === quote) inString = false;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      inString = true;
+      quote = ch;
+    } else if (ch === '{') {
+      stack.push(i);
+    } else if (ch === '}') {
+      stack.pop();
+    }
+  }
+  return stack.at(-1) ?? null;
+}
+
+/** Include an immediately surrounding opening ```json fence in the hidden suffix. */
+function includeOpeningJsonFence(text: string, start: number): number {
+  const before = text.slice(0, start);
+  const fenceLine = /^[ \t]*(`{3,})[ \t]*([^\s`]*)?[ \t]*\r?$/gm;
+  let open: { index: number; width: number; language: string; bodyStart: number } | null = null;
+  let match: RegExpExecArray | null;
+  while ((match = fenceLine.exec(before)) !== null) {
+    const width = match[1]!.length;
+    const language = (match[2] ?? '').toLowerCase();
+    if (!open) {
+      open = { index: match.index, width, language, bodyStart: match.index + match[0].length };
+    } else if (!language && width >= open.width) {
+      open = null;
+    }
+  }
+
+  // Only a genuinely unmatched bare/JSON fence can belong to this payload. A
+  // completed earlier fence leaves `open` null; treating its closer as an opener
+  // would remove the closer and corrupt otherwise-visible markdown.
+  if (!open || (open.language !== '' && open.language !== 'json')) return start;
+  return /^\s*$/.test(before.slice(open.bodyStart)) ? open.index : start;
+}
+
 /** Top-level balanced `{...}` spans, quote-aware (handles ' and "). */
 function balancedObjects(s: string): Array<{ raw: string; start: number }> {
   const out: Array<{ raw: string; start: number }> = [];

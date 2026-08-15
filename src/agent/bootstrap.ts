@@ -9,7 +9,7 @@ import {
 } from '../config.js';
 import { vaultExists } from '../auth/vault.js';
 import { vaultUnlocked } from '../state/globalStore.js';
-import { createProvider } from '../provider/index.js';
+import { createProvider, entryStreamContract } from '../provider/index.js';
 import { ToolRegistry } from '../tools/registry.js';
 import { BgRegistry } from '../tools/bgShell.js';
 import {
@@ -27,8 +27,16 @@ import { configuredContextWindow, detectServerContextWindow, mlxOfflineReady } f
 import { discoverSkills, skillsIndexBlock, type SkillEntry } from '../skills/loader.js';
 import { WakeupScheduler } from './wakeup.js';
 import { Context } from './context.js';
-import { evaluateOffline, isLocalBaseUrl, OFFLINE_BANNER } from '../safety/offline.js';
-import { osSandboxStatus } from '../safety/sandbox.js';
+import {
+  evaluateOffline,
+  isLocalBaseUrl,
+  OFFLINE_BANNER,
+  OFFLINE_UNENFORCED_WARNING,
+  offlineEgressClaim,
+  offlineEgressEnforced,
+} from '../safety/offline.js';
+import { osSandboxStatus, sandboxToolAvailable } from '../safety/sandbox.js';
+import { setOfflineMode } from '../safety/egress.js';
 import { registerSecret } from '../util/redact.js';
 import { lc } from '../util/lc.js';
 import { ProjectMemory } from '../state/memory.js';
@@ -38,6 +46,8 @@ import { makeMemoryTool } from '../tools/memory.js';
 import { TodoList } from './todo.js';
 import { PlanModeState } from './planMode.js';
 import { buildStyledSystem } from './system.js';
+import { setCustomStyles } from './styles.js';
+import { discoverCustomStyles } from './outputStyles.js';
 import {
   clampLocalContextBudget,
   keepLastTurnsForBudget,
@@ -46,7 +56,7 @@ import {
 import { makeTodoTool } from '../tools/todo.js';
 import { type OutputStyle } from '../styles.js';
 import { resolveSystem } from '../system/resolveSystem.js';
-import { runHookPhase } from '../hooks/runner.js';
+import { runHookPhaseDetached } from '../hooks/runner.js';
 import type { Flags } from '../cli/flags.js';
 
 /**
@@ -138,7 +148,7 @@ export interface AgentSession {
    */
   connectMcp: () => Promise<Array<{ stop(): void }>>;
   /** Build and activate a complete model entry for automatic fallback. */
-  activateModel: (entry: ModelEntry) => Promise<{ provider: ReturnType<typeof createProvider>; model: string }>;
+  activateModel: (entry: ModelEntry, signal?: AbortSignal) => Promise<{ provider: ReturnType<typeof createProvider>; model: string }>;
 }
 
 /**
@@ -198,7 +208,14 @@ function sameBaseUrl(a: string | undefined, b: string | undefined): boolean {
 export function buildEnvBlock(
   workspaceRoot: string,
   additionalRoots: string[] = [],
-  guard: { yolo?: boolean; noSandbox?: boolean; unrestricted?: boolean; offline?: boolean } = {},
+  guard: {
+    yolo?: boolean;
+    noSandbox?: boolean;
+    unrestricted?: boolean;
+    offline?: boolean;
+    /** Injectable OS-sandbox tool presence so both offline prompt states are testable. */
+    sandboxToolPresent?: boolean;
+  } = {},
 ): string {
   const lines = [
     `- **working directory (cwd): ${workspaceRoot}** — run_shell runs here, relative paths resolve here, and scratch/output files belong here (NOT /tmp).`,
@@ -243,9 +260,15 @@ export function buildEnvBlock(
   );
 
   if (guard.offline) {
+    // F07-04: the egress denial rides on the OS sandbox, which fails open when bwrap/seatbelt
+    // are missing (and is dropped under --yolo / --no-sandbox / full autonomy) — never claim a
+    // boundary the host cannot bind.
+    const egress = offlineEgressClaim(
+      offlineEgressEnforced(guard, guard.sandboxToolPresent ?? sandboxToolAvailable()),
+    );
     lines.push(
       `- Offline Shadow Mode: ACTIVE. No provider network beyond the local model server. ` +
-      `web_fetch, web_search, and MCP tools are NOT registered this session, and run_shell network egress is denied. ` +
+      `web_fetch, web_search, and MCP tools are NOT registered this session, and ${egress} ` +
       `Do not attempt to reach the internet — those tools do not exist here. Work entirely from local files and the local model.`,
     );
   }
@@ -285,9 +308,10 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     .filter(Boolean)
     .join('\n\n');
 
-  // session_start hook (init)
+  // session_start hook (init). F06-09: detached fire-and-forget — session_start is not a DENY
+  // phase (nothing reads its verdict), so it must not gate first paint behind init scripts.
   if (cfg.hooks?.session_start?.length) {
-    runHookPhase('session_start', cfg.hooks.session_start, { workspaceRoot, sessionId: opts.sessionId ?? 'main' });
+    runHookPhaseDetached('session_start', cfg.hooks.session_start, { workspaceRoot, sessionId: opts.sessionId ?? 'main' });
   }
 
   const allowImport = process.env.SHADOW_ALLOW_IMPORT === '1';
@@ -318,6 +342,9 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   // preset, or a baseUrl whose host is localhost/LAN). Fail fast + friendly when the
   // active model is a cloud provider — before we spin up anything or touch the network.
   const offline = flags.offline ?? false;
+  // P2-01: arm the egress broker's offline wall (and the dispatcher-layer backstop behind it)
+  // BEFORE anything can touch the network — the wall is a hard invariant, not a banner promise.
+  setOfflineMode(offline);
   if (offline) {
     const decision = evaluateOffline({
       label: activeModelEntry?.label ?? `${cfg.provider}/${cfg.model}`,
@@ -329,6 +356,11 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     });
     if (!decision.ok) fail(lc.red(decision.error!) + '\n');
     write(lc.bold(OFFLINE_BANNER) + '\n');
+    // F07-04: say out loud when the "no run_shell egress" half of the banner is not actually
+    // enforceable here — same predicate the env block uses, so prompt and banner agree.
+    if (!offlineEgressEnforced({ yolo: flags.yolo, noSandbox: flags.noSandbox, unrestricted }, sandboxToolAvailable())) {
+      write(lc.yellow('⚠ ' + OFFLINE_UNENFORCED_WARNING) + '\n');
+    }
   }
   // Local endpoints: ALWAYS clamp soft budget to the real server window (or a 32k default).
   // Config contextBudget:128000 on a 32k llama.cpp is a no-op for capacity — without this clamp
@@ -382,13 +414,20 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     entrySelected: opts.lastPicked != null,
     configSelfHosted: cfg.selfHosted,
   });
+  // P1A-04: the operator escape hatch beats any per-entry config — a rescue env must apply
+  // to a live wedged session without editing config.json. Strict positive-int only; a bogus
+  // value is ignored so a typo cannot silently disable the watchdog.
   const provider = createProvider({
+    // P1A-04 knobs + P1A-06 capability block, SHADOW_IDLE_MS env override included (F10-01:
+    // one shared helper with the TUI rebuild sites so the contract can't drift between them).
+    ...entryStreamContract(activeModelEntry ?? undefined),
     provider: startProvider as 'anthropic' | 'openai' | 'mock',
     model: cfg.model,
     apiKey: startApiKey,
     authToken,
     baseUrl: startBaseUrl,
     selfHosted: startSelfHosted,
+    reasoningRoundtrip: cfg.reasoningRoundtrip,
   });
 
   const registry = new ToolRegistry();
@@ -435,6 +474,13 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   registry.register(makeToolSearch(registry));
 
   const wakeup = new WakeupScheduler();
+  // F08-12: register user-defined output styles so buildStyledSystem + the /style picker resolve
+  // them by name. Jailed loader; failures are non-fatal (a bad styles dir must not break startup).
+  try {
+    setCustomStyles(discoverCustomStyles(opts.workspaceRoot, homedir()));
+  } catch {
+    setCustomStyles([]);
+  }
   const systemForStyle = (style: OutputStyle): string => buildStyledSystem(baseSystem, style, facts);
   const system = systemForStyle(activeStyle);
 
@@ -445,6 +491,10 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     contextBudget: cfg.contextBudget,
     triggerRatio: cfg.summarizeTriggerRatio,
     keepLastTurns: cfg.keepLastTurns,
+    // P1B-02: microcompaction (clear stale tool-result bodies before the summarizer fires). ON by
+    // default; this wires the disable switch so `microcompact: false` actually takes effect.
+    microcompact: cfg.microcompact,
+    microcompactRatio: cfg.microcompactTriggerRatio,
   };
   let context: Context;
   if (opts.resumeSessionPath) {
@@ -472,7 +522,11 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     return await registerMcpServers(registry, cfg.mcpServers, workspaceRoot);
   };
 
-  const activateModel = async (entry: ModelEntry): Promise<{ provider: ReturnType<typeof createProvider>; model: string }> => {
+  const activateModel = async (
+    entry: ModelEntry,
+    signal?: AbortSignal,
+  ): Promise<{ provider: ReturnType<typeof createProvider>; model: string }> => {
+    signal?.throwIfAborted();
     let nextProvider = entry.provider;
     let baseUrl = resolveBaseUrl(entry.provider, entry.baseUrl);
     const cred = resolveEntryCredential(entry, { vaultIsLocked: vaultExists() && !vaultUnlocked() });
@@ -484,6 +538,7 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     let apiKey = cred.apiKey;
     let hardWindow = configuredContextWindow(entry);
     const local = await opts.launchLocalServer(entry, offline);
+    signal?.throwIfAborted();
     if (local) {
       nextProvider = local.provider;
       baseUrl = local.baseUrl;
@@ -493,6 +548,7 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
       throw new Error(`offline mode refused cloud fallback "${entry.label}"`);
     } else if (isLocalBaseUrl(baseUrl) && baseUrl) {
       hardWindow = (await detectServerContextWindow(baseUrl)) ?? hardWindow;
+      signal?.throwIfAborted();
     }
 
     const budget = hardWindow
@@ -503,6 +559,9 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
       triggerRatio: triggerRatioForBudget(budget, baseContextPolicy.triggerRatio),
       keepLastTurns: keepLastTurnsForBudget(budget, baseContextPolicy.keepLastTurns),
     };
+    // All awaited construction/probing is complete. Keep activation atomic: an obsolete turn may
+    // have warmed a local server, but it must not switch the live model, config, or context policy.
+    signal?.throwIfAborted();
     context.setPolicy(policy, true);
     cfg.provider = nextProvider;
     cfg.model = entry.model;
@@ -511,12 +570,15 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     cfg.summarizeTriggerRatio = policy.triggerRatio;
     cfg.keepLastTurns = policy.keepLastTurns;
     const next = createProvider({
+      // P1A-04 knobs + P1A-06 capability block (F10-01 shared helper — see entryStreamContract).
+      ...entryStreamContract(entry),
       provider: nextProvider,
       model: entry.model,
       apiKey,
       authToken: cred.authToken,
       baseUrl,
       selfHosted: entry.selfHosted,
+      reasoningRoundtrip: cfg.reasoningRoundtrip,
     });
     return { provider: next, model: entry.model };
   };

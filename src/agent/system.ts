@@ -1,7 +1,9 @@
-import { styles, type OutputStyle } from './styles.js';
+import { styles, customStyleBlock, type OutputStyle } from './styles.js';
 
 export function buildStyledSystem(baseSystem: string, style: OutputStyle, facts?: string): string {
-  const styleBlock = styles[style]?.block.trimStart() ?? '';
+  // Built-in style first; fall back to a registered custom style (F08-12). `style` is typed as the
+  // built-in union but a custom style name arrives here as a string at runtime — resolve either.
+  const styleBlock = (styles[style]?.block ?? customStyleBlock(style) ?? '').trimStart();
   return [
     baseSystem + (styleBlock ? `\n${styleBlock}` : ''),
     facts

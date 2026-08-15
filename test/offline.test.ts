@@ -1,15 +1,19 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { parseArgs } from '../src/cli/flags.js';
 import {
   evaluateOffline,
   isLocalBaseUrl,
   isLocalHost,
   isLocalModelTarget,
+  offlineEgressEnforced,
   OFFLINE_BANNER,
+  OFFLINE_UNENFORCED_WARNING,
 } from '../src/safety/offline.js';
 import { ToolRegistry } from '../src/tools/registry.js';
 import { registerBuiltinTools } from '../src/tools/index.js';
+import { buildEnvBlock } from '../src/agent/bootstrap.js';
 
 // ── (a) --offline parses as a boolean flag ──────────────────────────────────────
 test('parseArgs: --offline parses to flags.offline === true', () => {
@@ -90,4 +94,52 @@ test('isLocalModelTarget: gguf OR local baseUrl counts as local', () => {
 test('OFFLINE_BANNER states the no-cloud / no-web guarantee', () => {
   assert.match(OFFLINE_BANNER, /local model/i);
   assert.match(OFFLINE_BANNER, /no web tools/i);
+});
+
+// ── (e) F07-04: the system-prompt egress claim must match what the host enforces ─
+// The sandbox fails open when bwrap/seatbelt are missing, so "egress is denied" is
+// only true with confinement active. `sandboxToolPresent` is the injection seam —
+// both states run on any host, no monkey-patching.
+test('buildEnvBlock: offline + sandbox tool present → claims egress denied', () => {
+  const block = buildEnvBlock('/nonexistent-ws', [], { offline: true, sandboxToolPresent: true });
+  assert.match(block, /Offline Shadow Mode: ACTIVE/);
+  assert.match(block, /run_shell network egress is denied/);
+  assert.doesNotMatch(block, /CANNOT be enforced/);
+});
+
+test('buildEnvBlock: offline + NO sandbox tool → names the missing enforcement, never claims denial', () => {
+  const block = buildEnvBlock('/nonexistent-ws', [], { offline: true, sandboxToolPresent: false });
+  assert.match(block, /Offline Shadow Mode: ACTIVE/);
+  assert.match(block, /run_shell egress CANNOT be enforced on this host \(no bwrap\/seatbelt/);
+  assert.doesNotMatch(block, /egress is denied/);
+});
+
+test('buildEnvBlock: offline + confinement dropped (--yolo) → unenforced claim even with the tool present', () => {
+  const block = buildEnvBlock('/nonexistent-ws', [], { offline: true, yolo: true, sandboxToolPresent: true });
+  assert.match(block, /CANNOT be enforced/);
+  assert.doesNotMatch(block, /egress is denied/);
+});
+
+test('offlineEgressEnforced: needs confinement ON and the platform tool present', () => {
+  assert.equal(offlineEgressEnforced({}, true), true);
+  assert.equal(offlineEgressEnforced({}, false), false);
+  assert.equal(offlineEgressEnforced({ yolo: true }, true), false);
+  assert.equal(offlineEgressEnforced({ noSandbox: true }, true), false);
+  assert.equal(offlineEgressEnforced({ unrestricted: true }, true), false);
+});
+
+test('OFFLINE_UNENFORCED_WARNING names the missing enforcement', () => {
+  assert.match(OFFLINE_UNENFORCED_WARNING, /cannot be enforced/i);
+  assert.match(OFFLINE_UNENFORCED_WARNING, /bwrap\/seatbelt/);
+  assert.match(OFFLINE_UNENFORCED_WARNING, /unconfined/);
+});
+
+// ── (f) F07-04 wiring: the startup warning actually fires beside the banner ──────
+test('bootstrap: offline banner site gates OFFLINE_UNENFORCED_WARNING on the shared predicate', () => {
+  const src = readFileSync(new URL('../src/agent/bootstrap.ts', import.meta.url), 'utf8');
+  const banner = src.indexOf('write(lc.bold(OFFLINE_BANNER)');
+  assert.ok(banner > -1, 'the offline banner write is still in bootstrap');
+  const after = src.slice(banner, banner + 600);
+  assert.match(after, /offlineEgressEnforced\(/, 'warning gated on the same predicate the env block uses');
+  assert.match(after, /OFFLINE_UNENFORCED_WARNING/, 'the warning text is written beside the banner');
 });

@@ -1,7 +1,6 @@
 /** Shared image helpers used by the `/image` attach flow (TUI) and the `view_image` tool. */
-import { fetch as undiciFetch } from 'undici';
 import { assertUrlAllowed } from '../safety/netguard.js';
-import { closeAgent, pinnedAgent } from '../tools/webFetch.js';
+import { shadowFetch } from '../safety/egress.js';
 
 export const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
 
@@ -28,42 +27,41 @@ export async function fetchRemoteImage(raw: string, maxBytes = MAX_IMAGE_BYTES):
   let current = raw;
   for (let redirects = 0; redirects <= 4; redirects += 1) {
     const allowed = await assertUrlAllowed(current);
-    const agent = pinnedAgent(allowed.ips);
-    try {
-      const response = await undiciFetch(allowed.url, {
-        dispatcher: agent,
+    // Egress broker (P2-01): pinned to the validated IP set + recorded in the egress receipt.
+    const response = await shadowFetch(
+      allowed.url.href,
+      {
         redirect: 'manual',
         signal: AbortSignal.timeout(15_000),
-      });
-      if (response.status >= 300 && response.status < 400) {
-        const location = response.headers.get('location');
-        if (!location || redirects === 4) throw new Error('remote image redirected too many times');
-        current = new URL(location, allowed.url).toString();
-        continue;
-      }
-      if (!response.ok) throw new Error(`remote image returned HTTP ${response.status}`);
-      const mediaType = (response.headers.get('content-type') ?? '').split(';')[0]!.trim().toLowerCase();
-      if (!/^image\/(?:png|jpeg|gif|webp)$/.test(mediaType)) throw new Error('remote URL is not a supported image');
-      const declared = Number(response.headers.get('content-length'));
-      if (Number.isFinite(declared) && declared > maxBytes) throw new Error('remote image exceeds 20 MiB');
-      const reader = response.body?.getReader();
-      if (!reader) throw new Error('remote image response had no body');
-      const chunks: Uint8Array[] = [];
-      let total = 0;
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        total += value.byteLength;
-        if (total > maxBytes) {
-          await reader.cancel().catch(() => undefined);
-          throw new Error('remote image exceeds 20 MiB');
-        }
-        chunks.push(value);
-      }
-      return { bytes: Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)), total), mediaType };
-    } finally {
-      closeAgent(agent);
+      },
+      { purpose: 'image', pinnedIps: allowed.ips },
+    );
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get('location');
+      if (!location || redirects === 4) throw new Error('remote image redirected too many times');
+      current = new URL(location, allowed.url).toString();
+      continue;
     }
+    if (!response.ok) throw new Error(`remote image returned HTTP ${response.status}`);
+    const mediaType = (response.headers.get('content-type') ?? '').split(';')[0]!.trim().toLowerCase();
+    if (!/^image\/(?:png|jpeg|gif|webp)$/.test(mediaType)) throw new Error('remote URL is not a supported image');
+    const declared = Number(response.headers.get('content-length'));
+    if (Number.isFinite(declared) && declared > maxBytes) throw new Error('remote image exceeds 20 MiB');
+    const reader = response.body?.getReader();
+    if (!reader) throw new Error('remote image response had no body');
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => undefined);
+        throw new Error('remote image exceeds 20 MiB');
+      }
+      chunks.push(value);
+    }
+    return { bytes: Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)), total), mediaType };
   }
   throw new Error('remote image redirected too many times');
 }

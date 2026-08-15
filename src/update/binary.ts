@@ -8,6 +8,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { shadowFetch } from '../safety/egress.js';
 
 const DEFAULT_RELEASE_BASE = 'https://shadow.redpillreader.com/bin';
 const MAX_BINARY_BYTES = 512 * 1024 * 1024;
@@ -36,7 +37,10 @@ function releaseBase(): string {
 }
 
 async function download(url: string, maxBytes: number): Promise<Buffer> {
-  const response = await fetch(url, { redirect: 'error', signal: AbortSignal.timeout(60_000) });
+  const response = await shadowFetch(url, { redirect: 'error', signal: AbortSignal.timeout(60_000) }, {
+    purpose: 'update-binary',
+    origin: 'user',
+  });
   if (!response.ok) throw new Error(`download failed (${response.status}) for ${url}`);
   const declared = Number(response.headers.get('content-length') ?? 0);
   if (declared > maxBytes) throw new Error(`download exceeds ${maxBytes} byte limit: ${url}`);

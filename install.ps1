@@ -30,9 +30,74 @@ function Die  ($m) {
 $script:CleanupPaths = @()
 
 # ── verify: signature over SHASUMS256.txt, then the binary's SHA-256 ───────────
-# Fails CLOSED: the signature must verify against the pinned key (needs PowerShell 7.1+),
-# then the binary's SHA-256 must match the signed manifest. Set SHADOW_INSECURE_SKIP_VERIFY=1
-# to bypass entirely (don't, except to debug on a runtime without signature support).
+# Fails CLOSED: the signature must verify against the pinned key, then the binary's
+# SHA-256 must match the signed manifest. PowerShell 7.1+ verifies via ImportFromPem;
+# Windows PowerShell 5.1 (.NET Framework 4.7+) and PS 7.0 (.NET Core 3.1) verify the
+# same ECDSA P-256 signature natively (the pinned key + DER signature are decoded below).
+# Runtimes with neither abort (fail closed). Set SHADOW_INSECURE_SKIP_VERIFY=1 to bypass
+# entirely (don't, except to debug on a runtime without signature support).
+
+# Decode an RFC 3279 ECDSA signature (SEQUENCE { INTEGER r, INTEGER s }) into the IEEE
+# P1363 r||s form (32 bytes each, big-endian, left-padded) that .NET Framework's
+# ECDsaCng.VerifyData expects. Strict on purpose: any deviation throws (fail closed).
+function ConvertTo-P1363Signature([byte[]]$der) {
+  $i = 0
+  if ($der.Length -lt 8 -or $der[$i] -ne 0x30) { throw 'sig: not a DER SEQUENCE' }; $i++
+  $seqLen = $der[$i]; $i++
+  if ($seqLen -ge 0x80) { throw 'sig: long-form SEQUENCE length not allowed' }
+  if ($i + $seqLen -ne $der.Length) { throw 'sig: trailing garbage after SEQUENCE' }
+  $end = $i + $seqLen
+  $parts = @()
+  foreach ($n in 1..2) {
+    if ($i -ge $end -or $der[$i] -ne 0x02) { throw 'sig: expected INTEGER' }; $i++
+    if ($i -ge $end) { throw 'sig: INTEGER length missing' }
+    $intLen = $der[$i]; $i++
+    if ($intLen -ge 0x80 -or $intLen -eq 0) { throw 'sig: bad INTEGER length' }
+    if ($i + $intLen -gt $end) { throw 'sig: INTEGER overruns SEQUENCE' }
+    [byte[]]$intBytes = $der[$i..($i + $intLen - 1)]; $i += $intLen
+    # strict DER: reject negative INTEGERs and redundant sign padding
+    if ($intBytes[0] -band 0x80) { throw 'sig: negative INTEGER not allowed' }
+    if ($intBytes.Length -gt 1 -and $intBytes[0] -eq 0 -and ($intBytes[1] -band 0x80) -eq 0) { throw 'sig: non-canonical INTEGER padding' }
+    $z = 0
+    if ($intBytes.Length -gt 1 -and $intBytes[0] -eq 0) { $z = 1 }   # drop the single canonical sign pad
+    [byte[]]$mag = $intBytes[$z..($intBytes.Length - 1)]
+    if ($mag.Length -gt 32) { throw 'sig: INTEGER larger than the P-256 order' }
+    [byte[]]$pad = New-Object byte[] (32 - $mag.Length)
+    $parts += ,([byte[]]($pad + $mag))
+  }
+  if ($i -ne $end) { throw 'sig: trailing garbage inside SEQUENCE' }
+  return ,([byte[]]($parts[0] + $parts[1]))
+}
+
+# Extract the pinned P-256 public point from the SPKI PEM. Strict on purpose: a P-256
+# SubjectPublicKeyInfo is exactly 91 bytes with a fixed 26-byte header.
+function Get-PinnedEcPoint {
+  $b64 = ($ShadowPubKey -split '\r?\n' | Where-Object { $_ -and $_ -notmatch '^-----' }) -join ''
+  [byte[]]$der = [Convert]::FromBase64String($b64)
+  [byte[]]$prefix = 0x30,0x59,0x30,0x13,0x06,0x07,0x2a,0x86,0x48,0xce,0x3d,0x02,0x01,0x06,0x08,0x2a,0x86,0x48,0xce,0x3d,0x03,0x01,0x07,0x03,0x42,0x00,0x04
+  if ($der.Length -ne 91) { throw 'pubkey: not a 91-byte P-256 SubjectPublicKeyInfo' }
+  for ($k = 0; $k -lt 27; $k++) { if ($der[$k] -ne $prefix[$k]) { throw 'pubkey: not the pinned P-256 key header' } }
+  $pt = New-Object System.Security.Cryptography.ECPoint
+  $pt.X = [byte[]]$der[27..58]
+  $pt.Y = [byte[]]$der[59..90]
+  return $pt
+}
+
+# Verify SHASUMS256.txt on runtimes without ImportFromPem (Windows PowerShell 5.1 on
+# .NET Framework 4.7+, PS 7.0 on .NET Core 3.1) using their native ECDSA. Throws on
+# any problem, and the caller fails closed on throw.
+function Verify-ShadowSigNative([byte[]]$data, [byte[]]$sigDer) {
+  $params = New-Object System.Security.Cryptography.ECParameters
+  $params.Curve = [System.Security.Cryptography.ECCurve+NamedCurves]::nistP256
+  $params.Q = Get-PinnedEcPoint
+  $ec = [System.Security.Cryptography.ECDsa]::Create()
+  try {
+    $ec.ImportParameters($params)
+    [byte[]]$raw = ConvertTo-P1363Signature $sigDer
+    return [bool]$ec.VerifyData($data, $raw, [System.Security.Cryptography.HashAlgorithmName]::SHA256)
+  } finally { $ec.Dispose() }
+}
+
 function Verify-Download($binPath, $assetName, $baseUrl) {
   if ($env:SHADOW_INSECURE_SKIP_VERIFY -eq '1') {
     Warn 'WARNING: SHADOW_INSECURE_SKIP_VERIFY=1 - skipping signature + checksum verification.'
@@ -48,28 +113,41 @@ function Verify-Download($binPath, $assetName, $baseUrl) {
     try { Invoke-WebRequest -Uri "$baseUrl/SHASUMS256.txt.sig" -OutFile $sigPath  -UseBasicParsing } catch { Die "cannot fetch SHASUMS256.txt.sig - this release is unsigned; refusing to install unverified." }
 
     # 1) authenticity: SHASUMS256.txt must be signed by Shadow's release key.
-    # ImportFromPem + the DSASignatureFormat overload are .NET 5+, i.e. PowerShell 7.1+.
-    # PowerShell 7.0 (.NET Core 3.1) and Windows PowerShell 5.1 lack them → abort (fail closed).
-    $v = $PSVersionTable.PSVersion
-    $sigCapable = ($v.Major -gt 7) -or ($v.Major -eq 7 -and $v.Minor -ge 1)
-    if ($sigCapable) {
+    try {
       $sumsBytes = [IO.File]::ReadAllBytes($sumsPath)
       $sigBytes  = [IO.File]::ReadAllBytes($sigPath)
-      $ok = $false
+    } catch {
+      Die "cannot read the downloaded manifest/signature: $($_.Exception.Message)"
+    }
+    $v = $PSVersionTable.PSVersion
+    $ok = $false
+    if (($v.Major -gt 7) -or ($v.Major -eq 7 -and $v.Minor -ge 1)) {
+      # ImportFromPem + the DSASignatureFormat overload are .NET 5+, i.e. PowerShell 7.1+.
+      $ec = [System.Security.Cryptography.ECDsa]::Create()
       try {
-        $ec = [System.Security.Cryptography.ECDsa]::Create()
         $ec.ImportFromPem($ShadowPubKey)
         $ok = $ec.VerifyData($sumsBytes, $sigBytes, [System.Security.Cryptography.HashAlgorithmName]::SHA256, [System.Security.Cryptography.DSASignatureFormat]::Rfc3279DerSequence)
       } catch {
         # any error here (bad key/sig/DER) on a capable runtime = treat as failure, fail closed
         Die "signature verification error: $($_.Exception.Message) - aborting (possible tampering)."
-      }
-      if (-not $ok) { Die "SIGNATURE VERIFICATION FAILED for SHASUMS256.txt - the download host may be compromised. Aborting." }
+      } finally { $ec.Dispose() }
     } else {
-      # FAIL CLOSED: checksum-only would verify the binary against an attacker-controlled
-      # manifest (a compromised host rewrites SHASUMS too), which is no protection at all.
-      Die "signature verification requires PowerShell 7.1+ (this is PowerShell $v).`n       install PowerShell 7 (https://aka.ms/powershell) and re-run:`n         irm https://raw.githubusercontent.com/Blackfrost-AI/Shadow_CLI/main/install.ps1 | iex`n       or, ONLY if you accept an unverified download:  `$env:SHADOW_INSECURE_SKIP_VERIFY=1"
+      # Windows PowerShell 5.1 (.NET Framework) / PS 7.0 (.NET Core 3.1) lack ImportFromPem +
+      # DSASignatureFormat. Stock Windows ships 5.1, so this is the default Windows path:
+      # .NET Framework 4.7+ — bundled with every current Windows — verifies ECDSA P-256
+      # natively once the pinned key and the DER signature are decoded (helpers above).
+      try {
+        $ok = Verify-ShadowSigNative $sumsBytes $sigBytes
+      } catch {
+        $msg = $_.Exception.Message
+        if ($msg -match 'Cannot find type') {
+          # runtime older than .NET Framework 4.7 — missing APIs, NOT tampering
+          Die "signature verification is not supported on PowerShell $v (its .NET is older than 4.7).`n       install PowerShell 7.1+ (https://aka.ms/powershell) and re-run,`n       or, ONLY if you accept an unverified download:  `$env:SHADOW_INSECURE_SKIP_VERIFY=1"
+        }
+        Die "signature verification error on PowerShell $v : $msg - aborting (possible tampering)."
+      }
     }
+    if (-not $ok) { Die "SIGNATURE VERIFICATION FAILED for SHASUMS256.txt - the download host may be compromised. Aborting." }
 
     # 2) integrity: our binary's hash must match the signed list
     $expected = $null
@@ -81,7 +159,7 @@ function Verify-Download($binPath, $assetName, $baseUrl) {
     $actual = (Get-FileHash -Algorithm SHA256 -Path $binPath).Hash.ToLower()
     if ($actual -ne $expected) { Die "CHECKSUM MISMATCH for $assetName`n       expected (signed): $expected`n       actual (download): $actual`n       aborting (corrupted or tampered)." }
 
-    # only reachable once the signature verified (PS < 7.1 aborts above)
+    # only reachable once the signature verified (every failure path above aborts)
     Say 'verified signature + checksum ✓'
   } finally {
     Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $vtmp
@@ -96,9 +174,10 @@ $url   = "$base/$asset"
 # Pinned ECDSA P-256 public key for Shadow's OFFLINE release-signing key. SHASUMS256.txt is
 # signed with the matching private key (never on the server); the installer verifies that
 # signature before trusting any hash, so a compromised host can't ship a tampered binary that
-# passes. Signature verification needs PowerShell 7.1+ (.NET 5+); on older PowerShell the install
-# ABORTS (checksum-only against an attacker-controlled manifest is no protection) unless the user
-# explicitly sets SHADOW_INSECURE_SKIP_VERIFY=1.
+# passes. Verification uses ImportFromPem on PowerShell 7.1+ and native .NET Framework 4.7+
+# ECDSA on Windows PowerShell 5.1 / PS 7.0 (stock Windows works); on runtimes with NEITHER the
+# install ABORTS (checksum-only against an attacker-controlled manifest is no protection)
+# unless the user explicitly sets SHADOW_INSECURE_SKIP_VERIFY=1.
 $ShadowPubKey = @'
 -----BEGIN PUBLIC KEY-----
 MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE+5WMu9iMUEp0j1eehkH/xGts2NHZ

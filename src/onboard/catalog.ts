@@ -1,4 +1,17 @@
 import type { ProviderName } from '../provider/index.js';
+import type { ModelCapabilities } from '../config.js';
+
+/**
+ * ModelEntry extras a catalog preset ships (P1A-06 step 4). When present, onboarding persists the
+ * target as a NAMED ModelEntry carrying them — the top-level provider/model/baseUrl patch cannot
+ * hold per-entry contract fields (capabilities / stream knobs), and without a carrier the preset's
+ * declared wire contract would silently not exist at runtime.
+ */
+export interface PresetEntryExtras {
+  selfHosted?: boolean;
+  idleTimeoutMs?: number;
+  capabilities?: ModelCapabilities;
+}
 
 /**
  * Curated catalog of major model providers for onboarding. Each preset maps to
@@ -26,6 +39,8 @@ export interface ProviderPreset {
   bearer?: boolean;
   /** Placeholder entry shown but not selectable yet (no endpoint wired — deliberate). */
   comingSoon?: boolean;
+  /** ModelEntry extras persisted with this preset (declared wire contract — see PresetEntryExtras). */
+  entry?: PresetEntryExtras;
 }
 
 export const PROVIDERS: ProviderPreset[] = [
@@ -74,6 +89,19 @@ export const PROVIDERS: ProviderPreset[] = [
     defaultModel: 'deepseek-chat',
     kind: 'cloud',
     keyUrl: 'https://platform.deepseek.com/api_keys',
+  },
+  {
+    // Moonshot's international OpenAI-compatible endpoint; China-mainland accounts use
+    // https://api.moonshot.cn/v1 instead — editable at the base-URL prompt. The kimi-*thinking*
+    // default activates the family profile (reasoning_content replay in tool loops + the
+    // low/high/max effort scale); any other Kimi id can be typed over it.
+    id: 'moonshot',
+    label: 'Moonshot AI (Kimi)',
+    adapter: 'openai',
+    baseUrl: 'https://api.moonshot.ai/v1',
+    defaultModel: 'kimi-k2-thinking',
+    kind: 'cloud',
+    keyUrl: 'https://platform.moonshot.ai/console/api-keys',
   },
   {
     // Qwen's official OpenAI-compatible endpoint. The model field remains ordinary/free-form,
@@ -162,6 +190,32 @@ export const PROVIDERS: ProviderPreset[] = [
     defaultModel: 'local-model',
     kind: 'local',
     promptModel: true,
+  },
+  {
+    // Self-hosted frontier serve (vLLM/SGLang, OpenAI-compatible) running Qwen 3.8 Max open
+    // weights. Ships the FULL declared wire contract out of the box, because a
+    // `--served-model-name` alias carries no Qwen marker for id-detection: the capability block
+    // (P1A-06 — 262k output floor, DashScope effort scale, preserve_thinking) plus a 600s idle
+    // frame (P1A-04 — these serves send no SSE keepalives during long prefill, and a big-context
+    // turn can sit past the default 120s watchdog before its first token). Deployment plumbing
+    // only: the model itself is the previous Qwen architecture (founder guidance 2026-08-09) and
+    // the block below mirrors the test-pinned contract in test/qwen38-compat.test.ts verbatim.
+    id: 'qwen-selfhosted',
+    label: 'Self-hosted Qwen 3.8 Max (vLLM/SGLang)',
+    adapter: 'openai',
+    baseUrl: 'http://localhost:8000/v1',
+    defaultModel: 'qwen3.8-max',
+    kind: 'local',
+    entry: {
+      selfHosted: true,
+      idleTimeoutMs: 600_000,
+      capabilities: {
+        preserveThinking: true,
+        reasoning: 'interleaved',
+        effortScale: ['low', 'medium', 'xhigh'],
+        maxOutputTokens: 262_144,
+      },
+    },
   },
   {
     id: 'custom',

@@ -14,7 +14,7 @@ import { looksAnthropicDistilled, toAnthropicBaseUrl } from '../util/transport.j
 import { normalizeBaseUrl } from '../config.js';
 import type { Message } from '../provider/provider.js';
 import { registerSecret, redactString } from '../util/redact.js';
-import { persistOnboardTarget } from './persistTarget.js';
+import { persistOnboardTarget, type OnboardTargetInput } from './persistTarget.js';
 
 const ESC = '\x1b[';
 const c = {
@@ -132,6 +132,8 @@ export function persistTerminalOnboardTarget(input: {
   baseUrl?: string;
   customEndpoint: boolean;
   selfHosted?: boolean;
+  /** Contract extras from the chosen catalog preset (persisted as a ModelEntry — P1A-06 step 4). */
+  entryExtras?: OnboardTargetInput['entryExtras'];
 }): void {
   persistOnboardTarget({
     provider: input.adapter,
@@ -139,6 +141,7 @@ export function persistTerminalOnboardTarget(input: {
     baseUrl: input.baseUrl,
     customEndpoint: input.customEndpoint,
     selfHosted: input.selfHosted,
+    entryExtras: input.entryExtras,
   });
 }
 
@@ -636,6 +639,9 @@ export async function runOnboard(): Promise<boolean> {
             baseUrl,
             customEndpoint: preset.kind === 'custom',
             selfHosted,
+            // P1A-06 step 4: a preset shipping a wire contract persists it as a ModelEntry so the
+            // capability block + idle knob actually reach bootstrap (provider+model resolution).
+            entryExtras: preset.entry ? { label: preset.label, ...preset.entry } : undefined,
           });
           if (apiKey) saveCredential(adapter, { apiKey, ...(baseUrl ? { baseUrl } : {}) });
           if (authToken) saveCredential(adapter, { authToken, ...(baseUrl ? { baseUrl } : {}) });

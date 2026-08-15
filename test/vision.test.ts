@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { makeDescribeMediaTool } from '../src/tools/vision.js';
+import { resolveFakeHosts } from './helpers/fakeHostEgress.js';
 
 const PIXEL_PNG_B64 =
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
@@ -11,6 +12,7 @@ const PIXEL_PNG_B64 =
 test('describe_media keeps the supported OpenAI-compatible vision backend', async () => {
   const root = mkdtempSync(join(tmpdir(), 'shadow-vision-'));
   const originalFetch = globalThis.fetch;
+  const restoreEgress = resolveFakeHosts(); // vision.test is not resolvable — let the broker pass it to the stub
   try {
     writeFileSync(join(root, 'pixel.png'), Buffer.from(PIXEL_PNG_B64, 'base64'));
     let requestUrl = '';
@@ -54,6 +56,7 @@ test('describe_media keeps the supported OpenAI-compatible vision backend', asyn
       /^data:image\/png;base64,/,
     );
   } finally {
+    restoreEgress();
     globalThis.fetch = originalFetch;
     rmSync(root, { recursive: true, force: true });
   }

@@ -21,6 +21,7 @@ export function modelGroup(e: ModelEntry): string {
   if (/grok/.test(m)) return 'xAI';
   if (/gemini|gemma|palm/.test(m)) return 'Google';
   if (/deepseek/.test(m)) return 'DeepSeek';
+  if (/kimi|moonshot/.test(m)) return 'Moonshot';
   if (/qwen/.test(m)) return 'Qwen';
   if (/llama|codellama/.test(m)) return 'Meta';
   if (/mistral|mixtral|codestral|magistral/.test(m)) return 'Mistral';

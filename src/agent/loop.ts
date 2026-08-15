@@ -7,6 +7,7 @@ import { classifyToolCall } from '../safety/classifier.js';
 import { resolvePermissionRule, type PermissionRule } from '../safety/rules.js';
 import type { ShadowConfig } from '../config.js';
 import { runHooks, runHookPhase } from '../hooks/runner.js';
+import { diagnosticsNoteFor } from './diagnostics.js';
 import { isFallbackEligible, resolveFallbackEntry } from '../provider/fallback.js';
 import { looksLikeTokenOverflow } from '../provider/stream.js';
 import type { UserQuestion } from './approval.js';
@@ -22,11 +23,15 @@ import type { TodoList } from './todo.js';
 import type { PlanModeState } from './planMode.js';
 import { createReadTracker } from '../tools/readTracker.js';
 import { redactString } from '../util/redact.js';
-import { sniffToolCalls } from '../provider/textToolCalls.js';
+import { sniffToolCalls, stripTextualToolIntent } from '../provider/textToolCalls.js';
 import { normalizeForeignTool } from '../tools/foreignAdapter.js';
 import { extractPatchBlock } from '../provider/applyPatch.js';
-import { scrubControlTokens } from '../util/scrub.js';
+import { scrubControlTokens, scrubForDisplay } from '../util/scrub.js';
+import { envelopeSafeSlice } from '../safety/envelope.js';
+import { hasKnownReasoningMarker } from '../provider/openai.js';
 import { DEFAULT_EFFORT, effortDirective } from './effort.js';
+import { resolve as resolvePath, join } from 'node:path';
+import { GLOBAL_DIR } from '../state/globalStore.js';
 
 export interface LoopDeps {
   provider: Provider;
@@ -50,6 +55,9 @@ export interface LoopDeps {
   workspaceRoot: string;
   /** Extra granted roots (additionalDirectories / --add-dir) file tools + the sandbox may use. */
   additionalRoots?: string[];
+  /** F06-10: true when this loop IS a sub-agent. Stamped onto every ToolContext so a nested
+   *  `agent` call can bypass the admission gate (deadlock guard — see makeAgentTool). */
+  nestedAgent?: boolean;
   dryRun: boolean;
   maxToolResultChars: number;
   contextBudget: number; // tokens, for the HUD context-% readout
@@ -68,13 +76,30 @@ export interface LoopDeps {
   permissionRules?: PermissionRule[];
   autoClassifier?: boolean;
   hooks?: ShadowConfig['hooks']; // full set; only some phases are invoked from the loop today
+  // P3-06 v0 — extension → diagnostics-command map; see src/agent/diagnostics.ts. Folded into
+  // successful write-tool results so the model sees compiler/linter verdicts in-loop.
+  diagnostics?: ShadowConfig['diagnostics'];
+  // P2-12 — the confinement-aware approval escalation (second axis of the two-layer sandbox
+  // policy, P3-04). `shellConfined === false` means the OS sandbox was REQUESTED but this host
+  // has no tool to enforce it — an unconfined run_shell is a bigger decision than a confined
+  // one, so per `sandboxFailurePolicy` it stops at the approval gate ('auto': suppressible like
+  // the autonomy floor; 'fail-closed': never bends; 'warn': no escalation, warning in result).
+  // `undefined` = not applicable (sandbox off / --yolo / --no-sandbox).
+  shellConfined?: boolean;
+  sandboxFailurePolicy?: 'auto' | 'fail-closed' | 'warn';
   models?: ModelEntry[];
   fallbackModel?: string;
   /** Activate a fallback's complete entry (provider, endpoint and credentials), not just its id. */
-  resolveFallback?: (entry: ModelEntry) => Promise<{ provider: Provider; model: string }>;
+  resolveFallback?: (entry: ModelEntry, signal?: AbortSignal) => Promise<{ provider: Provider; model: string }>;
   parallelTools?: boolean;
   streamShell?: boolean;
   now?: () => number;
+  /** Injectable sleep for retry backoff (tests stub this to avoid real delays). */
+  sleep?: (ms: number) => Promise<void>;
+  /** The PREVIOUS run's stop reason, when the caller tracks it (the TUI does). Enables the honest
+   *  empty-response diagnosis: a turn after a `max_tokens` stop that then comes back empty is a
+   *  budget-starved reasoner, not a wrong endpoint (P1A-08). */
+  priorStopReason?: StopReasonExt;
   /** When set, a context snapshot is written after each assistant turn. */
   sessionLog?: SessionLogType;
   /**
@@ -96,10 +121,16 @@ export interface LoopResult {
 const MAX_REPAIR_ATTEMPTS = 3;
 /** Total clean empty end_turn responses allowed before the provider is treated as unhealthy. */
 const MAX_EMPTY_RESPONSE_ATTEMPTS = 3;
+/** Bounded backoff (ms) before each re-request after a clean empty end_turn. Index N-1 = delay before the Nth retry. */
+const EMPTY_RESPONSE_BACKOFF_MS = [100, 250];
 /** Nth CONSECUTIVE identical (tool+args) call that gets a loop-guard nudge instead of running. */
 const LOOP_GUARD_LIMIT = 3;
 /** Synthetic tool_result content for a tool_use orphaned by an interrupt (ESC/Ctrl-C). */
 const INTERRUPTED_RESULT = 'Tool execution was interrupted (ESC / Ctrl-C) before this call produced a result.';
+const STEERED_RESULT = 'Tool execution was skipped because the user sent a new message before this call started.';
+/** Synthetic tool_result content for a call never enlisted because a budget ceiling was already crossed (F04-10). */
+const BUDGET_SKIPPED_RESULT =
+  'Tool execution was skipped because the session budget (iterations, tokens, cost, or wall clock) was reached before this call started.';
 
 export class AgentLoop {
   private autonomy: AutonomyLevel;
@@ -112,6 +143,24 @@ export class AgentLoop {
   private readonly readTracker = createReadTracker();
   private readonly approvedPlanExitIds = new Set<string>();
   private fallbackUsed = false;
+  /**
+   * F04-06: the healer runs on EVERY request build, but its duplicate-drop observation must be
+   * reported once per assistant message, not once per turn. Keyed on the (immutable) message
+   * object, so this is bounded by history length and needs no manual cleanup.
+   */
+  private readonly healerDupReported = new WeakSet<Message>();
+  /**
+   * User steering is deliberately separate from the turn's hard-abort signal. A hard abort may
+   * race an in-flight tool and unwind immediately; steering must never release the process run
+   * lock while an MCP or other uncooperative side effect is still running. Instead it aborts only
+   * model-side work (provider streaming / compaction), lets the active tool settle, skips calls
+   * that have not started, and stops at the next paired history boundary. (On a PARALLEL batch the
+   * skip window is the admission pipeline: not-yet-admitted siblings are cancelled, admitted ones
+   * run to completion — see the F04-07 dispatch comment.)
+   */
+  private steerRequested = false;
+  private readonly modelAbort = new AbortController();
+  private readonly modelSignal: AbortSignal;
   /**
    * Index of the assistant turn being executed. SESSION-scoped, not instance-scoped: an AgentLoop
    * is constructed per user message, so a plain `= 0` made turn 1 and turn 5 of the same session
@@ -137,6 +186,7 @@ export class AgentLoop {
     private readonly deps: LoopDeps,
     autonomy: AutonomyLevel,
   ) {
+    this.modelSignal = AbortSignal.any([deps.signal, this.modelAbort.signal]);
     this.autonomy = autonomy;
     this.approvals = deps.approvals ?? new SessionApprovals();
     this.effort = deps.effort ?? DEFAULT_EFFORT;
@@ -153,12 +203,45 @@ export class AgentLoop {
   }
 
   /**
+   * Retry backoff. Resolves early (never rejects) when the turn's hard-abort signal fires so a
+   * Ctrl-C during a backoff window is acted on by the `for (;;)` abort check instead of waiting
+   * out the timer. Tests inject deps.sleep to make backoff instantaneous.
+   */
+  private delay(ms: number): Promise<void> {
+    if (ms <= 0) return Promise.resolve();
+    if (this.deps.sleep) return this.deps.sleep(ms);
+    return new Promise((resolve) => {
+      const onAbort = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        this.deps.signal.removeEventListener('abort', onAbort);
+        resolve();
+      }, ms);
+      this.deps.signal.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
+  /**
+   * Yield this loop to a newly submitted user message at the next safe boundary.
+   * Provider streaming and automatic compaction stop immediately; an active tool is allowed to
+   * finish so its side effects cannot overlap the replacement turn.
+   */
+  requestSteer(): boolean {
+    if (this.steerRequested) return false;
+    this.steerRequested = true;
+    this.modelAbort.abort('user_steer');
+    return true;
+  }
+
+  /**
    * Every approval goes through here so all four call sites get an id and an abort race for
    * free. See settleWithAbort in approval.ts for why the race is not optional.
    */
   private requestApproval(req: Omit<ApprovalRequest, 'id' | 'signal'>): Promise<ApprovalDecision> {
-    const full: ApprovalRequest = { ...req, id: nextApprovalId(), signal: this.deps.signal };
-    return settleWithAbort(this.deps.gate.request(full), this.deps.signal);
+    const full: ApprovalRequest = { ...req, id: nextApprovalId(), signal: this.modelSignal };
+    return settleWithAbort(this.deps.gate.request(full), this.modelSignal);
   }
 
 
@@ -188,7 +271,15 @@ export class AgentLoop {
   }
 
   private async maybeCompact(provider: Provider, model: string, system: string, force = false): Promise<boolean> {
-    const did = await this.deps.context.maybeSummarize(provider, model, force, this.deps.signal, {
+    // P1B-02: cheap in-place reclamation FIRST — clear stale compactable tool_result bodies before
+    // the (expensive) summarizer round-trip. Silent by design; if it frees enough, the summarizer
+    // no-ops this turn. Wrapped so a microcompaction failure can never suppress the real fallback.
+    try {
+      this.deps.context.microcompact(provider);
+    } catch {
+      /* best-effort optimization; summarization below remains the safety net */
+    }
+    const result = await this.deps.context.maybeSummarize(provider, model, force, this.modelSignal, {
       system,
       tools: this.deps.registry.toSchemas(),
       temperature: this.deps.temperature,
@@ -203,22 +294,44 @@ export class AgentLoop {
         }
       },
     });
-    if (did) {
-      this.deps.bus.emit({ type: 'compaction', trigger: 'auto' });
-      if (this.deps.hooks?.post_compact?.length) {
+    if (result === 'summarized' || result === 'truncated') {
+      this.deps.bus.emit({ type: 'compaction', trigger: 'auto', degraded: result === 'truncated' });
+      // post_compact hooks assume a summary handoff just replaced old history — running them
+      // after a degraded (tombstone-only) reclaim would fire them in a context that was never
+      // rewritten, so they run only on a real summarization.
+      if (result === 'summarized' && this.deps.hooks?.post_compact?.length) {
         runHookPhase('post_compact', this.deps.hooks.post_compact, { workspaceRoot: this.deps.workspaceRoot });
       }
     }
-    return did;
+    // F04-11: compaction failure is VISIBLE. A degraded compaction gets a warning on the bus
+    // (rendered by the TUI and the headless renderer alike) plus a session-log entry — the old
+    // `catch { return false; }` swallowed the failure and the session sailed into a server 400.
+    // consumeDegradedReport dedupes: a summarizer that stays broken re-fires compaction every
+    // turn (right — each attempt may succeed once new reclaimable results arrive), but the
+    // warning must not spam once per turn. The episode resets on a healthy compaction.
+    if ((result === 'truncated' || result === 'failed') && this.deps.context.consumeDegradedReport()) {
+      this.deps.bus.emit({
+        type: 'finding',
+        severity: 'warn',
+        title: result === 'truncated' ? 'Compaction degraded — local truncation' : 'Compaction failed',
+        body:
+          result === 'truncated'
+            ? 'The context summarizer failed; context was reclaimed locally by dropping the oldest tool results. The session continues with coarser older history.'
+            : 'The context summarizer failed and no local reclamation was possible — context is still over budget. The next request may fail.',
+      });
+      this.deps.sessionLog?.record({ kind: 'compaction_degraded', mode: result });
+    }
+    return result === 'summarized' || result === 'truncated';
   }
 
   async run(): Promise<LoopResult> {
     const { bus, budget, context } = this.deps;
     let finalAnswer = '';
     let emptyResponseAttempts = 0;
+    let emptyNudgeSent = false;
 
     for (;;) {
-      if (this.deps.signal.aborted) return this.stop('interrupted', finalAnswer);
+      if (this.deps.signal.aborted || this.steerRequested) return this.stop('interrupted', finalAnswer);
 
       const stop = budget.check(this.now());
       if (stop) return this.stop(stop, finalAnswer);
@@ -244,9 +357,25 @@ export class AgentLoop {
       // text-only sessions skip proactive compaction and depend on a server overflow to recover.
       try {
         await this.maybeCompact(this.deps.provider, this.deps.model, sys);
-      } catch {
-        // Compaction is an optimization; a failed summary must not tear down the turn.
+      } catch (err) {
+        // Compaction is an optimization; a failed summary must not tear down the turn. But the
+        // failure itself must be VISIBLE (F04-11): the estimator/harvest/trim paths can throw on
+        // malformed history, and the old empty catch swallowed it — the over-budget session then
+        // sailed silently into the server 400 compaction exists to prevent.
+        if (this.deps.context.consumeDegradedReport()) {
+          bus.emit({
+            type: 'finding',
+            severity: 'warn',
+            title: 'Compaction error',
+            body: `Automatic compaction threw (${(err as Error)?.message ?? err}); context was not reclaimed. The next request may fail if the window is full.`,
+          });
+          this.deps.sessionLog?.record({ kind: 'compaction_degraded', mode: 'error' });
+        }
       }
+      // A steering message can arrive while automatic compaction is streaming. Context keeps the
+      // rewrite atomic, but without this boundary check we still sent the now-obsolete model turn
+      // immediately afterwards (and signal-ignoring local providers could then hang indefinitely).
+      if (this.deps.signal.aborted || this.steerRequested) return this.stop('interrupted', finalAnswer);
       const req: CompletionRequest = {
         model: this.deps.model,
         system: sys,
@@ -260,7 +389,9 @@ export class AgentLoop {
         effort: this.effort,
         cacheTtl: this.deps.cacheTtl,
         fastMode: this.deps.fastMode,
-        signal: this.deps.signal, // so ESC cancels the in-flight request immediately
+        // Hard interrupts and user steering both cancel MODEL work. Tools continue to receive
+        // only deps.signal so a steering prompt cannot orphan a side effect in the background.
+        signal: this.modelSignal,
       };
 
       const turn = await this.runProviderTurnWithFallback(this.deps.provider, req);
@@ -270,6 +401,8 @@ export class AgentLoop {
       // already shown, but never recover or execute a native/textual tool call from that turn:
       // a call assembled before the failing frame may itself be truncated.
       const providerFailed = turn.providerError !== undefined;
+      const turnInterrupted = this.modelSignal.aborted;
+      const turnIncomplete = providerFailed || turnInterrupted;
 
       // Recover tool calls a weaker model emitted as TEXT (e.g. <tool_call>{…}</tool_call>,
       // call:NAME{…}, {"tool_calls":[…]}) instead of via the native channel — only when the
@@ -279,7 +412,7 @@ export class AgentLoop {
       // !badJsonMsg guard is intentionally absent here — a clean TEXT call must still be
       // recovered even when a *separate* native attempt was malformed; `toolCalls.length===0`
       // already prevents double-executing a real native call.
-      if (!providerFailed && turn.toolCalls.length === 0) {
+      if (!turnIncomplete && turn.toolCalls.length === 0) {
         const isKnown = (n: string): boolean => this.deps.registry.get(n) !== undefined;
         const toCalls = (calls: { name: string; input: unknown }[]): ToolCall[] =>
           calls.map((c, i) => ({ id: `txt_${this.now()}_${i}`, name: c.name, input: c.input }));
@@ -314,7 +447,21 @@ export class AgentLoop {
         }
       }
       // Strip leaked chat-template / control tokens from the committed answer.
-      turn.text = scrubControlTokens(turn.text);
+      // An incomplete stream may contain a half-written textual tool envelope. Preserve only
+      // visible prose: incomplete tool intent, signed thinking, and provider reasoning are not
+      // safe to replay on the replacement turn.
+      if (turnIncomplete) {
+        let visible = stripTextualToolIntent(turn.text);
+        const printedPatch = extractPatchBlock(visible);
+        if (printedPatch) visible = printedPatch.cleaned;
+        else {
+          const partialPatch = visible.indexOf('*** Begin Patch');
+          if (partialPatch >= 0) visible = visible.slice(0, partialPatch);
+        }
+        turn.text = scrubForDisplay(visible);
+      } else {
+        turn.text = scrubControlTokens(turn.text);
+      }
 
       // A normal end_turn with no answer and no tools is not a successful completion. Retry the
       // unchanged conversation twice (three TOTAL attempts), with each request still charged by
@@ -322,8 +469,7 @@ export class AgentLoop {
       // blocks so the retry sees the same valid conversation rather than an incomplete assistant
       // turn. Errors, tool_use, max_tokens, pause_turn and interrupts all keep their own handling.
       const cleanEmptyEndTurn =
-        !providerFailed &&
-        !this.deps.signal.aborted &&
+        !turnIncomplete &&
         turn.stopReason === 'end_turn' &&
         !turn.badJsonMsg &&
         turn.toolCalls.length === 0 &&
@@ -331,26 +477,58 @@ export class AgentLoop {
       if (cleanEmptyEndTurn) {
         emptyResponseAttempts += 1;
         if (emptyResponseAttempts < MAX_EMPTY_RESPONSE_ATTEMPTS) {
-          bus.emit({ type: 'retry', attempt: emptyResponseAttempts, delayMs: 0, reason: 'empty response' });
+          // Corrective nudge: give the model honest guidance instead of silently re-asking the
+          // unchanged prompt. Sent ONCE per recovery sequence so the message history stays clean
+          // and the model cannot be blamed for an answer it was never prompted to give.
+          if (!emptyNudgeSent) {
+            emptyNudgeSent = true;
+            context.append({
+              role: 'user',
+              content: [
+                {
+                  type: 'text',
+                  text: 'Your previous response was empty — no text and no tool call. ' +
+                    'Please respond to the task now with an actual answer or a tool call.',
+                },
+              ],
+            });
+          }
+          // Bounded backoff before the re-request; first retry waits, second waits a little longer.
+          const delayMs = EMPTY_RESPONSE_BACKOFF_MS[emptyResponseAttempts - 1] ?? 0;
+          bus.emit({ type: 'retry', attempt: emptyResponseAttempts, delayMs, reason: 'empty response' });
+          await this.delay(delayMs);
           continue;
         }
+        // Honest diagnosis (P1A-08): the endpoint answered — this is NOT a wrong-endpoint shape.
+        // A reasoning model (or a turn right after a max_tokens stop) most likely exhausted its
+        // output budget inside hidden reasoning before any visible text; say so and name the fix.
+        const budgetStarved =
+          this.deps.priorStopReason === 'max_tokens' || hasKnownReasoningMarker(this.deps.model);
         bus.emit({
           type: 'error',
           message:
-            `Model returned an empty response after ${MAX_EMPTY_RESPONSE_ATTEMPTS} attempts. ` +
-            'Check the configured model name and endpoint, then try again or choose a different model.',
+            `Model returned an empty response after ${MAX_EMPTY_RESPONSE_ATTEMPTS} attempts — the endpoint is up ` +
+            `and accepted every request, but produced no visible tokens.` +
+            (budgetStarved
+              ? ` This is the classic shape of a reasoning model whose output budget ran out before any answer text` +
+                (this.deps.priorStopReason === 'max_tokens'
+                  ? ' (the previous turn already stopped at the output-token cap)'
+                  : '') +
+                ` — raise maxOutputTokens (or lower /effort) and try again.`
+              : ` Check that the model id matches what this server actually serves, or try a different model.`),
         });
         return this.stop('provider_error', finalAnswer);
       }
       // Empty-response attempts are consecutive: any substantive or specially-signalled turn
       // ends that recovery sequence (and either continues through its own path or terminates).
       emptyResponseAttempts = 0;
+      emptyNudgeSent = false;
 
       // Commit the assistant turn to history. Thinking blocks lead the turn (the
       // Anthropic adapter requires it) and MUST be preserved with their signatures
       // or the next request 400s when this turn carried tool_use.
       const assistantBlocks: ContentBlock[] = [];
-      if (!providerFailed) {
+      if (!turnIncomplete) {
         for (const tb of turn.thinkingBlocks) {
           // Stamp the producing model so a later /model switch drops these (their
           // signatures / encrypted blobs are only valid for the model that issued them).
@@ -362,35 +540,26 @@ export class AgentLoop {
         }
       }
       if (turn.text) assistantBlocks.push({ type: 'text', text: turn.text });
-      if (!providerFailed) {
+      if (!turnIncomplete) {
         for (const c of turn.toolCalls) {
           assistantBlocks.push({ type: 'tool_use', id: c.id, name: c.name, input: c.input, ...(c.signature ? { signature: c.signature } : {}) });
         }
       }
       if (assistantBlocks.length) {
         const assistantMessage: Message = { role: 'assistant', content: assistantBlocks };
-        if (providerFailed) {
+        if (turnIncomplete) {
           assistantMessage.interrupted = true;
         } else if (turn.providerReasoning) {
           assistantMessage.providerReasoning = { ...turn.providerReasoning, model: this.deps.model };
         }
         context.append(assistantMessage);
-        if (!providerFailed && turn.thinkingText.trim()) {
+        if (!turnIncomplete && turn.thinkingText.trim()) {
           bus.emit({ type: 'reasoning_done', text: turn.thinkingText });
         }
         // Provider errors are emitted while consuming the stream. Renderers close the live
         // assistant row at that point, so emitting assistant_done afterward would print the same
         // partial text a second time. The streamed `text` events already preserved it once.
-        if (!providerFailed) bus.emit({ type: 'assistant_done', text: turn.text });
-        // An interrupt (ESC/Ctrl-C) that lands AFTER a tool_use is committed but
-        // BEFORE its tool ran leaves the turn unpaired. Synthesize an {ok:false}
-        // tool_result for every such tool_use BEFORE snapshotting — both so the
-        // snapshot is restorable and so the next request doesn't 400 on a dangling
-        // tool_use. Only snapshot once the turn is paired.
-        if (!providerFailed && this.deps.signal.aborted && turn.toolCalls.length > 0) {
-          const synthetic = this.synthesizeMissingResults(turn.toolCalls, []);
-          if (synthetic.length) context.append({ role: 'user', content: synthetic });
-        }
+        if (!turnIncomplete) bus.emit({ type: 'assistant_done', text: turn.text });
         // Capture BEFORE the increment: this turn's tools (which run further down the loop)
         // must stamp their checkpoints with the turn being snapshotted here, not the next one.
         const snapTurn = this.turnIndex;
@@ -402,14 +571,15 @@ export class AgentLoop {
       }
       if (turn.text) finalAnswer = turn.text;
 
+      // Interrupted mid-turn (ESC / Ctrl-C broke the stream) → report it as such,
+      // not as a natural end_turn. This takes precedence over an error frame emitted while an
+      // aborted adapter unwinds: the user steered; Shadow did not independently fail the turn.
+      if (this.deps.signal.aborted || this.steerRequested) return this.stop('interrupted', finalAnswer);
+
       // A provider-error frame poisons the WHOLE turn even if useful-looking text or tool calls
       // arrived first. Partial text was committed above for recovery/audit, but tool calls were
       // deliberately excluded and must never reach executeCall.
       if (providerFailed) return this.stop('provider_error', finalAnswer);
-
-      // Interrupted mid-turn (ESC / Ctrl-C broke the stream) → report it as such,
-      // not as a natural end_turn.
-      if (this.deps.signal.aborted) return this.stop('interrupted', finalAnswer);
 
       // No tools requested. Either the task is done, OR the model TRIED to call a
       // tool but its JSON was unrepairable — in which case feed the error back and
@@ -418,15 +588,24 @@ export class AgentLoop {
         if (turn.badJsonMsg) {
           if (this.repairAttempts < MAX_REPAIR_ATTEMPTS) {
             this.repairAttempts += 1;
-            bus.emit({ type: 'retry', attempt: this.repairAttempts, delayMs: 0, reason: 'malformed tool-call JSON' });
+            bus.emit({
+              type: 'retry',
+              attempt: this.repairAttempts,
+              delayMs: 0,
+              // Honest HUD label: a nameless call is not a JSON problem (P1A-07).
+              reason: turn.namelessCall ? 'tool call missing its name' : 'malformed tool-call JSON',
+            });
             context.append({
               role: 'user',
               content: [
                 {
                   type: 'text',
                   text:
-                    `Your previous message tried to call a tool, but its arguments were not valid JSON ` +
-                    `(${turn.badJsonMsg}). Re-send the tool call with valid JSON arguments and nothing else.`,
+                    turn.namelessCall
+                      ? `Your previous message tried to call a tool, but its tool name was omitted ` +
+                        `(${turn.badJsonMsg}). Re-send the tool call WITH the tool name.`
+                      : `Your previous message tried to call a tool, but its arguments were not valid JSON ` +
+                        `(${turn.badJsonMsg}). Re-send the tool call with valid JSON arguments and nothing else.`,
                 },
               ],
             });
@@ -480,8 +659,19 @@ export class AgentLoop {
       let fatal = false;
       const runCalls = async (calls: ToolCall[]) => {
         const blocks: ContentBlock[] = [];
-        for (const call of calls) {
+        for (let i = 0; i < calls.length; i++) {
+          const call = calls[i]!;
           if (this.deps.signal.aborted) return { blocks, fatal: true };
+          if (this.steerRequested) return { blocks, fatal: false };
+          // F04-10: budget is enforced in-call, not only between turns — a long serial batch
+          // that crosses the wall-clock/cost ceiling mid-batch used to keep enlisting calls to
+          // the end. Stop enlisting at the ceiling; pair the unrun calls with an explicit
+          // synthetic result so the model sees WHY they did not run. checkSpending (not check):
+          // the iteration cap bounds provider turns, not the tools of the final turn.
+          if (this.deps.budget.checkSpending(this.now())) {
+            for (const rest of calls.slice(i)) blocks.push(this.resultBlock(rest.id, false, BUDGET_SKIPPED_RESULT));
+            return { blocks, fatal: false };
+          }
           const { block, isFatal, images } = await this.executeCall(call);
           blocks.push(block);
           if (images) turnImages.push(...images);
@@ -498,8 +688,71 @@ export class AgentLoop {
         // Serialize permission-gated calls so approve-for-session applies before siblings run.
         !turn.toolCalls.some((c) => this.mayNeedPermissionPrompt(c));
       if (parallelOk) {
-        const parts = await Promise.all(turn.toolCalls.map((call) => this.executeCall(call)));
-        for (const p of parts) {
+        // F04-07 + F04-10: sequential ADMISSION, parallel EXECUTION. The old dispatch
+        // (Promise.all(map(executeCall))) ran every call's start-time check inside ONE
+        // synchronous tick, so once the batch was underway no steer, interrupt, or budget
+        // crossing could reach a not-yet-run sibling. Each admission decision now chains after
+        // the previous one and yields an event-loop turn, so a cancellation or spending-ceiling
+        // crossing that lands BETWEEN admissions cancels/skips the not-yet-admitted siblings
+        // (paired via STEERED_RESULT / BUDGET_SKIPPED_RESULT). The window is the admission
+        // pipeline itself — siblings already admitted run to completion — so on a typical 2-5
+        // call batch it is short by design; the serial path below can stop at any call boundary.
+        //
+        // The loop guard's counter is snapshotted per sibling: every sibling sees the
+        // pre-batch state, so legitimately identical parallel calls cannot trip the
+        // consecutive-repeat guard on EACH OTHER. After the batch the counter advances by
+        // exactly ONE step — a batch is one decision, not N sequential retries, but it is
+        // also not zero: restoring the snapshot let a model that retries the same call in
+        // pairs every turn evade the guard forever (the exact stuck loop it exists to break).
+        // Uniform batch → one repetition of the shared signature; mixed batch → the last
+        // action wins with a fresh count (diverse parallel activity is not a stuck loop);
+        // fully cancelled batch → state untouched.
+        const guardSig = this.lastCallSig;
+        const guardRepeats = this.consecutiveRepeats;
+        let admit: Promise<void> = Promise.resolve();
+        const parts = turn.toolCalls.map((call) => {
+          const decision = admit.then(() => this.decideAdmission());
+          const part = decision.then(
+            (verdict): Promise<{ block: ContentBlock; isFatal: boolean; images?: ImageBlock[]; sig?: string }> | { block: ContentBlock; isFatal: boolean; images?: ImageBlock[]; sig?: string } => {
+              if (verdict === 'cancelled') return this.cancelledCall(call);
+              if (verdict === 'budget') {
+                return { block: this.resultBlock(call.id, false, BUDGET_SKIPPED_RESULT), isFatal: false };
+              }
+              // Freeze the guard at its pre-batch state for each sibling (see above).
+              this.lastCallSig = guardSig;
+              this.consecutiveRepeats = guardRepeats;
+              // Tag the result with this call's guard signature (executeCall canonicalizes
+              // call.name first) so the post-batch step can advance the cross-turn counter.
+              return this.executeCall(call).then((r) => ({
+                ...r,
+                sig: `${call.name}:${safeJson(call.input) ?? ''}`,
+              }));
+            },
+          );
+          admit = decision.then(
+            () => undefined,
+            () => undefined,
+          );
+          // A rejecting part must never kill the turn: settle it into a synthetic failed block
+          // so every tool_use stays paired and the post-batch guard step below still runs.
+          return part.catch(
+            (err): { block: ContentBlock; isFatal: boolean; images?: ImageBlock[]; sig?: string } => ({
+              block: this.resultBlock(call.id, false, `Tool dispatch failed: ${(err as Error)?.message ?? err}`),
+              isFatal: true,
+            }),
+          );
+        });
+        const resolved = await Promise.all(parts);
+        // Advance the cross-turn guard by ONE step from the signatures actually admitted
+        // (admission order = array order; see the snapshot comment above).
+        const ranSigs = resolved.map((p) => p.sig).filter((s): s is string => typeof s === 'string');
+        if (ranSigs.length > 0) {
+          const last = ranSigs[ranSigs.length - 1]!;
+          const uniform = ranSigs.every((s) => s === last);
+          this.lastCallSig = last;
+          this.consecutiveRepeats = uniform && last === guardSig ? guardRepeats + 1 : 1;
+        }
+        for (const p of resolved) {
           resultBlocks.push(p.block);
           if (p.images) turnImages.push(...p.images);
           if (p.isFatal) fatal = true;
@@ -513,15 +766,21 @@ export class AgentLoop {
       // yet-run tool_use blocks without results. Pair every orphan with a synthetic
       // {ok:false} tool_result before this user turn is committed, or the dangling
       // tool_use 400s every later request and corrupts the snapshot.
-      resultBlocks.push(...this.synthesizeMissingResults(turn.toolCalls, resultBlocks));
+      resultBlocks.push(
+        ...this.synthesizeMissingResults(
+          turn.toolCalls,
+          resultBlocks,
+          this.steerRequested && !this.deps.signal.aborted ? STEERED_RESULT : INTERRUPTED_RESULT,
+        ),
+      );
       // A mixed turn (some calls ran, some had malformed JSON) silently dropped the bad
       // ones — tell the model so it can resend them, alongside the good calls' results.
       if (turn.badCalls.length > 0) {
         resultBlocks.push({
           type: 'text',
           text:
-            `Note: ${turn.badCalls.length} tool call(s) in your last message had invalid JSON arguments and were NOT run ` +
-            `(${turn.badCalls.join('; ')}). Re-send those calls with valid JSON.`,
+            `Note: ${turn.badCalls.length} tool call(s) in your last message could not be run ` +
+            `(${turn.badCalls.join('; ')}). Re-send those calls correctly.`,
         });
       }
       // Images loaded by view_image ride the same user turn, after the tool_result blocks.
@@ -542,6 +801,7 @@ export class AgentLoop {
       // are correct (the parallel path already re-checks aborted at the top of the loop).
       if (fatal && this.deps.signal.aborted) return this.stop('interrupted', finalAnswer);
       if (fatal) return this.stop('fatal_tool_error', finalAnswer);
+      if (this.steerRequested) return this.stop('interrupted', finalAnswer);
 
       const stop2 = budget.check(this.now());
       if (stop2) return this.stop(stop2, finalAnswer);
@@ -562,12 +822,22 @@ export class AgentLoop {
     stopReason?: 'end_turn' | 'tool_use' | 'max_tokens' | 'pause_turn';
     badJsonMsg?: string;
     badCalls: string[];
+    namelessCall: boolean;
     providerError?: { code: string; message: string };
   }> {
     let model = this.deps.model;
     let activeProvider = provider;
     let overflowCompactTried = false;
+    const interruptedTurn = () => ({
+      text: '',
+      toolCalls: [] as ToolCall[],
+      thinkingBlocks: [] as Array<{ thinking: string; signature: string } | { redactedData: string }>,
+      thinkingText: '',
+      badCalls: [] as string[],
+      namelessCall: false,
+    });
     for (let attempt = 0; attempt < 3; attempt++) {
+      if (req.signal?.aborted) return interruptedTurn();
       try {
         // Always send LIVE context (after a compact retry it shrinks), still healing any
         // dangling tool_use pairs so a corrupt snapshot can't 400 the retry.
@@ -576,6 +846,9 @@ export class AgentLoop {
           model,
           messages: this.healDanglingToolUses(this.deps.context.messages()),
         });
+        // Do not turn a user steer into a fallback request. Some adapters surface a final error
+        // frame while their aborted stream unwinds; that error belongs to the obsolete turn.
+        if (req.signal?.aborted) return turn;
         const err = turn.providerError;
         // Local 32k servers: "request (N tokens) exceeds available context size" — shrink history
         // and retry once before giving up or falling back.
@@ -589,6 +862,7 @@ export class AgentLoop {
           overflowCompactTried = true;
           try {
             const did = await this.maybeCompact(activeProvider, model, this.deps.system, true);
+            if (req.signal?.aborted) return turn;
             if (did) {
               this.deps.bus.emit({
                 type: 'retry',
@@ -598,8 +872,18 @@ export class AgentLoop {
               });
               continue;
             }
-          } catch {
-            /* fall through */
+          } catch (err) {
+            // Same visibility rule as the proactive path (F04-11): a throw here means the
+            // overflow recovery failed — surface it once instead of failing silently.
+            if (this.deps.context.consumeDegradedReport()) {
+              this.deps.bus.emit({
+                type: 'finding',
+                severity: 'warn',
+                title: 'Compaction error',
+                body: `Overflow compaction threw (${(err as Error)?.message ?? err}); context was not reclaimed.`,
+              });
+              this.deps.sessionLog?.record({ kind: 'compaction_degraded', mode: 'error' });
+            }
           }
         }
         if (
@@ -615,14 +899,16 @@ export class AgentLoop {
         ) {
           const fb = resolveFallbackEntry(model, this.deps.models ?? [], this.deps.fallbackModel);
           if (
+            !req.signal?.aborted &&
             !this.fallbackUsed &&
             fb &&
             fb.model !== model &&
             (this.deps.resolveFallback || canReuseProviderForFallback(model, fb, this.deps.models ?? []))
           ) {
             const activated = this.deps.resolveFallback
-              ? await this.deps.resolveFallback(fb)
+              ? await this.deps.resolveFallback(fb, req.signal)
               : { provider: activeProvider, model: fb.model };
+            if (req.signal?.aborted) return turn;
             this.fallbackUsed = true;
             const from = model;
             model = activated.model;
@@ -636,11 +922,13 @@ export class AgentLoop {
         }
         return turn;
       } catch (err) {
+        if (req.signal?.aborted) return interruptedTurn();
         const e = err as Error;
         const code = e.message.split(':')[0]?.trim() ?? 'error';
         const fb = resolveFallbackEntry(model, this.deps.models ?? [], this.deps.fallbackModel);
         if (
           attempt === 0 &&
+          !req.signal?.aborted &&
           !this.fallbackUsed &&
           fb &&
           fb.model !== model &&
@@ -648,8 +936,9 @@ export class AgentLoop {
           isFallbackEligible(code, e.message, parseHttpStatus(code))
         ) {
           const activated = this.deps.resolveFallback
-            ? await this.deps.resolveFallback(fb)
+            ? await this.deps.resolveFallback(fb, req.signal)
             : { provider: activeProvider, model: fb.model };
+          if (req.signal?.aborted) return interruptedTurn();
           this.fallbackUsed = true;
           const from = model;
           model = activated.model;
@@ -663,6 +952,7 @@ export class AgentLoop {
         throw err;
       }
     }
+    if (req.signal?.aborted) return interruptedTurn();
     return this.runProviderTurn(activeProvider, { ...req, model });
   }
 
@@ -679,6 +969,7 @@ export class AgentLoop {
     stopReason?: 'end_turn' | 'tool_use' | 'max_tokens' | 'pause_turn';
     badJsonMsg?: string;
     badCalls: string[];
+    namelessCall: boolean;
     providerError?: { code: string; message: string };
   }> {
     const t0 = this.now();
@@ -689,12 +980,13 @@ export class AgentLoop {
     let providerReasoning: { text: string; field: 'reasoning_content' | 'reasoning' } | undefined;
     let stopReason: 'end_turn' | 'tool_use' | 'max_tokens' | 'pause_turn' | undefined;
     let badJsonMsg: string | undefined;
+    let namelessCall = false;
     const badCalls: string[] = [];
     let providerError: { code: string; message: string } | undefined;
 
     try {
       for await (const ev of provider.send(req)) {
-        if (this.deps.signal.aborted) break; // ESC / Ctrl-C — stop consuming the stream now
+        if (req.signal?.aborted) break; // hard interrupt or user steering — stop consuming now
         switch (ev.type) {
           case 'text':
             text += ev.delta;
@@ -743,9 +1035,10 @@ export class AgentLoop {
             // Redact: a provider error body can echo the request (incl. the key) and
             // this message is shown on the HUD/stdout, not just the redacted session log.
             this.deps.bus.emit({ type: 'error', message: redactString(`${ev.code}: ${ev.message}`) });
-            if (ev.code === 'bad_tool_json') {
+            if (ev.code === 'bad_tool_json' || ev.code === 'nameless_tool_call') {
               badJsonMsg = ev.message;
-              badCalls.push(ev.message); // every malformed call, so a mixed turn can feed them all back
+              if (ev.code === 'nameless_tool_call') namelessCall = true;
+              badCalls.push(ev.message); // every recoverable tool-call error, so a mixed turn can feed them all back
             } else providerError = { code: ev.code, message: ev.message };
             // The bus 'error' event above is the SINGLE user-facing render for provider errors.
             // We deliberately do NOT throw here (it used to double-render: the TUI runOne catch
@@ -765,21 +1058,52 @@ export class AgentLoop {
     } catch (err) {
       // An aborted fetch (ESC mid-stream) throws — that's a clean interrupt, not an
       // error; run() sees signal.aborted next and stops with 'interrupted'.
-      if (!this.deps.signal.aborted) throw err;
+      if (!req.signal?.aborted) throw err;
     } finally {
       this.deps.bus.emit({ type: 'latency', ms: this.now() - t0 });
     }
-    return { text, toolCalls, thinkingBlocks, thinkingText, providerReasoning, stopReason, badJsonMsg, badCalls, providerError };
+    return { text, toolCalls, thinkingBlocks, thinkingText, providerReasoning, stopReason, badJsonMsg, badCalls, namelessCall, providerError };
   }
 
   /** Gate, validate, and run one tool call; return its result block. */
   private async executeCall(call: ToolCall): Promise<{ block: ContentBlock; isFatal: boolean; images?: ImageBlock[] }> {
     const { registry, bus } = this.deps;
+    if (this.preExecutionCancelled()) return this.cancelledCall(call);
     const normalized = normalizeForeignTool({ name: call.name, input: call.input });
     call.name = normalized.name;
     call.input = normalized.input;
     const tool = registry.get(call.name);
     if (!tool) {
+      // Loop guard for unknown tools (F04-05): this early return used to skip the guard below,
+      // so a model hallucinating the SAME unknown name over and over ran to the iteration cap —
+      // a token furnace on a fresh serve. Count with the same signature state; the 3rd
+      // consecutive identical strike is non-recoverable and stops the run, naming the tools
+      // that actually exist so the transcript shows exactly what the model could have called.
+      const unknownSig = `${call.name}:${safeJson(call.input) ?? ''}`;
+      if (unknownSig === this.lastCallSig) {
+        this.consecutiveRepeats += 1;
+      } else {
+        this.lastCallSig = unknownSig;
+        this.consecutiveRepeats = 1;
+      }
+      if (this.consecutiveRepeats >= LOOP_GUARD_LIMIT) {
+        bus.emit({ type: 'tool_denied', call, reason: 'repeated identical unknown-tool call (loop guard)' });
+        const available = registry.list().map((t) => t.name).join(', ');
+        const result: ToolResult = {
+          ok: false,
+          summary: `unknown tool: ${call.name}`,
+          error: {
+            code: 'unknown_tool',
+            message:
+              `unknown tool: ${call.name} — requested ${this.consecutiveRepeats} times in a row. ` +
+              `No such tool exists. Available tools: ${available}`,
+            recoverable: false,
+          },
+          meta: { tool: call.name, durationMs: 0, risk: 'read' },
+        };
+        this.emitToolEnd(call, result);
+        return { block: this.resultBlock(call.id, false, this.serialize(result)), isFatal: true };
+      }
       const result: ToolResult = {
         ok: false,
         summary: `unknown tool: ${call.name}`,
@@ -846,6 +1170,7 @@ export class AgentLoop {
         reason: parsed.data.reason,
         preview: parsed.data.reason,
       });
+      if (this.preExecutionCancelled()) return this.cancelledCall(call);
       if (decision === 'deny') {
         bus.emit({ type: 'tool_denied', call, reason: 'plan enter denied by user' });
         return {
@@ -877,6 +1202,7 @@ export class AgentLoop {
         preview: parsed.data.questions.map((q) => q.question).join('; '),
         questions: parsed.data.questions as UserQuestion[],
       });
+      if (this.preExecutionCancelled()) return this.cancelledCall(call);
       if (decision === 'deny') {
         bus.emit({ type: 'tool_denied', call, reason: 'user declined to answer' });
         return {
@@ -904,6 +1230,7 @@ export class AgentLoop {
     }
 
     const planDecision = await this.checkPlanMode(call, tool.risk);
+    if (this.preExecutionCancelled()) return this.cancelledCall(call);
     if (planDecision) return planDecision;
 
     // Permission rules — evaluated before coarse autonomy.
@@ -934,7 +1261,9 @@ export class AgentLoop {
         provider: this.deps.provider,
         model: this.deps.model,
         temperature: this.deps.temperature,
+        signal: this.modelSignal,
       });
+      if (this.preExecutionCancelled()) return this.cancelledCall(call);
       if (verdict.verdict === 'hard_deny') {
         bus.emit({ type: 'tool_denied', call, reason: verdict.reason });
         return {
@@ -964,6 +1293,13 @@ export class AgentLoop {
     // on the spot rather than a config line written weeks earlier.
     const forced = planExitApproved ? null : (this.deps.forceConfirm?.(call, tool.risk) ?? null);
 
+    // F07-01 (P1A-01): a write/edit that TOUCHES the safety config always gates — like the denylist,
+    // it does not bend for autonomy, an `allow` rule, a session approval, or a plan-mode grant. Only a
+    // live human may change the file that decides what needs a gate. (Detector is cheap; run it only
+    // on the two write-path tools so a read of the same file stays quiet.)
+    const configTouch =
+      (call.name === 'write_file' || call.name === 'edit_file') && touchesConfigFile(call);
+
     // Bash read-only auto-allow at auto-read+ — never bypasses denylist / forceConfirm.
     const bashReadOnlyAllow =
       !forced &&
@@ -976,12 +1312,28 @@ export class AgentLoop {
         ...(this.deps.additionalRoots ?? []),
       ]);
 
+    // P2-12 — confinement-aware escalation: a run_shell that would execute UNCONFINED (sandbox
+    // requested, host has no tool) is a bigger decision than a confined one. `warn` keeps the
+    // pre-P2-12 behavior (no gate; warning folded into the tool result); `auto` gates like the
+    // autonomy floor — session/prefix approvals, allow-rules and the read-only fast path may
+    // suppress it; `fail-closed` joins the denylist tier: the bar NEVER bends, every unconfined
+    // call asks every time.
+    const unconfinedShell =
+      call.name === 'run_shell' &&
+      this.deps.shellConfined === false &&
+      (this.deps.sandboxFailurePolicy ?? 'auto') !== 'warn';
+    const unconfinedNoBend = unconfinedShell && this.deps.sandboxFailurePolicy === 'fail-closed';
+
     const sessionApproved = this.isSessionApproved(call, preview);
     if (
       // A non-null `forced` (catastrophic denylist) ALWAYS gates — no session
       // approval, rule `allow`, or bash-read-only fast path may bypass it. The
       // denylist is the one rule that does not bend.
       forced ||
+      // F07-01: a write/edit touching the safety config always gates, exactly like the denylist.
+      configTouch ||
+      // P2-12: fail-closed unconfined shells gate exactly like the denylist — never suppressed.
+      unconfinedNoBend ||
       // Autonomy is a HARD FLOOR. When the autonomy level requires confirmation for this risk we gate,
       // unless a DETERMINISTIC / USER-CONFIGURED override applies: a session/prefix approval, a plan-mode
       // grant, a permission-rule `allow`, or the read-only-shell fast path. The LLM classifier — which is
@@ -993,7 +1345,7 @@ export class AgentLoop {
         !planReadLikeAllowed &&
         !ruleAllow &&
         !bashReadOnlyAllow &&
-        (ruleAsk || classifierAsk || needsApproval(tool.risk, this.autonomy)))
+        (unconfinedShell || ruleAsk || classifierAsk || needsApproval(tool.risk, this.autonomy)))
     ) {
       const decision = await this.requestApproval({
         kind: 'permission',
@@ -1001,13 +1353,20 @@ export class AgentLoop {
         risk: tool.risk,
         reason:
           forced ??
-          (classifierAsk
-            ? classifierReason
-            : ruleAsk
-              ? `permission rule requires confirmation for ${call.name}`
-              : `autonomy=${this.autonomy} requires confirmation for ${tool.risk}`),
+          (configTouch
+            ? `editing the safety config (${call.name}) always requires confirmation (P1A-01)`
+            : unconfinedNoBend
+              ? '⚠ UNCONFINED — no OS sandbox on this host; run_shell will run WITHOUT confinement (policy: fail-closed — this gate never bends)'
+              : unconfinedShell
+                ? '⚠ UNCONFINED — no OS sandbox on this host; run_shell will run WITHOUT confinement (policy: auto)'
+                : classifierAsk
+                  ? classifierReason
+                  : ruleAsk
+                    ? `permission rule requires confirmation for ${call.name}`
+                    : `autonomy=${this.autonomy} requires confirmation for ${tool.risk}`),
         preview,
       });
+      if (this.preExecutionCancelled()) return this.cancelledCall(call);
       if (typeof decision === 'object' && 'setAutonomy' in decision) {
         this.setAutonomy(decision.setAutonomy);
       } else if (typeof decision === 'object' && 'approveForSession' in decision) {
@@ -1043,14 +1402,19 @@ export class AgentLoop {
       }
     }
 
+    // Final safe boundary. Steering never cancels a tool once `tool_start` has been emitted, but
+    // anything still in classification/approval/validation must be skipped and paired cleanly.
+    if (this.preExecutionCancelled()) return this.cancelledCall(call);
     bus.emit({ type: 'tool_start', call, risk: tool.risk });
     const sessionLog = this.deps.sessionLog;
     const ctx: ToolContext = {
       workspaceRoot: this.deps.workspaceRoot,
       additionalRoots: this.deps.additionalRoots,
+      nestedAgent: this.deps.nestedAgent === true,
       signal: this.deps.signal,
       log: () => {},
       dryRun: this.deps.dryRun,
+      maxToolResultChars: this.deps.maxToolResultChars,
       readTracker: this.readTracker,
       streamShell: this.deps.streamShell !== false,
       toolCallId: call.id,
@@ -1098,6 +1462,19 @@ export class AgentLoop {
       });
     }
 
+    // P3-06 v0 — diagnostics feedback loop: after a SUCCESSFUL file write, run the mapped
+    // extension's command (from the trusted global config) and fold its verdict into the tool
+    // result. Advisory only — never changes `result.ok`; the model self-corrects next turn.
+    const diagNote = await diagnosticsNoteFor({
+      tool: call.name,
+      ok: result.ok,
+      dryRun: this.deps.dryRun,
+      input: parsed.data,
+      workspaceRoot: this.deps.workspaceRoot,
+      diagnostics: this.deps.diagnostics,
+    });
+    if (diagNote) result.summary += diagNote;
+
     this.emitToolEnd(call, result);
 
     const isFatal = !result.ok && result.error?.recoverable === false;
@@ -1115,13 +1492,47 @@ export class AgentLoop {
     return { block: this.resultBlock(call.id, false, this.serialize(result)), isFatal: false };
   }
 
+  private preExecutionCancelled(): boolean {
+    return this.steerRequested || this.deps.signal.aborted;
+  }
+
+  private cancelledCall(call: ToolCall): { block: ContentBlock; isFatal: boolean } {
+    const reason = this.steerRequested ? STEERED_RESULT : INTERRUPTED_RESULT;
+    return { block: this.resultBlock(call.id, false, reason), isFatal: false };
+  }
+
+  /**
+   * F04-07/F04-10 admission decision for one parallel call, made at dispatch time — after an
+   * event-loop yield (admissionTick) so a steer/interrupt arriving from the outside (stdin,
+   * SIGINT) or a spending crossing can land BETWEEN admissions instead of finding every call
+   * already enlisted in one synchronous tick.
+   */
+  private async decideAdmission(): Promise<'run' | 'cancelled' | 'budget'> {
+    await this.admissionTick();
+    if (this.preExecutionCancelled()) return 'cancelled';
+    if (this.deps.budget.checkSpending(this.now())) return 'budget';
+    return 'run';
+  }
+
+  /**
+   * One event-loop turn between parallel admissions. Tests inject deps.sleep to control the
+   * pacing deterministically; production uses setTimeout(0) (a macrotask, so real external
+   * events interleave). Kept separate from delay(), which short-circuits ms<=0.
+   */
+  private admissionTick(): Promise<void> {
+    if (this.deps.sleep) return this.deps.sleep(0);
+    return new Promise((resolve) => setTimeout(resolve, 0));
+  }
+
   private emitToolEnd(call: ToolCall, result: ToolResult): void {
     this.deps.bus.emit({ type: 'tool_end', call, result });
     this.emitFindings(result);
   }
 
   private emitFindings(result: ToolResult): void {
-    for (const f of result.meta.findings ?? []) {
+    // meta is required by the ToolResult type, but runtime-registered (plugin/adapter) tools
+    // sit outside TS's sight — a missing meta must not throw here, outside the tool try/catch.
+    for (const f of result.meta?.findings ?? []) {
       this.deps.bus.emit({ type: 'finding', title: f.title, body: f.body, severity: f.severity });
     }
   }
@@ -1140,6 +1551,7 @@ export class AgentLoop {
         reason: 'approve the current plan and exit plan mode before implementation tools can run',
         preview: previewOf(call),
       });
+      if (this.preExecutionCancelled()) return this.cancelledCall(call);
       if (typeof decision === 'object' && 'setAutonomy' in decision) {
         this.setAutonomy(decision.setAutonomy);
         this.approvedPlanExitIds.add(call.id);
@@ -1175,7 +1587,10 @@ export class AgentLoop {
     const max = this.deps.maxToolResultChars;
     if (body.length > max) {
       const omitted = body.length - max;
-      body = `${body.slice(0, max)}\n…(truncated, ${omitted} bytes omitted)`;
+      // P3-05: last-line-of-defense cut. envelopeSafeSlice guarantees this truncation can never
+      // leave an envelope open (tools clamp via fitPayload BEFORE enveloping, so it normally
+      // never fires for enveloped results).
+      body = `${envelopeSafeSlice(body, max)}\n…(truncated, ${omitted} characters omitted)`;
     }
     return body;
   }
@@ -1190,12 +1605,16 @@ export class AgentLoop {
    * (ESC/Ctrl-C) leaves behind — a committed tool_use with no matching tool_result
    * makes every later request 400.
    */
-  private synthesizeMissingResults(calls: ToolCall[], have: ContentBlock[]): ContentBlock[] {
+  private synthesizeMissingResults(
+    calls: ToolCall[],
+    have: ContentBlock[],
+    reason = INTERRUPTED_RESULT,
+  ): ContentBlock[] {
     const paired = new Set<string>();
     for (const b of have) if (b.type === 'tool_result') paired.add(b.toolCallId);
     const out: ContentBlock[] = [];
     for (const c of calls) {
-      if (!paired.has(c.id)) out.push(this.resultBlock(c.id, false, INTERRUPTED_RESULT));
+      if (!paired.has(c.id)) out.push(this.resultBlock(c.id, false, reason));
     }
     return out;
   }
@@ -1224,21 +1643,65 @@ export class AgentLoop {
       if (uses.length === 0) continue;
       const next = messages[i + 1];
       const satisfied = new Set<string>();
+      const matchingResults = new Map<string, Extract<ContentBlock, { type: 'tool_result' }>>();
+      const useIds = new Set(uses.map((use) => use.id));
       if (next && next.role === 'user' && Array.isArray(next.content)) {
+        const dupIds: string[] = [];
         for (const b of next.content) {
-          if ((b as { type?: string }).type === 'tool_result') {
-            const id = (b as { tool_use_id?: string }).tool_use_id;
-            if (id) satisfied.add(id);
+          // Context uses the provider-neutral `toolCallId` field. Reading the wire-format
+          // `tool_use_id` here made every perfectly paired result look missing, so the healer
+          // inserted a second synthetic result and corrupted otherwise valid history.
+          if (b.type === 'tool_result' && useIds.has(b.toolCallId)) {
+            satisfied.add(b.toolCallId);
+            // F04-06: LAST result wins, not first. A duplicate means the call was retried; the
+            // final outcome is the truth. The dropped duplicates are collected and surfaced
+            // below (once per assistant message) instead of vanishing silently.
+            if (matchingResults.has(b.toolCallId)) dupIds.push(b.toolCallId);
+            matchingResults.set(b.toolCallId, b);
           }
+        }
+        if (dupIds.length > 0 && !this.healerDupReported.has(m)) {
+          this.healerDupReported.add(m);
+          const message = `healer dropped duplicate tool_result(s) for id(s) ${dupIds.join(', ')}; last result wins`;
+          this.deps.bus.emit({ type: 'debug', code: 'healer_dup_tool_result', message });
+          this.deps.sessionLog?.record({
+            kind: 'healer_dup_tool_result',
+            toolCallIds: dupIds,
+            policy: 'last-wins',
+          });
         }
       }
       const orphans = uses.filter((b) => !satisfied.has(b.id));
-      if (orphans.length === 0) continue;
+      const observedOrder = next && next.role === 'user' && Array.isArray(next.content)
+        ? next.content
+            .filter((b): b is Extract<ContentBlock, { type: 'tool_result' }> => b.type === 'tool_result' && useIds.has(b.toolCallId))
+            .map((b) => b.toolCallId)
+        : [];
+      const expectedObservedOrder = uses.filter((use) => satisfied.has(use.id)).map((use) => use.id);
+      const orderWrong = observedOrder.some((id, index) => id !== expectedObservedOrder[index]);
+      if (orphans.length === 0 && !orderWrong && observedOrder.length === matchingResults.size) continue;
       out = out ?? [...messages];
       // Index into the COPY: each splice shifts everything after it, so recompute from the copy's
       // own contents rather than trusting `i` to still line up.
       const at = out.indexOf(m);
-      out.splice(at + 1, 0, { role: 'user', content: orphans.map((b) => this.resultBlock(b.id, false, INTERRUPTED_RESULT)) });
+      if (matchingResults.size > 0 && next && next.role === 'user' && Array.isArray(next.content)) {
+        // Qwen/Hermes templates serialize parallel tool responses positionally (the rendered
+        // response blocks carry no ids). Prepending only missing results can therefore attach an
+        // existing output to the wrong call. Rebuild the matching prefix in tool_use order,
+        // synthesizing gaps, then preserve unrelated results/images/text exactly once afterward.
+        const ordered = uses.map(
+          (use) => matchingResults.get(use.id) ?? this.resultBlock(use.id, false, INTERRUPTED_RESULT),
+        );
+        const remainder = next.content.filter(
+          (block) => block.type !== 'tool_result' || !useIds.has(block.toolCallId),
+        );
+        out[at + 1] = { ...next, content: [...ordered, ...remainder] };
+      } else {
+        out.splice(at + 1, 0, {
+          role: 'user',
+          content: uses.map((use) => this.resultBlock(use.id, false, INTERRUPTED_RESULT)),
+        });
+      }
     }
     return out ?? messages;
   }
@@ -1283,7 +1746,17 @@ export class AgentLoop {
     const preview = previewOf({ ...call, name: canonical, input: normalized.input });
     // The denylist does not bend for anything, so check it before the session-approval shortcut.
     if (this.deps.forceConfirm?.({ ...call, name: canonical, input: normalized.input }, tool.risk)) return true;
+    // F07-01 (P1A-01): a write/edit touching the safety config always prompts, like the denylist.
+    if ((canonical === 'write_file' || canonical === 'edit_file') && touchesConfigFile({ ...call, name: canonical })) return true;
+    // P2-12: an unconfined run_shell (sandbox requested, no host tool) escalates to the gate.
+    // fail-closed never bends — treat it like the denylist, BEFORE the session-approval shortcut.
+    const unconfinedEscalation =
+      canonical === 'run_shell' &&
+      this.deps.shellConfined === false &&
+      (this.deps.sandboxFailurePolicy ?? 'auto') !== 'warn';
+    if (unconfinedEscalation && this.deps.sandboxFailurePolicy === 'fail-closed') return true;
     if (this.isSessionApproved({ ...call, name: canonical }, preview)) return false;
+    if (unconfinedEscalation) return true;
     if (needsApproval(tool.risk, this.autonomy)) return true;
     // A permission rule may demand confirmation regardless of level.
     const rule = resolvePermissionRule({ ...call, name: canonical, input: normalized.input }, preview, this.deps.permissionRules ?? []);
@@ -1313,6 +1786,39 @@ function shellCommandOf(input: unknown): string | null {
   if (!input || typeof input !== 'object') return null;
   const cmd = (input as { command?: unknown }).command;
   return typeof cmd === 'string' ? cmd : null;
+}
+
+/**
+ * F07-01 (P1A-01): editing the config that DISARMS the safety gates must always prompt — at every
+ * autonomy level, over every allow rule, session approval, and read-only fast path. This is the
+ * persistence-chain close-out: a model (or a cloned repo) that gets `write_file` auto-approved at
+ * `auto-edit` (the default) could otherwise rewrite `shadow.config.json` — and while the untrusted
+ * project file is now de-fanged at load, the GLOBAL `~/.shadow/config.json` is not (it is the
+ * trusted layer). Only a live human gate stands between an LLM and a change to your provider,
+ * baseUrl, permissionRules, or jail. Match any `shadow.config.json` under the workspace AND the
+ * global config; substring (not full-resolve) so a touching write to `x/shadow.config.json.bak` or a
+ * `.../shadow.config.json/tmp` still prompts — false positive costs one prompt, never a bypass.
+ * Symlink edge: a bare filename match can't chase `ln -s ~/.shadow/config.json evil.link`, but the
+ * jail's resolveWithin+realpath confines writes to granted roots, and the global config's realpath
+ * lives outside them — so the symlink targets outside the jail are already refused upstream.
+ */
+export function touchesConfigFile(call: ToolCall): boolean {
+  const input = call.input;
+  if (!input || typeof input !== 'object') return false;
+  const p = (input as { path?: unknown }).path;
+  if (typeof p !== 'string' || !p) return false;
+  // Fast path: any path whose segments include `shadow.config.json` (project config, in any dir).
+  // The trailing boundary tolerates a touching suffix (`.bak`, `.tmp`) so a write to
+  // `x/shadow.config.json.bak` still prompts — a false positive costs one prompt, never a bypass
+  // (see the doc comment above). It deliberately does NOT match a `.ts` extension
+  // (`src/shadow.config.json.ts` is source code, not the config that disarms the gates).
+  if (/(^|[/\\])shadow\.config\.json([/\\]|$|\.(?!ts$))/.test(p)) return true;
+  // Absolute path that resolves to the global trusted config (~/.shadow/config.json) under any name.
+  try {
+    return resolvePath(p) === join(GLOBAL_DIR, 'config.json');
+  } catch {
+    return false;
+  }
 }
 
 /**

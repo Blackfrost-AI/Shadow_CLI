@@ -138,10 +138,13 @@ export function createStore() {
         break;
       }
       case 'tool_start': {
+        // A sub-agent's forwarded tool is tagged with e.subagent (its taskId). Attribute it with a
+        // ↳ marker + a subagent field so it reads as delegated activity, not a parent tool row.
         const item = push({
           kind: 'tool',
           callId: e.call?.id,
-          name: e.call?.name ?? 'tool',
+          name: e.subagent ? `↳ ${e.call?.name ?? 'tool'}` : (e.call?.name ?? 'tool'),
+          subagent: e.subagent ?? null,
           args: e.call?.args,
           risk: e.risk,
           status: 'running',
@@ -240,6 +243,17 @@ export function createStore() {
       case 'todo':
       case 'plan_mode':
         break;
+      // F06-10: a queued announcement says so; admission re-announces with queued cleared.
+      case 'subagent_start': {
+        push({ kind: 'status', text: e.queued
+          ? `▸ sub-agent ${e.subagentType ?? 'agent'}${e.description ? ` · ${e.description}` : ''} queued — waiting for a concurrency slot${e.background ? ' (background)' : ''}`
+          : `▸ sub-agent ${e.subagentType ?? 'agent'}${e.description ? ` · ${e.description}` : ''} started${e.background ? ' (background)' : ''}`, tone: 'muted' });
+        break;
+      }
+      case 'subagent_end': {
+        push({ kind: 'status', text: `▸ sub-agent ${e.subagentType ?? 'agent'} ${e.ok ? 'finished' : 'failed'}`, tone: e.ok ? 'muted' : 'warn' });
+        break;
+      }
       // A finished sub-agent's total spend. The terminal folds it into session cost; this mirror
       // reports the PARENT turn's usage only, so there is no surface for it here — but it must be
       // named explicitly, or the default branch would print "unhandled event" on every sub-agent.

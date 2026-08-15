@@ -35,6 +35,10 @@ export interface ToolContext {
   signal: AbortSignal; // for timeouts / Ctrl-C
   log: (msg: string) => void;
   dryRun: boolean; // when true, write/exec tools no-op and report what they WOULD do
+  /** P3-05: the loop's tool-result size budget. Untrusted payloads are clamped to it BEFORE
+   *  enveloping so the envelope's END marker always survives into the context (a downstream
+   *  truncation that severed it would hand a forged END marker its escape wedge). */
+  maxToolResultChars?: number;
   readTracker?: ReadTracker; // read-before-edit guard (present in the real loop, optional in tests)
   /** When true, run_shell emits live stdout/stderr chunks via onShellOutput. */
   streamShell?: boolean;
@@ -45,6 +49,9 @@ export interface ToolContext {
   toolCallId?: string;
   /** When set, write tools save a pre-mutation checkpoint for `/rewind`. */
   checkpoint?: { sessionId: string; turn: number };
+  /** F06-10: true when this tool runs inside a sub-agent loop. A nested `agent` call uses it
+   *  to bypass the session admission gate — queuing behind its own parent's permit deadlocks. */
+  nestedAgent?: boolean;
 }
 
 export interface Tool<I = unknown, O = unknown> {

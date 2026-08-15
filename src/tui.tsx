@@ -12,10 +12,16 @@ import {
   reconCount,
   type CollapseKind,
 } from './tui/toolDisplay.js';
+import { renderSubAgentPanel, type SubAgentView } from './tui/subagentPanel.js';
+import { emitNotification, NOTIFY_MIN_TURN_MS, NOTIFY_APPROVAL_WAIT_MS } from './util/notify.js';
+import { discoverCustomCommands, expandCommandBody } from './tui/customCommands.js';
+import { resolveEditor, openEditorFile } from './tui/externalEditor.js';
+import { atMentionToken, walkWorkspaceFiles, rankFileCandidates, expandFileMentions } from './tui/fileMentions.js';
 import { supportsInlineImages, saveAndOpen, canOpenViewer } from './util/termImage.js';
 import {
   extractCommittableUnits,
   clampTail,
+  clampLiveRest,
   stripTrailingNewlines,
   dupKey,
   repeatStep,
@@ -24,10 +30,11 @@ import {
 import { computeLayout, formatStatusStrip, pinnedMaxItems, composerMaxRows, fitHud } from './tui/layout.js';
 import { PendingOverlay, ModelPickerOverlay } from './tui/overlays.js';
 import { buildSeats, resolveTableEntries, parseTableInput, seatTag, MIN_SEATS, MAX_SEATS, type Seat, type SpeakerTag } from './tui/roundTable.js';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { homedir } from 'node:os';
 import type { Message, Provider, ToolCall, ContentBlock, ImageBlock, Effort } from './provider/provider.js';
 import type { ToolRegistry } from './tools/registry.js';
-import { EventBus } from './agent/events.js';
+import { EventBus, type StopReasonExt } from './agent/events.js';
 import { Budget } from './agent/budget.js';
 import { maybeNotifyUpdate } from './update/checkUpdate.js';
 import { parseMarkdown, renderTableLines, wrapSpans, type MdSpan } from './util/markdown.js';
@@ -92,10 +99,12 @@ import {
 import { cycleAutonomy, raiseAutonomy, type AutonomyLevel } from './safety/permissions.js';
 import { applyPermissionCommand } from './safety/permissionCmd.js';
 import { isLocalBaseUrl, isLocalModelTarget } from './safety/offline.js';
+import { egressSummary } from './safety/egress.js';
+import { sandboxConfinement } from './safety/sandbox.js';
 import { clampLocalContextBudget, keepLastTurnsForBudget, triggerRatioForBudget } from './util/contextBudget.js';
 import { familyProfile } from './config/familyProfiles.js';
 import { SessionLog } from './state/session.js';
-import { createProvider, type ProviderName } from './provider/index.js';
+import { createProvider, entryStreamContract, type ProviderName } from './provider/index.js';
 import {
   disableMcpServer,
   enableContextCooler,
@@ -134,7 +143,7 @@ import {
   removeLocalModel,
 } from './local/garage.js';
 import { runDoctor, formatDoctorReport } from './doctor.js';
-import { type OutputStyle } from './styles.js';
+import { customStyleNames, type OutputStyle } from './styles.js';
 import {
   groupedModelRows,
   firstSelectableRow,
@@ -150,7 +159,8 @@ import { ProjectMemory } from './state/memory.js';
 import { buildCodexAuthUrl, clearSubAuth, getSubAuth, importOfficialCredential, type SubProvider } from './auth/index.js';
 import { loadAgentDefs } from './agent/defs.js';
 import { existsSync, writeFileSync, statSync, readFileSync, readdirSync } from 'node:fs';
-import { join, resolve, isAbsolute } from 'node:path';
+import { join, resolve, isAbsolute, basename, dirname } from 'node:path';
+import { listPlugins, setPluginEnabled, enabledPluginDirs, PLUGIN_CONTENT_DIRS, displaySafe } from './plugins/manager.js';
 import { friendlyDeniedReason } from './util/deniedReason.js';
 import { vimNormalKey, type VimMode } from './tui/vim.js';
 import { runHookPhase } from './hooks/runner.js';
@@ -170,6 +180,9 @@ import { bindingsForDisplay, initKeybindingsFile } from './tui/keybindings/loade
 import type { ContextName } from './tui/keybindings/types.js';
 import { claimMode, releaseMode, updateReset, restoreTerminal, installRestoreHandlers } from './tui/terminalState.js';
 import { scrubForDisplay } from './util/scrub.js';
+import { stripTextualToolIntent } from './provider/textToolCalls.js';
+import { splitStreamToolIntentCapped } from './tui/streamIntent.js';
+import { extractPatchBlock } from './provider/applyPatch.js';
 import { scrubbedEnv } from './util/safeEnv.js';
 import { displayWidth, takeByWidth } from './tui/width.js';
 import { stripCtl, formatUsage, shellCommandOf, agentAttr, oneLine, formatDiffStats, shortPath } from './tui/format.js';
@@ -223,6 +236,12 @@ export function runStatusLine(cmd: string, ctx: StatusLineCtx, cb: (line: string
   try {
     const child = spawn('sh', ['-c', cmd], {
       stdio: ['pipe', 'pipe', 'ignore'],
+      // F07-03: run the statusLine with cwd = HOME, NOT the workspace (which spawn inherits from
+      // Shadow's own cwd). A relative script path inside a statusLine command would otherwise resolve
+      // against a potentially hostile cloned repo — the same drive-by bait class as hooks. Pinning to
+      // HOME removes that vector without breaking legitimate `date`-style commands. The workspace is
+      // still available to the command via the explicit $SHADOW_CWD env var below.
+      cwd: homedir(),
       env: {
         ...scrubbedEnv(),
         SHADOW_MODEL: ctx.model,
@@ -294,6 +313,12 @@ interface SlashCommand {
   name: string;
   desc: string;
   dispatch?: string;
+  /** F10-07: a user-defined command loaded from .shadow/commands or .claude/commands. Its body is
+   *  a prompt template submitted as a turn (with $ARGUMENTS/$1 substitution), not a builtin action. */
+  custom?: { body: string };
+  /** F08-04: an @-file candidate row. Accepting it REPLACES the `@partial` token with `@path`,
+   *  rather than running a command. `start` is the index of the `@` in the composer. */
+  mention?: { start: number; path: string };
 }
 /** A dropdown row: a command, or (when `base` is set) a completed first ARGUMENT of one —
  *  `name` then holds the full submission text ("/theme colorblind") and `base` the command. */
@@ -324,16 +349,17 @@ const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/usage', desc: 'Alias for /cost' },
   { name: '/stats', desc: 'Show session token usage and cost (alias for /cost)', dispatch: '/cost' },
   { name: '/context', desc: 'Show context-window usage' },
+  { name: '/connections', desc: 'Show the egress receipt: every host Shadow reached this session, why, allowed/denied' },
   { name: '/export', desc: 'Export session to markdown (optional path)' },
   { name: '/copy', desc: 'Copy the last answer to the clipboard (/copy code → last code block); Alt+C' },
   { name: '/session', desc: 'Show current session id, log path, and message count' },
   { name: '/resume', desc: 'Resume a prior session (optional session id/path)' },
   { name: '/rewind', desc: 'Rewind to a turn index (e.g. /rewind 2)' },
   { name: '/init', desc: 'Scaffold SHADOW.md in the workspace' },
-  { name: '/agents', desc: 'List agent definitions' },
+  { name: '/agents', desc: 'List running agents + definitions; /agents kill <id|all> cancels a background agent' },
   { name: '/skills', desc: 'List discovered repo skills' },
   { name: '/workflows', desc: 'List workflow files' },
-  { name: '/plugins', desc: 'Show extension/plugin status' },
+  { name: '/plugins', desc: 'List installed plugins; /plugins enable|disable <name>' },
   { name: '/mcp', desc: 'List, inspect, enable, or disable MCP servers' },
   { name: '/memory', desc: 'Show project memory facts' },
   { name: '/tasks', desc: 'Show or clear the live task list (/tasks clear)' },
@@ -426,6 +452,10 @@ const SLASH_ARG_COMPLETIONS: Record<string, ArgProvider> = {
     { value: 'procedural', desc: 'Terse step-by-step execution' },
   ],
   '/copy': [{ value: 'code', desc: 'Copy only the last fenced code block' }],
+  '/plugins': [
+    { value: 'enable', desc: 'Enable an installed plugin: /plugins enable <name>' },
+    { value: 'disable', desc: 'Disable a plugin: /plugins disable <name>' },
+  ],
   '/config': [
     { value: 'show', desc: 'Show safe runtime settings (secrets hidden)' },
     { value: 'get temperature', desc: 'Show self-hosted sampling temperature' },
@@ -542,19 +572,21 @@ function slashMatches(
   input: string,
   current?: Record<string, string | undefined>,
   ctx?: ArgContext,
+  extra: SlashCommand[] = [],
 ): SlashMenuItem[] {
   if (!input.startsWith('/')) return [];
   if (isPathLikeSlashToken(input)) return []; // a path (/Users/…, /x.y) is not a command — no menu
+  const all = extra.length ? [...SLASH_COMMANDS, ...extra] : SLASH_COMMANDS;
   const sp = input.indexOf(' ');
   if (sp < 0) {
     const q = input.slice(1);
-    if (!q) return SLASH_COMMANDS.filter((c) => !/\balias\b/i.test(c.desc));
+    if (!q) return all.filter((c) => !/\balias\b/i.test(c.desc));
     // NAME-only fuzzy — deliberately no description search: Enter runs the selected row, and
     // a desc match on a mistyped name ("/modle") would execute an unrelated command instead
     // of falling through to the did-you-mean suggestion.
-    return fuzzyRank(SLASH_COMMANDS, q, (c) => c.name.slice(1)).map((r) => r.item);
+    return fuzzyRank(all, q, (c) => c.name.slice(1)).map((r) => r.item);
   }
-  const cmd = findSlashCommand(input.slice(0, sp));
+  const cmd = findSlashCommand(input.slice(0, sp), extra);
   if (!cmd) return [];
   const provider = SLASH_ARG_COMPLETIONS[slashDispatchName(cmd)];
   if (!provider) return [];
@@ -582,8 +614,8 @@ function slashDispatchName(cmd: SlashCommand): string {
   return cmd.dispatch ?? cmd.name;
 }
 
-function findSlashCommand(name: string): SlashCommand | undefined {
-  return SLASH_COMMANDS.find((c) => c.name === name);
+function findSlashCommand(name: string, extra: SlashCommand[] = []): SlashCommand | undefined {
+  return SLASH_COMMANDS.find((c) => c.name === name) ?? extra.find((c) => c.name === name);
 }
 
 /** Levenshtein distance, early-exiting when it must exceed `max` — for did-you-mean on typos.
@@ -622,12 +654,35 @@ function suggestSlash(first: string): string | undefined {
 /** Classify a `/`-leading submission: a KNOWN command, a likely TYPO (/modl), or a PATH/message the
  *  user pasted or typed (/Users/…, /tmp). This is what stops a directory being rejected as a command.
  *  Typos carry a `suggestion` when a command is plausibly close. */
-function classifySlash(task: string): { cmd?: SlashCommand; kind: 'command' | 'typo' | 'message'; suggestion?: string } {
+function classifySlash(task: string, extra: SlashCommand[] = []): { cmd?: SlashCommand; kind: 'command' | 'typo' | 'message'; suggestion?: string } {
   const first = task.split(/\s+/)[0] ?? '';
-  const cmd = findSlashCommand(first);
+  const cmd = findSlashCommand(first, extra);
   if (cmd) return { cmd, kind: 'command' };
   if (isPathLikeSlashToken(first) || pathExistsSafe(first)) return { kind: 'message' };
   return { kind: 'typo', suggestion: suggestSlash(first) };
+}
+
+type QueuedTask = {
+  text: string;
+  /** Human messages steer the active agent; commands and scheduled wakeups wait for turn-end. */
+  kind: 'steer' | 'deferred';
+};
+
+function queuedTaskKind(task: string): QueuedTask['kind'] {
+  if (!task.startsWith('/')) return 'steer';
+  return classifySlash(task).kind === 'message' ? 'steer' : 'deferred';
+}
+
+/** Display-safe assistant text. Textual/native-looking calls are execution intent, never prose. */
+function sanitizeAssistantText(text: string): string {
+  let visible = stripTextualToolIntent(text);
+  const patch = extractPatchBlock(visible);
+  if (patch) visible = patch.cleaned;
+  else {
+    const partialPatch = visible.indexOf('*** Begin Patch');
+    if (partialPatch >= 0) visible = visible.slice(0, partialPatch);
+  }
+  return scrubForDisplay(visible);
 }
 
 const SAFE_CONFIG_KEYS = [
@@ -694,7 +749,7 @@ function parseSubProvider(value: string | undefined): SubProvider | null {
 }
 
 /** Informational slash commands safe to run mid-turn without interrupting the agent. */
-const SLASH_WHILE_RUNNING = new Set(['/help', '/cost', '/usage', '/context', '/fast', '/effort', '/version', '/copy']);
+const SLASH_WHILE_RUNNING = new Set(['/help', '/cost', '/usage', '/context', '/connections', '/fast', '/effort', '/version', '/copy']);
 
 /**
  * The selectable model list for the `/model` picker: the configured `models`, or a
@@ -794,6 +849,8 @@ function listNamedEntries(dir: string): string[] {
 function workflowInventory(workspaceRoot: string): string[] {
   const roots = [
     { label: 'workspace', dir: join(workspaceRoot, '.shadow', 'workflows') },
+    // Enabled plugins contribute workflow runbooks too (P3-07); the dir is <plugin>/workflows.
+    ...enabledPluginDirs('workflows').map((dir) => ({ label: `plugin:${basename(dirname(dir))}`, dir })),
     { label: 'global', dir: join(GLOBAL_DIR, 'workflows') },
   ];
   const lines: string[] = [];
@@ -879,7 +936,8 @@ function helpLines(topic: HelpTopic): BannerLine[] {
       { text: '  / opens commands  ·  ↑/↓ select  ·  Tab completes  ·  Esc closes', dimColor: true },
       { text: '  Shift+Tab changes mode  ·  Ctrl+O folds details  ·  Ctrl+T expands tasks', dimColor: true },
       { text: 'While Shadow works', color: C.purple, bold: true },
-      { text: '  Keep typing and press Enter to queue the next request  ·  Esc interrupts', dimColor: true },
+      { text: '  Keep typing and press Enter to steer the active turn  ·  Esc interrupts', dimColor: true },
+      { text: '  State-changing slash commands wait until the current turn ends.', dimColor: true },
       { text: 'Approvals: y once · n deny · s session · f shell prefix · a raise autonomy', dimColor: true },
       { text: 'Exit: Ctrl+C twice (or Ctrl+D on an empty composer)', dimColor: true },
       { text: 'Customize bindings with /keybindings init.', dimColor: true },
@@ -1001,6 +1059,10 @@ export interface TuiOpts {
   autonomy: AutonomyLevel;
   bypass: boolean; // --yolo
   offline?: boolean; // --offline (Offline Shadow Mode)
+  /** F06-09: resolves when the background MCP connect settles — the "mcp: connecting…" chip
+   *  shows until then. Late registration is safe (tools resolve by name at call time), so this
+   *  is a status surface only, never a gate. */
+  mcpPending?: Promise<void>;
   version: string;
   styleState?: TuiStyleState;
   todoList?: TodoList;
@@ -1680,7 +1742,22 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // tool_start/tool_end forwarded events (SubagentBus.meta) for each agent's current activity.
   // Rendered as a distinct "Running N agents" panel so a sub-agent never hijacks the parent's own
   // activeTool row. Map stays immutable (every update returns a fresh Map) so Ink re-renders.
-  const [subAgents, setSubAgents] = useState<Map<string, { taskId: string; subagentType: string; description?: string; tool?: string; argPreview?: string }>>(new Map());
+  const [subAgents, setSubAgents] = useState<Map<string, SubAgentView>>(new Map());
+  // F06-09: MCP servers connect in the background so first paint is never gated on them. This
+  // flag drives the transient "mcp: connecting…" chip; it clears the moment the settle promise
+  // resolves (success OR failure — per-server failures already warn on stderr).
+  const [mcpConnecting, setMcpConnecting] = useState(opts.mcpPending != null);
+  useEffect(() => {
+    if (!opts.mcpPending) return;
+    let alive = true;
+    const clear = (): void => {
+      if (alive) setMcpConnecting(false);
+    };
+    opts.mcpPending.then(clear, clear);
+    return () => {
+      alive = false;
+    };
+  }, []);
   // Mid-turn recon burst (read/grep/glob…): counts accumulate so the live row reads
   // "Reading 3 files, Grepping 1 pattern · path" instead of flashing every single call.
   // Cleared when a signal tool (edit/shell/…) starts or the turn ends.
@@ -1729,12 +1806,12 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const routeInFlightRef = useRef(false); // a seat route is building/running — block a second concurrent route
   const [pickerOpen, setPickerOpen] = useState(false); // model-picker has focus
   const [pickerIndex, setPickerIndex] = useState(0); // selected row in the model picker
-  // Type-ahead queue: messages/slash-commands submitted WHILE a turn is running are
-  // pushed here (FIFO) instead of interrupting the turn; the queue is flushed in order
-  // when the turn ends. `queued` mirrors the ref for the live "queued" indicator.
-  const queuedTasksRef = useRef<string[]>([]);
-  const [queued, setQueuedState] = useState<string[]>([]);
-  const setQueued = useCallback((next: string[]) => {
+  // Pending input remains FIFO, but human messages now STEER the active loop: model-side work is
+  // cancelled immediately and the message starts at the next safe boundary. Commands and wakeups
+  // remain deferred until turn-end. `queued` mirrors the ref for the live pending indicator.
+  const queuedTasksRef = useRef<QueuedTask[]>([]);
+  const [queued, setQueuedState] = useState<QueuedTask[]>([]);
+  const setQueued = useCallback((next: QueuedTask[]) => {
     queuedTasksRef.current = next;
     setQueuedState(next);
   }, []);
@@ -1783,6 +1860,15 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // current turn (reset at turn start) so per-turn increases are counted once.
   const sessionCostRef = useRef(0);
   const prevTurnCostRef = useRef(0);
+  // Session-level TOKEN accumulation (P1B-03), by the same delta method as cost: the per-turn
+  // Budget resets each turn, so sum incremental in/out tokens across turns (prevTurn* reset at turn
+  // start). Sub-agent tokens accrue here too via subagent_usage. This is the real SESSION total —
+  // lastUsageRef is only the LAST TURN, which /cost used to mislabel "(session)".
+  const sessionInTokRef = useRef(0);
+  const sessionOutTokRef = useRef(0);
+  const prevTurnInTokRef = useRef(0);
+  const prevTurnOutTokRef = useRef(0);
+  const sessionTurnsRef = useRef(0);
 
   // Refs for values read inside the (stable) key handler / async loop, to avoid
   // stale closures without re-subscribing on every render.
@@ -1803,6 +1889,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
    */
   const compactingRef = useRef(false);
   const compactAbortRef = useRef<AbortController | null>(null);
+  /** Long-running slash work that probes providers but does not own an AgentLoop/run lock. */
+  const asyncCommandRef = useRef(false);
 
   /**
    * Rewindable snapshot turns, refreshed when a turn ends. Read from the session log rather than
@@ -1855,6 +1943,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const firstRef = useRef(true);
   const controllerRef = useRef<AbortController | null>(null);
   const loopRef = useRef<AgentLoop | null>(null);
+  // Last completed run's stop reason — feeds the next loop's priorStopReason so an empty-response
+  // failure right after a max_tokens stop is diagnosed as a starved output budget (P1A-08).
+  const lastStopReasonRef = useRef<StopReasonExt | undefined>(undefined);
   // Hand main() a getter for the live turn controller so `shadow --web` can interrupt the
   // terminal's turn from the browser. controllerRef is stable; the closure always reads live.
   // On unmount, abandon any in-flight turn's run lock: in production the TUI unmounts only at
@@ -1929,6 +2020,37 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const handleTableInputRef = useRef<((raw: string) => void) | null>(null);
   const startTableRef = useRef<((arg: string) => void) | null>(null);
   const flushQueueRef = useRef<(() => void) | null>(null);
+  // startTurn is defined below but runSlash (above it) needs it for custom-command dispatch (F10-07).
+  const startTurnRef = useRef<((task: string) => void) | null>(null);
+  // F10-07: custom slash commands loaded from .shadow/commands / .claude/commands (workspace + ~).
+  // Builtins always win — a repo can't shadow /clear etc. Loaded once at mount; refreshed on /clear.
+  const customCommandsRef = useRef<SlashCommand[]>([]);
+  const customCommandsLoadedRef = useRef(false);
+  // F08-04: cached workspace file list for @-mention completion. Walked lazily on first @ use (a
+  // big repo walk shouldn't tax startup) and reused for the session; refreshed on /clear.
+  const fileListRef = useRef<string[]>([]);
+  const fileListLoadedRef = useRef(false);
+  const ensureFileList = useCallback((): string[] => {
+    if (!fileListLoadedRef.current) {
+      fileListLoadedRef.current = true;
+      try { fileListRef.current = walkWorkspaceFiles(opts.workspaceRoot); } catch { fileListRef.current = []; }
+    }
+    return fileListRef.current;
+  }, [opts.workspaceRoot]);
+  const loadCustomCommands = useCallback(() => {
+    try {
+      const builtin = new Set(SLASH_COMMANDS.map((c) => c.name));
+      customCommandsRef.current = discoverCustomCommands(opts.workspaceRoot, homedir())
+        .filter((c) => !builtin.has(`/${c.name}`))
+        .map((c) => ({ name: `/${c.name}`, desc: c.description, custom: { body: c.body } }));
+    } catch {
+      customCommandsRef.current = [];
+    }
+  }, [opts.workspaceRoot]);
+  if (!customCommandsLoadedRef.current) {
+    customCommandsLoadedRef.current = true;
+    loadCustomCommands();
+  }
   const goalRef = useRef<string | null>(null);
   // Extra granted roots, mutable at runtime via /add-dir (seeded from startup config/--add-dir).
   // The loop deps re-read this ref each turn, so a grant takes effect on the next turn.
@@ -1966,7 +2088,6 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     const saved = normalizeThemeName(opts.cfg.lastTheme as string | undefined);
     if (saved) applyTheme(saved);
   }
-  runningRef.current = running;
   pendingRef.current = pending;
   // NOTE: inputRef/cursorRef are deliberately NOT synced from state here. They are
   // written directly by setLine/setComposer and the caret/backspace handlers and are
@@ -2126,7 +2247,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // the current keypress; the composer consults them only to disambiguate. Declared ABOVE the
   // useInput(onKey) call so this listener is registered FIRST and the ref is fresh inside onKey.
   const rawKeyRef = useRef('');
-  const { internal_eventEmitter: inkInputEvents } = useStdin();
+  const { internal_eventEmitter: inkInputEvents, setRawMode, stdin: inkStdin } = useStdin();
+  // F08-10: Ctrl-X arms the external-editor chord; the next Ctrl-E opens $EDITOR on the draft.
+  const ctrlXArmedRef = useRef(false);
   useEffect(() => {
     if (!inkInputEvents) return;
     const onData = (d: unknown): void => {
@@ -2158,7 +2281,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     // put raw CSI/OSC bytes straight into the draft, where they corrupted the rendered composer,
     // broke width measurement, and were then sent to the provider. Tabs and newlines survive —
     // they are legitimate content in a paste.
-    const text = stripCtl(rawText);
+    // stripCtl removes ESC-led sequences, but Ink strips a chunk-LEADING ESC before we see it, so a
+    // stray paste-marker fragment can arrive as the bare text `[200~`/`[201~`. Drop those too so a
+    // fragment can never land literally in the draft (P1A-14: paste markers are transport, not text).
+    const text = stripCtl(rawText).replace(/\[20[01]~/g, '');
     const c = cursorRef.current;
     const s = inputRef.current;
     if (isBigPaste(text)) {
@@ -2290,7 +2416,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       if (m.role === 'user') {
         pushLine({ kind: 'user', text: `❯ ${text}`, color: C.green, bold: true, meta: 'you' });
       } else if (m.role === 'assistant') {
-        pushLine({ kind: 'assistant', text: scrubForDisplay(text), color: C.fg, meta: 'assistant' });
+        const display = sanitizeAssistantText(text);
+        if (display.trim()) pushLine({ kind: 'assistant', text: display, color: C.fg, meta: 'assistant' });
       }
     }
     if (tools > 0) {
@@ -2298,6 +2425,78 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     }
   }, [context, pushLine]);
   repaintFromContextRef.current = repaintFromContext;
+
+  // F08-10: open the current draft in $VISUAL/$EDITOR (Ctrl-X Ctrl-E). Idle-only — spawnSync blocks
+  // the whole event loop (including provider streaming), so this must never run mid-turn. Ink leaves
+  // raw mode while the editor owns the tty, then re-enters; the edited text replaces the composer.
+  const openExternalEditor = useCallback(() => {
+    if (!setRawMode || !process.stdout.isTTY) {
+      pushLine({ text: 'External editor needs an interactive terminal.', dimColor: true });
+      return;
+    }
+    const editor = resolveEditor();
+    const session = openEditorFile(inputRef.current);
+    try {
+      setRawMode(false);
+      const r = spawnSync(`${editor} "${session.file}"`, { stdio: 'inherit', shell: true });
+      if (r.error) {
+        pushLine({ text: `Couldn't launch "${editor}": ${r.error.message}. Set $EDITOR.`, color: C.red });
+      } else {
+        const edited = session.read();
+        setComposer(edited, edited.length); // caret at end of the edited draft
+      }
+    } catch (e) {
+      pushLine({ text: `External editor failed: ${(e as Error).message}`, color: C.red });
+    } finally {
+      try { setRawMode(true); } catch { /* terminal may have gone away */ }
+      setStaticEpoch((n) => n + 1); // editor likely used the alt-screen — force a repaint on return
+      session.cleanup();
+    }
+  }, [setRawMode, pushLine, setComposer]);
+
+  // F08-11: "While you were away" — a one-shot, non-streaming recap of the just-resumed conversation
+  // via the CURRENT provider. Best-effort: bounded output, silent on error, and it NEVER starts a
+  // real turn or touches the run lock (it's a read-only summary shown boxed).
+  const showResumeRecap = useCallback(async () => {
+    const provider = providerRef.current;
+    if (!provider) return;
+    try {
+      const recent = context.messages().slice(-30);
+      const transcript = recent
+        .map((m) => {
+          const text = m.content.map((b) => (b.type === 'text' ? b.text : b.type === 'tool_use' ? `[tool: ${b.name}]` : '')).join(' ').trim();
+          return text ? `${m.role}: ${text.slice(0, 500)}` : '';
+        })
+        .filter(Boolean)
+        .join('\n');
+      if (!transcript) return;
+      const req = {
+        model: currentRef.current.model,
+        system: 'You summarize a coding session so the user can pick up where they left off. Be concise.',
+        messages: [{ role: 'user', content: [{ type: 'text', text: `Summarize where this session left off in 2-4 short bullet points (what was being worked on, current state, obvious next step). No preamble.\n\n${transcript}` }] }],
+        tools: [],
+        maxOutputTokens: 400,
+        temperature: opts.cfg.temperature,
+      } as Parameters<typeof provider.send>[0];
+      let out = '';
+      for await (const ev of provider.send(req)) {
+        if (ev.type === 'text') out += ev.delta;
+        else if (ev.type === 'error') return; // silent — a recap must never nag
+      }
+      out = out.trim();
+      if (!out) return;
+      pushLine({
+        kind: 'system',
+        text: 'recap',
+        lines: [
+          { text: 'While you were away', color: C.cyan, bold: true },
+          ...out.split('\n').map((l) => ({ text: `  ${l}`, dimColor: true })),
+        ],
+      });
+    } catch {
+      /* a recap is a nicety — never surface its failure */
+    }
+  }, [context, pushLine, opts.cfg.temperature]);
 
   /** Push an inline-image item to the transcript and handle the display fallback. On a terminal
    *  that renders inline images, flatten paints the pixels + a durable placeholder. On any other
@@ -2602,6 +2801,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       setMenuIndex(0);
       const dispatch = slashDispatchName(cmd);
       const arg = (rawLine ?? '').slice(cmd.name.length).trim();
+      // F10-07: a custom command isn't a builtin action — its body is a prompt template. Expand the
+      // arguments and submit it as a normal turn (goes through the same gate/steer path as typing).
+      if (cmd.custom) {
+        const prompt = expandCommandBody(cmd.custom.body, arg);
+        if (prompt.trim()) startTurnRef.current?.(prompt);
+        return;
+      }
       switch (dispatch) {
         case '/help': {
           const topic = (arg || 'overview').toLowerCase();
@@ -2668,6 +2874,20 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           opts.todoList?.write([]); // clear the backing source so the agent starts fresh
           attachmentsRef.current = []; // drop any queued image attachments
           setAttachCount(0);
+          // P1B-03: /clear resets the conversation, so reset the session usage readout too — the
+          // old code left stale token/cost totals (and the status line) attributed to a new session.
+          lastUsageRef.current = null;
+          sessionCostRef.current = 0;
+          prevTurnCostRef.current = 0;
+          sessionInTokRef.current = 0;
+          sessionOutTokRef.current = 0;
+          prevTurnInTokRef.current = 0;
+          prevTurnOutTokRef.current = 0;
+          sessionTurnsRef.current = 0;
+          costWarnedRef.current = false;
+          setStatus('0 tokens');
+          loadCustomCommands(); // F10-07: pick up any commands added since launch
+          fileListLoadedRef.current = false; // F08-04: re-walk for @-mentions on next use
           // Exit plan mode for REAL, not just in React state (D2). setPlanMode alone changed the
           // badge while PlanModeState stayed active — so plan.block() kept going into the system
           // prompt and every write was denied afterwards with NO on-screen explanation, because
@@ -2785,78 +3005,88 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             // Capability triage: the ACTIVE model (no arg) reuses the live provider;
             // a named preset is resolved + built (incl. gguf auto-serve) without swapping.
             const targetName = parts[1];
+            asyncCommandRef.current = true;
             void (async () => {
-              let prov = providerRef.current;
-              let model = currentRef.current.model;
-              let isLocal = false;
-              let label = `${currentRef.current.provider}/${currentRef.current.model}`;
-              if (targetName) {
-                const entry = findModelPreset(allEntries, targetName);
-                if (!entry) {
-                  pushLine({ text: `No model preset named "${targetName}".`, color: C.red });
-                  return;
-                }
-                label = entry.label;
-                model = entry.model;
-                isLocal = isLocalServedEntry(entry);
-                let p = entry.provider;
-                let baseUrl = resolveBaseUrl(entry.provider, entry.baseUrl);
-                const testCred = resolveEntryCredential(entry, {
-                  vaultIsLocked: vaultExists() && !vaultUnlocked(),
-                });
-                let apiKey = testCred.ok ? testCred.apiKey : undefined;
-                if (!testCred.ok) {
-                  pushLine({
-                    text: `${entry.label}: vault slot "${testCred.slot}" is ${testCred.reason === 'locked' ? 'locked' : 'empty'} — cannot test.`,
-                    color: C.red,
-                  });
-                  return;
-                }
-                if (isLocalServedEntry(entry)) {
-                  try {
-                    const r = await ensureLocalServer(entry, (m) => pushLine({ text: m, dimColor: true }));
-                    p = 'openai';
-                    baseUrl = r.baseUrl;
-                    apiKey = entry.apiKey ?? 'sk-local';
-                  } catch (e) {
-                    pushLine({ text: `Local model failed: ${(e as Error).message}`, color: C.red });
+              try {
+                let prov = providerRef.current;
+                let model = currentRef.current.model;
+                let isLocal = false;
+                let label = `${currentRef.current.provider}/${currentRef.current.model}`;
+                if (targetName) {
+                  const entry = findModelPreset(allEntries, targetName);
+                  if (!entry) {
+                    pushLine({ text: `No model preset named "${targetName}".`, color: C.red });
                     return;
                   }
+                  label = entry.label;
+                  model = entry.model;
+                  isLocal = isLocalServedEntry(entry);
+                  let p = entry.provider;
+                  let baseUrl = resolveBaseUrl(entry.provider, entry.baseUrl);
+                  const testCred = resolveEntryCredential(entry, {
+                    vaultIsLocked: vaultExists() && !vaultUnlocked(),
+                  });
+                  let apiKey = testCred.ok ? testCred.apiKey : undefined;
+                  if (!testCred.ok) {
+                    pushLine({
+                      text: `${entry.label}: vault slot "${testCred.slot}" is ${testCred.reason === 'locked' ? 'locked' : 'empty'} — cannot test.`,
+                      color: C.red,
+                    });
+                    return;
+                  }
+                  if (isLocalServedEntry(entry)) {
+                    try {
+                      const r = await ensureLocalServer(entry, (m) => pushLine({ text: m, dimColor: true }));
+                      p = 'openai';
+                      baseUrl = r.baseUrl;
+                      apiKey = entry.apiKey ?? 'sk-local';
+                    } catch (e) {
+                      pushLine({ text: `Local model failed: ${(e as Error).message}`, color: C.red });
+                      return;
+                    }
+                  }
+                  prov = createProvider({
+                    // F10-01: probe the entry with its real wire contract (idle knobs +
+                    // capability block) so /model test exercises what a session would use.
+                    ...entryStreamContract(entry),
+                    provider: p,
+                    model: entry.model,
+                    apiKey,
+                    authToken: testCred.authToken,
+                    baseUrl,
+                    selfHosted: p === 'openai' ? entry.selfHosted : undefined,
+                    reasoningRoundtrip: opts.cfg.reasoningRoundtrip,
+                  });
                 }
-                prov = createProvider({
-                  provider: p,
-                  model: entry.model,
-                  apiKey,
-                  authToken: testCred.authToken,
-                  baseUrl,
-                  selfHosted: p === 'openai' ? entry.selfHosted : undefined,
-                });
-              }
-              if (!prov) {
-                pushLine({ text: 'No active provider to test.', color: C.red });
-                return;
-              }
-              pushLine({ text: `Testing ${label} — running capability probes (this can take up to a minute)…`, dimColor: true });
-              try {
-                const result = await runModelCheck(prov, {
-                  model,
-                  providerName: currentRef.current.provider,
-                  isLocal,
-                  temperature: opts.cfg.temperature,
-                  log: (m) => pushLine({ text: m, dimColor: true }),
-                });
-                const rows = [
-                  ...result.probes.map((pr) => ({
-                    text: `${pr.status === 'pass' ? '✓' : '✗'} [${pr.status}] ${pr.label}: ${pr.detail}`,
-                    color: pr.status === 'pass' ? C.green : C.red,
-                  })),
-                  { text: `Verdict: ${result.verdict.toUpperCase()}`, color: result.verdict === 'agentic' ? C.green : result.verdict === 'limited' ? C.cyan : C.red },
-                  { text: `  ${result.recommendation}`, dimColor: true },
-                  { text: `  (${(result.elapsedMs / 1000).toFixed(1)}s)`, dimColor: true },
-                ];
-                pushLine({ kind: 'system', text: 'model test', lines: rows });
-              } catch (e) {
-                pushLine({ text: `Model test failed: ${(e as Error).message}`, color: C.red });
+                if (!prov) {
+                  pushLine({ text: 'No active provider to test.', color: C.red });
+                  return;
+                }
+                pushLine({ text: `Testing ${label} — running capability probes (this can take up to a minute)…`, dimColor: true });
+                try {
+                  const result = await runModelCheck(prov, {
+                    model,
+                    providerName: currentRef.current.provider,
+                    isLocal,
+                    temperature: opts.cfg.temperature,
+                    log: (m) => pushLine({ text: m, dimColor: true }),
+                  });
+                  const rows = [
+                    ...result.probes.map((pr) => ({
+                      text: `${pr.status === 'pass' ? '✓' : '✗'} [${pr.status}] ${pr.label}: ${pr.detail}`,
+                      color: pr.status === 'pass' ? C.green : C.red,
+                    })),
+                    { text: `Verdict: ${result.verdict.toUpperCase()}`, color: result.verdict === 'agentic' ? C.green : result.verdict === 'limited' ? C.cyan : C.red },
+                    { text: `  ${result.recommendation}`, dimColor: true },
+                    { text: `  (${(result.elapsedMs / 1000).toFixed(1)}s)`, dimColor: true },
+                  ];
+                  pushLine({ kind: 'system', text: 'model test', lines: rows });
+                } catch (e) {
+                  pushLine({ text: `Model test failed: ${(e as Error).message}`, color: C.red });
+                }
+              } finally {
+                asyncCommandRef.current = false;
+                flushQueueRef.current?.();
               }
             })();
             break;
@@ -3010,9 +3240,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           break;
         }
         case '/style': {
-          // No arg: cycle (original behavior). With arg: set directly — the arg was silently
-          // IGNORED before, so "/style learning" cycled to whatever came next. Menu-completable.
-          const styles: OutputStyle[] = ['proactive', 'explanatory', 'learning', 'procedural'];
+          // No arg: cycle (original behavior). With arg: set directly. F08-12: custom styles from
+          // .shadow/.claude output-styles dirs join the built-ins in the cycle + validation.
+          const styles: OutputStyle[] = ['proactive', 'explanatory', 'learning', 'procedural', ...(customStyleNames() as OutputStyle[])];
           const req = arg.toLowerCase();
           if (req && !(styles as readonly string[]).includes(req)) {
             pushLine({ text: `Unknown style "${arg}". Styles: ${styles.join(', ')}.`, color: C.red });
@@ -3099,12 +3329,26 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
               );
               if (ctl?.signal.aborted) {
                 pushLine({ text: 'Compaction cancelled — context unchanged.', dimColor: true });
+              } else if (did === 'summarized') {
+                pushLine({ text: 'Context compacted — earlier turns summarized.', color: C.cyan });
+              } else if (did === 'truncated') {
+                sessionLog.record({ kind: 'compaction_degraded', mode: 'truncated', source: 'manual' });
+                pushLine({
+                  text:
+                    'Summarizer unavailable — context reclaimed by dropping the oldest tool results ' +
+                    '(re-read any file you still need).',
+                  color: C.yellow,
+                });
+              } else if (did === 'failed') {
+                sessionLog.record({ kind: 'compaction_degraded', mode: 'failed', source: 'manual' });
+                pushLine({
+                  text:
+                    'Compaction failed — summarizer unavailable and nothing left to reclaim. ' +
+                    'Try /clear, or /model to a larger window.',
+                  color: C.red,
+                });
               } else {
-                pushLine(
-                  did
-                    ? { text: 'Context compacted — earlier turns summarized.', color: C.cyan }
-                    : { text: 'Nothing to compact yet.', dimColor: true },
-                );
+                pushLine({ text: 'Nothing to compact yet.', dimColor: true });
               }
             } catch (e) {
               pushLine(
@@ -3125,22 +3369,56 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         case '/cost':
         case '/usage': {
           const u = lastUsageRef.current;
-          if (!u) {
+          const sIn = sessionInTokRef.current;
+          const sOut = sessionOutTokRef.current;
+          if (!u && sIn === 0 && sOut === 0) {
             pushLine({ text: 'No usage recorded yet this session.', dimColor: true });
             break;
           }
-          pushLine({
-            kind: 'system',
-            text: 'cost',
-            lines: [
-              { text: `Tokens: ${u.inputTokens.toLocaleString()} in · ${u.outputTokens.toLocaleString()} out (session)` },
-              // Local / unpriced models never accrue cost — say so instead of a fake-precision
-              // $0.0000 (founder decision 2026-07-16: no dollar readouts on local models).
-              u.costUSD > 0
-                ? { text: `Cost:   $${u.costUSD.toFixed(4)}`, color: C.cyan }
-                : { text: 'Cost:   none — local/unpriced model', dimColor: true },
-            ],
-          });
+          // P1B-03: SESSION totals (summed across every turn + sub-agents) are the headline; the
+          // last turn is a separate line. The old readout showed only the last turn but labeled it
+          // "(session)" — a mislabel that undercounted multi-turn sessions.
+          const lines: BannerLine[] = [
+            { text: `Session (${sessionTurnsRef.current} turn${sessionTurnsRef.current === 1 ? '' : 's'}): ${sIn.toLocaleString()} in · ${sOut.toLocaleString()} out · ${(sIn + sOut).toLocaleString()} total` },
+            // Local / unpriced models never accrue cost — say so instead of a fake-precision
+            // $0.0000 (founder decision 2026-07-16: no dollar readouts on local models).
+            sessionCostRef.current > 0
+              ? { text: `Session cost: $${sessionCostRef.current.toFixed(4)}`, color: C.cyan }
+              : { text: 'Session cost: none — local/unpriced model', dimColor: true },
+          ];
+          if (u) {
+            lines.push({ text: `Last turn:    ${u.inputTokens.toLocaleString()} in · ${u.outputTokens.toLocaleString()} out${u.costUSD > 0 ? ` · $${u.costUSD.toFixed(4)}` : ''}`, dimColor: true });
+          }
+          pushLine({ kind: 'system', text: 'cost', lines });
+          break;
+        }
+        case '/connections': {
+          // P2-01: the session-scoped view of the egress receipt (`shadow egress` reads the
+          // persistent log from a fresh process; this shows the live in-memory aggregate).
+          const rows = egressSummary();
+          if (rows.length === 0) {
+            pushLine({ text: 'No egress recorded yet this session — nothing has left the box.', dimColor: true });
+            break;
+          }
+          const lines: BannerLine[] = [
+            { text: `Connections this session (${rows.length} host${rows.length === 1 ? '' : 's'}) — full receipt: \`shadow egress\``, bold: true },
+          ];
+          for (const r of rows) {
+            const counts = [
+              r.allowed > 0 ? `${r.allowed} allowed` : '',
+              r.denied > 0 ? `${r.denied} denied` : '',
+            ]
+              .filter(Boolean)
+              .join(' · ');
+            const seen = new Date(r.lastSeen).toLocaleTimeString();
+            lines.push({
+              text: `  ${r.host}  —  ${counts} · ${[...r.purposes].sort().join(', ')} · ${seen}`,
+              color: r.denied > 0 ? C.yellow : undefined,
+              dimColor: r.denied === 0,
+            });
+          }
+          lines.push({ text: 'Every outbound request flows the egress broker; --offline denies all non-local egress.', dimColor: true });
+          pushLine({ kind: 'system', text: 'connections', lines });
           break;
         }
         case '/resume': {
@@ -3188,6 +3466,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             // A different session is a different grant scope: "approve run_shell for this session"
             // must not silently carry into the one just loaded.
             sessionApprovalsRef.current.clear();
+            // F08-11: "While you were away" recap — one non-streaming summary of the restored
+            // conversation via the CURRENT provider. Opt-in (cfg.resumeRecap), silent on any error
+            // or if there's too little to summarize; never blocks the resume itself.
+            if (opts.cfg.resumeRecap && context.messages().length >= 6) void showResumeRecap();
           } catch (e) {
             pushLine({ text: `Resume failed: ${(e as Error).message}`, color: C.red });
           }
@@ -3260,15 +3542,57 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           break;
         }
         case '/agents': {
+          // `/agents kill <id|all>` cancels a running BACKGROUND sub-agent (F10-02 cancellation);
+          // bare `/agents` lists LIVE agents (running now) then the available definitions.
+          const parts = arg.split(/\s+/).filter(Boolean);
+          if (parts[0] === 'kill') {
+            const target = parts[1];
+            const live = [...subAgents.values()].filter((a) => a.background && !a.done);
+            if (!live.length) {
+              pushLine({ text: 'No background agents are running.', dimColor: true });
+              break;
+            }
+            if (!target) {
+              pushLine({ text: 'Usage: /agents kill <id|all>. Running: ' + live.map((a) => a.taskId).join(', '), dimColor: true });
+              break;
+            }
+            if (target === 'all') {
+              bus.emit({ type: 'cancel_subagent', taskId: '*' });
+              pushLine({ text: `Cancelling ${live.length} background agent${live.length === 1 ? '' : 's'}…`, color: C.yellow });
+              break;
+            }
+            const match = live.find((a) => a.taskId === target || a.taskId.endsWith(target));
+            if (!match) {
+              pushLine({ text: `No running background agent matches "${target}".`, color: C.red });
+              break;
+            }
+            bus.emit({ type: 'cancel_subagent', taskId: match.taskId });
+            pushLine({ text: `Cancelling ${match.subagentType} (${match.taskId})…`, color: C.yellow });
+            break;
+          }
+          const live = [...subAgents.values()];
           const defs = loadAgentDefs(opts.workspaceRoot);
-          pushLine({
-            kind: 'system',
-            text: 'agents',
-            lines: defs.map((d) => ({
-              text: `  ${d.name.padEnd(14)} ${d.description}${d.builtin ? ' (built-in)' : ''}`,
-              dimColor: true,
-            })),
-          });
+          const lines: BannerLine[] = [];
+          if (live.length) {
+            lines.push({ text: 'Running now:', color: C.cyan });
+            for (const a of live) {
+              // F06-10: a queued agent is NOT running — it holds no slot and runs no tools.
+              const state = a.done
+                ? a.ok === false ? 'failed' : 'done'
+                : a.queued
+                  ? 'queued (waiting for a slot)'
+                  : a.tool
+                    ? `${a.tool}`
+                    : 'running';
+              lines.push({ text: `  ${a.subagentType.padEnd(14)} ${a.taskId}${a.background ? ' [bg]' : ''} · ${state}`, dimColor: true });
+            }
+            lines.push({ text: `  (/agents kill <id|all> to cancel a background agent)`, dimColor: true });
+            lines.push({ text: 'Definitions:', color: C.cyan });
+          }
+          for (const d of defs) {
+            lines.push({ text: `  ${d.name.padEnd(14)} ${d.description}${d.builtin ? ' (built-in)' : ''}`, dimColor: true });
+          }
+          pushLine({ kind: 'system', text: 'agents', lines });
           break;
         }
         case '/skills': {
@@ -3297,19 +3621,57 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           break;
         }
         case '/plugins': {
-          const workspacePlugins = listNamedEntries(join(opts.workspaceRoot, '.shadow', 'plugins'));
-          const globalPlugins = listNamedEntries(join(GLOBAL_DIR, 'plugins'));
-          const lines = [
-            'Plugin manager: not installed in this build.',
-            'Supported extension points: skills, agents, MCP servers, workflows, hooks.',
-            ...(workspacePlugins.length ? [`workspace plugins: ${workspacePlugins.join(', ')}`] : []),
-            ...(globalPlugins.length ? [`global plugins: ${globalPlugins.join(', ')}`] : []),
-          ];
-          pushLine({
-            kind: 'system',
-            text: 'plugins',
-            lines: lines.map((text, i) => ({ text, color: i === 0 ? C.cyan : undefined, dimColor: i !== 0 })),
-          });
+          const sub = arg.trim().split(/\s+/);
+          if (sub[0] === 'enable' || sub[0] === 'disable') {
+            const name = sub[1] ?? '';
+            if (!name) {
+              pushLine({ text: `usage: /plugins ${sub[0]} <name>`, dimColor: true });
+              break;
+            }
+            try {
+              const info = setPluginEnabled(name, sub[0] === 'enable');
+              pushLine({
+                text:
+                  sub[0] === 'enable'
+                    ? `enabled plugin "${info.name}" — start a new session (or restart) to load its content.`
+                    : `disabled plugin "${info.name}" — start a new session (or restart) to unload its content.`,
+                color: sub[0] === 'enable' ? C.green : C.yellow,
+              });
+            } catch (err) {
+              pushLine({ text: (err as Error).message, color: C.red });
+            }
+            break;
+          }
+          const plugins = listPlugins();
+          const lines: BannerLine[] = [];
+          if (!plugins.length) {
+            lines.push({ text: 'No plugins installed. `shadow plugin add <git-url | path>` installs one (disabled until enabled).', dimColor: true });
+          }
+          for (const p of plugins) {
+            const counts =
+              PLUGIN_CONTENT_DIRS.filter((k) => p.counts[k] > 0)
+                .map((k) => `${p.counts[k]} ${k}`)
+                .join(' · ') || 'no content';
+            const prov =
+              p.meta.source.kind === 'git'
+                ? `${p.meta.source.url}${p.meta.source.commit ? ` @ ${p.meta.source.commit.slice(0, 12)}` : ''}`
+                : p.meta.source.path;
+            lines.push({
+              text: `${p.meta.enabled ? '●' : '○'} ${p.name} v${displaySafe(p.manifest.version, 64)} [${p.meta.enabled ? 'enabled' : 'disabled'}] — ${displaySafe(p.manifest.description, 300)}`,
+              color: p.meta.enabled ? C.green : C.yellow,
+            });
+            lines.push({ text: `    ${counts} · from ${displaySafe(prov, 320)}`, dimColor: true });
+          }
+          const offers = listNamedEntries(join(opts.workspaceRoot, '.shadow', 'plugins'));
+          if (offers.length) {
+            lines.push({
+              text: `workspace offers: ${offers.join(', ')} — a repo can only OFFER a plugin; install it with \`shadow plugin add <path>\`.`,
+              dimColor: true,
+            });
+          }
+          lines.push({ text: 'plugins are DATA-only bundles: commands · output-styles · skills · agents · workflows (never hooks/MCP).', dimColor: true });
+          lines.push({ text: '/plugins enable <name> · /plugins disable <name> · CLI: shadow plugin add|list|remove|search', dimColor: true });
+          pushLine({ kind: 'system', text: 'plugins', lines });
           break;
         }
         case '/memory': {
@@ -3488,6 +3850,17 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
                 ? [{ text: `temperature ${formatTemperature(opts.cfg.temperature ?? 1.0)} · self-hosted only`, dimColor: true }]
                 : []),
               { text: `workspace ${opts.workspaceRoot}`, dimColor: true },
+              // P2-12 — the confinement state is session-critical security context; keep it visible.
+              sandboxConfinement(opts.cfg.sandbox) === 'unconfined'
+                ? {
+                    text: `sandbox UNAVAILABLE on this host — run_shell ${
+                      opts.cfg.sandboxFailurePolicy === 'warn'
+                        ? 'runs UNCONFINED (policy: warn)'
+                        : `gates at approval (policy: ${opts.cfg.sandboxFailurePolicy})`
+                    }`,
+                    color: C.yellow,
+                  }
+                : { text: `sandbox ${sandboxConfinement(opts.cfg.sandbox)}`, dimColor: true },
               ...(goalRef.current ? [{ text: `goal: ${goalRef.current}`, color: C.purple }] : []),
             ],
           });
@@ -4065,31 +4438,39 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       if (opts2.clampBudget !== false && (opts2.applyPolicy?.() ?? true)) {
         const localish = isLocalBaseUrl(baseUrl);
         if (localish && baseUrl && !detectedWindow) detectedWindow = await detectServerContextWindow(baseUrl);
-        const hardWindow = detectedWindow ?? configuredContextWindow(entry);
-        const base = baseContextPolicyRef.current;
-        const nextBudget = hardWindow
-          ? clampLocalContextBudget(base.contextBudget, hardWindow)
-          : base.contextBudget;
-        const nextPolicy = {
-          contextBudget: nextBudget,
-          triggerRatio: triggerRatioForBudget(nextBudget, base.triggerRatio),
-          keepLastTurns: keepLastTurnsForBudget(nextBudget, base.keepLastTurns),
-        };
-        const previous = context.policy();
-        opts.cfg.contextBudget = nextPolicy.contextBudget;
-        opts.cfg.summarizeTriggerRatio = nextPolicy.triggerRatio;
-        opts.cfg.keepLastTurns = nextPolicy.keepLastTurns;
-        context.setPolicy(nextPolicy, true);
-        if (
-          previous.contextBudget !== nextPolicy.contextBudget ||
-          previous.triggerRatio !== nextPolicy.triggerRatio ||
-          previous.keepLastTurns !== nextPolicy.keepLastTurns
-        ) {
-          const source = hardWindow ? ` for ${hardWindow.toLocaleString()} server/model window` : '';
-          pushLine({ text: `  context policy → ${nextBudget.toLocaleString()} tokens${source}`, dimColor: true });
+        // The local context-window probe is asynchronous. Recheck before touching shared config or
+        // Context so a superseded fallback cannot partially switch policy after steering aborted it.
+        if (opts2.applyPolicy?.() ?? true) {
+          const hardWindow = detectedWindow ?? configuredContextWindow(entry);
+          const base = baseContextPolicyRef.current;
+          const nextBudget = hardWindow
+            ? clampLocalContextBudget(base.contextBudget, hardWindow)
+            : base.contextBudget;
+          const nextPolicy = {
+            contextBudget: nextBudget,
+            triggerRatio: triggerRatioForBudget(nextBudget, base.triggerRatio),
+            keepLastTurns: keepLastTurnsForBudget(nextBudget, base.keepLastTurns),
+          };
+          const previous = context.policy();
+          opts.cfg.contextBudget = nextPolicy.contextBudget;
+          opts.cfg.summarizeTriggerRatio = nextPolicy.triggerRatio;
+          opts.cfg.keepLastTurns = nextPolicy.keepLastTurns;
+          context.setPolicy(nextPolicy, true);
+          if (
+            previous.contextBudget !== nextPolicy.contextBudget ||
+            previous.triggerRatio !== nextPolicy.triggerRatio ||
+            previous.keepLastTurns !== nextPolicy.keepLastTurns
+          ) {
+            const source = hardWindow ? ` for ${hardWindow.toLocaleString()} server/model window` : '';
+            pushLine({ text: `  context policy → ${nextBudget.toLocaleString()} tokens${source}`, dimColor: true });
+          }
         }
       }
       const client = createProvider({
+        // F10-01: a live /model switch or in-TUI fallback must carry the entry's P1A-04 stream
+        // knobs + P1A-06 capability block exactly like bootstrap does — omitting them silently
+        // reverted the idle watchdog to 120s and dropped the self-hosted contract mid-session.
+        ...entryStreamContract(entry),
         provider,
         model: entry.model,
         apiKey,
@@ -4100,6 +4481,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             ? entry.selfHosted === true ||
               isLocalModelTarget({ gguf: entry.gguf, mlx: entry.mlx, vllm: entry.vllm, baseUrl })
             : undefined,
+        reasoningRoundtrip: opts.cfg.reasoningRoundtrip,
       });
       const selfHosted =
         provider === 'openai' &&
@@ -4153,7 +4535,12 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         const prof = familyProfile(entry.model);
         if (prof?.note) pushLine({ text: `  ${prof.family}: ${prof.note}`, dimColor: true });
       } finally {
-        if (generation === modelSwitchSeqRef.current) modelSwitchingRef.current = false;
+        if (generation === modelSwitchSeqRef.current) {
+          modelSwitchingRef.current = false;
+          // A queued `/model use` is an asynchronous barrier. Resume FIFO only after the provider,
+          // context policy, and footer all agree on the selected model.
+          flushQueueRef.current?.();
+        }
       }
     },
     [pushLine, buildProvider, opts],
@@ -4178,8 +4565,24 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       igateRef.current.show = (req) => {
         resetQuestionDialog();
         dialogTypeaheadRef.current = false;
+        // P1A-14: a modal opening mid-paste must not strand paste state. The §0.8 transport now
+        // buffers across the modal edge, but clear here too so a lost end-marker can never leave
+        // the composer diverting every subsequent key into a phantom paste buffer.
+        pastingRef.current = false;
+        pasteBufRef.current = '';
         dialogShownAtRef.current = Date.now(); // arm the type-ahead guard — see onKey §1
         setPending(req);
+        // P1B-04: if the user has stepped away, ping them when an approval sits unanswered. The
+        // timer self-guards on the SAME request still being pending, so a prompt answer never fires
+        // it and there is nothing to clear at the resolve sites. (req is null when CLEARING.)
+        if (req) {
+          const pendingId = req.id;
+          setTimeout(() => {
+            if (pendingRef.current?.id === pendingId) {
+              emitNotification(opts.cfg.notify ?? 'auto', 'Shadow', 'Approval needed', { isTTY: !!process.stdout.isTTY });
+            }
+          }, NOTIFY_APPROVAL_WAIT_MS);
+        }
       };
     }
     if (opts.wakeupHandler) {
@@ -4191,7 +4594,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         // and the other turn became un-interruptible. Queue it instead — the same FIFO a typed
         // message uses — and it runs when the current turn ends.
         if (runningRef.current) {
-          setQueued([...queuedTasksRef.current, line]); // setQueued keeps the ref in step
+          setQueued([...queuedTasksRef.current, { text: line, kind: 'deferred' }]); // keep the ref in step
           pushLine({ text: `  ⏰ wakeup queued (${reason}) — runs when this turn ends`, dimColor: true });
           return;
         }
@@ -4268,22 +4671,48 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             // scrollback) and keep only the still-open block live. Refs (not state) so this
             // is synchronous and immune to the stale-closure double-commit React would risk.
             streamBufRef.current += e.delta;
+            // BOUNDED intent split (P1A-11): the held tool-intent suffix is capped, so this rescan —
+            // and the extractCommittableUnits re-parse below — never sees more than the committed-away
+            // remainder plus a bounded tail. A malformed model that opens a tool envelope and never
+            // closes it can no longer grow the per-token work quadratically; committed blocks are
+            // already gone to <Static>, so only the (bounded) live tail is ever re-examined.
             // Commit at LINE granularity so the live region stays ~1 line and the composer holds still
             // (the reference client feel); multi-line constructs stay grouped. Units carry `pad` — a source
             // blank line preceded them — which maps to a rendered gap, so the streamed answer keeps
             // the model's paragraph rhythm instead of gluing into a wall of text.
-            const { units, rest, trailingBlank } = extractCommittableUnits(streamBufRef.current, padCarryRef.current);
+            const split = splitStreamToolIntentCapped(streamBufRef.current);
+            const { units, rest, trailingBlank } = extractCommittableUnits(split.visible, padCarryRef.current);
             for (const u of units) {
-              if (!u.text.trim()) continue;
+              const display = sanitizeAssistantText(u.text);
+              if (!display.trim()) continue;
               // Turn-scoped: suppress a verbatim re-emission of the answer (even a multi-block one),
               // but never legitimate new content and never an identical short answer in a later turn.
-              if (absorbAssistant(u.text)) continue;
-              pushLine({ kind: 'assistant', text: stripTrailingNewlines(u.text), color: C.fg, meta: 'assistant', tight: answerOpenRef.current && !u.pad });
+              if (absorbAssistant(display)) continue;
+              pushLine({ kind: 'assistant', text: stripTrailingNewlines(display), color: C.fg, meta: 'assistant', tight: answerOpenRef.current && !u.pad });
               answerOpenRef.current = true;
             }
             padCarryRef.current = trailingBlank;
-            streamBufRef.current = rest;
-            pendingStreamRef.current = rest;
+            // Second half of the P1A-11 bound: `rest` (an open construct extractCommittableUnits
+            // keeps live) grows without limit on a never-closing NON-tool fence — the ```python
+            // case the held-suffix cap above cannot see. Force-commit the oldest lines once it
+            // exceeds the cap (fence-continuity preserved by clampLiveRest), so BOTH retained
+            // buffers are bounded and the per-delta rescan can never go quadratic.
+            let liveRest = rest;
+            const clamped = clampLiveRest(liveRest);
+            if (clamped.commit !== null) {
+              const display = sanitizeAssistantText(clamped.commit);
+              if (display.trim() && !absorbAssistant(display)) {
+                pushLine({ kind: 'assistant', text: stripTrailingNewlines(display), color: C.fg, meta: 'assistant', tight: answerOpenRef.current });
+                answerOpenRef.current = true;
+              }
+              liveRest = clamped.rest;
+            }
+            streamBufRef.current = liveRest + split.held;
+            // `split.held` is capped (splitStreamToolIntentCapped / MAX_HELD_BYTES) and `liveRest`
+            // is capped (clampLiveRest / MAX_LIVE_REST_BYTES), so the live buffer and the next
+            // delta's rescan stay bounded even for a model that opens an envelope or fence and
+            // never closes it — no quadratic TUI freeze. Only the safe remainder is painted live.
+            pendingStreamRef.current = scrubForDisplay(liveRest);
             scheduleFlush();
           }
           break;
@@ -4321,7 +4750,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           // successfully RECOVERS a call, which requires the named tool to be registered — so a
           // weak local model naming a tool that doesn't exist, or emitting a malformed envelope,
           // left the raw XML in the committed answer, where markdown then mangled it further.
-          const finalText = scrubForDisplay(streamed ? streamBufRef.current : (e.text ?? ''));
+          const finalText = sanitizeAssistantText(streamed ? streamBufRef.current : (e.text ?? ''));
           setStreamNow('');
           setThinkNow('');
           // (Reasoning is folded by default now — no per-item collapse needed; Ctrl-O reveals all.)
@@ -4355,7 +4784,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             setSubAgents((prev) => {
               const m = new Map(prev);
               const cur = m.get(e.subagent!);
-              if (cur) m.set(e.subagent!, { ...cur, tool: e.call.name, argPreview: previewOf(e.call.input) });
+              if (cur) m.set(e.subagent!, { ...cur, tool: e.call.name, argPreview: previewOf(e.call.input), toolUseCount: cur.toolUseCount + 1 });
               return m;
             });
             break;
@@ -4527,20 +4956,33 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           setAutonomy(e.level);
           break;
         case 'compaction':
-          pushLine({
-            text: '  ⟳ context compacted — earlier turns summarized to free up room',
-            color: C.cyan,
-          });
+          pushLine(
+            e.degraded
+              ? {
+                  text: '  ⟳ context reclaimed locally — summarizer unavailable, no summary written',
+                  color: C.yellow,
+                }
+              : {
+                  text: '  ⟳ context compacted — earlier turns summarized to free up room',
+                  color: C.cyan,
+                },
+          );
           break;
         case 'usage':
           lastUsageRef.current = e;
           setStatus(formatUsage(e));
-          // Accumulate SESSION cost from per-turn usage deltas (the Budget resets
-          // each turn, so summing raw events would double-count within a turn).
+          // Accumulate SESSION cost AND tokens from per-turn usage deltas (the Budget resets
+          // each turn, so summing raw events would double-count within a turn). P1B-03.
           {
-            const delta = e.costUSD - prevTurnCostRef.current;
-            if (delta > 0) sessionCostRef.current += delta;
+            const dCost = e.costUSD - prevTurnCostRef.current;
+            if (dCost > 0) sessionCostRef.current += dCost;
             prevTurnCostRef.current = e.costUSD;
+            const dIn = e.inputTokens - prevTurnInTokRef.current;
+            if (dIn > 0) sessionInTokRef.current += dIn;
+            prevTurnInTokRef.current = e.inputTokens;
+            const dOut = e.outputTokens - prevTurnOutTokRef.current;
+            if (dOut > 0) sessionOutTokRef.current += dOut;
+            prevTurnOutTokRef.current = e.outputTokens;
           }
           // Soft cost guardrail: one-time notice when SESSION spend crosses the
           // configured threshold (distinct from budget.maxCostUSD's hard stop).
@@ -4557,19 +4999,38 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           }
           break;
         case 'subagent_start':
-          // A sub-agent came alive (sync or bg) — register it in the Running-N-agents panel (BUG 3).
+          // A sub-agent came alive (sync or bg) — register it in the Running-N-agents panel (BUG 3)
+          // with its counters seeded. `background` keeps it visible after the launching turn ends.
+          // F06-10: an agent waiting on a concurrency slot arrives with `queued: true`; admission
+          // RE-EMITS for the same taskId with queued cleared — re-registration is safe because the
+          // loop hasn't run yet, so the seeded zero counters cannot clobber real activity.
           setSubAgents((prev) => {
             const m = new Map(prev);
-            m.set(e.taskId, { taskId: e.taskId, subagentType: e.subagentType, description: e.description });
+            m.set(e.taskId, {
+              taskId: e.taskId,
+              subagentType: e.subagentType,
+              description: e.description,
+              background: e.background ?? false,
+              queued: e.queued ?? false,
+              toolUseCount: 0,
+              inputTokens: 0,
+              outputTokens: 0,
+              startedAt: Date.now(),
+            });
             return m;
           });
           break;
         case 'subagent_end':
-          // The sub-agent finished — deregister it so the panel only ever reflects ACTIVE agents.
+          // The sub-agent finished. A SYNC agent's answer commits as the `agent` tool result, so its
+          // panel row is removed. A BACKGROUND agent has no such transcript row yet (its result
+          // arrives later as a task-notification), so mark it done and LINGER — F10-02: it must stay
+          // visible through completion, and clears on the next user turn (see startTurn).
           setSubAgents((prev) => {
-            if (!prev.has(e.taskId)) return prev;
+            const cur = prev.get(e.taskId);
+            if (!cur) return prev;
             const m = new Map(prev);
-            m.delete(e.taskId);
+            if (cur.background) m.set(e.taskId, { ...cur, done: true, ok: e.ok, tool: undefined, argPreview: undefined });
+            else m.delete(e.taskId);
             return m;
           });
           break;
@@ -4579,6 +5040,19 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           // per-turn usage through was what overwrote the HUD with a foreign context % and made the
           // parent's next cost delta meaningless. Session cost still accrues, so /cost stays honest.
           if (e.costUSD > 0) sessionCostRef.current += e.costUSD;
+          // Sub-agent tokens accrue to the SESSION totals too (they ran on the user's behalf).
+          if (e.inputTokens) sessionInTokRef.current += e.inputTokens;
+          if (e.outputTokens) sessionOutTokRef.current += e.outputTokens;
+          // Attribute the tokens to the exact agent row (taskId) so the panel shows real scale.
+          if (e.taskId && (e.inputTokens || e.outputTokens)) {
+            setSubAgents((prev) => {
+              const cur = prev.get(e.taskId!);
+              if (!cur) return prev;
+              const m = new Map(prev);
+              m.set(e.taskId!, { ...cur, inputTokens: e.inputTokens ?? cur.inputTokens, outputTokens: e.outputTokens ?? cur.outputTokens });
+              return m;
+            });
+          }
           break;
         case 'todo':
           setTodoItems(e.items);
@@ -4623,6 +5097,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           });
           break;
         case 'stop':
+          lastStopReasonRef.current = e.reason;
           // Keep the /rewind menu honest: a turn just produced (or failed to produce) a snapshot.
           try {
             rewindableTurnsRef.current = sessionLog.path ? SessionLog.countSnapshots(sessionLog.path) : 0;
@@ -4633,7 +5108,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           // streamed so the partial reply lands in scrollback instead of vanishing. On a
           // clean turn the buffer is already empty here, so this is a no-op.
           if (streamBufRef.current.trim()) {
-            pushLine({ kind: 'assistant', text: stripTrailingNewlines(streamBufRef.current), color: C.fg, meta: 'assistant', tight: answerOpenRef.current && !padCarryRef.current && !leadsWithBlock(streamBufRef.current) });
+            const display = sanitizeAssistantText(streamBufRef.current);
+            if (display.trim()) pushLine({ kind: 'assistant', text: stripTrailingNewlines(display), color: C.fg, meta: 'assistant', tight: answerOpenRef.current && !padCarryRef.current && !leadsWithBlock(display) });
           }
           answerOpenRef.current = false;
           padCarryRef.current = false;
@@ -4653,6 +5129,17 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           setShellPid(null);
           setShellWarn(null);
           if (e.reason !== 'end_turn') pushLine({ text: `  · ${e.reason}`, dimColor: true });
+          // P1B-04: ping when a LONG turn finishes, so the user can tab away during a slow
+          // self-hosted run and be called back. Guarded to a TTY (never into a pipe) and to turns
+          // past the threshold; `notify: off` silences it.
+          if (Date.now() - runStartRef.current >= NOTIFY_MIN_TURN_MS) {
+            emitNotification(
+              opts.cfg.notify ?? 'auto',
+              'Shadow',
+              e.reason === 'end_turn' ? 'Turn complete' : `Turn ended · ${e.reason}`,
+              { isTTY: !!process.stdout.isTTY },
+            );
+          }
           break;
       }
     });
@@ -4674,9 +5161,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             text: `  ! ${h.message ?? 'user_prompt_submit hook denied this prompt'}`,
             color: C.red,
           });
+          // This task may have come from the FIFO. A denied prompt must not strand whatever was
+          // behind it merely because runOne returned before reaching its normal finally block.
+          queueMicrotask(() => flushQueueRef.current?.());
           return;
         }
       }
+      runningRef.current = true;
       setRunning(true);
       // Process-wide run lock: exactly one turn executes at a time across the TUI and every web
       // session (decision 1 — two agents in one repo corrupt each other). priority:true — the
@@ -4694,6 +5185,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         // ESC while queued behind another session: nothing but `running` (and the controller) has
         // been touched. Re-enable the composer and drain type-ahead, exactly as a finished turn does.
         controllerRef.current = null;
+        runningRef.current = false;
         setRunning(false);
         flushQueueRef.current?.();
         return;
@@ -4770,11 +5262,14 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         // grants held on the loop itself expired as soon as the user typed again — "(s) approve for
         // session" re-prompted one message later.
         approvals: sessionApprovalsRef.current,
+        priorStopReason: lastStopReasonRef.current,
         continuityState: goalRef.current ? `Standing goal:\n${goalRef.current}` : undefined,
-        resolveFallback: async (entry) => {
+        resolveFallback: async (entry, fallbackSignal) => {
+          fallbackSignal?.throwIfAborted();
           const build = buildProviderRef.current;
           if (!build) throw new Error('fallback provider builder is unavailable');
-          const built = await build(entry);
+          const built = await build(entry, { applyPolicy: () => !fallbackSignal?.aborted });
+          fallbackSignal?.throwIfAborted();
           if (!built.ok) throw new Error(built.error);
           providerRef.current = built.client;
           currentRef.current = { provider: built.provider, model: built.model };
@@ -4805,7 +5300,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         // stuck fixed-height box with a blank status row. Commit any streamed tail first so an
         // errored turn still leaves its partial answer in the transcript.
         if (streamBufRef.current.trim()) {
-          pushLine({ kind: 'assistant', text: stripTrailingNewlines(streamBufRef.current), color: C.fg, meta: 'assistant', tight: answerOpenRef.current && !padCarryRef.current && !leadsWithBlock(streamBufRef.current) });
+          const display = sanitizeAssistantText(streamBufRef.current);
+          if (display.trim()) pushLine({ kind: 'assistant', text: stripTrailingNewlines(display), color: C.fg, meta: 'assistant', tight: answerOpenRef.current && !padCarryRef.current && !leadsWithBlock(display) });
         }
         answerOpenRef.current = false;
         padCarryRef.current = false;
@@ -4818,6 +5314,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         setToolLine(null);
         setActiveTool(null);
         setLiveRecon(null);
+        runningRef.current = false;
         setRunning(false);
         // Per-task timer: total wall-clock the agent worked on this turn — paralleling the
         // per-tool `(2.3s)` and per-thought `thought for 9s`, but for the whole task. Only when
@@ -4844,9 +5341,25 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // is nothing to commit here.) Shared by the idle-submit path and the type-ahead queue flush.
   const startTurn = useCallback(
     (task: string) => {
+      // P1A-15: every turn start (direct AND queued — flushQueue routes through here) returns the
+      // composer to INSERT when vim is on. A turn launched from NORMAL mode otherwise stranded the
+      // user there when it ended: the vim key block is gated on !runningRef, so during the turn keys
+      // fell through, and after it the composer was still in NORMAL and swallowed typing as motions.
+      if (vimEnabledRef.current && vimModeRef.current !== 'insert') setVimMode('insert');
+      // F10-02: clear FINISHED background-agent rows that lingered from the previous turn (the user
+      // has moved on). Still-running agents stay so a long bg job spans turns visibly.
+      setSubAgents((prev) => {
+        if (![...prev.values()].some((a) => a.done)) return prev;
+        const m = new Map<string, SubAgentView>();
+        for (const [id, a] of prev) if (!a.done) m.set(id, a);
+        return m;
+      });
       // Commit the finished turn's cost into the session total baseline, then reset
-      // the per-turn cursor so the next turn's usage deltas accumulate from 0.
+      // the per-turn cursors so the next turn's usage deltas accumulate from 0 (P1B-03).
       prevTurnCostRef.current = 0;
+      prevTurnInTokRef.current = 0;
+      prevTurnOutTokRef.current = 0;
+      sessionTurnsRef.current += 1;
       // New turn → the verbatim-repeat detector starts fresh (an identical short answer in this
       // turn is real, not a repeat of the last turn's).
       answerRunRef.current = [];
@@ -4854,10 +5367,14 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       const nImg = attachmentsRef.current.length;
       const userText = task || `📎 ${nImg} image${nImg === 1 ? '' : 's'}`;
       pushLine({ kind: 'user', text: `❯ ${userText}`, color: C.green, bold: true, meta: 'you' });
-      void runOne(task);
+      // F08-04: the echo above shows what the user typed (`@path` visible); the MODEL gets the
+      // referenced files inlined so it doesn't need a read_file round-trip. Unresolved @tokens stay
+      // literal text.
+      void runOne(expandFileMentions(task, opts.workspaceRoot));
     },
-    [pushLine, runOne],
+    [pushLine, runOne, opts.workspaceRoot],
   );
+  startTurnRef.current = startTurn;
 
   // ── Collaboration Mode (experimental round-table) ─────────────────────────────
   // A hand-off is a scoped, non-persistent selectModel: point the live provider at the seat, tag its
@@ -4886,6 +5403,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       } finally {
         speakerRef.current = null; // baton returns to the human
         routeInFlightRef.current = false;
+        flushQueueRef.current?.();
       }
     },
     [pushLine, runOne],
@@ -4906,6 +5424,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       preTableRef.current = null;
     }
     speakerRef.current = null;
+    tableRef.current = null;
     setTable(null);
     pushLine({ text: 'Round-table ended — back to your single model.', color: C.cyan });
   }, [pushLine, context, opts.cfg]);
@@ -4953,7 +5472,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         target: { ...activeTargetRef.current },
         policy: context.policy(),
       };
-      setTable({ seats });
+      const nextTable = { seats };
+      tableRef.current = nextTable; // queue flushing reads the ref before React's state commit
+      setTable(nextTable);
       pushLine({
         kind: 'system',
         text: 'table-open',
@@ -5002,20 +5523,26 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   );
   handleTableInputRef.current = handleTableInput;
 
-  // Flush the type-ahead queue in FIFO order. Slash commands run synchronously (same
-  // dispatch path as a typed one) and we keep draining; a plain message starts a turn
-  // and we stop — that turn's completion re-invokes flushQueue for the remainder.
+  // Flush pending input in FIFO order. Most slash commands are synchronous, but compaction and
+  // model activation are explicit barriers: their own finally blocks resume the drain only after
+  // shared context/provider state is coherent. A plain message starts a turn and stops the drain.
   const flushQueue = useCallback(() => {
     while (queuedTasksRef.current.length > 0) {
       const [next, ...rest] = queuedTasksRef.current;
       setQueued(rest);
-      const task = (next ?? '').trim();
+      const task = (next?.text ?? '').trim();
       if (!task) continue;
+      if (tableRef.current) {
+        handleTableInputRef.current?.(task);
+        if (routeInFlightRef.current || runningRef.current) return;
+        continue;
+      }
       if (task.startsWith('/')) {
-        const s = classifySlash(task);
+        const s = classifySlash(task, customCommandsRef.current);
         if (s.kind === 'command') {
           runSlash(s.cmd!, task);
-          continue; // slash command is synchronous — keep draining
+          if (runningRef.current || compactingRef.current || modelSwitchingRef.current || asyncCommandRef.current) return;
+          continue;
         }
         if (s.kind === 'typo') {
           pushLine({ text: `Unknown command: ${task.split(/\s+/)[0]} — type / for the list.`, color: C.red });
@@ -5072,11 +5599,110 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         pushLine({ text: '  ^C — press Ctrl-C again to quit (Esc just interrupts)', dimColor: true });
         return;
       }
+      // 0.5) EXTERNAL EDITOR CHORD — Ctrl-X arms, then Ctrl-E opens $EDITOR on the draft (F08-10).
+      // Resolved above the composer so the armed Ctrl-E isn't swallowed by the move-to-end binding.
+      // Idle-only: the editor blocks the event loop, so never while a turn runs or a modal is open.
+      if (ctrlXArmedRef.current) {
+        ctrlXArmedRef.current = false;
+        if (key.ctrl && ch === 'e') {
+          openExternalEditor();
+          return;
+        }
+        // Ctrl-X was not followed by Ctrl-E — fall through and handle this key normally.
+      }
+      if (key.ctrl && ch === 'x' && !runningRef.current && !pendingRef.current && !pickerOpenRef.current && !searchRef.current) {
+        ctrlXArmedRef.current = true;
+        return;
+      }
+      // 0.8) BRACKETED PASTE is a TRANSPORT, not a focus owner (P1A-14, F03-01). It is resolved
+      // ABOVE the dialog/picker owners below, because a paste is never a decision: before this
+      // hoist, a paste into an open approval dialog had its \x1b[200~ start marker swallowed by the
+      // dialog branch's unconditional return, and the paste CONTENT then flowed into the decision
+      // path chunk-by-chunk — a newline arriving as its own chunk parsed as key.return and could
+      // APPROVE the pending call, and a multi-chunk paste whose end marker landed after the dialog
+      // closed stranded pastingRef set → permanent input lockout. Now the markers are consumed here
+      // first; the completed paste is inserted by insertPastable, which routes to the composer draft
+      // regardless of which owner has focus (the same place type-ahead sends keys during a dialog),
+      // so a paste can never resolve a modal and can never strand paste state across a modal edge.
+      //
+      // Ink mangles the raw stream two ways this block undoes (see use-input.js): a chunk-LEADING
+      // \x1b is stripped, so the start marker arrives as '[200~' (inner markers keep their ESC) —
+      // restore it before matching; and a chunk that IS a named key ('\r'→return, '\t'→tab) arrives
+      // with input '' and only the flag set — mid-paste those are literal bytes, re-materialize them.
+      const chp = ch && (ch.startsWith('[200~') || ch.startsWith('[201~')) ? `\x1b${ch}` : ch;
+      if (pastingRef.current) {
+        const piece = chp || (key.return ? '\n' : key.tab ? '\t' : '');
+        if (!piece) return; // unrepresentable key mid-paste (arrows etc.) — drop
+        const endIdx = piece.indexOf(PASTE_END);
+        if (endIdx < 0) {
+          pasteBufRef.current += piece;
+          // Runaway guard: no end marker after 8 MB means the marker was lost (or a
+          // hostile stream) — bail out of paste mode rather than buffer forever.
+          if (pasteBufRef.current.length > 8 * 1024 * 1024) {
+            pastingRef.current = false;
+            pasteBufRef.current = '';
+          }
+          return;
+        }
+        const content = pasteBufRef.current + piece.slice(0, endIdx);
+        pastingRef.current = false;
+        pasteBufRef.current = '';
+        insertPastable(content.replace(/\r\n?/g, '\n'));
+        return;
+      }
+      if (chp && chp.includes(PASTE_START)) {
+        const startIdx = chp.indexOf(PASTE_START);
+        // Text typed in the same stdin read BEFORE the paste began inserts normally first.
+        const prefix = chp.slice(0, startIdx);
+        if (prefix) insertPastable(prefix.replace(/\r\n?/g, '\n'));
+        const after = chp.slice(startIdx + PASTE_START.length);
+        const endIdx = after.indexOf(PASTE_END);
+        if (endIdx >= 0) {
+          // Whole paste in one chunk — the common case.
+          insertPastable(after.slice(0, endIdx).replace(/\r\n?/g, '\n'));
+        } else {
+          pastingRef.current = true;
+          pasteBufRef.current = after;
+        }
+        return;
+      }
+
       // 1) Approval dialog has focus.
       if (pendingRef.current) {
         const g = igateRef.current;
         if (!g) return;
         const kind = pendingRef.current.kind;
+        // Enter with composer text means "send my follow-up", never "approve whatever dialog
+        // happened to open over my typing". Queue before resolving the gate so the loop's promise
+        // continuation cannot outrun us; explicitly deny the pending action, then steer model work.
+        if (key.return && inputRef.current.trim()) {
+          const task = inputRef.current.trim();
+          const taskKind = queuedTaskKind(task);
+          setQueued([...queuedTasksRef.current, { text: task, kind: taskKind }]);
+          historyRef.current.push(task);
+          histIdxRef.current = historyRef.current.length;
+          setLine('');
+          dialogTypeaheadRef.current = false;
+          // P1A-15: an Enter that lands inside the arm window was almost certainly the user
+          // finishing their sentence just as the dialog popped — NOT a decision on a dialog they
+          // have not seen. Do not g.respond('deny') an unseen gate; steer instead (the steer's
+          // abort resolves the pending gate through settleWithAbort), so the message is queued and
+          // model work redirected without a phantom denial the user never chose.
+          if (Date.now() - dialogShownAtRef.current < dialogArmMs()) {
+            loopRef.current?.requestSteer();
+            pushLine({ text: '  ↪ pending message — steering (dialog not yet seen)', dimColor: true });
+            return;
+          }
+          g.respond('deny');
+          const steered = taskKind === 'steer' ? (loopRef.current?.requestSteer() ?? false) : false;
+          pushLine({
+            text: steered
+              ? '  ↪ pending message — current action denied; steering now'
+              : '  ↪ pending input — current action denied; queued in order',
+            dimColor: true,
+          });
+          return;
+        }
         // ── Type-ahead guard ──────────────────────────────────────────────────────────────────
         // "Type your next message while the agent works" is an advertised workflow, and the gate
         // can open MID-SENTENCE. Every keystroke already in flight was then routed straight into
@@ -5213,56 +5839,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
 
       // 2) Ctrl-C is handled as a RESERVED CHORD at the top of this handler (§0), above every
       // focus owner, so it works while a dialog or the picker holds the keystream.
-
-      // 2.8) Bracketed paste (mode 2004, enabled at mount). Everything between the
-      // \x1b[200~ … \x1b[201~ markers is buffered and inserted as ONE atomic paste:
-      // embedded newlines can't submit mid-paste, a pasted Tab can't drive the menu, a
-      // pasted Esc can't interrupt the running turn, and vim-NORMAL can't eat pasted
-      // chars as motions. Multi-chunk pastes (large buffers arrive in several stdin
-      // reads) keep buffering until the end marker shows up.
-      //
-      // Ink mangles the raw stream two ways this block must undo (see use-input.js):
-      //  - a chunk-LEADING \x1b is stripped, so the start marker arrives as '[200~'
-      //    (inner markers keep their ESC) — restore it before matching;
-      //  - a chunk that IS a named key ('\r' → return, '\t' → tab) arrives with input ''
-      //    and only the flag set — mid-paste those are literal bytes, re-materialize them.
-      const chp = ch && (ch.startsWith('[200~') || ch.startsWith('[201~')) ? `\x1b${ch}` : ch;
-      if (pastingRef.current) {
-        const piece = chp || (key.return ? '\n' : key.tab ? '\t' : '');
-        if (!piece) return; // unrepresentable key mid-paste (arrows etc.) — drop
-        const endIdx = piece.indexOf(PASTE_END);
-        if (endIdx < 0) {
-          pasteBufRef.current += piece;
-          // Runaway guard: no end marker after 8 MB means the marker was lost (or a
-          // hostile stream) — bail out of paste mode rather than buffer forever.
-          if (pasteBufRef.current.length > 8 * 1024 * 1024) {
-            pastingRef.current = false;
-            pasteBufRef.current = '';
-          }
-          return;
-        }
-        const content = pasteBufRef.current + piece.slice(0, endIdx);
-        pastingRef.current = false;
-        pasteBufRef.current = '';
-        insertPastable(content.replace(/\r\n?/g, '\n'));
-        return;
-      }
-      if (chp && chp.includes(PASTE_START)) {
-        const startIdx = chp.indexOf(PASTE_START);
-        // Text typed in the same stdin read BEFORE the paste began inserts normally first.
-        const prefix = chp.slice(0, startIdx);
-        if (prefix) insertPastable(prefix.replace(/\r\n?/g, '\n'));
-        const after = chp.slice(startIdx + PASTE_START.length);
-        const endIdx = after.indexOf(PASTE_END);
-        if (endIdx >= 0) {
-          // Whole paste in one chunk — the common case.
-          insertPastable(after.slice(0, endIdx).replace(/\r\n?/g, '\n'));
-        } else {
-          pastingRef.current = true;
-          pasteBufRef.current = after;
-        }
-        return;
-      }
+      // 2.8) Bracketed paste is handled as a TRANSPORT at §0.8, above the dialog/picker owners
+      // (P1A-14) — it is not a focus owner, so it cannot be trapped behind a modal's return.
 
       // 2.9) Reverse history search (Ctrl+R). While open it OWNS typing, backspace, Enter and Esc.
       //
@@ -5277,6 +5855,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           const saved = st.saved;
           applySearch(null);
           setLine(saved); // Esc restores exactly what was there before the search opened
+          // P1A-15: if a turn is running under an open search, one Esc closes the search AND
+          // interrupts — otherwise the user's reflexive "Esc to stop" was eaten by the search owner
+          // and the turn kept going with no visible reason.
+          if (runningRef.current) {
+            controllerRef.current?.abort();
+            loopRef.current?.requestSteer();
+          }
           return;
         }
         if (key.return) {
@@ -5300,7 +5885,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         }
         return; // swallow everything else while the search owns the line
       }
-      if (key.ctrl && ch === 'r' && historyRef.current.length > 0) {
+      // P1A-15: do NOT open reverse-search while a turn is running. An open search OWNS Esc and
+      // Enter, so opening it mid-turn captured the very keys the user needs to interrupt or steer.
+      if (key.ctrl && ch === 'r' && historyRef.current.length > 0 && !runningRef.current) {
         applySearch({ query: '', index: -1, saved: inputRef.current });
         return;
       }
@@ -5358,8 +5945,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         }
       }
 
-      // 3) Esc — the interrupt key. While a turn runs, Esc stops it (and the type-ahead queue
-      // then flushes, so a queued message runs next). When idle, Esc cancels a pending queue,
+      // 3) Esc — the interrupt key. While a turn runs, Esc stops it (and pending input then
+      // flushes, so a steering message runs next). When idle, Esc cancels pending input,
       // else clears the composer. Session always survives — only Ctrl-C quits.
       if (key.escape) {
         if (compactingRef.current) {
@@ -5373,13 +5960,16 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           // landed BELOW "⎋ interrupted" and read as a second, post-interrupt reply. Clearing the
           // buffer here makes this the sole commit; `stop` then finds it empty and no-ops.
           if (streamBufRef.current.trim()) {
-            pushLine({
-              kind: 'assistant',
-              text: stripTrailingNewlines(scrubForDisplay(streamBufRef.current)),
-              color: C.fg,
-              meta: 'assistant',
-              tight: answerOpenRef.current && !padCarryRef.current && !leadsWithBlock(streamBufRef.current),
-            });
+            const display = sanitizeAssistantText(streamBufRef.current);
+            if (display.trim()) {
+              pushLine({
+                kind: 'assistant',
+                text: stripTrailingNewlines(display),
+                color: C.fg,
+                meta: 'assistant',
+                tight: answerOpenRef.current && !padCarryRef.current && !leadsWithBlock(display),
+              });
+            }
             streamBufRef.current = '';
             answerOpenRef.current = false;
             padCarryRef.current = false;
@@ -5407,7 +5997,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       // (A pending approval/question dialog is handled above and always returns, so
       // by here no dialog is open — the resolver only sees the normal editing view.)
       if (pickerOpenRef.current) kbContexts.push('ModelPicker');
-      if (slashMatches(inputRef.current, undefined, argCtxRef.current ?? undefined).length > 0) kbContexts.push('Autocomplete');
+      if (slashMatches(inputRef.current, undefined, argCtxRef.current ?? undefined, customCommandsRef.current).length > 0) kbContexts.push('Autocomplete');
       kbContexts.push('Transcript', 'Chat', 'Global');
       if (kbConsume(ch, key, kbContexts)) return;
 
@@ -5420,9 +6010,21 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       // instead of reaching handleTableInput, which answered with instructions to type the very
       // thing that had just been swallowed. Suppressing the menu lets Enter fall through to the
       // submit path, where the table router already parses `/table done` correctly.
-      const menu = tableRef.current
+      // F08-04: the key handler recomputes the menu from live refs (not the render `menu`), so the
+      // @-mention picker must be recomputed here too or Tab/Enter can't accept a file candidate.
+      const keyMentionTok = tableRef.current ? null : atMentionToken(inputRef.current, cursorRef.current);
+      const keyMentionMenu: SlashMenuItem[] = keyMentionTok
+        ? rankFileCandidates(ensureFileList(), keyMentionTok.partial, 8).map((p) => ({
+            name: `@${p}`,
+            desc: 'file',
+            mention: { start: keyMentionTok.start, path: p },
+          }))
+        : [];
+      const menu = keyMentionMenu.length
+        ? keyMentionMenu
+        : tableRef.current
         ? []
-        : slashMatches(inputRef.current, undefined, argCtxRef.current ?? undefined);
+        : slashMatches(inputRef.current, undefined, argCtxRef.current ?? undefined, customCommandsRef.current);
       if (menu.length > 0) {
         const sel = Math.min(menuIndexRef.current, menu.length - 1);
         if (key.upArrow) {
@@ -5436,6 +6038,22 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         // Tab autocompletes; Shift+Tab must NOT. Without the guard the slash menu swallowed
         // Shift+Tab and autocompleted instead, so the autonomy ring was unreachable for as long as
         // the menu was open — the one moment a user is most likely to reach for it.
+        // F08-04: an @-file candidate — Tab OR Enter inserts the path (replacing the @partial),
+        // never runs a command. A trailing space closes the token so the picker dismisses.
+        const acceptMention = (item: SlashMenuItem): void => {
+          const m = item.mention!;
+          const before = inputRef.current.slice(0, m.start);
+          const after = inputRef.current.slice(cursorRef.current);
+          const insert = `@${m.path} `;
+          setComposer(before + insert + after, m.start + insert.length);
+          setMenuIndex(0);
+        };
+        if ((key.tab && !key.shift) || key.return) {
+          if (menu[sel]?.mention) {
+            acceptMention(menu[sel]!);
+            return;
+          }
+        }
         if (key.tab && !key.shift) {
           if (menu[sel]!.hint) return; // informational row — nothing to complete to
           setLine(menu[sel]!.name); // autocomplete to the selected command
@@ -5460,7 +6078,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             // Mid-turn, a command that isn't live-safe is QUEUED (runs when the turn ends); a
             // live-safe one (/help, /cost, …) and any command when idle runs immediately.
             if (runningRef.current && !SLASH_WHILE_RUNNING.has(slashDispatchName(cmd))) {
-              setQueued([...queuedTasksRef.current, item.name]);
+              setQueued([...queuedTasksRef.current, { text: item.name, kind: 'deferred' }]);
               setLine('');
               setMenuIndex(0);
             } else {
@@ -5669,6 +6287,15 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           pushLine({ text: 'Model switch is still initializing — your draft is preserved.', dimColor: true });
           return;
         }
+        if (asyncCommandRef.current) {
+          if (!task) return;
+          setQueued([...queuedTasksRef.current, { text: task, kind: queuedTaskKind(task) }]);
+          historyRef.current.push(task);
+          histIdxRef.current = historyRef.current.length;
+          setLine('');
+          pushLine({ text: '  queued — model capability check in progress', dimColor: true });
+          return;
+        }
         // Collaboration Mode: while a round-table is active, the composer routes to seats instead of
         // starting a normal turn. `/table` START (no table yet) falls through to the slash dispatch below.
         if (tableRef.current) {
@@ -5688,7 +6315,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         // Compaction is REWRITING the shared context — a turn started now would read it mid-rebuild.
         // Queue instead of racing; the queue flushes when compaction finishes.
         if (compactingRef.current) {
-          setQueued([...queuedTasksRef.current, task]);
+          setQueued([...queuedTasksRef.current, { text: task, kind: queuedTaskKind(task) }]);
           historyRef.current.push(task);
           histIdxRef.current = historyRef.current.length;
           setLine('');
@@ -5696,9 +6323,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           return;
         }
         if (runningRef.current) {
-          // Type-ahead: a turn is in flight. Informational slash commands run live;
-          // everything else is QUEUED (FIFO) and flushed when the turn ends — the turn
-          // is NOT interrupted (reference-client style). Esc clears the queue; Ctrl-C aborts.
+          // Informational slash commands run live. State-changing commands remain deferred, but
+          // a human message requests a model-only interrupt and resumes at the next safe history
+          // boundary (an in-flight tool is allowed to settle first).
           if (task.startsWith('/')) {
             const cmdName = task.split(/\s+/)[0] ?? '';
             const cmd = findSlashCommand(cmdName);
@@ -5708,14 +6335,28 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             }
           }
           if (!task) return; // image-only can't be queued (attachments flush with the next typed message)
-          setQueued([...queuedTasksRef.current, task]);
+          const kind = queuedTaskKind(task);
+          // Queue FIRST: requestSteer may unwind the loop synchronously enough for finally to flush.
+          setQueued([...queuedTasksRef.current, { text: task, kind }]);
           historyRef.current.push(task);
           histIdxRef.current = historyRef.current.length;
           setLine('');
+          if (kind === 'steer') {
+            // Ask the CURRENT loop every time. A queued message left over from an earlier loop must
+            // not suppress steering a newer active loop. If no loop exists yet we are only waiting
+            // for the process run lock: preserve A→B FIFO instead of aborting and silently dropping A.
+            const steered = loopRef.current?.requestSteer() ?? false;
+            pushLine({
+              text: steered
+                ? '  ↪ pending message — steering at the next safe boundary'
+                : '  ↪ pending message — queued in order',
+              dimColor: true,
+            });
+          }
           return;
         }
         if (task.startsWith('/')) {
-          const s = classifySlash(task);
+          const s = classifySlash(task, customCommandsRef.current);
           if (s.kind === 'command') {
             runSlash(s.cmd!, task);
             return;
@@ -5862,7 +6503,20 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // (approval / model picker) suppresses it.
   // Live settings surfaced inside argument menus (the "✓ current" row) — a picker that shows
   // where you ARE doubles as a status readout.
-  const menu = !pending && !pickerOpen
+  // F08-04: when an `@`-token is being edited, the menu becomes a file picker (fuzzy over the
+  // cached workspace walk). Mutually exclusive with the slash menu — a `/` line and an `@` token
+  // can't both be the active token.
+  const mentionTok = !pending && !pickerOpen ? atMentionToken(input, cursorRef.current) : null;
+  const mentionMenu: SlashMenuItem[] = mentionTok
+    ? rankFileCandidates(ensureFileList(), mentionTok.partial, 8).map((p) => ({
+        name: `@${p}`,
+        desc: 'file',
+        mention: { start: mentionTok.start, path: p },
+      }))
+    : [];
+  const menu = mentionMenu.length
+    ? mentionMenu
+    : !pending && !pickerOpen
     ? slashMatches(
         input,
         {
@@ -5874,6 +6528,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           '/fast': opts.cfg.fastMode ? 'on' : 'off',
         },
         argCtxRef.current,
+        customCommandsRef.current,
       )
     : [];
   const selIndex = Math.min(menuIndex, Math.max(0, menu.length - 1));
@@ -5900,7 +6555,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // between the transcript and the input on every idle screen. The no-jump property that actually
   // matters still holds: the height is constant for the whole of a turn. (The content flags — not
   // `running` alone — because live events can arrive without this TUI owning the turn.)
-  const liveActive = running || !!think || !!stream || !!activeTool;
+  // F10-02: a running (or just-finished, lingering) sub-agent keeps the live slot open even after the
+  // launching turn ends — a background agent must not vanish the moment its parent turn completes.
+  const liveActive = running || !!think || !!stream || !!activeTool || subAgents.size > 0;
   const liveWant = menuOpen || !liveActive ? 0 : LIVE_SLOT_ROWS;
   // Pinned agent state: ONE line by default. Ctrl-T expands the full list (idle OR mid-turn).
   const todoCurrent = todoItems.find((t) => t.status === 'in_progress')?.subject ?? '';
@@ -5959,6 +6616,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const safetyMarkers: ChromeMarker[] = [
     ...(opts.offline ? [{ text: 'OFFLINE', color: C.cyan, bold: true }] : []),
     ...(opts.bypass ? [{ text: '⚠ sandbox:off', color: C.red, bold: true }] : []),
+    // Transient, quiet, and LAST: a status, not a safety contract — it must never shove OFFLINE
+    // or sandbox:off off the hint row on narrow terminals.
+    ...(mcpConnecting ? [{ text: 'mcp: connecting…', color: C.dim }] : []),
   ];
   const safetyText = safetyMarkers.map((m) => m.text).join(' · ');
   const safetyPrefixCols = safetyText ? displayWidth(safetyText) + 3 : 0; // trailing " · "
@@ -6039,7 +6699,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     (menu.length > 0
       ? `↑/↓ select · Tab complete · Enter ${running ? 'queues' : 'runs'} · Esc cancel`
       : running
-        ? 'Type to queue · Enter queues · Option+Enter newline · Esc interrupts · Ctrl-C ×2 quits'
+        ? 'Type to steer · Enter steers · Option+Enter newline · Esc interrupts · Ctrl-C ×2 quits'
         : table
           ? tableLegend
           : `${idleStrip}${idleTail}`);
@@ -6105,27 +6765,25 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           {!menuOpen && hudFit.liveRows > 0 ? (
             <Box flexDirection="column" height={hudFit.liveRows} overflow="hidden" justifyContent="flex-end">
             {(subAgents.size > 0 && !previewStream) ? (() => {
-              // Running-N-agents panel (BUG 3): live delegated agents, each showing its current
-              // tool. Rendered ABOVE the activeTool/think/stream rows and bottom-aligned, so if
-              // the terminal is short the panel clips first and the primary live row is never
-              // hidden. Capped at 3 visible + "+N more" so it can never blow the live region.
-              const list = Array.from(subAgents.values());
-              const visible = list.slice(0, 3);
-              const more = list.length - visible.length;
+              // Running-N-agents panel (BUG 3): live delegated agents, each showing type · current
+              // tool · tool-use count · tokens, mirroring Claude Code's AgentProgressLine. Bounded
+              // to the live budget (renderSubAgentPanel degrades to one summary row when it can't
+              // fit) and bottom-aligned, so it clips gracefully before the primary live row.
+              // The parent's own activeTool row (usually the `agent` call itself) reserves 1 row.
+              // Per-type colors, read from the live palette (C is a mutated singleton).
+              const SUBAGENT_COLORS = [C.cyan, C.purple, C.green, C.yellow, C.accent];
+              const reserved = (activeTool || stream || think) ? 1 : 0;
+              const panelRows = Math.max(1, hudFit.liveRows - reserved);
+              const lines = renderSubAgentPanel(Array.from(subAgents.values()), panelRows, SUBAGENT_COLORS.length);
               return (
                 <Box flexDirection="column" paddingLeft={PAGE_MARGIN}>
-                  {visible.map((s) => (
-                    <Text key={s.taskId} wrap="truncate">
-                      <Text color={C.cyan}>▸ </Text>
-                      <Text>{s.subagentType}</Text>
-                      {s.tool ? (
-                        <Text color={C.dim}>{` · ${s.tool}${s.argPreview ? ` ${s.argPreview}` : ''}`}</Text>
-                      ) : (
-                        <Text color={C.dim}>{' · running…'}</Text>
-                      )}
+                  {lines.map((l, i) => (
+                    <Text key={`${l.kind}-${i}`} wrap="truncate">
+                      <Text color={l.running ? C.cyan : C.dim}>{`${l.glyph} `}</Text>
+                      {l.label ? <Text color={l.colorIndex >= 0 ? SUBAGENT_COLORS[l.colorIndex] : undefined} bold>{l.label}</Text> : null}
+                      <Text color={C.dim}>{l.detail}</Text>
                     </Text>
                   ))}
-                  {more > 0 ? <Text color={C.dim}>{`  +${more} more`}</Text> : null}
                 </Box>
               );
             })() : null}
@@ -6283,16 +6941,16 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       ) : null}
 
       <Box flexDirection="column" flexShrink={0} marginTop={hudFit.marginTop ? 1 : 0}>
-        {/* Type-ahead queue — what the user submitted while the turn is running, flushed
-            in order when it finishes. Visible so they know the input was accepted (Esc clears). */}
+        {/* Pending input — human messages steer at a safe boundary; commands/wakeups remain FIFO
+            deferred. Visible so the user knows the input was accepted. */}
         {hudFit.queued ? (
           // wrap="truncate": 3+ queued items would wrap to a 2nd row and shift the composer mid-turn.
           // Hidden while the menu is open — those rows belong to the menu's frame budget. Inset to the
           // page margin in stock so it lines up with the composer/strip rather than sitting flush-left.
           <Box paddingLeft={PAGE_MARGIN}>
             <Text wrap="truncate" color={C.cyan}>
-              {`⏳ queued (${queued.length}): ${queued
-                .map((q) => (q.length > 40 ? q.slice(0, 39) + '…' : q))
+              {`${queued.some((q) => q.kind === 'steer') ? '↪ pending' : '⏳ queued'} (${queued.length}): ${queued
+                .map((q) => (q.text.length > 40 ? q.text.slice(0, 39) + '…' : q.text))
                 .join('  ·  ')}`}
             </Text>
           </Box>
@@ -6459,14 +7117,33 @@ const A = {
 
 
 export function attachRenderer(bus: EventBus, _opts?: { animate: boolean }): () => void {
+  // Sub-agent taskId → type, so a delegated tool line can name its agent instead of a bare taskId.
+  const subagentType = new Map<string, string>();
   return bus.on((e) => {
     switch (e.type) {
       case 'text':
         if (e.delta) process.stdout.write(stripCtl(e.delta));
         break;
-      case 'tool_start':
-        process.stdout.write(`\n${A.dim}↳ ${e.call.name} ${stripCtl(previewOf(e.call.input))}${A.reset}\n`);
+      case 'subagent_start':
+        subagentType.set(e.taskId, e.subagentType);
+        // F06-10: a queued announcement reads as queued; the admission re-announcement then prints
+        // the normal started line — two honest lines instead of one misleading one.
+        if (e.queued) {
+          process.stdout.write(`\n${A.dim}▸ sub-agent ${e.subagentType}${e.description ? ` · ${stripCtl(e.description)}` : ''} queued — waiting for a concurrency slot${e.background ? ' (background)' : ''}${A.reset}\n`);
+        } else {
+          process.stdout.write(`\n${A.cyan}▸ sub-agent ${e.subagentType}${e.description ? ` · ${stripCtl(e.description)}` : ''} started${e.background ? ' (background)' : ''}${A.reset}\n`);
+        }
         break;
+      case 'subagent_end':
+        process.stdout.write(`${e.ok ? A.dim : A.yellow}▸ sub-agent ${e.subagentType ?? subagentType.get(e.taskId) ?? 'agent'} ${e.ok ? 'finished' : 'failed'}${A.reset}\n`);
+        break;
+      case 'tool_start': {
+        // A forwarded sub-agent tool is tagged with e.subagent (taskId); attribute it so headless
+        // output distinguishes delegated activity from the parent's own (BUG 3 headless half).
+        const who = e.subagent ? `${A.cyan}[${subagentType.get(e.subagent) ?? 'agent'}]${A.dim} ` : '';
+        process.stdout.write(`\n${A.dim}↳ ${who}${e.call.name} ${stripCtl(previewOf(e.call.input))}${A.reset}\n`);
+        break;
+      }
       case 'tool_end': {
         const mark = e.result.ok ? `${A.green}ok${A.reset}` : `${A.red}err${A.reset}`;
         process.stdout.write(`  ${mark} ${stripCtl(oneLine(e.result.summary))}\n`);
@@ -6493,7 +7170,11 @@ export function attachRenderer(bus: EventBus, _opts?: { animate: boolean }): () 
         process.stdout.write(`  ${A.dim}model fallback: ${e.from} → ${e.to}${A.reset}\n`);
         break;
       case 'compaction':
-        process.stdout.write(`  ${A.dim}⟳ context compacted — earlier turns summarized${A.reset}\n`);
+        process.stdout.write(
+          e.degraded
+            ? `  ${A.yellow}⟳ context reclaimed locally — summarizer unavailable${A.reset}\n`
+            : `  ${A.dim}⟳ context compacted — earlier turns summarized${A.reset}\n`,
+        );
         break;
       case 'retry':
         process.stdout.write(`  retry ${e.attempt} in ${e.delayMs}ms (${oneLine(e.reason)})\n`);

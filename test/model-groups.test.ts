@@ -27,6 +27,8 @@ test('cloud models group by company', () => {
   assert.equal(modelGroup(m('grok-4')), 'xAI');
   assert.equal(modelGroup(m('gemini-flash-latest')), 'Google');
   assert.equal(modelGroup(m('deepseek-chat')), 'DeepSeek');
+  assert.equal(modelGroup(m('kimi-k2-thinking')), 'Moonshot');
+  assert.equal(modelGroup(m('moonshot-v1-128k')), 'Moonshot');
 });
 
 test('explicit group overrides derivation', () => {

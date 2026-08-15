@@ -6,27 +6,39 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { z } from 'zod';
-import { TuiApp, type TuiOpts } from '../src/tui.js';
-import { EventBus } from '../src/agent/events.js';
-import { Context } from '../src/agent/context.js';
-import { ToolRegistry } from '../src/tools/registry.js';
-import { createProvider } from '../src/provider/index.js';
-import { loadConfig } from '../src/config.js';
-import { AgentLoop, type LoopDeps } from '../src/agent/loop.js';
-import { Budget } from '../src/agent/budget.js';
-import { AutoDenyGate } from '../src/agent/approval.js';
+import { isolateHome, assertStoreIsolated } from './helpers/isolateHome.js';
+
+// Redirect ~/.shadow to a throwaway HOME BEFORE importing the store. The TUI's `/permissions add`
+// now persists permission rules GLOBAL-only (F07-01) via `saveGlobalConfig` (~/.shadow/config.json),
+// so without isolation this test would write the user's real global config.
+const { home: HOME } = isolateHome('perm-loop');
+const store = await import('../src/state/globalStore.js');
+assertStoreIsolated(store.GLOBAL_DIR, HOME);
+const { loadConfig } = await import('../src/config.js');
+const { TuiApp } = await import('../src/tui.js');
+const { EventBus } = await import('../src/agent/events.js');
+const { Context } = await import('../src/agent/context.js');
+const { ToolRegistry } = await import('../src/tools/registry.js');
+const { createProvider } = await import('../src/provider/index.js');
+const { AgentLoop } = await import('../src/agent/loop.js');
+const { Budget } = await import('../src/agent/budget.js');
+const { AutoDenyGate } = await import('../src/agent/approval.js');
+const { ok } = await import('../src/tools/types.js');
+import type { TuiOpts } from '../src/tui.js';
+import type { LoopDeps } from '../src/agent/loop.js';
 import type { ProviderEvent } from '../src/provider/provider.js';
 import type { Tool } from '../src/tools/types.js';
-import { ok } from '../src/tools/types.js';
 
 const tick = () => new Promise((r) => setTimeout(r, 80));
 const ANSI = new RegExp(String.fromCharCode(27) + '\\[[0-9;]*m', 'g');
 const strip = (s: string | undefined) => (s ?? '').replace(ANSI, '');
 
-test('/permissions add/remove persists to project file and updates transcript', async () => {
+test('/permissions add/remove persists to the GLOBAL config and never touches the project file (F07-01)', async () => {
   const ws = mkdtempSync(join(tmpdir(), 'perm-tui-'));
   const cfgPath = join(ws, 'shadow.config.json');
-  writeFileSync(cfgPath, JSON.stringify({ provider: 'mock', model: 'm', permissionRules: [] }, null, 2) + '\n');
+  const projectSrc = JSON.stringify({ provider: 'mock', model: 'm', permissionRules: [] }, null, 2) + '\n';
+  writeFileSync(cfgPath, projectSrc);
+  const globalConfigPath = join(store.GLOBAL_DIR, 'config.json');
   try {
     const cfg = loadConfig(ws, { provider: 'mock', model: 'm' });
     const opts: TuiOpts = {
@@ -61,11 +73,16 @@ test('/permissions add/remove persists to project file and updates transcript', 
     const out = strip(frames.join('\n'));
     assert.match(out, /Added rule #0/);
     assert.match(out, /Removed rule #0/);
-    const onDisk = JSON.parse(readFileSync(cfgPath, 'utf8')) as { permissionRules: unknown[] };
-    assert.equal(onDisk.permissionRules.length, 0);
+
+    // F07-01: the untrusted project file is NEVER written — the rule round-trips through the global
+    // store only. After add + remove, the global config is back to an empty rule set.
+    assert.equal(readFileSync(cfgPath, 'utf8'), projectSrc, 'project shadow.config.json is untouched');
+    const rules = (((loadConfig(ws).permissionRules) as unknown[]) ?? []);
+    assert.equal(rules.length, 0, 'add+remove round-trip leaves no rules in the (global) live config');
     unmount();
   } finally {
     rmSync(ws, { recursive: true, force: true });
+    rmSync(globalConfigPath, { force: true });
   }
 });
 

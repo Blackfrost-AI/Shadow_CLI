@@ -7,11 +7,21 @@
  * OVER-reporting: a path that *could* leak is always listed, even if it's off by default.
  *
  * The only things that can send traffic in a session are: (a) the model provider, (b) the explicit
- * web_fetch / web_search tools, (c) configured MCP servers, and (d) the opt-in update check. There is no
- * telemetry path (a source guard, test/no-telemetry.test.ts, keeps it that way).
+ * web_fetch / web_search tools, (c) configured MCP servers — including the npm-registry package resolve
+ * an npx-launched one performs on first connect, (d) the opt-in update check, (d2) the opt-in plugin-index
+ * lookup (off unless `pluginIndexUrl` is set) plus the user-run `shadow plugin add <git-url>` clone,
+ * (e) a configured vision endpoint (describe_media uploads the image bytes there), (f) the one-time
+ * HuggingFace weight download when a repo-id model preset is first served, and (g) user-configured
+ * hooks / statusLine shell commands, which can run arbitrary shell including network. The plugin clone is
+ * a git child process, so it bypasses the fetch broker and is journaled separately (purpose 'plugin-clone').
+ * There is no telemetry path (a source guard +
+ * pinned remote-host snapshot, test/no-telemetry.test.ts, keep it that way), and every deliberate
+ * egress path flows the broker in src/safety/egress.ts, which journals each request to a local
+ * receipt (~/.shadow/egress.log → `shadow egress`).
  */
 import { isLocalBaseUrl } from '../safety/offline.js';
-import { mlxOfflineReady } from '../gguf.js';
+import { sandboxConfinement } from '../safety/sandbox.js';
+import { mlxOfflineReady, isMlxDir } from '../gguf.js';
 import { vaultExists } from '../auth/vault.js';
 import { legacyCredentialsExist } from '../state/globalStore.js';
 import { available as keychainAvailable } from '../auth/keychain.js';
@@ -53,8 +63,15 @@ export interface PrivacyConfigView {
   model?: string;
   baseUrl?: string;
   updateCheck?: boolean;
+  pluginIndexUrl?: string;
+  pluginIndexKey?: string;
   mcpServers?: Record<string, { url?: string; command?: string; args?: string[] }>;
-  models?: Array<{ label?: string; baseUrl?: string; gguf?: string; mlx?: string }>;
+  models?: Array<{ label?: string; baseUrl?: string; gguf?: string; mlx?: string; vllm?: string }>;
+  vision?: { baseUrl: string };
+  hooks?: Record<string, string[] | undefined>;
+  statusLine?: string;
+  sandbox?: 'auto' | 'off';
+  sandboxFailurePolicy?: 'auto' | 'fail-closed' | 'warn';
 }
 
 export interface PrivacyEnv {
@@ -139,6 +156,18 @@ export function buildPrivacyReport(cfg: PrivacyConfigView, env: PrivacyEnv): Pri
         scope: 'on-connect',
         note: offline ? 'skipped in offline mode' : 'local subprocess — may make its own network calls',
       });
+      // An npx-launched server (e.g. the pinned Playwright browser preset) resolves its package
+      // from the npm registry on FIRST connect — that resolution is egress in its own right.
+      if (s.command === 'npx') {
+        egress.push({
+          name: `npm registry (MCP "${name}")`,
+          target: 'registry.npmjs.org',
+          active: !offline,
+          scope: 'on-connect',
+          note: offline ? 'skipped in offline mode' : 'npx resolves the pinned package on first connect; cached afterwards',
+        });
+        if (!offline) warnings.push(`MCP server "${name}" is launched via npx — first connect resolves its package from the npm registry.`);
+      }
     }
   }
 
@@ -152,6 +181,91 @@ export function buildPrivacyReport(cfg: PrivacyConfigView, env: PrivacyEnv): Pri
     note: !updateOn ? 'off (default) — makes zero calls' : offline ? 'suppressed in offline mode' : 'payload-free version GET, at most once/day',
   });
   if (updateOn && !offline) warnings.push(`Opt-in update check will contact ${UPDATE_HOST} at most once a day (no identifiers sent).`);
+
+  // (d2) Plugin index (P3-07) — Shadow ships with NO central catalog; this path exists only if the
+  // user set `pluginIndexUrl` themselves (global-only key — a project file cannot set it). When a
+  // `pluginIndexKey` is configured the index body is refused unless its detached signature verifies.
+  if (cfg.pluginIndexUrl?.trim()) {
+    const signed = Boolean(cfg.pluginIndexKey?.trim());
+    egress.push({
+      name: 'Plugin index lookup',
+      target: hostOf(cfg.pluginIndexUrl),
+      active: !offline,
+      scope: 'opt-in',
+      note: offline
+        ? 'suppressed in offline mode'
+        : `only on \`shadow plugin search\` / \`add <name>\` — entries are untrusted listings; \`add <name>\` resolves a name to its clone URL (still scheme-allowlisted)${signed ? '; signature-verified (fail-closed)' : '; UNSIGNED — configure pluginIndexKey to require a signature'}`,
+    });
+    if (!offline) {
+      warnings.push(`Plugin index lookups contact ${hostOf(cfg.pluginIndexUrl)} (your configured pluginIndexUrl).`);
+      if (!signed) warnings.push('pluginIndexUrl is set WITHOUT pluginIndexKey — index responses are not signature-verified.');
+    }
+  }
+
+  // (d3) Plugin install (P3-07) — `shadow plugin add <git-url>` clones the remote. This is a git
+  // CHILD PROCESS, so it never touches shadowFetch/the offline fetch wall; the manager enforces the
+  // offline refusal itself and journals a receipt (purpose 'plugin-clone'). Disclosed here because
+  // the capability exists in every install, config or not — it only sends bytes when YOU run it.
+  egress.push({
+    name: 'Plugin install (git clone)',
+    target: 'the git remote you pass to `shadow plugin add` (scheme-allowlisted: https/ssh/file/scp)',
+    active: !offline,
+    scope: 'opt-in',
+    note: offline
+      ? 'refused in offline mode (local file:// sources still work)'
+      : 'only when you run `shadow plugin add <git-url>` — scrubbed env, receipt journaled (purpose plugin-clone)',
+  });
+
+  // (e) Vision endpoint — describe_media POSTs the image bytes (base64) to YOUR configured vision
+  // model. Not registered at all in offline mode.
+  if (cfg.vision?.baseUrl) {
+    const visionLocal = isLocalBaseUrl(cfg.vision.baseUrl);
+    egress.push({
+      name: 'Vision endpoint (describe_media)',
+      target: hostOf(cfg.vision.baseUrl),
+      active: !offline,
+      scope: 'on-tool-use',
+      note: offline ? 'not registered in offline mode' : visionLocal ? 'local endpoint — image bytes stay on your network' : 'uploads image bytes (base64) when the agent describes media',
+    });
+    if (!offline && !visionLocal) warnings.push(`Images passed to describe_media go to ${hostOf(cfg.vision.baseUrl)} (your configured vision endpoint).`);
+  }
+
+  // (f) Repo-id model presets — the FIRST serve downloads the weights from huggingface.co (cached
+  // thereafter). A directory target, or a repo id already in the HF cache, never touches the network.
+  for (const m of cfg.models ?? []) {
+    const repoId = m.mlx && !isMlxDir(m.mlx) ? m.mlx : m.vllm && !isMlxDir(m.vllm) ? m.vllm : undefined;
+    if (!repoId || mlxOfflineReady(repoId)) continue;
+    egress.push({
+      name: `Model weights "${m.label ?? repoId}"`,
+      target: 'huggingface.co',
+      active: !offline,
+      scope: 'on-connect',
+      note: offline ? 'refused in offline mode' : 'first serve only — weights download once into the HuggingFace cache',
+    });
+    if (!offline) warnings.push(`Preset "${m.label ?? repoId}" will download its weights from huggingface.co on first serve (not cached yet).`);
+  }
+
+  // (g) Hooks + statusLine — user-configured shell, run OUTSIDE the sandbox, so it can make its own
+  // network calls and offline mode cannot stop it. Listed rather than silently trusted.
+  const hookCount = Object.values(cfg.hooks ?? {}).reduce((n, a) => n + (a?.length ?? 0), 0);
+  if (hookCount > 0) {
+    egress.push({
+      name: 'Hooks',
+      target: `local shell: ${hookCount} configured hook script${hookCount === 1 ? '' : 's'}`,
+      active: true,
+      scope: 'always',
+      note: 'user-configured shell — can run arbitrary commands, including network; runs even in offline mode',
+    });
+  }
+  if (cfg.statusLine) {
+    egress.push({
+      name: 'Status line',
+      target: `local shell: ${cfg.statusLine}`,
+      active: true,
+      scope: 'always',
+      note: 'user-configured shell — can run arbitrary commands, including network; runs even in offline mode',
+    });
+  }
 
   // Credentials at rest.
   const credential = ((): PrivacyReport['credentials'] => {
@@ -167,6 +281,18 @@ export function buildPrivacyReport(cfg: PrivacyConfigView, env: PrivacyEnv): Pri
     }
   })();
   if (env.credStore === 'plaintext') warnings.push('API keys are stored in plaintext (~/.shadow/credentials.json). Encrypt them with `shadow onboard --web`.');
+
+  // P2-12 — confinement state widens exposure exactly like the entries above: an unconfined
+  // run_shell means the agent's commands touch this machine with YOUR user permissions.
+  if (sandboxConfinement(cfg.sandbox ?? 'auto') === 'unconfined') {
+    const policy = cfg.sandboxFailurePolicy ?? 'auto';
+    warnings.push(
+      `run_shell runs UNCONFINED on this host — the OS sandbox was requested but no tool enforces it here. ` +
+        (policy === 'warn'
+          ? 'Failure policy is warn: unconfined commands run with a warning folded into the result only.'
+          : `Failure policy is ${policy}: unconfined commands stop at the approval gate${policy === 'fail-closed' ? ' every time (the gate never bends)' : ''}.`),
+    );
+  }
 
   // Offline eligibility.
   // An mlx REPO-ID preset counts only once its weights are cached — an eligibility claim that
@@ -187,7 +313,8 @@ export function buildPrivacyReport(cfg: PrivacyConfigView, env: PrivacyEnv): Pri
     egress,
     credentials: credential,
     offlineEligible,
-    telemetry: 'none — no analytics, crash-reporting, or phone-home; enforced by a source guard (test/no-telemetry.test.ts)',
+    telemetry:
+      'none — no analytics, crash-reporting, or phone-home; enforced by a source guard + pinned host snapshot (test/no-telemetry.test.ts). Every outbound request flows through a single egress broker and is journaled to a local receipt — `shadow egress` / ~/.shadow/egress.log',
     warnings,
   };
 }

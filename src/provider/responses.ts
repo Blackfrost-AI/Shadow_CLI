@@ -10,6 +10,7 @@ import {
   type StopReason,
 } from './provider.js';
 import { streamWithRetry } from './stream.js';
+import { sseEvents, parseSseData, nonEmptyParts } from './sse.js';
 import { buildOpenAIBody, toOpenAIMessages } from './openai.js';
 import { parseToolArgs } from './toolJson.js';
 import { ThinkingSplitter } from '../util/thinkingTags.js';
@@ -22,8 +23,10 @@ export function buildResponsesBody(
   req: CompletionRequest,
   fallbackModel: string,
   stream = true,
-  opts: { selfHosted?: boolean } = {},
+  opts: { selfHosted?: boolean; stripParams?: ReadonlySet<string>; reasoningRoundtrip?: 'last' | 'none' } = {},
 ): Record<string, unknown> {
+  // stripParams flow into buildOpenAIBody and delete rejected params at the source, so the
+  // `chat.temperature` / `chat.tool_choice` copies below never re-add a remembered-rejected param.
   const chat = buildOpenAIBody(req, fallbackModel, false, opts);
   const input = (chat.messages as unknown[]) ?? toOpenAIMessages(req);
   const body: Record<string, unknown> = {
@@ -203,52 +206,50 @@ export async function* parseResponsesSSE(lines: AsyncIterable<string>): AsyncIte
   let streamedOutputText = false;
   const splitter = new ThinkingSplitter();
 
-  for await (const rawLine of lines) {
-    const line = rawLine.trim();
-    if (!line.startsWith('data:')) continue;
-    const payload = line.slice(5).trim();
-    if (!payload || payload === '[DONE]') continue;
-    let obj: ResponsesSSE;
-    try {
-      obj = JSON.parse(payload) as ResponsesSSE;
-    } catch {
-      continue;
-    }
+  for await (const ev of sseEvents(lines)) {
+    if (ev.kind === 'other') continue;
+    // P2-03 (F01-08): spec-compliant SSE reassembly; '[DONE]' filtered per part.
+    const parts = nonEmptyParts(ev.parts).filter((x) => x.trim() !== '[DONE]');
+    if (parts.length === 0) continue;
 
-    if (obj.error) {
-      yield {
-        type: 'error',
-        recoverable: true,
-        code: String(obj.error.code ?? obj.error.type ?? 'provider_stream_error'),
-        message: String(obj.error.message ?? 'responses stream error'),
-      };
-      continue;
-    }
+    for (const parsed of parseSseData(parts.join('\n'), parts)) {
+      const obj = parsed as ResponsesSSE;
 
-    if (obj.type === 'response.output_text.delta' && obj.delta) {
-      streamedOutputText = true;
-      yield* yieldTextThroughSplitter(obj.delta, splitter);
-    }
+      if (obj.error) {
+        yield {
+          type: 'error',
+          recoverable: true,
+          code: String(obj.error.code ?? obj.error.type ?? 'provider_stream_error'),
+          message: String(obj.error.message ?? 'responses stream error'),
+        };
+        continue;
+      }
 
-    if (obj.type === 'response.function_call_arguments.delta') {
-      const key = `k${keySeq.n}`;
-      if (!calls.has(key)) calls.set(key, { id: `call_${keySeq.n}`, name: '', args: '' });
-      const cur = calls.get(key)!;
-      if (typeof obj.delta === 'string') cur.args += obj.delta;
-    }
+      if (obj.type === 'response.output_text.delta' && obj.delta) {
+        streamedOutputText = true;
+        yield* yieldTextThroughSplitter(obj.delta, splitter);
+      }
 
-    if (obj.type === 'response.completed' && obj.response) {
-      const u = readResponsesUsage(obj.response.usage);
-      inputTokens = u.inputTokens;
-      outputTokens = u.outputTokens;
-      cacheReadTokens = u.cacheReadTokens;
-      yield* yieldResponsesOutputItems(
-        obj.response.output ?? [],
-        { emitText: !streamedOutputText, splitter },
-        calls,
-        keySeq,
-      );
-      if (obj.response.status === 'failed') stopReason = 'end_turn';
+      if (obj.type === 'response.function_call_arguments.delta') {
+        const key = `k${keySeq.n}`;
+        if (!calls.has(key)) calls.set(key, { id: `call_${keySeq.n}`, name: '', args: '' });
+        const cur = calls.get(key)!;
+        if (typeof obj.delta === 'string') cur.args += obj.delta;
+      }
+
+      if (obj.type === 'response.completed' && obj.response) {
+        const u = readResponsesUsage(obj.response.usage);
+        inputTokens = u.inputTokens;
+        outputTokens = u.outputTokens;
+        cacheReadTokens = u.cacheReadTokens;
+        yield* yieldResponsesOutputItems(
+          obj.response.output ?? [],
+          { emitText: !streamedOutputText, splitter },
+          calls,
+          keySeq,
+        );
+        if (obj.response.status === 'failed') stopReason = 'end_turn';
+      }
     }
   }
 
@@ -268,12 +269,35 @@ export class ResponsesProvider implements Provider {
   private readonly baseUrl: string;
   private readonly model: string;
   private readonly selfHosted: boolean;
+  // P1A-04 per-endpoint knobs (parity with the chat-completions variant).
+  private readonly idleTimeoutMs: number | undefined;
+  private readonly firstByteTimeoutMs: number | undefined;
+  private readonly streamRetries: number | undefined;
+  // P2-03 (F01-05): params a 400 named and the ladder stripped, remembered for this provider
+  // instance (the session) so later turns build WITHOUT them — the OpenAIProvider pattern.
+  private readonly strippedParams = new Set<string>();
+  // F06-08: reasoning round-trip mode (parity with OpenAIProvider; replay enters this wire only
+  // via messages captured earlier on the chat-completions wire).
+  private readonly reasoningRoundtrip: 'last' | 'none';
 
-  constructor(opts: { apiKey?: string; baseUrl?: string; model: string; selfHosted?: boolean }) {
+  constructor(opts: {
+    apiKey?: string;
+    baseUrl?: string;
+    model: string;
+    selfHosted?: boolean;
+    idleTimeoutMs?: number;
+    firstByteTimeoutMs?: number;
+    streamRetries?: number;
+    reasoningRoundtrip?: 'last' | 'none';
+  }) {
     this.apiKey = opts.apiKey;
     this.baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
     this.model = opts.model;
     this.selfHosted = opts.selfHosted === true || isLocalBaseUrl(this.baseUrl);
+    this.idleTimeoutMs = opts.idleTimeoutMs;
+    this.firstByteTimeoutMs = opts.firstByteTimeoutMs;
+    this.streamRetries = opts.streamRetries;
+    this.reasoningRoundtrip = opts.reasoningRoundtrip ?? 'last';
   }
 
   estimateTokens(messages: import('./provider.js').Message[]): number {
@@ -284,14 +308,26 @@ export class ResponsesProvider implements Provider {
     const model = req.model || this.model;
     const headers: Record<string, string> = { 'content-type': 'application/json' };
     if (this.apiKey) headers.Authorization = `Bearer ${this.apiKey}`;
+    const bodyOpts = {
+      selfHosted: this.selfHosted,
+      stripParams: this.strippedParams as ReadonlySet<string>,
+      reasoningRoundtrip: this.reasoningRoundtrip,
+    };
     yield* streamWithRetry({
       url: `${this.baseUrl}/responses`,
       headers,
-      body: buildResponsesBody(req, model, true, { selfHosted: this.selfHosted }),
+      body: buildResponsesBody(req, model, true, bodyOpts),
       parse: parseResponsesSSE,
       signal: req.signal,
-      nonStreamBody: buildResponsesBody(req, model, false, { selfHosted: this.selfHosted }),
+      nonStreamBody: buildResponsesBody(req, model, false, bodyOpts),
       parseNonStream: eventsFromResponsesCompletion,
+      selfHosted: this.selfHosted,
+      idleTimeoutMs: this.idleTimeoutMs,
+      firstByteTimeoutMs: this.firstByteTimeoutMs,
+      streamRetries: this.streamRetries,
+      onParamStripped: (param) => {
+        this.strippedParams.add(param);
+      },
     });
   }
 }

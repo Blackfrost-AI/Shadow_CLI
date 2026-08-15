@@ -40,12 +40,35 @@ const hasBwrap = (): boolean =>
   ['/usr/bin/bwrap', '/bin/bwrap', '/usr/local/bin/bwrap'].some((p) => existsSync(p));
 
 /**
- * Credential directories no agent-run shell should ever read. Absolute, resolved once at module
- * load. These are DENY rules layered over `(allow default)` — nothing here is granted by the
- * workspace allow, so adding a path only ever removes access.
+ * Credential/token locations no agent-run shell should ever read. Absolute, resolved once at
+ * module load. These are DENY rules layered over `(allow default)` — nothing here is granted by
+ * the workspace allow, so adding a path only ever removes access.
+ *
+ * The list is a curated enumeration (the structural inversion — deny $HOME reads by default,
+ * allow workspace + grants — is tracked as P3-04 v1; it breaks legitimate tooling reads until
+ * the grant model catches up). Entries are credential-bearing ONLY: key material, registry/API
+ * tokens, cloud CLI credential caches. Deliberately NOT listed: .gitconfig, .bashrc/.zshrc,
+ * .npm (cache), package-manager caches — useful, not secret.
  */
-const SECRET_READ_DENY: readonly string[] = ['.ssh', '.aws', '.gnupg', '.config/gh', '.netrc', '.docker/config.json', '.kube']
-  .map((rel) => join(homedir(), rel));
+export const SECRET_READ_DENY: readonly string[] = [
+  '.ssh',
+  '.aws',
+  '.gnupg',
+  '.config/gh',
+  '.netrc',
+  '.docker/config.json',
+  '.kube',
+  // P3-04 (F07-06 structural half): widen past the original seven. Each entry is a known
+  // token/credential store that a self-hosted-model injection could otherwise be steered into
+  // reading and folding into a tool result (i.e. handing to the provider).
+  '.npmrc', // registry auth tokens
+  '.pypirc', // PyPI upload credentials
+  '.git-credentials', // plaintext git passwords
+  '.config/gcloud', // Google Cloud ADC + tokens
+  '.azure', // Azure CLI tokens
+  '.config/huggingface', // HF tokens
+  '.m2/settings.xml', // Maven repository credentials (a file, subpath-of-file denies fine)
+].map((rel) => join(homedir(), rel));
 
 /** The macOS seatbelt profile, parameterized by WS (workspace) and SD (~/.shadow). */
 function seatbeltProfile(allowNetwork: boolean, extraWrite: string[]): string {
@@ -166,4 +189,35 @@ export function osSandboxStatus(requested: boolean): string {
   if (!requested) return 'OFF';
   if (sandboxToolAvailable()) return 'ON (bwrap or seatbelt where available)';
   return 'REQUESTED but UNAVAILABLE — run_shell runs UNCONFINED';
+}
+
+/**
+ * P2-12 — the confinement state as ONE value, for every surface that reports or acts on it
+ * (/status, doctor, the loop's approval escalation, the startup banner):
+ *   'off'        — confinement not requested (sandbox: 'off' / --no-sandbox / --yolo / full autonomy).
+ *   'confined'   — requested AND this host has the tool to enforce it.
+ *   'unconfined' — requested but NO tool on this host: run_shell would run unconfined. This is
+ *                  the state the failure policy (`sandboxFailurePolicy`) decides what to do about.
+ */
+export function sandboxConfinement(sandboxMode: 'auto' | 'off'): 'off' | 'confined' | 'unconfined' {
+  if (sandboxMode === 'off') return 'off';
+  return sandboxToolAvailable() ? 'confined' : 'unconfined';
+}
+
+/**
+ * The loud, user-facing startup banner for the 'unconfined' state (P3-04: the unconfined state
+ * must be impossible to miss). Empty string when there is nothing to warn about.
+ */
+export function unconfinedBanner(mode: 'auto' | 'off', failurePolicy: 'auto' | 'fail-closed' | 'warn'): string {
+  if (sandboxConfinement(mode) !== 'unconfined') return '';
+  const consequence =
+    failurePolicy === 'warn'
+      ? 'run_shell will execute WITHOUT confinement (policy: warn — warning folded into results only).'
+      : failurePolicy === 'fail-closed'
+        ? 'EVERY run_shell will stop at the approval gate, every time (policy: fail-closed).'
+        : 'run_shell will stop at the approval gate until you approve it (policy: auto).';
+  return (
+    `⚠ OS SANDBOX UNAVAILABLE on this host — ${consequence} ` +
+    `Install bubblewrap (Linux) or set sandboxFailurePolicy / sandbox in ~/.shadow/config.json to change this.`
+  );
 }

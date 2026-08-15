@@ -6,7 +6,7 @@
 
 > **A true gift of freedom and privacy.**
 > Zero-telemetry · provider-neutral · phone home to no one.
-> Current build: **`v5.5.1`** — opt-in Chrome automation, Qwen 3.8 readiness, and self-hosted sampling controls.
+> Current build: **`v6.14.0`** — a faster core (read caps, single-pass width, clamped MCP envelopes), and a Windows installer that verifies on stock PowerShell 5.1.
 
 **Shadow is a zero-telemetry, provider-neutral coding agent that runs on your terms.** Point it at any model — Anthropic, any OpenAI-compatible endpoint, Gemini, or a local model on your own box — and it works as a coding / sysadmin agent over your workspace. **No Shadow account, no signup, no phone-home:** the only outbound traffic is the provider *you* chose and the web tools the agent explicitly invokes. Your config stays local and readable (`~/.shadow/config.json`), your keys never leave your machine, and you can switch models mid-session **without losing context**.
 
@@ -71,7 +71,7 @@ The installer detects your platform, downloads the matching binary, **verifies i
 
 ### Verifying the download 🔒
 
-Shadow is a security tool, so the installer **fails closed**. It downloads `SHASUMS256.txt` plus an ECDSA‑P256 signature (`SHASUMS256.txt.sig`) made with an **offline** release key, verifies that signature against the public key **pinned in the installer**, and only then checks the binary's SHA‑256 against the signed manifest. A compromised download host can't forge the signature, so a tampered binary is rejected — the install aborts. (Signature verification uses `openssl` on macOS/Linux and PowerShell 7+ on Windows; Windows PowerShell 5.1 falls back to the checksum with a warning.) The release public key is [`public/bin/SHASUMS256.pub`](https://shadow.redpillreader.com/bin/SHASUMS256.pub) and is embedded in `install.sh`/`install.ps1` — read them before piping to a shell.
+Shadow is a security tool, so the installer **fails closed**. It downloads `SHASUMS256.txt` plus an ECDSA‑P256 signature (`SHASUMS256.txt.sig`) made with an **offline** release key, verifies that signature against the public key **pinned in the installer**, and only then checks the binary's SHA‑256 against the signed manifest. A compromised download host can't forge the signature, so a tampered binary is rejected — the install aborts. (Verification uses `openssl` on macOS/Linux; on Windows, PowerShell 7.1+ verifies via `ImportFromPem` and Windows PowerShell 5.1 — stock Windows — verifies via .NET Framework's native ECDSA; runtimes with neither abort.) The release public key is [`public/bin/SHASUMS256.pub`](https://shadow.redpillreader.com/bin/SHASUMS256.pub) and is embedded in `install.sh`/`install.ps1` — read them before piping to a shell.
 
 ### Build from source (optional)
 

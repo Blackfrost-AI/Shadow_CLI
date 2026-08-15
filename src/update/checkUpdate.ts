@@ -16,6 +16,7 @@
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { GLOBAL_DIR } from '../state/globalStore.js';
+import { shadowFetch } from '../safety/egress.js';
 
 /** The authoritative version lives in the public repo's package.json (bumped every release). Reading
  *  it needs no bespoke endpoint and is trivially auditable. */
@@ -76,7 +77,11 @@ export async function maybeNotifyUpdate(
   const state = opts.statePath ?? statePath();
   if (now - lastCheckAt(state) < DAY_MS) return null; // at most once a day
   recordCheckAt(state, now); // record BEFORE the request so a hang/offline can't re-fire every launch
-  const doFetch = opts.fetchImpl ?? fetch;
+  // Default transport is the egress broker (receipt + offline wall); tests may still inject a stub.
+  const doFetch =
+    opts.fetchImpl ??
+    ((input: string | URL, init?: RequestInit) =>
+      shadowFetch(String(input), init, { purpose: 'update-check', origin: 'user' }));
   try {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), 3000);

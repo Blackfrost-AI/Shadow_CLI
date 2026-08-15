@@ -25,11 +25,14 @@ export type LoopEvent =
   | { type: 'tool_denied'; call: ToolCall; reason: string; subagent?: string }
   | { type: 'usage'; inputTokens: number; outputTokens: number; costUSD: number; contextPct: number }
   | { type: 'latency'; ms: number }
-  | { type: 'compaction'; trigger: 'auto' | 'manual' } // earlier turns summarized to reclaim context (surfaced for TUI + eval verification)
+  | { type: 'compaction'; trigger: 'auto' | 'manual'; degraded?: boolean } // earlier turns summarized to reclaim context (surfaced for TUI + eval verification); degraded: the summarizer FAILED and context was reclaimed by local truncation only (F04-11)
   | { type: 'autonomy'; level: AutonomyLevel }
   | { type: 'todo'; items: TodoItem[] }
   | { type: 'plan_mode'; plan: PlanSnapshot }
   | { type: 'retry'; attempt: number; delayMs: number; reason: string }
+  // Diagnostic channel (F04-06): machine-readable loop internals (e.g. the healer dropping a
+  // duplicate tool_result). Renderers ignore it by default; the session log persists it.
+  | { type: 'debug'; code: string; message: string }
   | { type: 'error'; message: string }
   | { type: 'stop'; reason: StopReasonExt; finalAnswer: string }
   | { type: 'shell_output'; callId: string; stream: 'stdout' | 'stderr'; chunk: string }
@@ -39,15 +42,23 @@ export type LoopEvent =
   | { type: 'bg_agent_launched'; taskId: string; prompt: string; subagentType?: string } // launch metadata recorded to main ctx for snapshot/recovery
   // A finished sub-agent's TOTAL spend, emitted once by the `agent` tool. Sub-agents run on their
   // own Budget, so their per-turn `usage` events must NOT reach the parent HUD (see SubagentBus);
-  // this carries the one number the session cost readout genuinely needs.
-  | { type: 'subagent_usage'; costUSD: number; subagent?: string }
+  // this carries the one number the session cost readout genuinely needs. `taskId` + token counts
+  // let the HUD attribute the spend to the exact agent panel row (not just the type).
+  | { type: 'subagent_usage'; costUSD: number; subagent?: string; taskId?: string; inputTokens?: number; outputTokens?: number }
   // Sub-agent visibility (BUG 3). Emitted by the `agent` tool directly on the PARENT bus so the
   // TUI/REPL can surface what delegated agents are doing WITHOUT folding them into the parent's
   // single live-tool row. `subagent_start`/`subagent_end` bracket a sub-agent's run; live activity
   // arrives on the forwarded `tool_start`/`tool_end` events, which the SubagentBus tags with the
   // same `subagent` taskId so the UI can route them to the sub-agent panel instead of the parent.
-  | { type: 'subagent_start'; taskId: string; subagentType: string; description?: string }
+  // F06-10: the session concurrency semaphore can delay a sub-agent's admission. A delayed agent
+  // is announced with `queued: true`, then RE-announced with `queued: false` once a slot frees —
+  // re-registration is safe because nothing has run yet (counters are still zero at admission).
+  | { type: 'subagent_start'; taskId: string; subagentType: string; description?: string; background?: boolean; queued?: boolean }
   | { type: 'subagent_end'; taskId: string; ok: boolean; subagentType?: string }
+  // A REQUEST (UI → running bg agent) to cancel a background sub-agent by taskId, or all when
+  // taskId is '*'. Emitted on the parent bus; the bg `agent` tool run listens for its own taskId and
+  // aborts its sub-loop. Completes the F10-02 story: bg agents were visible but uncancellable.
+  | { type: 'cancel_subagent'; taskId: string }
 
 export type StopReasonExt =
   | StopReason
@@ -99,6 +110,10 @@ export const SUBAGENT_FORWARDED_EVENTS: ReadonlySet<LoopEvent['type']> = new Set
   'task_notification',
   'subagent_usage',
   'error',
+  // F04-11: a sub-agent's degraded compaction (and its loop-guard warnings) must reach the
+  // operator, not die on a bus nobody renders. Findings are rare operator-facing warnings —
+  // forwarding them cannot spam the way streamed deltas would.
+  'finding',
 ] as const);
 
 /**
@@ -119,7 +134,10 @@ export class SubagentBus extends EventBus {
   override emit(e: LoopEvent): void {
     super.emit(e);
     if (this.forward.has(e.type)) {
-      if (this.meta && (e.type === 'tool_start' || e.type === 'tool_end' || e.type === 'tool_denied')) {
+      if (
+        this.meta &&
+        (e.type === 'tool_start' || e.type === 'tool_end' || e.type === 'tool_denied' || e.type === 'finding')
+      ) {
         this.parent.emit({ ...e, subagent: this.meta.subagent } as LoopEvent);
       } else {
         this.parent.emit(e);

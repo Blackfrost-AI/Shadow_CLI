@@ -82,13 +82,19 @@ export function graphemes(s: string): string[] {
   return Array.from(s);
 }
 
-/** The grapheme cluster starting at UTF-16 index `i` (never splits a surrogate pair or a ZWJ run). */
+/**
+ * The grapheme cluster starting at UTF-16 index `i` (never splits a surrogate pair or a ZWJ run).
+ * F06-06: iterates `segmenter.segment(text)` directly — the old cut segmented `text.slice(i)`,
+ * copying and re-segmenting the entire tail on every call. Hot callers only ever ask for i = 0.
+ */
 export function nextCluster(text: string, i: number): string {
   if (!segmenter) {
     const cp = text.codePointAt(i);
     return cp === undefined ? '' : String.fromCodePoint(cp);
   }
-  for (const g of segmenter.segment(text.slice(i))) return g.segment;
+  for (const g of segmenter.segment(text)) {
+    if (g.index >= i) return g.segment;
+  }
   return text.slice(i, i + 1);
 }
 
@@ -99,13 +105,30 @@ export function nextCluster(text: string, i: number): string {
  * measure "too wide" and get needlessly split.
  */
 export function displayWidth(s: string): number {
+  const clean = s.replace(/\x1b\[[0-9;]*m/g, '');
+  if (isPlainAscii(clean)) return clean.length; // F06-06: fast path — no segmentation
   let w = 0;
-  for (const g of graphemes(s.replace(/\x1b\[[0-9;]*m/g, ''))) {
-    let gw = 0;
-    for (const ch of g) gw = Math.max(gw, charWidth(ch.codePointAt(0) ?? 0));
-    w += gw;
-  }
+  for (const g of graphemes(clean)) w += clusterWidth(g);
   return w;
+}
+
+/** True when every UTF-16 unit is printable ASCII (0x20..0x7e) — then width === length, and no
+ * segmentation is needed. This is the overwhelmingly common case for transcript rows. */
+function isPlainAscii(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c < 0x20 || c > 0x7e) return false;
+  }
+  return true;
+}
+
+const SGR_RE = /\x1b\[[0-9;]*m/g;
+
+/** Width of one grapheme cluster: its widest code point. */
+function clusterWidth(cluster: string): number {
+  let gw = 0;
+  for (const ch of cluster) gw = Math.max(gw, charWidth(ch.codePointAt(0) ?? 0));
+  return gw;
 }
 
 /**
@@ -115,38 +138,106 @@ export function displayWidth(s: string): number {
  * `.slice(0, room)` it replaces could not offer. When even the first cluster is too wide (a 2-column
  * character with `cols === 1`), `head` comes back empty so the caller can wrap instead of looping;
  * callers that cannot wrap must handle the empty head explicitly.
+ *
+ * F06-06: ONE segmentation pass carrying the running index (`g.index` is the UTF-16 offset, so
+ * nothing is re-sliced per cluster). The old cut called `nextCluster` → `segmenter.segment(text.slice(i))`
+ * per step — an O(n²) re-segment of the shrinking tail that turned a long line into a multi-second
+ * stall (flatten.ts measures every transcript row through here). SGR escapes are stripped FIRST,
+ * matching displayWidth's documented semantics (they occupy no columns); the old per-cluster
+ * measurement could not match the full escape and counted its `[31m` tail as visible width.
  */
 export function takeByWidth(s: string, cols: number): { head: string; rest: string; width: number } {
   if (cols <= 0) return { head: '', rest: s, width: 0 };
+  const clean = s.replace(SGR_RE, '');
+  if (isPlainAscii(clean)) {
+    return { head: clean.slice(0, cols), rest: clean.slice(cols), width: Math.min(clean.length, cols) };
+  }
+  if (segmenter) {
+    let w = 0;
+    let cut = clean.length;
+    for (const g of segmenter.segment(clean)) {
+      const cw = clusterWidth(g.segment);
+      if (w + cw > cols) {
+        cut = g.index;
+        break;
+      }
+      w += cw;
+    }
+    return { head: clean.slice(0, cut), rest: clean.slice(cut), width: w };
+  }
+  // No Intl.Segmenter: code-point walk (never splits a surrogate pair; ZWJ sequences can split —
+  // the same fallback the old cut degraded to, since nextCluster falls back to single code points).
   let w = 0;
   let i = 0;
-  while (i < s.length) {
-    const cluster = nextCluster(s, i);
-    if (cluster === '') break;
-    const cw = displayWidth(cluster);
+  while (i < clean.length) {
+    const cp = clean.codePointAt(i)!;
+    const cw = charWidth(cp);
     if (w + cw > cols) break;
     w += cw;
-    i += cluster.length;
+    i += cp > 0xffff ? 2 : 1;
   }
-  return { head: s.slice(0, i), rest: s.slice(i), width: w };
+  return { head: clean.slice(0, i), rest: clean.slice(i), width: w };
 }
 
-/** Hard-split into chunks of at most `cols` columns each. Always returns ≥ 1 chunk. */
+/**
+ * Hard-split into chunks of at most `cols` columns each. Always returns ≥ 1 chunk.
+ *
+ * F06-06: single segmentation pass for the WHOLE string — the old cut re-ran takeByWidth on the
+ * shrinking remainder per chunk, re-segmenting from scratch each time (O(chunks × n) segmenter
+ * work on top of the O(n²) per-step slice).
+ */
 export function chunksByWidth(s: string, cols: number): string[] {
-  const w = Math.max(1, cols);
+  const budget = Math.max(1, cols);
+  const clean = s.replace(SGR_RE, '');
+  if (clean === '') return [''];
+  if (isPlainAscii(clean)) {
+    const out: string[] = [];
+    for (let i = 0; i < clean.length; i += budget) out.push(clean.slice(i, i + budget));
+    return out;
+  }
   const out: string[] = [];
-  let rest = s;
-  while (rest !== '') {
-    const { head, rest: tail } = takeByWidth(rest, w);
-    if (head === '') {
+  let chunkStart = 0;
+  let w = 0;
+  const close = (end: number): void => {
+    out.push(clean.slice(chunkStart, end));
+    chunkStart = end;
+    w = 0;
+  };
+  if (segmenter) {
+    let prevEnd = 0;
+    for (const g of segmenter.segment(clean)) {
+      const cw = clusterWidth(g.segment);
+      if (w > 0 && w + cw > budget) close(g.index);
       // A single cluster wider than the whole budget: emit it alone rather than spin forever.
-      const cluster = nextCluster(rest, 0) || rest.slice(0, 1);
-      out.push(cluster);
-      rest = rest.slice(cluster.length);
-      continue;
+      // (No close() here: w === 0 means nothing is pending — closing would emit an empty chunk.)
+      if (cw > budget && w === 0) {
+        out.push(g.segment);
+        chunkStart = g.index + g.segment.length;
+        w = 0;
+      } else {
+        w += cw;
+      }
+      prevEnd = g.index + g.segment.length;
     }
-    out.push(head);
-    rest = tail;
+    if (chunkStart < prevEnd) close(prevEnd);
+  } else {
+    let i = 0;
+    while (i < clean.length) {
+      const cp = clean.codePointAt(i)!;
+      const cw = charWidth(cp);
+      const len = cp > 0xffff ? 2 : 1;
+      if (w > 0 && w + cw > budget) close(i);
+      // Same as the segmenter branch: w === 0 means nothing pending, so no close() here.
+      if (cw > budget && w === 0) {
+        out.push(clean.slice(i, i + len));
+        chunkStart = i + len;
+        w = 0;
+      } else {
+        w += cw;
+      }
+      i += len;
+    }
+    if (chunkStart < clean.length) close(clean.length);
   }
   return out.length ? out : [''];
 }

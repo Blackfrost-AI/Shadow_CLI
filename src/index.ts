@@ -14,7 +14,8 @@ import {
 } from './config.js';
 import { vaultExists } from './auth/vault.js';
 import { vaultUnlocked } from './state/globalStore.js';
-import { createProvider } from './provider/index.js';
+import { createProvider, entryStreamContract } from './provider/index.js';
+import { assessReasoningReplayAlias } from './provider/openai.js';
 import {
   configuredContextWindow,
   detectServerContextWindow,
@@ -59,6 +60,7 @@ import { Context } from './agent/context.js';
 import { AgentLoop } from './agent/loop.js';
 import { buildLoopDeps } from './agent/loopDeps.js';
 import { createAgentSession } from './agent/bootstrap.js';
+import { MAX_WAKEUPS_PER_WINDOW } from './agent/wakeup.js';
 import { raiseAutonomy, type AutonomyLevel } from './safety/permissions.js';
 import { makeDenylist } from './safety/denylist.js';
 import type { ToolCall } from './provider/provider.js';
@@ -75,6 +77,7 @@ import { runDoctor, formatDoctorReport } from './doctor.js';
 import { runModelCheck, formatModelCheckReport } from './doctor/modelCheck.js';
 import { buildPrivacyReport, gatherPrivacyEnv, formatPrivacyReport, type PrivacyConfigView } from './doctor/privacy.js';
 import { DEV_UNRESTRICTED, resolveUnrestricted } from './buildProfile.js';
+import { unconfinedBanner } from './safety/sandbox.js';
 import { runTui, attachRenderer } from './tui.js';
 import { runOnboard } from './onboard/onboard.js';
 import { INSTALL_DIR } from './installDir.js';
@@ -141,10 +144,12 @@ function helpText(): string {
     '  update               self-update: git checkout → pull+rebuild; binary install → re-fetch from host',
     '  export [path.md]     export session log to markdown (--session, --out)',
     '  mcp <list|enable|disable>  manage MCP servers (e.g. `mcp enable browser`)',
+    '  plugin <add|list|enable|disable|remove|search>  local-first plugin manager (data-only markdown bundles)',
     '  local <add|list|test|use|remove>  manage local models — .gguf or MLX (no Ollama/LM Studio needed)',
     '  doctor               diagnose Node, ripgrep, credentials, provider, guardrails',
     '  doctor --privacy     prove this config\'s privacy posture: egress, keys-at-rest, offline (no network)',
     '  doctor model [name]  capability test: can this model code agentically? (active model or a preset)',
+    '  egress               show the outbound-connection receipt (~/.shadow/egress.log) — who Shadow talked to, why, allowed/denied',
     '  resume [--session]   resume a prior session from its latest context snapshot',
     '  login codex|grok     OAuth login (codex only; grok uses API key)',
     '',
@@ -333,6 +338,155 @@ function runMcp(args: string[]): void {
   }
 
   stdout.write('usage: shadow mcp <list | enable browser | enable context-cooler [--path <p>] | disable <name>>\n');
+}
+
+// ── Plugin manager (P3-07 — local-first, auditable, DATA-only) ──────────────
+
+function pluginUsage(): string {
+  return [
+    'usage: shadow plugin <command>',
+    '',
+    '  add <git-url | path>   install a plugin (installs DISABLED — review, then enable)',
+    '  add <name>             resolve <name> against your configured plugin index, then install',
+    '  list                   show installed plugins (status · provenance · contributions)',
+    '  enable <name>          enable an installed plugin',
+    '  disable <name>         disable a plugin (files stay installed)',
+    '  remove <name>          archive the plugin under ~/.shadow/plugins/.removed/',
+    '  search [query]         search the configured index (pluginIndexUrl — none by default)',
+    '',
+    'Plugins are DATA-only: they contribute markdown to the five declarative surfaces',
+    '(commands, output-styles, skills, agents, workflows). Hooks and MCP servers can NEVER',
+    'be installed by a plugin — those stay manual entries in ~/.shadow/config.json.',
+    '',
+  ].join('\n');
+}
+
+type IndexCfg = { pluginIndexUrl?: string; pluginIndexKey?: string };
+
+async function runPlugin(args: string[], offline = false): Promise<void> {
+  const {
+    installPluginFromArg, installPluginFromGit, listPlugins, setPluginEnabled, removePlugin,
+    PLUGIN_CONTENT_DIRS, displaySafe,
+  } = await import('./plugins/manager.js');
+  const { fetchPluginIndex, filterIndex, resolveIndexUrl } = await import('./plugins/registry.js');
+  const fail = (msg: string): void => {
+    process.stderr.write(msg + '\n');
+    process.exitCode = 1;
+  };
+  const sub = args[0];
+
+  if (!sub || sub === 'help' || sub === '--help' || sub === '-h') {
+    stdout.write(pluginUsage());
+    return;
+  }
+
+  if (sub === 'list') {
+    const plugins = listPlugins();
+    if (plugins.length === 0) {
+      stdout.write('No plugins installed. `shadow plugin add <git-url | path>` installs one — disabled until you enable it.\n');
+      return;
+    }
+    for (const p of plugins) {
+      const status = p.meta.enabled ? lc.green('enabled ') : lc.yellow('disabled');
+      const prov = p.meta.source.kind === 'git'
+        ? `${p.meta.source.url}${p.meta.source.commit ? ` @ ${p.meta.source.commit.slice(0, 12)}` : ''}`
+        : p.meta.source.path;
+      const counts = PLUGIN_CONTENT_DIRS
+        .filter((k) => p.counts[k] > 0)
+        .map((k) => `${p.counts[k]} ${k}`)
+        .join(', ') || 'no content';
+      // Every field below is attacker-controlled (manifest/index bytes) — displaySafe before print.
+      stdout.write(`  ${status} ${lc.bold(p.name)} v${displaySafe(p.manifest.version, 64)} — ${displaySafe(p.manifest.description, 300)}\n`);
+      stdout.write(`         ${lc.gray(`${counts} · from ${displaySafe(prov, 320)}`)}\n`);
+    }
+    stdout.write('Commands: shadow plugin enable <name> · disable <name> · remove <name> · search [query]\n');
+    return;
+  }
+
+  if (sub === 'add') {
+    const arg = (args[1] ?? '').trim();
+    if (!arg) return fail('usage: shadow plugin add <git-url | path | index-name>');
+    // A bare token with no path/URL shape is an index NAME lookup; anything else is a direct source.
+    const directSource =
+      arg.includes('/') || arg.includes(':') || arg.includes('@') || arg.startsWith('.') || arg.startsWith('~');
+    try {
+      let source = arg;
+      if (!directSource) {
+        const gcfg = loadGlobalConfig() as IndexCfg;
+        const url = await resolveIndexUrl(arg, gcfg);
+        if (!url) {
+          return fail(
+            `plugin "${arg}" is not in your configured index. Use a git URL or path directly: shadow plugin add <git-url | path>`,
+          );
+        }
+        stdout.write(lc.gray(`index entry "${arg}" → ${displaySafe(url, 320)}\n`));
+        source = url;
+      }
+      const info = directSource ? installPluginFromArg(source, { offline }) : installPluginFromGit(source, { offline });
+      stdout.write(lc.green(`✓ installed plugin "${info.name}" v${displaySafe(info.manifest.version, 64)} — DISABLED until you review it`) + '\n');
+      stdout.write(`  files:  ${info.dir}\n`);
+      stdout.write(`  enable: shadow plugin enable ${info.name}   (or /plugins enable ${info.name} in the TUI)\n`);
+    } catch (err) {
+      return fail((err as Error).message);
+    }
+    return;
+  }
+
+  if (sub === 'enable' || sub === 'disable') {
+    const name = (args[1] ?? '').trim();
+    if (!name) return fail(`usage: shadow plugin ${sub} <name>`);
+    try {
+      const info = setPluginEnabled(name, sub === 'enable');
+      if (sub === 'enable') {
+        stdout.write(lc.green(`✓ enabled plugin "${info.name}"`) + ' — start a new session (or restart) to load its content.\n');
+      } else {
+        stdout.write(lc.yellow(`disabled plugin "${info.name}"`) + ' — start a new session (or restart) to unload its content.\n');
+      }
+    } catch (err) {
+      return fail((err as Error).message);
+    }
+    return;
+  }
+
+  if (sub === 'remove') {
+    const name = (args[1] ?? '').trim();
+    if (!name) return fail('usage: shadow plugin remove <name>');
+    try {
+      const archive = removePlugin(name);
+      stdout.write(`archived plugin "${name}" → ${archive}\n`);
+      stdout.write(lc.gray('(remove archives, never deletes — the folder can be restored or inspected)\n'));
+    } catch (err) {
+      return fail((err as Error).message);
+    }
+    return;
+  }
+
+  if (sub === 'search') {
+    const query = args.slice(1).join(' ');
+    try {
+      const idx = await fetchPluginIndex(loadGlobalConfig() as IndexCfg);
+      const badge = idx.keyConfigured
+        ? lc.green('signature verified')
+        : lc.yellow('unsigned index — entries are untrusted listings; review before installing');
+      stdout.write(`index: ${displaySafe(idx.sourceUrl, 2048)} (${badge})\n`);
+      const rows = filterIndex(idx.entries, query);
+      if (rows.length === 0) {
+        stdout.write('no matching entries.\n');
+        return;
+      }
+      for (const e of rows) {
+        stdout.write(`  ${lc.bold(e.name)}${e.version ? ` v${e.version}` : ''} — ${e.description}\n`);
+        stdout.write(`         ${lc.gray(displaySafe(e.url, 2048))}\n`);
+      }
+      stdout.write('Install: shadow plugin add <url>  (installs DISABLED — review the files before enabling)\n');
+    } catch (err) {
+      return fail((err as Error).message);
+    }
+    return;
+  }
+
+  stdout.write(pluginUsage());
+  process.exitCode = 1;
 }
 
 // Minimal ANSI helpers for `shadow local` output (matches the onboarding tone).
@@ -620,6 +774,8 @@ async function runDoctorModel(name: string | undefined, cwd: string): Promise<vo
   let probeProvider;
   try {
     probeProvider = createProvider({
+      // F10-01: probe with the entry's real wire contract (idle knobs + capability block).
+      ...entryStreamContract(entry ?? undefined),
       provider: startProvider,
       model,
       apiKey,
@@ -777,6 +933,18 @@ async function main(): Promise<void> {
     if (!report.ok) process.exitCode = 1;
     return;
   }
+  if (argv[0] === 'egress') {
+    // The runtime receipt: aggregate ~/.shadow/egress.log from DISK so this works in a fresh
+    // process, independent of whatever session recorded it (P2-01 acceptance criterion).
+    const { readEgressLogAggregate, formatEgressReport, egressLogPath } = await import('./safety/egress.js');
+    const rows = await readEgressLogAggregate();
+    stdout.write(formatEgressReport(rows, egressLogPath()) + '\n');
+    return;
+  }
+  if (argv[0] === 'plugin' || argv[0] === 'plugins') {
+    await runPlugin(argv.slice(1), argv.includes('--offline'));
+    return;
+  }
   const flags = parseArgs(argv);
   if (flags.help) {
     stdout.write(helpText() + '\n');
@@ -868,6 +1036,15 @@ async function main(): Promise<void> {
   });
   if (flags.noSandbox || unrestricted) cfg = { ...cfg, sandbox: 'off' };
 
+  // P3-04 — the unconfined state must be IMPOSSIBLE TO MISS: a loud banner at startup whenever
+  // the sandbox was requested but this host has no tool to enforce it (the failure policy then
+  // decides what the approval gate does about it — see sandboxFailurePolicy). Printed before any
+  // UI starts so both the TUI and headless paths show it.
+  {
+    const banner = unconfinedBanner(cfg.sandbox, cfg.sandboxFailurePolicy);
+    if (banner) process.stderr.write(`${banner}\n`);
+  }
+
   const workspaceRoot = resolve(cwd, flags.workspace ?? '.');
   // Extra granted roots (config additionalDirectories / --add-dir), absolute + de-duped.
   // These widen BOTH the file-tool jail and the run_shell sandbox so an approved write
@@ -953,10 +1130,26 @@ async function main(): Promise<void> {
   void memory;
   void skills;
   void facts;
-  void wakeup;
 
   const bus = new EventBus();
-  bus.on((e) => sessionLog.record({ kind: 'event', ...e }));
+  // recordEvent drops the per-token stream deltas (text/thinking/shell_output) that used to
+  // trigger a redact+stringify+write on EVERY token; the committed assistant_done/reasoning_done
+  // events carry the same text for resume/replay (P1B-06).
+  bus.on((e) => sessionLog.recordEvent(e));
+
+  // P1A-10: warn once at startup when the active model's reasoning-replay contract is
+  // alias-ambiguous — a self-hosted endpoint whose id carries no known reasoning marker and that
+  // has no capability override. Pointing at the pre-set override (capabilities block) resolves it.
+  const aliasReasoningWarning = assessReasoningReplayAlias(
+    session.activeModelEntry?.model ?? cfg.model,
+    {
+      selfHosted: session.startSelfHosted,
+      capabilities: session.activeModelEntry?.capabilities,
+    },
+  );
+  if (aliasReasoningWarning) {
+    bus.emit({ type: 'finding', severity: 'warn', title: 'Alias-safe reasoning replay', body: aliasReasoningWarning });
+  }
 
   // Hoisted above the --web mirror below: its model()/autonomy() getters close over these live
   // bindings, and a GET /api/sessions can call them while main() is still awaiting MCP startup
@@ -1067,12 +1260,23 @@ async function main(): Promise<void> {
 
   // Offline mode: skip MCP servers entirely — they are outbound connectors (another egress
   // vector), so an offline session keeps nothing but the local model.
-  let mcpClients: Array<{ stop(): void }> = [];
+  const mcpClients: Array<{ stop(): void }> = [];
+  let mcpSettled: Promise<void> | undefined;
   if (offline) {
     const mcpCount = Object.keys(cfg.mcpServers ?? {}).length;
     if (mcpCount > 0) stdout.write(lc.gray(`Offline: skipping ${mcpCount} MCP server(s).`) + '\n');
-  } else {
-    mcpClients = await registerMcpServers(registry, cfg.mcpServers, workspaceRoot);
+  } else if (Object.keys(cfg.mcpServers ?? {}).length > 0) {
+    // F06-09: first paint is NOT gated on MCP connects. The loop resolves tools by NAME at call
+    // time (registry.get) and re-exports schemas every turn, so a server that registers late is
+    // merely "not there yet" for the first moments — never an error. Clients are tracked from
+    // CONSTRUCTION (onClient) so the exit handler below kills in-flight children too. Headless
+    // runs still await the settle before the first turn (a one-shot task gets its full toolbox);
+    // only the interactive TUI starts painting immediately.
+    const connecting = registerMcpServers(registry, cfg.mcpServers, workspaceRoot, (c) => mcpClients.push(c));
+    mcpSettled = connecting.then(
+      () => undefined,
+      () => undefined, // per-server failures are warned by registerMcpServers itself
+    );
   }
 
   // Shutdown cleanup: kill orphaned background shells + stdio MCP children + gguf servers on exit.
@@ -1126,6 +1330,21 @@ async function main(): Promise<void> {
   const wakeupHandler = {
     fire: (_task: string, _reason: string) => {},
   };
+  // F04-09: make the wakeup rate ceiling VISIBLE. The scheduler drops a due wakeup when the
+  // per-session ceiling is reached; without this wiring that drop would be silent and the model
+  // would believe the task is still scheduled. Surface it on the bus (warning) and the log.
+  wakeup.onRateLimited = (job) => {
+    bus.emit({
+      type: 'finding',
+      severity: 'warn',
+      title: 'Wakeup dropped: rate ceiling reached',
+      body:
+        `The scheduled wakeup "${job.reason}" was dropped because the session already fired ` +
+        `${MAX_WAKEUPS_PER_WINDOW} wakeups within the rate window. This protects against a ` +
+        `runaway self-rescheduling loop. Schedule with a longer delay if this task is still needed.`,
+    });
+    sessionLog.record({ kind: 'wakeup_rate_limited', task: job.task, reason: job.reason });
+  };
   registry.register(
     makeScheduleWakeupTool(wakeup, (task, reason) => wakeupHandler.fire(task, reason)),
   );
@@ -1158,6 +1377,8 @@ async function main(): Promise<void> {
             contextBudget: cfg.contextBudget,
             triggerRatio: cfg.summarizeTriggerRatio,
             keepLastTurns: cfg.keepLastTurns,
+            microcompact: cfg.microcompact, // P1B-02: honor the disable switch on sub-agent contexts too
+            microcompactRatio: cfg.microcompactTriggerRatio,
           }),
           signal: new AbortController().signal,
           // LIVE sub-agent model — parallelTools resolves against this, not cfg.model
@@ -1169,6 +1390,9 @@ async function main(): Promise<void> {
           todoList,
           planMode,
           streamShell: false,
+          // F04-11: a sub-agent's degraded compaction must leave a durable trace — without the
+          // session log its compaction_degraded record is a no-op and the failure is invisible.
+          sessionLog,
         }),
       getAutonomy: () => autonomy,
       contextBudget: cfg.contextBudget,
@@ -1176,6 +1400,7 @@ async function main(): Promise<void> {
       keepLastTurns: cfg.keepLastTurns,
       maxIterations: cfg.maxIterations,
       priceTable: cfg.priceTable,
+      subagentConcurrency: cfg.subagentConcurrency, // F06-10
     }),
   );
 
@@ -1252,8 +1477,10 @@ async function main(): Promise<void> {
       streamShell: !headless,
       sessionLog,
       continuityState: '',
-      resolveFallback: async (entry) => {
-        const activated = await session.activateModel(entry);
+      resolveFallback: async (entry, fallbackSignal) => {
+        fallbackSignal?.throwIfAborted();
+        const activated = await session.activateModel(entry, fallbackSignal);
+        fallbackSignal?.throwIfAborted();
         activeMainProvider = activated.provider;
         activeAgentProvider = activated.provider;
         activeAgentModel = activated.model;
@@ -1295,22 +1522,46 @@ async function main(): Promise<void> {
 
   // Headless: one-shot --task, --repl, or piped/redirected stdio (no TTY for the raw-mode UI).
   if (headless) {
+    // F06-09: headless runs keep the old contract — the full toolbox is present before the first
+    // turn. Only the interactive TUI paints ahead of the MCP settle.
+    if (mcpSettled) await mcpSettled;
+    const detach = attachRenderer(bus, { animate: false });
+    // Abort controllers are one-shot. Reusing one for the whole REPL meant the first Ctrl-C
+    // permanently poisoned every later prompt: each new AgentLoop saw an already-aborted signal
+    // and stopped immediately. Keep a fresh controller per turn and point SIGINT at EVERY live
+    // one: the RUNNING turn must stay interruptible, and a turn queued on the process run lock
+    // (a fired wakeup) must stay cancellable while queued. A single slot was a race — a wakeup
+    // queuing mid-turn overwrote the running turn's controller, so Ctrl-C aborted the queued
+    // one and left the running turn un-interruptible for the rest of its life.
+    const liveControllers = new Set<AbortController>();
+    const runHeadlessTask = async (task: string, gate: ApprovalGate): Promise<void> => {
+      const controller = new AbortController();
+      liveControllers.add(controller);
+      try {
+        await buildAndRun(task, gate, controller.signal);
+      } finally {
+        liveControllers.delete(controller);
+      }
+    };
     wakeupHandler.fire = (task, reason) => {
       const gate: ApprovalGate = yolo ? new AutoApproveGate() : new AutoDenyGate();
-      // Fire-and-forget: the run lock now serializes it behind any in-flight turn, so this both
-      // needs a .catch (the queued/abort path is a new rejection surface — an unhandled rejection
+      // Fire-and-forget: the run lock serializes it behind any in-flight turn, so this both
+      // needs a .catch (the queued/abort path is a rejection surface — an unhandled rejection
       // would exit the process under Node's default) and no longer races a concurrent wakeup.
-      void buildAndRun(`[wakeup: ${reason}] ${task}`, gate, new AbortController().signal).catch(() => {});
+      // F04-09: route through runHeadlessTask so the turn's controller joins liveControllers —
+      // SIGINT/Ctrl-C reaches wakeup turns exactly like typed ones (the old throwaway controller
+      // made a fired wakeup un-interruptible).
+      void runHeadlessTask(`[wakeup: ${reason}] ${task}`, gate).catch(() => {});
     };
-    const detach = attachRenderer(bus, { animate: false });
-    const controller = new AbortController();
-    const onSigint = () => controller.abort();
+    const onSigint = () => {
+      for (const c of liveControllers) c.abort();
+    };
     process.on('SIGINT', onSigint);
     try {
       if (flags.task) {
         // One-shot automation: no human to ask, so gated calls are denied.
         const gate: ApprovalGate = yolo ? new AutoApproveGate() : new AutoDenyGate();
-        await buildAndRun(flags.task, gate, controller.signal);
+        await runHeadlessTask(flags.task, gate);
       } else if (interactive) {
         const rl = createInterface({ input: process.stdin, output: process.stdout });
         const onTurnError = (err: unknown): void => {
@@ -1335,7 +1586,7 @@ async function main(): Promise<void> {
             if (task === 'exit' || task === 'quit') break;
             if (!task) continue;
             try {
-              await buildAndRun(task, gate, controller.signal);
+              await runHeadlessTask(task, gate);
             } catch (err) {
               onTurnError(err);
             }
@@ -1353,7 +1604,7 @@ async function main(): Promise<void> {
           if (task === 'exit' || task === 'quit') break;
           if (!task) continue;
           try {
-            await buildAndRun(task, gate, controller.signal);
+            await runHeadlessTask(task, gate);
           } catch (err) {
             process.stderr.write(`\n\x1b[31m${(err as Error).message}\x1b[0m\n`);
           }
@@ -1362,6 +1613,10 @@ async function main(): Promise<void> {
     } finally {
       detach();
       process.removeListener('SIGINT', onSigint);
+      // F04-09 teardown: pending wakeups belong to THIS session. Without clearing them a
+      // queued timer fires after the user has left — an invisible turn spending tokens and
+      // running tools against a torn-down gate.
+      wakeup.clear();
       await stopGgufServers();
       if (cfg.hooks?.session_end?.length) {
         runHookPhase('session_end', cfg.hooks.session_end, { workspaceRoot });
@@ -1393,6 +1648,7 @@ async function main(): Promise<void> {
       autonomy,
       bypass: yolo,
       offline,
+      mcpPending: mcpSettled,
       version: VERSION,
       styleState,
       todoList,
@@ -1425,6 +1681,8 @@ async function main(): Promise<void> {
       },
     });
   } finally {
+    // F04-09 teardown: cancel pending wakeups so none can fire after the TUI exits.
+    wakeup.clear();
     // The mirror holds an open listener; without closing it the process would not exit.
     if (webMirror) await webMirror.close().catch(() => {});
     await stopGgufServers();

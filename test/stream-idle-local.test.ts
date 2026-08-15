@@ -14,15 +14,22 @@ import { isLocalBaseUrl } from '../src/safety/offline.js';
  */
 test('the idle re-fire is suppressed for local endpoints only', () => {
   const src = readFileSync(new URL('../src/provider/stream.ts', import.meta.url), 'utf8');
+  // The C4 guard survives — a local/self-hosted idle trip must never re-POST the prompt.
   assert.match(
     src,
-    /if \(reason === 'idle' && isLocalBaseUrl\(a\.url\)\) return false;/,
-    'an idle trip against a local URL must not re-POST the prompt',
+    /if \(reason === 'idle' && \(selfHosted \|\| isLocalBaseUrl\(a\.url\)\)\) return false;/,
+    'an idle trip against a local/self-hosted URL must not re-POST the prompt',
   );
   // …and the idle call site must actually pass that reason, or the guard is dead code.
-  assert.match(src, /nonStreamFallback\(a, 'idle'\)/, "the idle path must tag itself as 'idle'");
-  // The empty-response path keeps the fallback — nothing was computed there, so a retry is free.
-  assert.match(src, /emitted === 0 && \(yield\* nonStreamFallback\(a\)\)/, 'the empty-response rescue stays');
+  assert.match(src, /nonStreamFallback\(a, 'idle', selfHosted\)/, "the idle path must tag itself as 'idle'");
+  // The empty-response rescue stays for a NON-self-hosted endpoint (public API never started —
+  // re-POST is free); but the SAME shape is tagged 'idle' for a headers-first self-hosted serve
+  // that already received the prompt (vLLM/SGLang long prefill, P1A-04).
+  assert.match(
+    src,
+    /nonStreamFallback\(a, selfHosted \? 'idle' : 'empty', selfHosted\)/,
+    'the mid-stream stall rescue is tagged idle for selfHosted, empty otherwise',
+  );
 });
 
 test('the local-URL predicate covers the shapes a local serve actually uses', () => {

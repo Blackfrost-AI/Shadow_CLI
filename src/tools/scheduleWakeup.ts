@@ -27,7 +27,10 @@ export function makeScheduleWakeupTool(
     inputSchema,
     async run(input) {
       const job = scheduler.schedule(input.delay_seconds, input.reason, input.task, onFire);
-      return ok('schedule_wakeup', 'read', 0, `Wakeup scheduled in ${input.delay_seconds}s: ${input.reason}`, {
+      // F04-09: report the EFFECTIVE delay — the scheduler raises sub-minimum requests to the
+      // floor, and the model must see that, not the delay it asked for.
+      const raised = job.delaySec > input.delay_seconds ? ` (raised to the ${job.delaySec}s minimum)` : '';
+      return ok('schedule_wakeup', 'read', 0, `Wakeup scheduled in ${job.delaySec}s${raised}: ${input.reason}`, {
         id: job.id,
         at: job.at,
       });

@@ -1,7 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Context } from '../src/agent/context.js';
+import { Context, TRUNCATED_RESULT_SENTINEL } from '../src/agent/context.js';
 import { MockProvider } from '../src/provider/mock.js';
+import type { Provider, ProviderEvent } from '../src/provider/provider.js';
 
 test('estimateTokens prefers the real recorded request size over the char/4 heuristic', () => {
   const ctx = new Context({ contextBudget: 100_000, triggerRatio: 0.75, keepLastTurns: 6 });
@@ -29,7 +30,7 @@ test('maybeSummarize(force) compacts even below the trigger threshold', async ()
   const provider = new MockProvider([[{ type: 'text', delta: 'SUMMARY' }, { type: 'done', stopReason: 'end_turn' }]]);
 
   const did = await ctx.maybeSummarize(provider, 'mock', true);
-  assert.equal(did, true, 'force compacts despite being under threshold');
+  assert.equal(did, 'summarized', 'force compacts despite being under threshold');
   const after = ctx.messages();
   assert.ok(after.length < before, 'history shrank');
   const note = after[1]!;
@@ -70,7 +71,7 @@ test('compaction prompt sees the authoritative recent tail and live goal state',
   const did = await ctx.maybeSummarize(provider, 'mock', true, undefined, {
     continuity: 'Standing goal: finish every confirmed security fix.',
   });
-  assert.equal(did, true);
+  assert.equal(did, 'summarized');
   assert.match(prompt, /RECENT RETAINED TAIL/);
   assert.match(prompt, /CURRENTLY editing src\/update\.ts/);
   assert.match(prompt, /NEXT run the signature tests/);
@@ -86,7 +87,7 @@ test('pre-compact callback fires only when a summary request actually starts', a
   const provider = new MockProvider([[{ type: 'text', delta: 'NEXT STEP — continue.' }, { type: 'done', stopReason: 'end_turn' }]]);
   assert.equal(await ctx.maybeSummarize(provider, 'mock', false, undefined, { beforeCompact: () => called++ }), false);
   assert.equal(called, 0);
-  assert.equal(await ctx.maybeSummarize(provider, 'mock', true, undefined, { beforeCompact: () => called++ }), true);
+  assert.equal(await ctx.maybeSummarize(provider, 'mock', true, undefined, { beforeCompact: () => called++ }), 'summarized');
   assert.equal(called, 1);
 });
 
@@ -119,7 +120,7 @@ test('compaction preserves later-turn instructions verbatim even when the summar
   }
   // Weak local summarizer: keeps NEXT STEP but omits the TASK line entirely.
   const weak = new MockProvider([[{ type: 'text', delta: 'NEXT STEP — continue with remaining files.' }, { type: 'done', stopReason: 'end_turn' }]]);
-  assert.equal(await ctx.maybeSummarize(weak, 'mock', true), true);
+  assert.equal(await ctx.maybeSummarize(weak, 'mock', true), 'summarized');
 
   const text = ctx.messages().map((m) => m.content.map((b) => (b.type === 'text' ? b.text : '')).join(' ')).join('\n');
   assert.match(text, /fetchJson/, 'the load-bearing instruction survives verbatim');
@@ -148,15 +149,40 @@ test('compaction carries instructions forward across a second compaction', async
   assert.equal(text.split('Rename symbol Foo to Bar').length - 1, 1, 'instruction is carried, not duplicated');
 });
 
-test('maybeSummarize aborts (keeps history) if the summary comes back empty', async () => {
+test('maybeSummarize with an empty summary is a VISIBLE failure and never destroys history', async () => {
   const ctx = new Context({ contextBudget: 1_000_000, triggerRatio: 0.75, keepLastTurns: 1 });
   ctx.pinTask({ role: 'user', content: [{ type: 'text', text: 'the task' }] });
   for (let i = 0; i < 4; i++) ctx.append({ role: i % 2 ? 'user' : 'assistant', content: [{ type: 'text', text: `m${i}` }] });
   const before = ctx.messages().length;
-  // Provider yields no text → empty summary. Must NOT destroy history for nothing.
+  // Provider yields no text → empty summary. F04-11: that is a failure, not a silent no-op —
+  // the caller must be able to tell. With only text turns there is nothing reclaimable locally,
+  // so the outcome is 'failed'; history must still NOT be destroyed for nothing.
   const provider = new MockProvider([[{ type: 'done', stopReason: 'end_turn' }]]);
-  assert.equal(await ctx.maybeSummarize(provider, 'mock', true), false, 'empty summary → no-op');
+  assert.equal(await ctx.maybeSummarize(provider, 'mock', true), 'failed', 'empty summary → visible failure');
   assert.equal(ctx.messages().length, before, 'history intact');
+});
+
+test('maybeSummarize abort after a partial delta leaves context byte-for-byte unchanged', async () => {
+  const ctx = new Context({ contextBudget: 1_000_000, triggerRatio: 0.75, keepLastTurns: 1 });
+  ctx.pinTask({ role: 'user', content: [{ type: 'text', text: 'the task' }] });
+  for (let i = 0; i < 5; i++) {
+    ctx.append({ role: i % 2 ? 'user' : 'assistant', content: [{ type: 'text', text: `message ${i}` }] });
+  }
+  ctx.recordActualTokens(1234);
+  const before = structuredClone(ctx.exportState());
+  const controller = new AbortController();
+  const provider: Provider = {
+    name: 'partial-compact',
+    estimateTokens: () => 100,
+    async *send(): AsyncIterable<ProviderEvent> {
+      yield { type: 'text', delta: 'TRUNCATED SUMMARY' };
+      controller.abort();
+      yield { type: 'done', stopReason: 'end_turn' };
+    },
+  };
+
+  assert.equal(await ctx.maybeSummarize(provider, 'mock', true, controller.signal), false);
+  assert.deepEqual(ctx.exportState(), before, 'an aborted summary cannot rewrite or re-arm context state');
 });
 
 test('maybeSummarize without force is a no-op under the threshold', async () => {
@@ -190,13 +216,13 @@ test('hysteresis: auto-compact re-arms only when post-compact is under the trigg
     [{ type: 'text', delta: 'ALREADY DONE — early work.\nNEXT STEP — finish.' }, { type: 'done', stopReason: 'end_turn' }],
     [{ type: 'text', delta: 'should not run' }, { type: 'done', stopReason: 'end_turn' }],
   ]);
-  assert.equal(await ctx.maybeSummarize(provider, 'mock', true), true, 'first compact succeeds');
+  assert.equal(await ctx.maybeSummarize(provider, 'mock', true), 'summarized', 'first compact succeeds');
   const mid = ctx.messages().length;
   // Under threshold + rearmed → auto path no-ops.
   assert.equal(await ctx.maybeSummarize(provider, 'mock', false), false, 'hysteresis blocks re-compact under threshold');
   assert.equal(ctx.messages().length, mid, 'history unchanged under hysteresis');
   // Force still works (manual /compact).
-  assert.equal(await ctx.maybeSummarize(provider, 'mock', true), true, 'force bypasses hysteresis');
+  assert.equal(await ctx.maybeSummarize(provider, 'mock', true), 'summarized', 'force bypasses hysteresis');
 });
 
 test('after compact the pin is not a raw first prompt that invites a restart', async () => {
@@ -218,7 +244,7 @@ test('after compact the pin is not a raw first prompt that invites a restart', a
       { type: 'done', stopReason: 'end_turn' },
     ],
   ]);
-  assert.equal(await ctx.maybeSummarize(provider, 'mock', true), true);
+  assert.equal(await ctx.maybeSummarize(provider, 'mock', true), 'summarized');
   const pin = ctx.messages()[0]!;
   assert.equal(pin.content[0]!.type, 'text');
   if (pin.content[0]!.type === 'text') {
@@ -229,4 +255,74 @@ test('after compact the pin is not a raw first prompt that invites a restart', a
   }
   const all = ctx.messages().map((m) => m.content.map((b) => (b.type === 'text' ? b.text : '')).join('')).join('\n');
   assert.match(all, /ALREADY DONE|NEXT STEP/, 'progress note carries done/next so work is not restarted');
+});
+
+// F04-11 degradation edge cases surfaced by the pre-release adversarial review.
+
+function toolResult(ctx: Context, id: string): { content: string } | undefined {
+  for (const m of ctx.messages()) {
+    for (const b of m.content) {
+      if (b.type === 'tool_result' && b.toolCallId === id) return b;
+    }
+  }
+  return undefined;
+}
+
+test('degraded truncation spares state-bearing results while reproducible output can still pay', async () => {
+  const ctx = new Context({ contextBudget: 1_000, triggerRatio: 0.75, keepLastTurns: 1 });
+  ctx.pinTask({ role: 'user', content: [{ type: 'text', text: 'objective' }] });
+  ctx.append({ role: 'assistant', content: [{ type: 'tool_use', id: 'r1', name: 'read_file', input: {} }] });
+  ctx.append({ role: 'user', content: [{ type: 'tool_result', toolCallId: 'r1', ok: true, content: 'x'.repeat(2_400) }] });
+  ctx.append({ role: 'assistant', content: [{ type: 'tool_use', id: 'a1', name: 'agent', input: {} }] });
+  ctx.append({ role: 'user', content: [{ type: 'tool_result', toolCallId: 'a1', ok: true, content: 'y'.repeat(800) }] });
+  ctx.append({ role: 'assistant', content: [{ type: 'text', text: 'z'.repeat(400) }] });
+  // Summarizer yields nothing → empty summary → degradation path.
+  const provider = new MockProvider([[{ type: 'done', stopReason: 'end_turn' }]]);
+
+  assert.equal(await ctx.maybeSummarize(provider, 'mock', true), 'truncated');
+  assert.equal(toolResult(ctx, 'r1')?.content, TRUNCATED_RESULT_SENTINEL, 'reproducible output paid the bill');
+  assert.equal(toolResult(ctx, 'a1')?.content, 'y'.repeat(800), 'the state-bearing agent answer was spared');
+});
+
+test('degraded truncation only touches state-bearing results once nothing else is left', async () => {
+  const ctx = new Context({ contextBudget: 1_000, triggerRatio: 0.75, keepLastTurns: 1 });
+  ctx.pinTask({ role: 'user', content: [{ type: 'text', text: 'objective' }] });
+  ctx.append({ role: 'assistant', content: [{ type: 'tool_use', id: 'r1', name: 'read_file', input: {} }] });
+  ctx.append({ role: 'user', content: [{ type: 'tool_result', toolCallId: 'r1', ok: true, content: 'x'.repeat(40) }] });
+  ctx.append({ role: 'assistant', content: [{ type: 'tool_use', id: 'a1', name: 'agent', input: {} }] });
+  ctx.append({ role: 'user', content: [{ type: 'tool_result', toolCallId: 'a1', ok: true, content: 'y'.repeat(2_800) }] });
+  ctx.append({ role: 'assistant', content: [{ type: 'text', text: 'z'.repeat(400) }] });
+  const provider = new MockProvider([[{ type: 'done', stopReason: 'end_turn' }]]);
+
+  assert.equal(await ctx.maybeSummarize(provider, 'mock', true), 'truncated');
+  assert.equal(toolResult(ctx, 'r1')?.content, TRUNCATED_RESULT_SENTINEL, 'pass 1 took the reproducible body');
+  assert.equal(toolResult(ctx, 'a1')?.content, TRUNCATED_RESULT_SENTINEL, 'pass 2 took the state-bearing body — still over after pass 1');
+});
+
+test('microcompact never overwrites the degradation tombstone', () => {
+  const ctx = new Context({ contextBudget: 100, triggerRatio: 0.75, keepLastTurns: 1, microcompact: true });
+  ctx.pinTask({ role: 'user', content: [{ type: 'text', text: 'task' }] });
+  ctx.append({ role: 'assistant', content: [{ type: 'tool_use', id: 'x', name: 'read_file', input: {} }] });
+  ctx.append({ role: 'user', content: [{ type: 'tool_result', toolCallId: 'x', ok: true, content: TRUNCATED_RESULT_SENTINEL }] });
+  // Pad past MICROCOMPACT_KEEP_RECENT so the tombstoned result is old enough to be a candidate.
+  for (let i = 0; i < 9; i++) {
+    ctx.append({ role: i % 2 ? 'assistant' : 'user', content: [{ type: 'text', text: `filler ${i}` }] });
+  }
+  ctx.recordActualTokens(1_000); // push the estimate over the microcompact gate
+
+  const cleared = ctx.microcompact(new MockProvider());
+  assert.equal(toolResult(ctx, 'x')?.content, TRUNCATED_RESULT_SENTINEL, 'the forensic marker survives');
+  assert.equal(cleared, false, 'nothing reclaimable existed — microcompact must not claim it cleared');
+});
+
+test('over budget with nothing compactable is a visible failure, not a silent no-op', async () => {
+  const ctx = new Context({ contextBudget: 100, triggerRatio: 0.75, keepLastTurns: 6 });
+  ctx.pinTask({ role: 'user', content: [{ type: 'text', text: 'objective' }] });
+  ctx.append({ role: 'assistant', content: [{ type: 'text', text: 'A'.repeat(800) }] }); // ≈200 tokens > 75 trigger
+  ctx.append({ role: 'user', content: [{ type: 'text', text: 'ok' }] });
+
+  // History is shorter than pin+keep: nothing can be summarized or tombstoned, but the session
+  // IS over budget — the CompactResult contract says that must be distinguishable from health.
+  assert.equal(await ctx.maybeSummarize(new MockProvider(), 'mock', false), 'failed');
+  assert.equal(ctx.messages().length, 3, 'history untouched');
 });

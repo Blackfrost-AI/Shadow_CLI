@@ -24,7 +24,7 @@ test('mode "server" lists local servers + custom, and NO cloud vendors', () => {
   const ids = list.map((p) => p.id);
   assert.deepEqual(
     ids.sort(),
-    ['custom', 'lmstudio', 'ollama', 'ollama-anthropic'].sort(),
+    ['custom', 'lmstudio', 'ollama', 'ollama-anthropic', 'qwen-selfhosted'].sort(),
     'exactly the local-server entries + custom',
   );
 });

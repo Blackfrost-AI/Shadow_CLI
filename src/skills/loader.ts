@@ -1,6 +1,7 @@
 import { existsSync, lstatSync, readdirSync, openSync, readSync, closeSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { resolveWithin } from '../safety/workspaceJail.js';
+import { enabledPluginDirs } from '../plugins/manager.js';
 
 export interface SkillEntry {
   name: string;
@@ -28,13 +29,26 @@ function readCapped(file: string, max: number): string {
   }
 }
 
-/** Discover SKILL.md files for progressive-disclosure injection (Claude skills parity). */
+/**
+ * Discover SKILL.md files for progressive-disclosure injection (Claude skills parity).
+ *
+ * Roots come in two flavors: workspace roots are JAILED (untrusted repo — every path is
+ * realpath'd + jail-checked against the workspace), while enabled-plugin roots (P3-07) are
+ * already-complete paths inside ~/.shadow from data-only, user-enabled installs, so they skip
+ * the workspace jail. Workspace roots are scanned FIRST and the first occurrence of a skill name
+ * wins, so repo skills outrank plugin skills of the same name (the repo is where the user is
+ * actually working).
+ */
 export function discoverSkills(workspaceRoot: string): SkillEntry[] {
   const out: SkillEntry[] = [];
-  for (const dir of SKILL_DIRS) {
-    const root = resolve(workspaceRoot, dir);
+  const seen = new Set<string>();
+  const roots: Array<{ root: string; jailed: boolean }> = [
+    ...SKILL_DIRS.map((dir) => ({ root: resolve(workspaceRoot, dir), jailed: true })),
+    ...enabledPluginDirs('skills').map((dir) => ({ root: dir, jailed: false })),
+  ];
+  for (const { root, jailed } of roots) {
     if (!existsSync(root)) continue;
-    // A symlinked skills root could redirect discovery outside the workspace — skip it outright.
+    // A symlinked skills root could redirect discovery outside its tree — skip it outright.
     try {
       if (lstatSync(root).isSymbolicLink()) continue;
     } catch {
@@ -49,6 +63,7 @@ export function discoverSkills(workspaceRoot: string): SkillEntry[] {
       continue;
     }
     for (const name of entries) {
+      if (seen.has(name)) continue; // first-wins: workspace roots were scanned first
       const skillPath = join(root, name, 'SKILL.md');
       if (!existsSync(skillPath)) continue;
       try {
@@ -57,9 +72,12 @@ export function discoverSkills(workspaceRoot: string): SkillEntry[] {
         if (lstatSync(skillPath).isSymbolicLink()) continue;
         // Containment: realpath + jail check. A symlinked PARENT dir that escapes the
         // workspace throws here and is skipped; we only ever read the resolved in-jail path.
-        const safePath = resolveWithin(workspaceRoot, skillPath);
+        // Plugin roots live in ~/.shadow (installed + enabled by the user), not the workspace,
+        // so the workspace jail does not apply to them — same posture as ~/.shadow/commands.
+        const safePath = jailed ? resolveWithin(workspaceRoot, skillPath) : skillPath;
         const body = readCapped(safePath, MAX_SKILL_BYTES);
         const desc = parseDescription(body) ?? name;
+        seen.add(name);
         out.push({ name, path: skillPath, description: desc, body: body.trim() });
       } catch {
         // skip unreadable / out-of-jail

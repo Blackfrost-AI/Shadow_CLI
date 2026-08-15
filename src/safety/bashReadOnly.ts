@@ -109,6 +109,83 @@ function uniqWritesOutput(head: string): boolean {
 const READS_FILE_OPERANDS = /^(?:cat|head|tail|less|more|od|xxd|hexdump|strings|file|stat|wc|nl|base64)\b/i;
 
 /**
+ * GNU/BSD grep-family options that CONSUME the following token as a VALUE (not a path operand).
+ * These must be skipped or the pattern file/dir operand after them would be misread as a path.
+ * rg uses hyphen-free long values with `=` too, handled below. Keep in sync with real binaries.
+ */
+const VALUE_TAKING_OPTS = new Set([
+  '-e', '-f', '-m', '-A', '-B', '-C', '-D', '-d',
+  '--pattern', '--file', '--max-count', '--context', '--after-context', '--before-context',
+  '--devices', '--directories', '--include', '--exclude', '--exclude-dir', '--exclude-from',
+  '--regexp', '--group-separator', '--binary-files', '--label',
+  // rg's long forms (and their `=` variants are filtered separately)
+  '--type', '--type-add', '--glob', '--iglob', '--ignore-file', '--path-separator',
+  '--max-columns', '--max-filesize', '--max-depth', '--threads', '--sort', '--field',
+]);
+
+/**
+ * The search-command scoping gap (F07-02): `grep`/`rg`/`find` were on the read-only fast path, but
+ * `readsOutsideRoots` only scoped cat/head/tail viewers, so `grep -rI password /etc ~/.config`,
+ * `rg -il token ~`, or `find ~ -name id_rsa` ALL ran unprompted at the default auto-edit autonomy —
+ * and their output (which may be a SECRET) entered context → provider next turn. This is the exact
+ * attack the cat/head comment documents, unfixed for the recursive search commands.
+ *
+ * We extract the PATH operands of the search command and scope them exactly like the viewers:
+ * an out-of-jail grep/rg/find demotes to the permission gate (never hard-blocks).
+ *
+ * Per-command path grammar:
+ *  - grep/rg: trailing positional PATH(S) after the pattern. We scan every non-flag operand and
+ *    scope the ones that look like paths (a leading `/`, `.`, or a `/` separator) — the plan's
+ *    "scan roots" (what follows `-r/-R` / recursive rg). A pattern alone (stdin) is unscoped.
+ *  - `find`: the start-path operand(s) come FIRST, before any `-name/-exec` test. We treat the
+ *    leading positional operands (before the first `-test`) as search roots.
+ *  - `git grep`: paths come after `--` (pathspec). We scope only the tokens after the separator.
+ *
+ * Ambiguity refuses to vouch: a glob/tilde/var/URI operand already bails in `outsideRoots` (regex
+ * `[*?[\]$~]`), so a misread pattern becomes a gate, never an auto-allow.
+ */
+function searchReadsOutsideRoots(head: string, roots: readonly string[]): boolean {
+  if (!roots.length) return false; // no roots configured → nothing to scope against (shape-only)
+  const m = /^(grep|rg|find)\b/.exec(head);
+  if (!m) return false;
+  const kind = m[1] as 'grep' | 'rg' | 'find';
+  const tokens = head.split(/\s+/).slice(1);
+  return searchOperandsOutsideRoots(tokens, roots, kind);
+}
+
+function searchOperandsOutsideRoots(
+  tokens: string[],
+  roots: readonly string[],
+  kind: 'grep' | 'rg' | 'find',
+): boolean {
+  for (let i = 0; i < tokens.length; i++) {
+    const t = tokens[i]!;
+    // find: operands BEFORE the first `-predicate` are the start paths; everything after `-name`/`-exec`
+    // is expression syntax (globs, predicates), never a search root. Stop scanning there.
+    if (kind === 'find' && t.startsWith('-') && t !== '-') break;
+    if (t === '--') {
+      continue;
+    }
+    if (t === '-' || t === '/dev/null' || t === '/dev/stdin') continue; // stdin marker, not a path
+    if (/^--[^=]+=/.test(t) || /^-[^=\s].*=/.test(t)) continue; // --flag=value carries its own operand
+    if (t.startsWith('-')) {
+      // A value-taking option swallows the NEXT token — skip both so the pattern isn't misread.
+      if (VALUE_TAKING_OPTS.has(t) || /^-[efmABCDd]$/.test(t)) i++;
+      continue;
+    }
+    // `find`'s search roots are the operands BEFORE the first `-name/-exec` test.
+    if (kind === 'find') {
+      if (outsideRoots(t, roots)) return true;
+      continue;
+    }
+    // grep / rg: any leading non-flag operand that looks like a PATH (starts with / ~ . or contains /)
+    // is a search location. A bare single-word pattern (stdin) is deliberately not scoped.
+    if (/^([/~.]|[\w.-]+\/)/.test(t) && outsideRoots(t, roots)) return true;
+  }
+  return false;
+}
+
+/**
  * Does this segment read a file OUTSIDE the granted roots? `cat`/`head`/`tail`/`stat` were
  * auto-allowed with no restriction whatsoever on their operands, so at the DEFAULT autonomy
  * `cat ~/.aws/credentials` ran unprompted and its contents became a tool result — i.e. they went
@@ -190,6 +267,10 @@ export function isBashReadOnly(command: string, roots: readonly string[] = []): 
       const head = segment.trim();
       if (!head || !isReadOnlySegment(head)) return false;
       if (readsOutsideRoots(head, roots)) return false;
+      // F07-02: recursive search commands must scope their PATH operands too — grep -rI foo /etc,
+      // rg -il token ~, find ~ -name x all demote to the gate, never auto-run. (git grep was never
+      // on the read-only fast path — no prefix exists — so it gates regardless of operands.)
+      if (searchReadsOutsideRoots(head, roots)) return false;
     }
   }
   return true;

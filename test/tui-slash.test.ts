@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import React from 'react';
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 import { render } from 'ink-testing-library';
 import {
@@ -505,7 +505,9 @@ test('/skills, /workflows, and /plugins expose extension status', async () => {
   await tick();
   stdin.write('\r');
   await tick();
-  assert.match(strip(frames.join('\n')), /Plugin manager: not installed/);
+  // P3-07: /plugins lists installed plugins (none here) and the data-only contract line, which is
+  // unconditional regardless of what the host's ~/.shadow/plugins contains.
+  assert.match(strip(frames.join('\n')), /plugins are DATA-only bundles/);
   unmount();
 });
 
@@ -780,6 +782,16 @@ test('runStatusLine returns the first stdout line, exposes SHADOW_* env, and fai
   assert.equal(await statusLineOnce('echo "$SHADOW_MODEL@$SHADOW_AUTONOMY"', slCtx), 'm@auto-edit', 'SHADOW_* env is passed');
   assert.equal(await statusLineOnce('exit 7', slCtx), '', 'a failing command yields empty output');
   assert.equal(await statusLineOnce('nonexistent_cmd_xyzzy_123', slCtx), '', 'a missing command yields empty output');
+});
+
+test('F07-03: runStatusLine runs with cwd = HOME, not ctx.cwd (no workspace bait resolution)', async () => {
+  // A relative script path inside a statusLine command must resolve against HOME, never the workspace.
+  // This guarantees a hostile cloned repo's relative file can never be executed by the statusLine.
+  const pwd = await statusLineOnce('pwd', slCtx); // slCtx.cwd is '/tmp' (a workspace stand-in)
+  assert.notEqual(pwd, slCtx.cwd, 'statusLine cwd is NOT the workspace');
+  assert.equal(pwd, homedir(), 'statusLine cwd is pinned to HOME');
+  // The workspace is still reachable explicitly via $SHADOW_CWD.
+  assert.equal(await statusLineOnce('printf %s "$SHADOW_CWD"', slCtx), slCtx.cwd, '$SHADOW_CWD still exposes the workspace');
 });
 
 test('a configured statusLine renders as a footer line', async () => {

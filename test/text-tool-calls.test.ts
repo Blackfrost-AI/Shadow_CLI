@@ -1,6 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { sniffToolCalls } from '../src/provider/textToolCalls.js';
+import {
+  findTextualToolIntentStart,
+  sniffToolCalls,
+  stripTextualToolIntent,
+} from '../src/provider/textToolCalls.js';
 
 const known = (n: string) => ['write_file', 'run_shell', 'read_file'].includes(n);
 
@@ -150,4 +154,41 @@ test('a JSON tool-call printed as a prose EXAMPLE is not executed (over-recovery
     known,
   );
   assert.equal(r.calls.length, 0, 'a bare {name,input} embedded in explanatory prose must NOT run the tool');
+});
+
+test('incomplete textual tool intent is stripped across every recovered dialect', () => {
+  const prefix = 'Useful answer before the unfinished call.';
+  const cases = [
+    `${prefix}\n<tool_call>{"name":"run_shell","arguments":{"command":"echo`,
+    `${prefix}\ncall:run_shell{"command":"echo`,
+    `${prefix}\n{"tool_calls":[{"name":"write_file","args":{"path":"a`,
+    `${prefix}\n{'writables':[{'tool_calls':[{'name':'write_file','args':{'path':'a`,
+    `${prefix}\n<function=write_file><parameter=path>a.txt</parameter><parameter=content>partial`,
+    `${prefix}\n<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>run_shell\n\`\`\`json\n{"command":"echo`,
+  ];
+
+  for (const source of cases) {
+    assert.equal(stripTextualToolIntent(source), prefix, source);
+  }
+});
+
+test('textual tool sanitizer uses parsed calls and preserves surrounding prose', () => {
+  const source =
+    'Before.\n```json\n{"tool_calls":[{"name":"read_file","args":{"path":"x.ts"}}]}\n```\nAfter.';
+  assert.equal(stripTextualToolIntent(source), 'Before.\n\nAfter.');
+  assert.equal(stripTextualToolIntent('ordinary prose about tool_calls and writables'), 'ordinary prose about tool_calls and writables');
+});
+
+test('findTextualToolIntentStart includes an opening JSON fence and catches a brace still in flight', () => {
+  const source = 'Visible.\n```json\n{"tool_calls":[{"name":"read_file"';
+  assert.equal(findTextualToolIntentStart(source), source.indexOf('```'));
+  assert.equal(findTextualToolIntentStart('Visible.\ncall:read_file'), 'Visible.\n'.length);
+});
+
+test('a completed earlier fence is not mistaken for the truncated envelope opener', () => {
+  const prefix = 'Example:\n```json\n{"ordinary":true}\n```\nVisible answer.';
+  const source = `${prefix}\n{"tool_calls":[{"name":"read_file","args":{"path":"x`;
+
+  assert.equal(findTextualToolIntentStart(source), prefix.length + 1, 'the prior closing fence remains outside the hidden suffix');
+  assert.equal(stripTextualToolIntent(source), prefix, 'sanitizing preserves the complete earlier markdown block');
 });

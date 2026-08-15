@@ -9,10 +9,69 @@
  * spinning up a process.
  */
 import { isIP } from 'node:net';
+import { parseV6 } from './netguard.js';
+
+/**
+ * Cloud instance-metadata addresses in EVERY spelling. 169.254.169.254 is
+ * AWS/GCP/Azure/Oracle IMDSv4; fd00:ec2::254 is AWS IMDSv6 — and it lives
+ * inside fc00::/7 ULA, so the "local" classification below would otherwise
+ * admit it under --offline. These are never a legitimate local serve.
+ */
+export function isCloudMetadataAddress(host: string): boolean {
+  const h = host.toLowerCase().replace(/^\[|\]$/g, '').replace(/%.*$/, '');
+  if (h === '169.254.169.254') return true;
+  if (isIP(h) !== 6) return false;
+  const b = parseV6(h);
+  if (!b) return false;
+  const imdsv6 = parseV6('fd00:ec2::254')!;
+  if (b.every((x, i) => x === imdsv6[i]!)) return true;
+  // IPv4-embedded spellings of 169.254.169.254 (mapped/compat/NAT64) and the
+  // v4-carrying transition tunnels (6to4, Teredo) — same unwrap netguard uses.
+  const v4 = ((): string | null => {
+    const mapped = b.slice(0, 10).every((x) => x === 0) && b[10] === 0xff && b[11] === 0xff;
+    const compat = b.slice(0, 12).every((x) => x === 0) && !(b[12] === 0 && b[13] === 0 && b[14] === 0 && b[15] === 0);
+    const nat64 = b[0] === 0x00 && b[1] === 0x64 && b[2] === 0xff && b[3] === 0x9b;
+    if (mapped || compat || nat64) return `${b[12]}.${b[13]}.${b[14]}.${b[15]}`;
+    if (b[0] === 0x20 && b[1] === 0x02) return `${b[2]}.${b[3]}.${b[4]}.${b[5]}`; // 6to4
+    if (b[0] === 0x20 && b[1] === 0x01 && b[2] === 0x00 && b[3] === 0x00) {
+      return `${(~b[12]!) & 0xff}.${(~b[13]!) & 0xff}.${(~b[14]!) & 0xff}.${(~b[15]!) & 0xff}`; // Teredo
+    }
+    return null;
+  })();
+  return v4 === '169.254.169.254';
+}
 
 /** The startup banner printed once when offline mode is active. */
 export const OFFLINE_BANNER =
   'Offline Shadow Mode — no provider network beyond your local model, no web tools.';
+
+/**
+ * Whether offline's "run_shell egress is denied" promise is actually enforced.
+ * The denial rides on the OS sandbox, so it needs confinement ON (not --yolo /
+ * --no-sandbox / full autonomy) AND the platform tool present — wrapCommand
+ * fails open when bwrap/seatbelt are missing (src/safety/sandbox.ts). Every
+ * surface that advertises the offline boundary (env block, startup banner)
+ * must go through this one predicate so they can never disagree.
+ */
+export function offlineEgressEnforced(
+  guard: { yolo?: boolean; noSandbox?: boolean; unrestricted?: boolean },
+  sandboxToolPresent: boolean,
+): boolean {
+  return !guard.yolo && !guard.noSandbox && !guard.unrestricted && sandboxToolPresent;
+}
+
+/** The run_shell egress clause of the offline env line — truthful per enforcement (F07-04). */
+export function offlineEgressClaim(enforced: boolean): string {
+  return enforced
+    ? 'run_shell network egress is denied.'
+    : 'run_shell egress CANNOT be enforced on this host (no bwrap/seatbelt confinement active) — the OS will not block shell network access, so the no-network contract is yours to honor in every command.';
+}
+
+/** Startup warning printed beside OFFLINE_BANNER when the egress half of the promise is unenforceable. */
+export const OFFLINE_UNENFORCED_WARNING =
+  'Offline requested, but run_shell egress cannot be enforced on this host (no bwrap/seatbelt confinement) — ' +
+  'shell commands run unconfined. Web tools and MCP stay disabled; the model is instructed to stay off the ' +
+  'network, but the OS will not stop it.';
 
 /**
  * Hostnames that count as "local": loopback, mDNS (`*.local`), and RFC-1918
@@ -23,6 +82,9 @@ export const OFFLINE_BANNER =
 export function isLocalHost(host: string): boolean {
   const h = host.toLowerCase().trim();
   if (!h) return false;
+  // Metadata addresses are NEVER local, whatever the spelling — fd00:ec2::254
+  // would otherwise match the ULA branch below and walk past the offline wall.
+  if (isCloudMetadataAddress(h)) return false;
   if (h === 'localhost') return true;
   if (h.endsWith('.local')) return true; // mDNS
   // IP literals: validate as a REAL IP in a local range. A plain prefix test (`/^127\./`) is unsafe —

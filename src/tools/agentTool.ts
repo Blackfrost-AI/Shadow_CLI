@@ -12,6 +12,7 @@ import { ToolRegistry } from './registry.js';
 import { createWorktree, removeWorktree } from './worktree.js';
 import { runHookPhase } from '../hooks/runner.js';
 import { SubagentBus } from '../agent/events.js';
+import { Semaphore } from '../util/semaphore.js';
 
 const inputSchema = z.object({
   prompt: z.string().min(1).describe('Task for the sub-agent.'),
@@ -33,6 +34,8 @@ export interface AgentToolDeps {
   keepLastTurns: number;
   maxIterations: number;
   priceTable: PriceTable;
+  /** F06-10: max sub-agents admitted at once (session-level semaphore). Default 4. */
+  subagentConcurrency?: number;
 }
 
 /** Claude Agent tool parity — isolated sub-loop with fresh context, returns final answer.
@@ -40,6 +43,11 @@ export interface AgentToolDeps {
  * run_in_background accepted in schema; impl in bg step.
  */
 export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSchema>, { answer?: string; taskId?: string; status?: string }> {
+  // F06-10: session-level admission gate. makeAgentTool is constructed ONCE per session (index.ts),
+  // so a closure-scoped semaphore is exactly session-scoped — it survives /model switches (which
+  // rebuild providers, not tools) and bounds ALL sub-agent loops, sync AND background: no more
+  // unbounded parallel provider streams when a model fans out a fleet of `agent` calls in one turn.
+  const semaphore = new Semaphore(deps.subagentConcurrency ?? 4);
   return {
     name: 'agent',
     description:
@@ -110,43 +118,87 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
       // from the parent's — the answer printed up to three times, the HUD flipped to the
       // sub-agent's context %, and /cost went to nonsense. See SUBAGENT_FORWARDED_EVENTS.
       const subBus = new SubagentBus(base.bus, undefined, { subagent: taskId });
+      // F10-02 (cancellation half): a BACKGROUND agent outlives its launching turn, so ctx.signal
+      // (the turn's signal) can no longer stop it. Give a bg agent its OWN abort, chained under
+      // ctx.signal, that a `cancel_subagent` bus request (from /agents kill) can trip.
+      const bgAbort = isBg ? new AbortController() : null;
       const loopDeps: LoopDeps = {
         ...base,
         bus: subBus,
         registry,
         context: subContext,
         budget,
-        signal: ctx.signal,
+        signal: bgAbort ? AbortSignal.any([ctx.signal, bgAbort.signal]) : ctx.signal,
         system: systemPrefix + base.system,
         model: def?.model ?? base.model,
         workspaceRoot: subWorkspaceRoot,
         additionalRoots: base.additionalRoots, // ensure sub-agents inherit jail/sanbox state (full under yolo)
+        nestedAgent: true, // F06-10: tools of THIS loop run inside a sub-agent (admission bypass marker)
       };
       const loop = new AgentLoop(loopDeps, deps.getAutonomy());
+
+      // F06-10 deadlock guard: a NESTED `agent` call (a sub-agent launching its own sub-agent)
+      // bypasses the admission gate. The parent sits parked on this very tool result while still
+      // holding ITS permit — if every slot is held by parked ancestors, a queued child would wait
+      // behind its own lineage forever (budget checks never fire inside a tool await; headless
+      // would simply hang). A parked ancestor is not streaming, so a chain is ONE active provider
+      // stream: admitting the child separately would double-count it. Top-level fan-out — the
+      // fleet-in-one-turn case the cap exists for — stays fully gated, and every nested agent is
+      // still bounded by its own iteration + wall-clock budget.
+      const nested = ctx.nestedAgent === true;
 
       if (isBg) {
         // record launch metadata via bus to main context (the real persisted one in outer scope); base.context here is throwaway from makeLoopDeps
         base.bus.emit({ type: 'bg_agent_launched' as any, taskId: taskId!, prompt: input.prompt, subagentType: agentType });
-        // surface the sub-agent in the TUI HUD immediately (BUG 3)
-        base.bus.emit({ type: 'subagent_start', taskId, subagentType: agentType, description: input.description });
+        // F06-10: take a permit up front so a fleet of bg launches cannot exceed the cap; when none
+        // is free announce as QUEUED — admission then happens INSIDE the fire-and-forget below, so
+        // a full semaphore never blocks the launching turn. Nested calls bypass (see `nested`).
+        const bgPermit0 = nested ? null : semaphore.tryAcquire();
+        // surface the sub-agent in the TUI HUD immediately (BUG 3). `background:true` keeps it in
+        // the panel after the launching turn ends (F10-02) instead of vanishing with the turn.
+        base.bus.emit({ type: 'subagent_start', taskId, subagentType: agentType, description: input.description, background: true, queued: !nested && bgPermit0 == null });
+
+        // Listen for a cancel request aimed at THIS agent (taskId or the '*' wildcard). The abort
+        // stops the sub-loop at its next boundary; unsubscribed in finally so a completed agent's id
+        // can't be re-triggered.
+        const offCancel = base.bus.on((e) => {
+          if (e.type === 'cancel_subagent' && (e.taskId === taskId || e.taskId === '*')) bgAbort?.abort('cancelled');
+        });
 
         // fire and forget; deliver via bus as task_notification (main context listener will turn into user msg)
         (async () => {
+          let permit = bgPermit0;
           try {
-            const res = await loop.run();
-            if (base.hooks?.subagent_stop?.length) {
-              runHookPhase('subagent_stop', base.hooks.subagent_stop, { workspaceRoot: subWorkspaceRoot, extra: { agentType, taskId, result: 'bg_done' } });
+            if (!nested && !permit) {
+              // loopDeps.signal = turn abort OR /agents-kill cancellation — either one must be able
+              // to dequeue an agent that never got a slot (a cancelled turn cannot leak a permit).
+              permit = await semaphore.acquire(loopDeps.signal);
+              // F06-10: queue wait is not loop time — restart the wall-clock budget at admission.
+              budget.restartClock(Date.now());
+              // admitted — re-announce with queued cleared (nothing has run yet, so re-registration
+              // is safe: the HUD counters for this taskId are still zero).
+              base.bus.emit({ type: 'subagent_start', taskId, subagentType: agentType, description: input.description, background: true });
             }
-            base.bus.emit({ type: 'subagent_usage', costUSD: budget.currentCostUSD, subagent: agentType });
-            base.bus.emit({ type: 'subagent_end', taskId, ok: true, subagentType: agentType });
-            base.bus.emit({ type: 'task_notification', taskId: taskId!, answer: res.finalAnswer || '', fromSubagent: agentType });
+            const res = await loop.run();
+            // A cancelled bg agent returns via stop('interrupted') (it does NOT throw), so report it
+            // as cancelled (ok:false) rather than a spurious "done" with a partial answer.
+            const cancelled = res.stopReason === 'interrupted';
+            if (base.hooks?.subagent_stop?.length) {
+              runHookPhase('subagent_stop', base.hooks.subagent_stop, { workspaceRoot: subWorkspaceRoot, extra: { agentType, taskId, result: cancelled ? 'bg_cancelled' : 'bg_done' } });
+            }
+            { const snap = budget.snapshot(Date.now()); base.bus.emit({ type: 'subagent_usage', costUSD: budget.currentCostUSD, subagent: agentType, taskId, inputTokens: snap.inputTokens, outputTokens: snap.outputTokens }); }
+            base.bus.emit({ type: 'subagent_end', taskId, ok: !cancelled, subagentType: agentType });
+            base.bus.emit({ type: 'task_notification', taskId: taskId!, answer: cancelled ? 'agent cancelled by user' : (res.finalAnswer || ''), fromSubagent: agentType });
           } catch (e) {
             if (base.hooks?.subagent_stop?.length) {
               runHookPhase('subagent_stop', base.hooks.subagent_stop, { workspaceRoot: subWorkspaceRoot, extra: { agentType, taskId, error: (e as Error).message } });
             }
             base.bus.emit({ type: 'subagent_end', taskId, ok: false, subagentType: agentType });
-            base.bus.emit({ type: 'task_notification', taskId: taskId!, answer: `agent bg error: ${(e as Error).message}`, fromSubagent: agentType });
+            const queuedAbort = (e as Error).message === 'aborted while queued';
+            base.bus.emit({ type: 'task_notification', taskId: taskId!, answer: queuedAbort ? 'agent cancelled while waiting for a slot' : `agent bg error: ${(e as Error).message}`, fromSubagent: agentType });
           } finally {
+            permit?.();
+            offCancel();
             if (worktreeCleanupPath) {
               try { removeWorktree(ctx.workspaceRoot, worktreeCleanupPath); } catch {}
             }
@@ -159,8 +211,30 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
       }
 
       // sync path (default)
+      // F06-10: admission via the session semaphore. Announce immediately so the HUD shows the
+      // agent; when no permit is free, announce as QUEUED and wait. On admission re-announce —
+      // safe because nothing has run yet (the HUD counters for this taskId are still zero).
+      // Nested calls bypass admission entirely (see `nested` above).
+      const permit0 = nested ? null : semaphore.tryAcquire();
       // surface the sub-agent in the TUI HUD immediately (BUG 3)
-      base.bus.emit({ type: 'subagent_start', taskId, subagentType: agentType, description: input.description });
+      base.bus.emit({ type: 'subagent_start', taskId, subagentType: agentType, description: input.description, background: false, queued: !nested && permit0 == null });
+      let permit = permit0;
+      if (!nested && !permit) {
+        try {
+          permit = await semaphore.acquire(loopDeps.signal);
+          // F06-10: queue wait is not loop time — restart the wall-clock budget at admission.
+          budget.restartClock(Date.now());
+        } catch {
+          // aborted while queued — the agent never ran: no stop hook, but the HUD row and any
+          // worktree still need cleanup, and the slot wait must not leak a fail report.
+          base.bus.emit({ type: 'subagent_end', taskId, ok: false, subagentType: agentType });
+          if (worktreeCleanupPath) {
+            try { removeWorktree(ctx.workspaceRoot, worktreeCleanupPath); } catch {}
+          }
+          return fail('agent', 'read', Date.now() - start, 'aborted', 'Sub-agent aborted while queued.');
+        }
+        base.bus.emit({ type: 'subagent_start', taskId, subagentType: agentType, description: input.description, background: false });
+      }
       try {
         const result = await loop.run();
         if (base.hooks?.subagent_stop?.length) {
@@ -168,7 +242,7 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         }
         // The sub-agent's per-turn `usage` events are (correctly) not forwarded, so report its
         // TOTAL spend once — otherwise sub-agent tokens would silently vanish from /cost.
-        base.bus.emit({ type: 'subagent_usage', costUSD: budget.currentCostUSD, subagent: agentType });
+        { const snap = budget.snapshot(Date.now()); base.bus.emit({ type: 'subagent_usage', costUSD: budget.currentCostUSD, subagent: agentType, taskId, inputTokens: snap.inputTokens, outputTokens: snap.outputTokens }); }
         base.bus.emit({ type: 'subagent_end', taskId, ok: true, subagentType: agentType });
         const data = { answer: result.finalAnswer };
         if (worktreeCleanupPath) {
@@ -184,6 +258,8 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
           try { removeWorktree(ctx.workspaceRoot, worktreeCleanupPath); } catch {}
         }
         return fail('agent', 'read', Date.now() - start, 'agent_failed', (e as Error).message);
+      } finally {
+        permit?.(); // null only on the nested bypass — no gate, nothing to release
       }
     },
   };

@@ -13,6 +13,24 @@
 // line classifications as this parser — re-implemented copies drifted (looser fence opens, trimmed
 // list tests) and made streamed output disagree with the non-streamed render of the same text.
 export const FENCE = /^\s*(```+|~~~+)\s*([\w+#.-]*)\s*$/;
+const FENCE_LINE = /^ {0,3}(`{3,}|~{3,})\s*([\w+#.-]*)\s*$/;
+/** Classify a line as a legal markdown code-fence marker, or null if it is not one.
+ *  A fence line requires ≤3 leading spaces and ≥3 identical ticks (`` ` `` or `~`). */
+export function matchFence(line) {
+    const m = FENCE_LINE.exec(line);
+    if (!m)
+        return null;
+    const marker = m[1];
+    return { char: marker[0], width: marker.length, lang: m[2] ?? '' };
+}
+/** CommonMark fence-close rule: a line closes a fence only if it is a fence of the SAME marker
+ *  char with width ≥ the opener's width. A 4-tick fence therefore cannot be closed by a 3-tick
+ *  line inside it (exactly what frontier models emit when writing about nested markdown), and a
+ *  ``` inside a ~~~ block (or vice versa) is literal content. */
+export function closesFence(line, open) {
+    const m = matchFence(line);
+    return m !== null && m.char === open.char && m.width >= open.width;
+}
 const HEADING = /^(#{1,6})\s+(.*)$/;
 const HR = /^\s*([-*_])(?:\s*\1){2,}\s*$/;
 export const QUOTE = /^\s*>/;
@@ -113,16 +131,15 @@ export function parseMarkdown(src) {
     let i = 0;
     while (i < lines.length) {
         const line = lines[i];
-        const fence = FENCE.exec(line);
-        if (fence) {
-            const marker = fence[1][0]; // ` or ~
-            const lang = fence[2] ?? '';
+        const openFence = matchFence(line);
+        if (openFence) {
+            const lang = openFence.lang;
             const code = [];
             i++;
             let closed = false;
             while (i < lines.length) {
                 const l = lines[i];
-                if (FENCE.test(l) && l.trim().startsWith(marker)) {
+                if (closesFence(l, openFence)) {
                     closed = true;
                     i++;
                     break;

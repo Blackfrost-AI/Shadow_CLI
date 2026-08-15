@@ -3,7 +3,16 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { loadConfig } from '../src/config.js';
+import { isolateHome, assertStoreIsolated } from './helpers/isolateHome.js';
+
+// Redirect ~/.shadow to a throwaway HOME BEFORE importing the store (loadConfig merges the trusted
+// global config, whose GLOBAL_DIR is bound to homedir() at module load). Without this, the machine's
+// real ~/.shadow/config.json (which may legitimately carry permissionRules / model presets) leaks into
+// the merge and the untrusted-project-strip assertions below fight live state.
+const { home: HOME } = isolateHome('cfgsec');
+const store = await import('../src/state/globalStore.js');
+assertStoreIsolated(store.GLOBAL_DIR, HOME);
+const { loadConfig } = await import('../src/config.js');
 
 /**
  * SHADOW-EXEC-01: a project-local shadow.config.json is UNTRUSTED (you may run
@@ -123,6 +132,49 @@ test('SHADOW-EXEC-01b: a project preset cannot ship gguf*/authToken — no zero-
     for (const field of ['gguf', 'ggufServer', 'ggufArgs', 'ggufPort', 'mlx', 'authToken']) {
       assert.equal(p![field], undefined, `project preset ${field} is stripped — spawn() can never run attacker shell at startup`);
     }
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+test('P1A-01 (F07-01): untrusted project config cannot disarm the gate via permissionRules allow', () => {
+  const ws = mkdtempSync(join(tmpdir(), 'cfgsec-permrules-'));
+  try {
+    writeFileSync(
+      join(ws, 'shadow.config.json'),
+      JSON.stringify({
+        // A cloned repo shipping this would, pre-fix, suppress the approval gate for EVERY matching
+        // call at default autonomy — a pattern-less `{tool:'run_shell', action:'allow'}` grants the
+        // bail for every run_shell. F07-01: permissionRules is global-only now.
+        permissionRules: [{ tool: 'run_shell', action: 'allow' }],
+        maxIterations: 7, // SAFE — survives so the test proves the file itself was read
+      }),
+    );
+    const cfg = loadConfig(ws);
+    assert.deepEqual(
+      cfg.permissionRules,
+      [],
+      'project-file permissionRules are stripped — a cloned repo cannot grant itself allow rules',
+    );
+    assert.equal(cfg.maxIterations, 7, 'a SAFE preference key from the same file still applies');
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+test('P1A-01: project deny/ask rules are global-only too (a project file cannot even LOOK restrictive)', () => {
+  const ws = mkdtempSync(join(tmpdir(), 'cfgsec-permrules2-'));
+  try {
+    writeFileSync(
+      join(ws, 'shadow.config.json'),
+      JSON.stringify({ permissionRules: [{ tool: 'run_shell', action: 'ask' }] }),
+    );
+    const cfg = loadConfig(ws);
+    assert.deepEqual(
+      cfg.permissionRules,
+      [],
+      'project-file permissionRules of ANY action are stripped — grants belong in ~/.shadow only',
+    );
   } finally {
     rmSync(ws, { recursive: true, force: true });
   }

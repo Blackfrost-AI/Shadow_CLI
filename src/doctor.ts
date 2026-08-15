@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { loadConfig, resolveApiKey, resolveAuthToken } from './config.js';
 import { DEV_UNRESTRICTED } from './buildProfile.js';
 import { GLOBAL_DIR } from './state/globalStore.js';
+import { sandboxConfinement } from './safety/sandbox.js';
 
 export type DoctorSeverity = 'error' | 'warn' | 'info';
 
@@ -162,6 +163,24 @@ export function runDoctor(cwd: string): DoctorReport {
         : DEV_UNRESTRICTED
           ? 'dev default: jail + OS sandbox OFF (buildProfile DEV_UNRESTRICTED=true). Use SHADOW_GUARDRAILS=on to test hardened mode'
           : 'buildProfile DEV_UNRESTRICTED=false — guardrails enabled by default',
+  });
+
+  // P2-12 — the persistent confinement state: what run_shell will ACTUALLY run under this
+  // session's config, and what the failure policy does about a missing sandbox tool.
+  const confinement = sandboxConfinement(cfg.sandbox);
+  checks.push({
+    id: 'sandbox-policy',
+    ok: confinement !== 'unconfined',
+    severity: confinement === 'unconfined' ? 'warn' : 'info',
+    detail:
+      confinement === 'off'
+        ? `run_shell confinement: OFF by config/flag (sandbox: 'off') — no OS sandbox applied`
+        : confinement === 'confined'
+          ? `run_shell confinement: ON (sandbox: auto, host tool present) · failure policy ${cfg.sandboxFailurePolicy}`
+          : `run_shell confinement: UNAVAILABLE — sandbox requested but no host tool; failure policy '${cfg.sandboxFailurePolicy}' ` +
+            (cfg.sandboxFailurePolicy === 'warn'
+              ? '(runs unconfined with a warning only)'
+              : '(unconfined run_shell stops at the approval gate)'),
   });
 
   return finalize(checks);

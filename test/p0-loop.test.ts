@@ -123,9 +123,9 @@ test('P0-12 loop guard: still trips on three back-to-back identical calls', asyn
   assert.equal(res.stopReason, 'max_iterations');
 });
 
-// ---- P0-11: an interrupted tool turn must leave every tool_use paired ----
+// ---- P0-11: an interrupted tool turn must never leave a dangling tool_use ----
 
-test('P0-11 interrupt: a tool_use committed before ESC is paired with a synthetic tool_result', async () => {
+test('P0-11 interrupt: incomplete tool intent is discarded before it reaches history', async () => {
   const controller = new AbortController();
   // The model streams a tool_use, then the user hits ESC (abort) before the tool runs.
   const provider: Provider = {
@@ -146,12 +146,13 @@ test('P0-11 interrupt: a tool_use committed before ESC is paired with a syntheti
 
   assert.equal(res.stopReason, 'interrupted', 'reports interrupted');
   assert.equal(ran, 0, 'the tool never executed (interrupted first)');
-  // The committed tool_use must not be left dangling — it would 400 every later request.
+  // An interrupted provider turn is incomplete. Retaining its tool_use and inventing a result
+  // pollutes the replacement prompt; omit both while preserving the history invariant.
   assertAllToolUsesPaired(context.messages());
-  const lastUser = [...context.messages()].reverse().find((m) => m.role === 'user');
-  assert.ok(
-    lastUser?.content.some((b) => b.type === 'tool_result' && b.toolCallId === 'k1' && b.ok === false),
-    'a synthetic {ok:false} tool_result was appended for the orphaned tool_use',
+  assert.equal(
+    context.messages().some((m) => m.content.some((b) => b.type === 'tool_use' || b.type === 'tool_result')),
+    false,
+    'the incomplete native tool call leaves no protocol fragments',
   );
 });
 
@@ -177,4 +178,82 @@ test('P0-11 defense-in-depth: a history ending in a dangling tool_use is healed 
     (m) => m.role === 'user' && m.content.some((b) => b.type === 'tool_result' && b.toolCallId === 'orphan'),
   );
   assert.ok(healed, 'the request sent to the provider paired the dangling tool_use');
+});
+
+test('P0-11 healer preserves an already-valid tool_result exactly once', async () => {
+  let seen: Message[] = [];
+  const provider: Provider = {
+    name: 'capture-valid-pair',
+    estimateTokens: () => 0,
+    async *send(req: { messages: Message[] }): AsyncIterable<ProviderEvent> {
+      seen = req.messages;
+      yield { type: 'text', delta: 'ok' };
+      yield { type: 'done', stopReason: 'end_turn' };
+    },
+  };
+  const { loop, context } = buildLoop(provider, [echoTool(() => {})]);
+  context.append({
+    role: 'assistant',
+    content: [{ type: 'tool_use', id: 'paired', name: 'echo', input: { msg: 'x' } }],
+  });
+  context.append({
+    role: 'user',
+    content: [{ type: 'tool_result', toolCallId: 'paired', ok: true, content: 'already satisfied' }],
+  });
+
+  await loop.run();
+
+  const matching = seen
+    .flatMap((m) => m.content)
+    .filter((b) => b.type === 'tool_result' && b.toolCallId === 'paired');
+  assert.equal(matching.length, 1, 'valid provider-neutral toolCallId is not healed a second time');
+  assert.equal(matching[0]?.type === 'tool_result' ? matching[0].content : '', 'already satisfied');
+});
+
+test('P0-11 healer keeps partially paired parallel results in tool_use order for Qwen templates', async () => {
+  let seen: Message[] = [];
+  const provider: Provider = {
+    name: 'capture-partial-pair',
+    estimateTokens: () => 0,
+    async *send(req: { messages: Message[] }): AsyncIterable<ProviderEvent> {
+      seen = req.messages;
+      yield { type: 'text', delta: 'ok' };
+      yield { type: 'done', stopReason: 'end_turn' };
+    },
+  };
+  const { loop, context } = buildLoop(provider, [echoTool(() => {})]);
+  context.append({
+    role: 'assistant',
+    content: [
+      { type: 'tool_use', id: 'first', name: 'echo', input: { msg: 'a' } },
+      { type: 'tool_use', id: 'second', name: 'echo', input: { msg: 'b' } },
+    ],
+  });
+  context.append({
+    role: 'user',
+    content: [
+      { type: 'tool_result', toolCallId: 'first', ok: true, content: 'first output' },
+      { type: 'text', text: 'preserve me' },
+    ],
+  });
+
+  await loop.run();
+
+  const assistantIndex = seen.findIndex((m) => m.content.some((b) => b.type === 'tool_use' && b.id === 'first'));
+  const paired = seen[assistantIndex + 1];
+  assert.equal(paired?.role, 'user');
+  assert.deepEqual(
+    paired?.content.map((b) =>
+      b.type === 'tool_result'
+        ? `${b.toolCallId}:${b.content}`
+        : b.type === 'text'
+          ? `text:${b.text}`
+          : b.type,
+    ),
+    [
+      'first:first output',
+      'second:Tool execution was interrupted (ESC / Ctrl-C) before this call produced a result.',
+      'text:preserve me',
+    ],
+  );
 });

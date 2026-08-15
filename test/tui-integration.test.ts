@@ -5,6 +5,7 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { render } from 'ink-testing-library';
+import { z } from 'zod';
 import { TuiApp, type TuiOpts } from '../src/tui.js';
 import { EventBus } from '../src/agent/events.js';
 import { Context } from '../src/agent/context.js';
@@ -12,6 +13,9 @@ import { ToolRegistry } from '../src/tools/registry.js';
 import { createProvider } from '../src/provider/index.js';
 import { loadConfig } from '../src/config.js';
 import { makeAskUserQuestionTool } from '../src/tools/askUser.js';
+import type { Tool } from '../src/tools/types.js';
+import { ok } from '../src/tools/types.js';
+import { runLock } from '../src/web/runLock.js';
 
 // The type-ahead guard (DIALOG_ARM_MS, see tui-typeahead-guard.test.ts) ignores keys pressed in the
 // first ~275 ms a dialog is up — they were in flight before it opened. A test driver answers in the
@@ -146,8 +150,11 @@ test('the spinner shows a live elapsed counter while a slow model is responding'
   unmount();
 });
 
-test('type-ahead: a message typed while running is queued, not interrupting, and flushed in order', async () => {
+test('type-ahead: a pending message interrupts model streaming and steers the next turn', async () => {
   const prompts: string[] = [];
+  let firstAborted = false;
+  let activeRequests = 0;
+  let maxActiveRequests = 0;
   const provider = {
     name: 'typeahead',
     estimateTokens: () => 0,
@@ -160,14 +167,112 @@ test('type-ahead: a message typed while running is queued, not interrupting, and
         .find((m) => m.role === 'user' && m.content.some((b) => b.type === 'text'));
       const text = last?.content.find((b) => b.type === 'text')?.text ?? '';
       prompts.push(text);
-      // The FIRST turn runs to completion on its own — type-ahead must NOT abort it.
-      if (prompts.length === 1) {
-        await new Promise((r) => setTimeout(r, 200));
-        yield { type: 'text' as const, delta: 'first reply' };
+      activeRequests += 1;
+      maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
+      try {
+        if (prompts.length === 1) {
+          yield { type: 'text' as const, delta: 'partial first answer' };
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, 1200);
+            const onAbort = () => {
+              clearTimeout(timer);
+              resolve();
+            };
+            if (req.signal.aborted) onAbort();
+            else req.signal.addEventListener('abort', onAbort, { once: true });
+          });
+          if (req.signal.aborted) {
+            firstAborted = true;
+            return;
+          }
+          yield { type: 'text' as const, delta: ' stale first completion' };
+          yield { type: 'done' as const, stopReason: 'end_turn' as const };
+          return;
+        }
+        yield { type: 'text' as const, delta: `steered reply: ${text}` };
         yield { type: 'done' as const, stopReason: 'end_turn' as const };
+      } finally {
+        activeRequests -= 1;
+      }
+    },
+  };
+  const cfg = loadConfig(process.cwd(), { provider: 'mock', model: 'm' });
+  const context = new Context({
+    contextBudget: cfg.contextBudget,
+    triggerRatio: cfg.summarizeTriggerRatio,
+    keepLastTurns: cfg.keepLastTurns,
+  });
+  const opts: TuiOpts = {
+    provider: provider as unknown as TuiOpts['provider'],
+    registry: new ToolRegistry(),
+    bus: new EventBus(),
+    context,
+    sessionLog: { record() {} } as unknown as TuiOpts['sessionLog'],
+    system: 'test',
+    workspaceRoot: process.cwd(),
+    cfg,
+    autonomy: 'auto-edit',
+    bypass: false,
+    version: '0.0.0',
+  };
+
+  const { stdin, frames, unmount } = render(React.createElement(TuiApp, { opts }));
+  const seen = () => frames.join('\n');
+  await new Promise((r) => setTimeout(r, 30));
+  stdin.write('first');
+  await new Promise((r) => setTimeout(r, 20));
+  stdin.write('\r');
+  await waitFor(() => /partial first answer/.test(seen()), 1500);
+
+  // Enter during provider streaming requests a model-only interrupt, then starts a fresh turn
+  // through the ordinary FIFO/run-lock path.
+  stdin.write('second');
+  await new Promise((r) => setTimeout(r, 20));
+  stdin.write('\r');
+  await waitFor(() => /steered reply: second/.test(seen()), 1500);
+  assert.equal(firstAborted, true, 'the pending message cancels the active model request promptly');
+  assert.equal(maxActiveRequests, 1, 'the replacement request starts only after the first unwinds');
+  assert.deepEqual(prompts, ['first', 'second'], 'the steering message becomes the next provider turn');
+  assert.doesNotMatch(seen(), /stale first completion/, 'the obsolete completion never reaches the transcript');
+  assert.match(seen(), /↪ pending message — steering at the next safe boundary/);
+  assert.match(seen(), /❯ second/, 'the steering message commits its user line like an idle send');
+
+  const messages = context.messages();
+  assert.equal(messages[0]?.role, 'user');
+  assert.deepEqual(messages[1], {
+    role: 'assistant',
+    content: [{ type: 'text', text: 'partial first answer' }],
+    interrupted: true,
+  });
+  assert.equal(messages[2]?.role, 'user', 'the steering message follows the interrupted partial');
+  assert.equal(messages[2]?.content[0]?.type, 'text');
+  if (messages[2]?.content[0]?.type === 'text') assert.equal(messages[2].content[0].text, 'second');
+  unmount();
+});
+
+test('type-ahead: multiple pending messages stay FIFO and do not auto-cancel the next turn', async () => {
+  const prompts: string[] = [];
+  const provider = {
+    name: 'fifo-typeahead',
+    estimateTokens: () => 0,
+    async *send(req: {
+      signal: AbortSignal;
+      messages: Array<{ role: string; content: Array<{ type: string; text?: string }> }>;
+    }) {
+      const last = [...req.messages].reverse().find((m) => m.role === 'user');
+      const prompt = last?.content.find((b) => b.type === 'text')?.text ?? '';
+      prompts.push(prompt);
+      if (prompts.length === 1) {
+        yield { type: 'text' as const, delta: 'first partial' };
+        await new Promise<void>((resolve) => {
+          if (req.signal.aborted) resolve();
+          else req.signal.addEventListener('abort', () => resolve(), { once: true });
+        });
+        // Leave enough unwind time for both pending messages to be submitted against turn A.
+        await new Promise((resolve) => setTimeout(resolve, 80));
         return;
       }
-      yield { type: 'text' as const, delta: `queued reply: ${text}` };
+      yield { type: 'text' as const, delta: `reply:${prompt}` };
       yield { type: 'done' as const, stopReason: 'end_turn' as const };
     },
   };
@@ -185,32 +290,279 @@ test('type-ahead: a message typed while running is queued, not interrupting, and
     system: 'test',
     workspaceRoot: process.cwd(),
     cfg,
-    autonomy: 'auto-edit',
+    autonomy: 'full',
     bypass: false,
     version: '0.0.0',
   };
 
   const { stdin, frames, unmount } = render(React.createElement(TuiApp, { opts }));
   const seen = () => frames.join('\n');
-  await new Promise((r) => setTimeout(r, 30));
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  stdin.write('A');
+  stdin.write('\r');
+  await waitFor(() => /first partial/.test(seen()));
+  stdin.write('B');
+  stdin.write('\r');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  stdin.write('C');
+  stdin.write('\r');
+
+  await waitFor(() => /reply:B/.test(seen()), 2000);
+  await waitFor(() => /reply:C/.test(seen()), 2000);
+  assert.deepEqual(prompts, ['A', 'B', 'C']);
+  assert.match(seen(), /reply:B/, 'B gets its own answer even though C was already queued');
+  unmount();
+});
+
+test('type-ahead while waiting for the process lock preserves the active prompt', async () => {
+  const release = runLock.tryAcquire('tui-fifo-test');
+  assert.ok(release, 'test acquired the process lock');
+  const prompts: string[] = [];
+  const provider = {
+    name: 'lock-fifo',
+    estimateTokens: () => 0,
+    async *send(req: { messages: Array<{ role: string; content: Array<{ type: string; text?: string }> }> }) {
+      const last = [...req.messages].reverse().find((m) => m.role === 'user');
+      const prompt = last?.content.find((b) => b.type === 'text')?.text ?? '';
+      prompts.push(prompt);
+      yield { type: 'text' as const, delta: `reply:${prompt}` };
+      yield { type: 'done' as const, stopReason: 'end_turn' as const };
+    },
+  };
+  const cfg = loadConfig(process.cwd(), { provider: 'mock', model: 'm' });
+  const opts: TuiOpts = {
+    provider: provider as unknown as TuiOpts['provider'],
+    registry: new ToolRegistry(),
+    bus: new EventBus(),
+    context: new Context({ contextBudget: cfg.contextBudget, triggerRatio: cfg.summarizeTriggerRatio, keepLastTurns: cfg.keepLastTurns }),
+    sessionLog: { record() {} } as unknown as TuiOpts['sessionLog'],
+    system: 'test',
+    workspaceRoot: process.cwd(),
+    cfg,
+    autonomy: 'full',
+    bypass: false,
+    version: '0.0.0',
+  };
+
+  const rendered = render(React.createElement(TuiApp, { opts }));
+  const seen = () => rendered.frames.join('\n');
+  try {
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    rendered.stdin.write('A');
+    rendered.stdin.write('\r');
+    await waitFor(() => runLock.state().waiting.includes('cli'));
+    rendered.stdin.write('B');
+    rendered.stdin.write('\r');
+    await waitFor(() => /queued in order/.test(seen()));
+    release();
+    await waitFor(() => /reply:A/.test(seen()), 2000);
+    await waitFor(() => /reply:B/.test(seen()), 2000);
+    assert.deepEqual(prompts, ['A', 'B'], 'A is not silently dropped while its lock acquisition waits');
+  } finally {
+    release();
+    rendered.unmount();
+  }
+});
+
+test('streaming textual tool envelopes never leak into Static, even across JSON delta boundaries', async () => {
+  let first = true;
+  const provider = {
+    name: 'stream-scrub',
+    estimateTokens: () => 0,
+    async *send(req: { signal: AbortSignal }) {
+      if (first) {
+        first = false;
+        yield { type: 'text' as const, delta: 'Useful line.\n' };
+        yield { type: 'text' as const, delta: '{\n' };
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        yield {
+          type: 'text' as const,
+          delta: '  "tool_calls": [{"name":"read_file","args":{"path":"secret"}}]\n}\n',
+        };
+        await new Promise<void>((resolve) => {
+          if (req.signal.aborted) resolve();
+          else req.signal.addEventListener('abort', () => resolve(), { once: true });
+        });
+        return;
+      }
+      yield { type: 'text' as const, delta: 'replacement done' };
+      yield { type: 'done' as const, stopReason: 'end_turn' as const };
+    },
+  };
+  const cfg = loadConfig(process.cwd(), { provider: 'mock', model: 'm' });
+  const context = new Context({ contextBudget: cfg.contextBudget, triggerRatio: cfg.summarizeTriggerRatio, keepLastTurns: cfg.keepLastTurns });
+  const opts: TuiOpts = {
+    provider: provider as unknown as TuiOpts['provider'],
+    registry: new ToolRegistry(),
+    bus: new EventBus(),
+    context,
+    sessionLog: { record() {} } as unknown as TuiOpts['sessionLog'],
+    system: 'test',
+    workspaceRoot: process.cwd(),
+    cfg,
+    autonomy: 'full',
+    bypass: false,
+    version: '0.0.0',
+  };
+
+  const { stdin, frames, unmount } = render(React.createElement(TuiApp, { opts }));
+  const seen = () => frames.join('\n');
+  await new Promise((resolve) => setTimeout(resolve, 40));
   stdin.write('first');
-  await new Promise((r) => setTimeout(r, 20));
   stdin.write('\r');
-  await waitFor(() => /Esc interrupt/.test(seen()), 1500);
-
-  // Type-ahead while the first turn is in flight: it should be QUEUED (visible), not run yet.
-  stdin.write('second');
-  await new Promise((r) => setTimeout(r, 20));
+  await waitFor(() => /Useful line/.test(seen()));
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  stdin.write('next');
   stdin.write('\r');
-  await waitFor(() => /queued \(1\)/.test(seen()), 1500);
-  assert.match(seen(), /queued \(1\): second/, 'the queued message is shown to the user');
-  assert.deepEqual(prompts, ['first'], 'the queued message has NOT started a turn yet');
+  await waitFor(() => /replacement done/.test(seen()), 2000);
 
-  // The first turn completes on its own (proves no interrupt), THEN the queue flushes.
-  await waitFor(() => /first reply/.test(seen()), 1500);
-  await waitFor(() => /queued reply: second/.test(seen()), 1500);
-  assert.deepEqual(prompts, ['first', 'second'], 'queued message ran after the turn, in order');
-  assert.match(seen(), /❯ second/, 'the flushed message commits its user line like a typed one');
+  assert.equal(frames.some((frame) => /"tool_calls"|"name":"read_file"/.test(frame)), false);
+  assert.equal(frames.some((frame) => /(?:^|\n)\s*\{\s*(?:\n|$)/m.test(frame)), false, 'a lone opening brace was never committed');
+  const interrupted = context.messages().find((m) => m.role === 'assistant' && m.interrupted);
+  assert.deepEqual(interrupted?.content, [{ type: 'text', text: 'Useful line.' }]);
+  unmount();
+});
+
+test('Enter on a typed follow-up denies an approval dialog and steers instead of approving', async () => {
+  let toolRuns = 0;
+  let sends = 0;
+  const registry = new ToolRegistry();
+  const dangerous: Tool<Record<string, never>, { ran: boolean }> = {
+    name: 'dangerous_write',
+    description: 'must be approved',
+    risk: 'write',
+    inputSchema: z.object({}),
+    async run() {
+      toolRuns += 1;
+      return ok('dangerous_write', 'write', 1, 'ran', { ran: true });
+    },
+  };
+  registry.register(dangerous);
+  const provider = {
+    name: 'approval-steer',
+    estimateTokens: () => 0,
+    async *send(req: { messages: Array<{ role: string; content: Array<{ type: string; text?: string }> }> }) {
+      sends += 1;
+      if (sends === 1) {
+        await new Promise((resolve) => setTimeout(resolve, 140));
+        yield { type: 'tool_call' as const, call: { id: 'guarded', name: 'dangerous_write', input: {} } };
+        yield { type: 'done' as const, stopReason: 'tool_use' as const };
+        return;
+      }
+      const last = [...req.messages].reverse().find((m) => m.role === 'user' && m.content.some((b) => b.type === 'text'));
+      const prompt = last?.content.find((b) => b.type === 'text')?.text ?? '';
+      yield { type: 'text' as const, delta: `follow-up:${prompt}` };
+      yield { type: 'done' as const, stopReason: 'end_turn' as const };
+    },
+  };
+  const cfg = loadConfig(process.cwd(), { provider: 'mock', model: 'm' });
+  const context = new Context({ contextBudget: cfg.contextBudget, triggerRatio: cfg.summarizeTriggerRatio, keepLastTurns: cfg.keepLastTurns });
+  const bus = new EventBus();
+  const events: string[] = [];
+  bus.on((event) => events.push(event.type));
+  const opts: TuiOpts = {
+    provider: provider as unknown as TuiOpts['provider'],
+    registry,
+    bus,
+    context,
+    sessionLog: { record() {}, recordSnapshot() {} } as unknown as TuiOpts['sessionLog'],
+    system: 'test',
+    workspaceRoot: process.cwd(),
+    cfg,
+    autonomy: 'manual',
+    bypass: false,
+    version: '0.0.0',
+  };
+
+  const { stdin, frames, unmount } = render(React.createElement(TuiApp, { opts }));
+  const seen = () => frames.join('\n');
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  stdin.write('initial');
+  stdin.write('\r');
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  stdin.write('change course');
+  await waitFor(() => /❯ change course/.test(seen()));
+  await waitFor(() => /dangerous_write/.test(seen()), 2000);
+  stdin.write('\r');
+  await waitFor(() => /follow-up:change course/.test(seen()), 2000);
+
+  assert.equal(toolRuns, 0, 'Enter never approved the pending write');
+  assert.equal(events.includes('tool_start'), false);
+  assert.equal(events.includes('tool_denied'), false, 'superseded is not mislabeled as an explicit denial');
+  const result = context.messages().flatMap((m) => m.content).find(
+    (b) => b.type === 'tool_result' && b.toolCallId === 'guarded',
+  );
+  assert.ok(result && result.type === 'tool_result');
+  assert.match(result.content, /new message/i);
+  unmount();
+});
+
+test('queued /compact is an asynchronous FIFO barrier before the next message', async () => {
+  let manualCompactStarted!: () => void;
+  const compactStarted = new Promise<void>((resolve) => (manualCompactStarted = resolve));
+  let finishCompact!: () => void;
+  const compactMayFinish = new Promise<void>((resolve) => (finishCompact = resolve));
+  const prompts: string[] = [];
+  const provider = {
+    name: 'compact-barrier',
+    estimateTokens: () => 0,
+    async *send(req: {
+      signal: AbortSignal;
+      messages: Array<{ role: string; content: Array<{ type: string; text?: string }> }>;
+    }) {
+      const last = [...req.messages].reverse().find((m) => m.role === 'user');
+      const prompt = last?.content.find((b) => b.type === 'text')?.text ?? '';
+      prompts.push(prompt);
+      if (prompts.length === 1) {
+        yield { type: 'text' as const, delta: 'working' };
+        await new Promise<void>((resolve) => {
+          if (req.signal.aborted) resolve();
+          else req.signal.addEventListener('abort', () => resolve(), { once: true });
+        });
+        return;
+      }
+      yield { type: 'text' as const, delta: `reply:${prompt}` };
+      yield { type: 'done' as const, stopReason: 'end_turn' as const };
+    },
+  };
+  const cfg = loadConfig(process.cwd(), { provider: 'mock', model: 'm' });
+  const context = new Context({ contextBudget: cfg.contextBudget, triggerRatio: cfg.summarizeTriggerRatio, keepLastTurns: cfg.keepLastTurns });
+  context.maybeSummarize = async (_provider, _model, force) => {
+    if (!force) return false;
+    manualCompactStarted();
+    await compactMayFinish;
+    return false;
+  };
+  const opts: TuiOpts = {
+    provider: provider as unknown as TuiOpts['provider'],
+    registry: new ToolRegistry(),
+    bus: new EventBus(),
+    context,
+    sessionLog: { record() {} } as unknown as TuiOpts['sessionLog'],
+    system: 'test',
+    workspaceRoot: process.cwd(),
+    cfg,
+    autonomy: 'full',
+    bypass: false,
+    version: '0.0.0',
+  };
+
+  const { stdin, frames, unmount } = render(React.createElement(TuiApp, { opts }));
+  const seen = () => frames.join('\n');
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  stdin.write('A');
+  stdin.write('\r');
+  await waitFor(() => /working/.test(seen()));
+  stdin.write('/compact');
+  stdin.write('\r');
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  stdin.write('B');
+  stdin.write('\r');
+  await compactStarted;
+  assert.deepEqual(prompts, ['A'], 'B cannot start against context while manual compaction is rewriting it');
+  finishCompact();
+  await waitFor(() => /reply:B/.test(seen()), 2000);
+  assert.deepEqual(prompts, ['A', 'B']);
   unmount();
 });
 

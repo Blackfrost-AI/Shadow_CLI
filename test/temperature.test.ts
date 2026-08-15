@@ -11,6 +11,7 @@ import type { CompletionRequest, Provider } from '../src/provider/provider.js';
 import { buildLoopDeps } from '../src/agent/loopDeps.js';
 import { Context } from '../src/agent/context.js';
 import { runModelCheck } from '../src/doctor/modelCheck.js';
+import { resolveFakeHosts } from './helpers/fakeHostEgress.js';
 
 // loadConfig reads ~/.shadow at module load. Keep these validation tests hermetic so a
 // developer's real temperature preference cannot change the expected default.
@@ -225,6 +226,7 @@ test('Responses wire follows the same self-hosted-only temperature gate', () => 
 
 test('provider instances gate temperature from their actual endpoint across both wire APIs', async () => {
   const originalFetch = globalThis.fetch;
+  const restoreEgress = resolveFakeHosts(); // models.example.net etc. are not resolvable — let them reach the stub
   const bodies: Array<Record<string, unknown>> = [];
   globalThis.fetch = async (url, init) => {
     bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
@@ -257,6 +259,7 @@ test('provider instances gate temperature from their actual endpoint across both
       req,
     );
   } finally {
+    restoreEgress();
     globalThis.fetch = originalFetch;
   }
 
@@ -286,7 +289,7 @@ test('compaction and model diagnostics preserve the configured local temperature
   context.append({ role: 'user', content: [{ type: 'text', text: 'recent instruction' }] });
   assert.equal(
     await context.maybeSummarize(provider, 'qwen3-coder', true, undefined, { temperature: 0.36 }),
-    true,
+    'summarized',
   );
   assert.equal(requests[0]?.temperature, 0.36, 'compaction request uses the live value');
 

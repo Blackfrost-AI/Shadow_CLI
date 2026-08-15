@@ -13,6 +13,7 @@
  */
 import type { ProviderEvent } from './provider.js';
 import { isLocalBaseUrl } from '../safety/offline.js';
+import { shadowFetch } from '../safety/egress.js';
 
 const MAX_ATTEMPTS = 5; // ~24s of ride-out across the ladder — see backoff()
 /** Max times we shrink an over-budget output cap and retry a 400 that says the request is too long. */
@@ -32,14 +33,36 @@ const NON_STREAM_TIMEOUT_MS = 180_000;
 class IdleWatchdog {
   readonly controller = new AbortController();
   fired = false;
+  /** The frame this watchdog was armed with at trip time (for honest idle-error messages). */
+  lastTripFrame: number;
   private timer: ReturnType<typeof setTimeout>;
 
-  constructor(private readonly ms: number) {
+  /**
+   * `nextKickFrame` (optional): the frame every SUBSEQUENT `kick()` re-arms with after the first.
+   * Used for `firstByteTimeoutMs` — a short (or long) budget for the very first chunk that hands
+   * off to the steady-state frame on the first byte. When omitted, `kick()` re-arms with the same
+   * `ms` frame as before (identical behavior for all pre-existing call sites and tests).
+   */
+  constructor(
+    private readonly ms: number,
+    nextKickFrame?: number,
+  ) {
+    this.lastTripFrame = ms;
+    if (nextKickFrame !== undefined && nextKickFrame !== ms) {
+      // Hop ONCE on the first kick; subsequent kicks stick to the steady-state frame.
+      this.kick = () => {
+        if (this.fired) return;
+        this.lastTripFrame = nextKickFrame;
+        clearTimeout(this.timer);
+        this.timer = setTimeout(() => this.trip(), nextKickFrame);
+      };
+    }
     this.timer = setTimeout(() => this.trip(), ms);
   }
 
   private trip(): void {
     this.fired = true;
+    this.lastTripFrame = this.ms;
     this.controller.abort();
   }
 
@@ -104,6 +127,121 @@ export interface StreamAttempt {
   nonStreamBody?: unknown;
   /** Parse a complete non-stream JSON response into ProviderEvents. */
   parseNonStream?: (obj: unknown) => Generator<ProviderEvent>;
+  /**
+   * Per-endpoint stream idle budget (ms since the last received event) before the watchdog
+   * re-trips. Resolved per-request by the provider from `idleTimeoutMs` (config) / `SHADOW_IDLE_MS`
+   * (env) / `IDLE_MS` (default). vLLM/SGLang send NO SSE keepalives during prefill, so a big-context
+   * frontier serve (Qwen 3.8 Max ≥ 128k ctx) needs a generous floor — the preamble is silent
+   * until the first token. UNSET stays 120s.
+   */
+  idleTimeoutMs?: number;
+  /**
+   * Idle budget (ms) applied ONLY until the FIRST event of a brand-new stream (after headers).
+   * Once any token arrives the budget falls back to {@link idleTimeoutMs}; used to catch a
+   * quietly-wedged header-flush server faster on the very first token without lengthening the
+   * steady-state bytes-to-bytes budget.
+   */
+  firstByteTimeoutMs?: number;
+  /**
+   * Retry ceiling for pre-200 transient failures (429/5xx/network). Overrides `MAX_ATTEMPTS`
+   * (default ~24s ride-out across the ladder). Per-endpoint — a busy frontier serve deserves
+   * more, a public endpoint less. UNSET = current ladder.
+   */
+  streamRetries?: number;
+  /**
+   * Set when the endpoint receiving this request is self-hosted (local/LAN or the explicit
+   * marker). Lets the mid-stream rescue avoid re-firing a duplicate prompt at a busy serve that
+   * already accepted the request — the rescue only fires AFTER headers, where the serve is known
+   * busy (see the `emitted === 0` guard in `streamWithRetry`).
+   */
+  selfHosted?: boolean;
+  /**
+   * Called once when a 400 forces the `tool_choice: "auto"` → `"none"` fallback (a self-hosted
+   * vLLM/SGLang started WITHOUT `--enable-auto-tool-choice`/`--tool-call-parser` rejects auto tool
+   * choice). The provider uses this to remember the endpoint's limitation for the rest of the
+   * session so later turns build with `"none"` directly instead of eating a 400 every turn.
+   */
+  onToolChoiceUnsupported?: () => void;
+  /**
+   * Called once per param when the generic param-strip ladder (P2-03 / F01-05) strips an optional
+   * request param a 400 named (stream_options / tool_choice / temperature). The provider uses it
+   * to remember the rejection for the rest of the session so later turns build WITHOUT the param
+   * instead of eating a 400 + retry every turn — the same remember-for-the-session shape as
+   * {@link onToolChoiceUnsupported}.
+   */
+  onParamStripped?: (param: StrippableParam) => void;
+}
+
+/** A 400 that specifically rejects `tool_choice: "auto"` (missing vLLM/SGLang tool-parser flags). */
+export function looksLikeToolChoiceUnsupported(message: string): boolean {
+  const m = message.toLowerCase();
+  return (
+    /tool[_ -]?choice/.test(m) &&
+    /(auto|require|not (supported|enabled|allowed)|enable-auto-tool-choice|tool[- ]?call[- ]?parser|unsupported)/.test(m)
+  );
+}
+
+/**
+ * Downgrade a request body's `tool_choice` to `"none"` so a serve without a tool-call parser stops
+ * 400-ing. The tools stay in the body: the model's chat template still renders them, so a
+ * tool-trained model (Qwen/Hermes) emits calls as text, which Shadow's text-tool-call recovery
+ * parses back out. Returns true if a change was made.
+ */
+export function setToolChoiceNone(body: unknown): boolean {
+  if (!body || typeof body !== 'object') return false;
+  const b = body as Record<string, unknown>;
+  if (b.tool_choice === 'none') return false;
+  if (!('tools' in b) && !('tool_choice' in b)) return false;
+  b.tool_choice = 'none';
+  return true;
+}
+
+/**
+ * Optional wire params Shadow sends that a strict or partial endpoint can flat-out reject
+ * (P2-03 / F01-05). Ordered by how commonly they trip gateways; `max_tokens` is NOT here —
+ * token-budget 400s have their own shrink ladder, and `stream`/`messages` are not optional.
+ */
+export const STRIPPABLE_PARAMS = ['stream_options', 'tool_choice', 'temperature'] as const;
+export type StrippableParam = (typeof STRIPPABLE_PARAMS)[number];
+
+const STRIP_PARAM_RES: Array<{ param: StrippableParam; re: RegExp }> = [
+  { param: 'stream_options', re: /stream_options/i },
+  { param: 'tool_choice', re: /tool_choice/i },
+  { param: 'temperature', re: /temperature/i },
+];
+
+/**
+ * Every strippable param a 400 message names, in ladder order. The param names are distinctive
+ * lowercase/snake_case tokens, so a plain substring match on provider error text is safe — this
+ * only ever FIRES on a 400. A message may name several (gateway policy banners list all the
+ * params they reject); the ladder walks the candidates in order and strips the FIRST one that
+ * is still present in the body and not already stripped.
+ */
+export function rejectedParamsInMessage(message: string): StrippableParam[] {
+  return STRIP_PARAM_RES.filter(({ re }) => re.test(message)).map(({ param }) => param);
+}
+
+/**
+ * True when a 400 message reads as a VALUE-validation error ("temperature 0.2 is below the
+ * minimum", "must be <= 2, got 5", "out of range") rather than a FIELD rejection ("Unsupported
+ * parameter", "unknown parameter", "not supported"). Value errors must stay TERMINAL: stripping
+ * the param would silently void a knob the user set explicitly (sampling re-defaults for the
+ * whole session) instead of surfacing the misconfiguration. A wrong call here costs a visible
+ * error with the server's own words — the honest failure mode.
+ */
+export function looksLikeParamValueError(message: string): boolean {
+  return /(below|above|out of range|too (low|high|small|large)|must (be|not exceed|not be greater)|at least|at most|expected .*got|got \d|between .{1,24} and|less than|greater than|maximum of|minimum of|invalid (value|range)|exceeds?)/i.test(
+    message,
+  );
+}
+
+/** Delete a rejected param from a request body. Returns true if it was present. */
+export function stripParamFromBody(body: unknown, param: string): boolean {
+  if (!body || typeof body !== 'object') return false;
+  const b = body as Record<string, unknown>;
+  if (!(param in b)) return false;
+  delete b[param];
+  return true;
 }
 
 /**
@@ -116,30 +254,55 @@ export interface StreamAttempt {
  *   - idle timeout                → recoverable error (no retry; already waited)
  */
 export async function* streamWithRetry(a: StreamAttempt): AsyncIterable<ProviderEvent> {
+  // Per-endpoint resolve (P1A-04): config-knob → SHADOW_IDLE_MS env → IDLE_MS default. The env
+  // override MUST beat config for the operator escape hatch; the watchdog frame must KNOW what
+  // frame the user picked, so resolve once per stream (not per attempt) and reuse for the error.
+  const idleBudget = a.idleTimeoutMs ?? IDLE_MS; // ms since last event before the watchdog trips
+  const frameMs = Math.max(0, idleBudget); // never negative; 0 = disable (kick immediately trips)
+  const maxRetries = a.streamRetries ?? MAX_ATTEMPTS;
+  // selfHosted is an explicit marker — vLLM/SGLang flush headers before prefill completes, so a
+  // headers-then-silence server looks like a mid-stream stall at emitted===0. The C4 no-re-POST
+  // protection must survive that shape too: a busy LOCAL serve already has the prompt.
+  const selfHosted = a.selfHosted === true || isLocalBaseUrl(a.url);
   let shrinks = 0;
   let imagesStripped = false;
+  let toolChoiceStripped = false;
+  // P2-03 (F01-05): params already stripped during THIS stream — each strips at most once, so a
+  // server rejecting several params is walked one 400 at a time, never a strip-loop.
+  const strippedParams = new Set<string>();
   for (let attempt = 1; ; attempt++) {
     if (a.signal?.aborted) return; // user already interrupted — don't even start
-    const idle = new IdleWatchdog(IDLE_MS);
+    // A headers-first serve may need a much longer wait for the FIRST token than for steady-state
+    // bytes (vLLM prefill). Arm firstByteTimeoutMs ONLY until the first body chunk — kick() has
+    // hopped to the steady-state frame by then, so every subsequent re-arm uses frameMs. This
+    // makes the first-byte budget a first-byte budget, not a smuggled tight idle budget.
+    const idle = new IdleWatchdog(a.firstByteTimeoutMs ?? frameMs, frameMs);
     // fetch aborts on EITHER an idle timeout OR a user interrupt (ESC/Ctrl-C).
     const fetchSignal = a.signal ? AbortSignal.any([idle.signal, a.signal]) : idle.signal;
     let res: Response;
     try {
-      res = await fetch(a.url, {
-        method: 'POST',
-        headers: a.headers,
-        body: JSON.stringify(a.body),
-        signal: fetchSignal,
-      });
+      // Routed through the egress broker (P2-01): offline wall + metadata-IP block + DNS
+      // pinning (the pin set is resolved ONCE and cached, so retries no longer re-resolve
+      // the provider host on every attempt) + the egress receipt.
+      res = await shadowFetch(
+        a.url,
+        {
+          method: 'POST',
+          headers: a.headers,
+          body: JSON.stringify(a.body),
+          signal: fetchSignal,
+        },
+        { purpose: 'provider', origin: 'user' },
+      );
     } catch (e) {
       idle.clear();
       if (a.signal?.aborted) return; // user interrupt — stop silently (loop reports 'interrupted')
       if (idle.fired) {
-        if (yield* nonStreamFallback(a, 'idle')) return;
-        yield idleError();
+        if (yield* nonStreamFallback(a, 'idle', selfHosted)) return;
+        yield idleError(frameMs);
         return;
       }
-      if (attempt < MAX_ATTEMPTS) {
+      if (attempt < maxRetries) {
         try {
           await backoff(attempt, undefined, a.signal);
         } catch {
@@ -155,7 +318,7 @@ export async function* streamWithRetry(a: StreamAttempt): AsyncIterable<Provider
       idle.clear();
       const retryAfterMs = parseRetryAfter(res.headers.get('retry-after'));
       const message = await readErrorMessage(res);
-      if (attempt < MAX_ATTEMPTS) {
+      if (attempt < maxRetries) {
         try {
           await backoff(attempt, retryAfterMs, a.signal); // honor the server's Retry-After when sent
         } catch {
@@ -203,6 +366,44 @@ export async function* streamWithRetry(a: StreamAttempt): AsyncIterable<Provider
           continue;
         }
       }
+      // A 400 from a self-hosted serve that rejects `tool_choice: "auto"` (vLLM/SGLang launched
+      // without `--enable-auto-tool-choice`/`--tool-call-parser`). Retry ONCE with `"none"`: the
+      // tools stay rendered by the chat template, the model still emits calls as text, and Shadow's
+      // text-tool-call recovery parses them — so the run WORKS instead of dying on turn 1. Without
+      // this, every agentic request to such a serve is dead on arrival.
+      if (res.status === 400 && !toolChoiceStripped && looksLikeToolChoiceUnsupported(message) && setToolChoiceNone(a.body)) {
+        if (a.nonStreamBody) setToolChoiceNone(a.nonStreamBody);
+        toolChoiceStripped = true;
+        a.onToolChoiceUnsupported?.();
+        continue;
+      }
+      // P2-03 (F01-05) — the generic param-strip ladder. A 400 whose message NAMES an optional
+      // param we sent (stream_options / tool_choice / temperature) retries once with that param
+      // stripped: the server's default behavior replaces it, and the run continues instead of
+      // dying on a gateway that rejects one knob. Ordered AFTER the specialized handlers above —
+      // token shrink, image strip, and tool_choice→none all make BETTER recoveries than a plain
+      // strip when they match. The provider is told, so the rest of the session builds without
+      // the param and never pays this 400 again (imagesStripped/toolChoiceStripped pattern).
+      //
+      // Two guards keep the strip honest:
+      //  - VALUE errors ("temperature 0.2 is below the minimum") stay TERMINAL — stripping would
+      //    silently void the user's knob instead of surfacing the misconfiguration;
+      //  - a message naming SEVERAL params walks the candidates in ladder order, skipping params
+      //    already stripped or absent from the body, so a policy banner listing every rejected
+      //    param (or a first-named param we never sent) cannot stall a viable recovery.
+      if (res.status === 400 && !looksLikeParamValueError(message)) {
+        let strippedParam: StrippableParam | null = null;
+        for (const param of rejectedParamsInMessage(message)) {
+          if (strippedParams.has(param)) continue;
+          if (!stripParamFromBody(a.body, param)) continue;
+          if (a.nonStreamBody) stripParamFromBody(a.nonStreamBody, param);
+          strippedParams.add(param);
+          a.onParamStripped?.(param);
+          strippedParam = param;
+          break;
+        }
+        if (strippedParam) continue;
+      }
       // 400 (bad request) / 401 (auth) / 403 (forbidden) / other 4xx — terminal.
       yield { type: 'error', recoverable: false, code: `http_${res.status}`, message };
       return;
@@ -222,12 +423,21 @@ export async function* streamWithRetry(a: StreamAttempt): AsyncIterable<Provider
     } catch (e) {
       if (a.signal?.aborted) {
         // user interrupt mid-stream — stop silently; the loop reports 'interrupted'
-      } else if (emitted === 0 && (yield* nonStreamFallback(a))) {
+      } else if (
+        emitted === 0 &&
+        (yield* nonStreamFallback(a, selfHosted ? 'idle' : 'empty', selfHosted))
+      ) {
         // recovered via non-stream POST — safe ONLY because nothing was emitted yet. Re-fetching after
         // partial output would duplicate the text/tool_use already streamed to the loop.
+        //
+        // P1A-04: a headers-first self-hosted serve (vLLM/SGLang send 200 + headers, then a long
+        // silent prefill) trips the watchdog with emitted===0 and looks like a mid-stream stall.
+        // Tag the rescue `'idle'` so the C4 no-re-POST protection fires — NEVER re-POST the full
+        // prompt at a local serve that already has it. The empty-response path is unchanged for a
+        // genuinely-silent public API (re-POSTing there is safe; the endpoint never started).
       } else {
         yield idle.fired
-          ? idleError()
+          ? idleError(idle.lastTripFrame)
           : { type: 'error', recoverable: true, code: 'stream_error', message: (e as Error).message };
       }
     } finally {
@@ -246,12 +456,16 @@ export async function fetchNonStreamResponse(
   body: unknown,
   signal?: AbortSignal,
 ): Promise<unknown> {
-  const res = await fetch(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-    signal,
-  });
+  const res = await shadowFetch(
+    url,
+    {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+      signal,
+    },
+    { purpose: 'provider', origin: 'user' },
+  );
   if (!res.ok) {
     const message = await readErrorMessage(res);
     throw new Error(`HTTP ${res.status}: ${message}`);
@@ -266,7 +480,7 @@ export async function fetchNonStreamResponse(
 }
 
 /** Try the non-stream fallback once; yields events and returns true on success. */
-async function* nonStreamFallback(a: StreamAttempt, reason: 'idle' | 'empty' = 'empty'): AsyncGenerator<ProviderEvent, boolean> {
+async function* nonStreamFallback(a: StreamAttempt, reason: 'idle' | 'empty' = 'empty', selfHosted = false): AsyncGenerator<ProviderEvent, boolean> {
   if (!a.nonStreamBody || !a.parseNonStream) return false;
   if (a.signal?.aborted) return false;
   // C4 — do NOT re-fire an identical prompt at a LOCAL server that has merely gone quiet.
@@ -276,7 +490,10 @@ async function* nonStreamFallback(a: StreamAttempt, reason: 'idle' | 'empty' = '
   // the same prompt queued, the first two minutes of work are thrown away, and the machine is
   // doing double the work to answer once. A remote endpoint that goes silent is usually a dropped
   // connection worth retrying; a local one is usually just busy.
-  if (reason === 'idle' && isLocalBaseUrl(a.url)) return false;
+  //
+  // What counts as "local": a URL the safety boundary already recognizes (loopback/LAN/mDNS), or an
+  // EXPLICITLY self-hosted endpoint on a public FQDN — those remote serves are just as busy.
+  if (reason === 'idle' && (selfHosted || isLocalBaseUrl(a.url))) return false;
   try {
     // The fallback gets its OWN timeout. It previously attached only `a.signal`, so the request
     // that was supposed to rescue a stall could itself hang indefinitely.
@@ -300,12 +517,13 @@ async function* nonStreamFallback(a: StreamAttempt, reason: 'idle' | 'empty' = '
   }
 }
 
-function idleError(): ProviderEvent {
+function idleError(frameMs = IDLE_MS): ProviderEvent {
   return {
     type: 'error',
     recoverable: true,
     code: 'idle_timeout',
-    message: `no response within ${IDLE_MS / 1000}s — the model may be overloaded or the connection stalled`,
+    message: `no response within ${Math.round(frameMs / 1000)}s — the model may be overloaded or the connection stalled` +
+      (frameMs !== IDLE_MS ? ` (configured stream idle timeout; raise \`idleTimeoutMs\` or ${'$'}SHADOW_IDLE_MS for a slow local serve)` : ''),
   };
 }
 

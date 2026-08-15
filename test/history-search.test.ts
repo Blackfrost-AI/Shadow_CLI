@@ -35,7 +35,10 @@ function makeOpts(): TuiOpts {
   return {
     // A REAL context + provider: submitting a turn is how history gets populated, and the stub
     // object every other test uses has no pinTask.
-    provider: new MockProvider([[{ type: 'done', stopReason: 'end_turn' } as never]]) as unknown as TuiOpts['provider'],
+    // A real (non-empty) answer so the turn COMPLETES immediately. An empty end_turn now triggers
+    // the empty-response corrective-retry backoff (~350ms of running), and P1A-15 correctly forbids
+    // opening reverse-search mid-turn — this test is about history search on an IDLE composer.
+    provider: new MockProvider([[{ type: 'text', delta: 'ok' }, { type: 'done', stopReason: 'end_turn' }] as never]) as unknown as TuiOpts['provider'],
     registry: new ToolRegistry() as unknown as TuiOpts['registry'],
     bus: new EventBus(),
     context: new Context({ contextBudget: 100000, triggerRatio: 0.75, keepLastTurns: 6 }) as TuiOpts['context'],

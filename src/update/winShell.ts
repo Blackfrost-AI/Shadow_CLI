@@ -2,11 +2,10 @@ import { execFileSync } from 'node:child_process';
 
 /**
  * Resolve which PowerShell to spawn for the Windows binary self-update.
- * install.ps1 verifies the release signature with .NET 5+ ECDSA APIs (ImportFromPem +
- * DSASignatureFormat) and FAILS CLOSED below PowerShell 7.1 — but the built-in `powershell`
- * is 5.1, so a hardcoded spawn broke every Windows self-update even with PS7 installed.
- * Prefer `pwsh` whenever it's on PATH; the 5.1 fallback still reaches install.ps1's own
- * actionable "requires PowerShell 7.1+" abort rather than failing silently.
+ * Prefer `pwsh` (PowerShell 7+) whenever it's on PATH — it verifies via ImportFromPem.
+ * The built-in `powershell` (5.1) fallback is also fully supported: install.ps1 verifies
+ * the same ECDSA-P256 signature on 5.1 via .NET Framework 4.7+'s native ECDSA (since
+ * v6.14.0; before that, 5.1 aborted and pwsh was the only working runtime).
  */
 export function windowsPowerShell(
   probe: (cmd: string, args: string[]) => unknown = (cmd, args) =>

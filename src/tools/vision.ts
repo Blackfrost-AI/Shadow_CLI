@@ -9,6 +9,7 @@ import type { Tool, ToolResult } from './types.js';
 import { ok, fail } from './types.js';
 import { resolveWithin } from '../safety/workspaceJail.js';
 import { imageMediaType } from '../util/image.js';
+import { shadowFetch } from '../safety/egress.js';
 
 export interface VisionConfig {
   baseUrl: string;
@@ -43,12 +44,16 @@ async function describeViaVision(
       },
     ],
   };
-  const res = await fetch(`${cfg.baseUrl.replace(/\/+$/, '')}/chat/completions`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-    signal,
-  });
+  const res = await shadowFetch(
+    `${cfg.baseUrl.replace(/\/+$/, '')}/chat/completions`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      signal,
+    },
+    { purpose: 'vision', origin: 'user' },
+  );
   if (!res.ok)
     throw new Error(`vision endpoint HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`);
   const j = (await res.json()) as { choices?: { message?: { content?: string } }[] };

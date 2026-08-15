@@ -135,3 +135,53 @@ test('T0-3: scoping applies to EVERY stage of a pipeline', () => {
   assert.equal(isBashReadOnly('cat /work/repo/a.txt | grep foo', roots), true);
   assert.equal(isBashReadOnly('grep foo /work/repo/a.txt | cat /Users/x/.netrc', roots), false);
 });
+
+// F07-02: recursive search commands (grep/rg/find) were read-only fast-path with NO operand scoping —
+// `grep -rI password /etc /root ~/.config` and `rg -il token ~` and `find ~ -name id_rsa` auto-ran
+// and their (possibly secret) output entered context. They now demote to the gate like the viewers.
+test('F07-02: grep/rg/find/git-grep out-of-workspace scan roots demote to the gate', () => {
+  const roots = ['/work/repo'];
+  // Plan's exact acceptance examples must gate.
+  assert.equal(isBashReadOnly('grep -rI foo /etc', roots), false, 'grep -rI into /etc gates');
+  assert.equal(isBashReadOnly('rg -il token ~', roots), false, 'rg scanning ~ gates (tilde)');
+  assert.equal(isBashReadOnly('find ~ -name x', roots), false, 'find from ~ gates (tilde)');
+  // Multi-root secret sweep.
+  assert.equal(isBashReadOnly('grep -rI password /etc /root /Users/x/.config', roots), false);
+  assert.equal(isBashReadOnly('rg -il token /Users/x', roots), false);
+  assert.equal(isBashReadOnly('find /Users/x -name id_rsa', roots), false);
+  // Escaping relative path.
+  assert.equal(isBashReadOnly('grep -r foo ../../outside', roots), false);
+  assert.equal(isBashReadOnly('rg foo ../..', roots), false);
+  // Absolute out-of-jail single path.
+  assert.equal(isBashReadOnly('grep foo /etc/passwd', roots), false);
+  assert.equal(isBashReadOnly('find /etc -name passwd', roots), false);
+  // `git grep -- pathspec`: git grep was never on the read-only fast path at all, so it gates
+  // regardless — confirmed in the in-workspace test below.
+});
+
+test('F07-02: in-workspace grep/rg/find STILL auto-run (no UX regression)', () => {
+  const roots = ['/work/repo'];
+  assert.equal(isBashReadOnly('grep -r foo .', roots), true);
+  assert.equal(isBashReadOnly('rg pattern src/', roots), true);
+  assert.equal(isBashReadOnly('grep -rn foo /work/repo/src', roots), true);
+  assert.equal(isBashReadOnly('find . -name "*.ts"', roots), true);
+  assert.equal(isBashReadOnly('find /work/repo -name a.ts', roots), true);
+  // A pattern-only grep (reads stdin) has no path operand to scope.
+  assert.equal(isBashReadOnly('grep foo', roots), true);
+  // NOTE: `git grep` was NEVER on the read-only fast path (no `git grep` prefix exists), so it gates
+  // regardless of operands — there is no out-of-jail gap to close and no behavior to preserve.
+  assert.equal(isBashReadOnly('git grep foo', roots), false);
+  assert.equal(isBashReadOnly('git grep foo -- ./src', roots), false);
+  // Value-taking options must NOT be mistaken for path operands.
+  assert.equal(isBashReadOnly('grep -e /work/repo/x -m 3 foo src/', roots), true);
+  assert.equal(isBashReadOnly('rg --glob=src/** foo /work/repo', roots), true);
+  assert.equal(isBashReadOnly('grep --include="*.ts" foo /work/repo', roots), true);
+});
+
+test('F07-02: shape-only classification (no roots) keeps grep/rg/find auto-allowed', () => {
+  // The classifier may run with no roots; scoping must not deny there (unchanged behavior).
+  assert.equal(isBashReadOnly('grep -r foo /etc'), true);
+  assert.equal(isBashReadOnly('rg -il token ~'), true);
+  assert.equal(isBashReadOnly('find / -name x'), true);
+  assert.equal(isBashReadOnly('grep foo /etc/passwd', []), true);
+});

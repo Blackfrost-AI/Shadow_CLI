@@ -125,6 +125,35 @@ test('a ``` inside a ~~~ fence is literal content — only the SAME marker close
   );
 });
 
+test('P1A-13: a 4-tick fence holding a 3-tick line is NOT closed by that line (width-correct close)', () => {
+  // Frontier models legitimately emit a 4-tick fence around content that itself contains a
+  // 3-tick ``` (e.g. prose about markdown). Width-correct close detection must NOT treat that
+  // inner 3-tick line as the closing fence — it stays literal content and the 4-tick opener
+  // remains open, so the whole block commits in one unit only at the real (4-tick) close.
+  const r = extractCommittableUnits('````md\ncode ```here```\nmore\n````\n');
+  assert.deepEqual(
+    r.units.map((u) => u.text),
+    ['````md\ncode ```here```\nmore\n````'],
+    '4-tick fence commits as ONE unit; the inner 3-tick line never closed it',
+  );
+});
+
+test('P1A-13: a 4-tick fence is NOT closed by a 3-tick fence line — only a >=4-tick close ends it', () => {
+  const r1 = extractCommittableUnits('````txt\nline one\n```\nline two\n');
+  assert.equal(r1.rest, '````txt\nline one\n```\nline two\n', '3-tick line does not close a 4-tick fence');
+  const r2 = extractCommittableUnits('````txt\nline one\n````\n');
+  assert.deepEqual(texts(r2), ['````txt\nline one\n````'], '4-tick close commits the block');
+});
+
+test('P1A-13: a >=4-space-indented fence line is NOT a fence (indented code block)', () => {
+  // CommonMark: a fence opener may be indented at most 3 spaces. A 4-space-indented ``` is an
+  // indented code block, not a fence, so it must NOT enter fence-hold semantics — the lines
+  // commit immediately as ordinary prose instead of being held for a (never-arriving) close.
+  const r = extractCommittableUnits('    ```\nnot a fence\n    ```\n');
+  assert.deepEqual(texts(r), ['    ```', 'not a fence', '    ```'], 'indented ``` lines commit as prose, not fence-held');
+  assert.equal(r.rest, '');
+});
+
 test('trailingBlank survives a delta-batch boundary via startPadded (paragraph break on the seam)', () => {
   // Batch 1 ends exactly on the blank separator…
   const a = extractCommittableUnits('first para\n\n');

@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, readdirSync, writeFileSync, unlinkSync, renameSync, chmodSync, mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { enabledPluginDirs } from '../plugins/manager.js';
 
 export interface AgentDef {
   name: string;
@@ -39,7 +40,14 @@ const BUILTIN_REVIEWER: AgentDef = {
 };
 
 function agentDirs(workspaceRoot: string): string[] {
-  return [join(homedir(), '.shadow', 'agents'), join(workspaceRoot, '.shadow', 'agents')];
+  // Later dirs WIN (byName overwrites). Existing order is home < workspace; enabled plugin dirs
+  // (P3-07, data-only installs) slot between them, so a repo agent still outranks a plugin, and
+  // a plugin outranks the user-global dir.
+  return [
+    join(homedir(), '.shadow', 'agents'),
+    ...enabledPluginDirs('agents'),
+    join(workspaceRoot, '.shadow', 'agents'),
+  ];
 }
 
 function parseFrontmatter(md: string): { attrs: Record<string, string | string[]>; body: string } {

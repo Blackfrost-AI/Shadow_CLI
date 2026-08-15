@@ -2,7 +2,7 @@
 // Extracted from tui.tsx so unit tests and the Ink shell share one implementation
 // without booting React.
 
-import { parseMarkdown, isTableSeparator, FENCE as MD_FENCE, LIST_ITEM as MD_LIST_ITEM, QUOTE as MD_QUOTE } from '../util/markdown.js';
+import { parseMarkdown, isTableSeparator, matchFence, closesFence, LIST_ITEM as MD_LIST_ITEM, QUOTE as MD_QUOTE } from '../util/markdown.js';
 // dupKey/repeatStep moved to src/util/repeat.ts so the web console can share them
 // (src/util is the only tree tsconfig.web.json transpiles to browser ESM).
 export { dupKey, repeatStep } from '../util/repeat.js';
@@ -23,7 +23,7 @@ export function extractCompleteBlocks(buf: string): { blocks: string[]; rest: st
   const parts = buf.split('\n');
   const blocks: string[] = [];
   let cur: string[] = [];
-  let inFence = false;
+  let fenceOpen: { char: '`' | '~'; width: number } | null = null;
   for (let i = 0; i < parts.length; i++) {
     const line = parts[i];
     // The final element has no trailing newline in `buf` — it is still streaming,
@@ -32,12 +32,20 @@ export function extractCompleteBlocks(buf: string): { blocks: string[]; rest: st
       cur.push(line);
       break;
     }
-    if (/^\s*```/.test(line)) {
-      inFence = !inFence;
+    if (fenceOpen !== null) {
+      // Close via the shared width-correct rule (same marker, width ≥ opener), so a 4-tick fence
+      // is never closed by a 3-tick line inside it.
+      if (closesFence(line, fenceOpen)) fenceOpen = null;
       cur.push(line);
       continue;
     }
-    if (!inFence && line.trim() === '') {
+    const open = matchFence(line);
+    if (open) {
+      fenceOpen = { char: open.char, width: open.width };
+      cur.push(line);
+      continue;
+    }
+    if (line.trim() === '') {
       // Top-level blank line → block boundary. Emit the block and drop the blank
       // separator (TranscriptRow supplies spacing between committed blocks).
       if (cur.length) {
@@ -104,7 +112,7 @@ export function extractCommittableUnits(
   const n = lines.length;
   const units: CommitUnit[] = [];
   let pending: string[] = []; // an open multi-line construct, held until it completes
-  let fenceChar: string | null = null; // the marker that OPENED the current fence (``` vs ~~~)
+  let fenceOpen: { char: '`' | '~'; width: number } | null = null; // the OPENED fence (marker + width) if inside one
   let padNext = startPadded; // gap owed to the next unit (blank line or block boundary behind us)
   // Line-level grouping policy uses the PARSER'S OWN regexes (imported), so what we hold together
   // is exactly what parseMarkdown renders together. Pipe lines are held so a real table commits
@@ -152,20 +160,22 @@ export function extractCommittableUnits(
   // is still being typed and always stays live.
   for (let i = 0; i < n - 1; i++) {
     const line = lines[i]!;
-    if (fenceChar !== null) {
+    if (fenceOpen !== null) {
       pending.push(line);
-      // Close ONLY on a full fence line of the SAME marker (parseMarkdown's exact rule): a ``` inside
-      // a ~~~ block is literal content, and `inline-code` at line start must not close anything.
-      if (MD_FENCE.test(line) && line.trim().startsWith(fenceChar)) {
-        fenceChar = null;
+      // Close ONLY via the shared width-correct rule (parseMarkdown's exact rule): same marker AND
+      // width ≥ opener width. A 4-tick fence is NOT closed by a 3-tick line inside it, and a ```
+      // inside a ~~~ block (or vice versa) is literal content, as is `inline-code` at line start.
+      // Centralizing this in markdown.ts keeps streamed commit and non-streamed render identical.
+      if (closesFence(line, fenceOpen)) {
+        fenceOpen = null;
         flush(); // fence closed → commit the whole block
       }
       continue;
     }
-    const fence = MD_FENCE.exec(line);
-    if (fence) {
+    const open = matchFence(line);
+    if (open) {
       flush();
-      fenceChar = fence[1]![0]!;
+      fenceOpen = { char: open.char, width: open.width };
       pending.push(line);
       continue;
     }
@@ -195,6 +205,58 @@ export function extractCommittableUnits(
 }
 
 /**
+ * Cap on the RETAINED live remainder, in bytes (P1A-11, second half).
+ *
+ * `extractCommittableUnits` keeps an open construct in `rest` until it completes — correct for a
+ * short list or table, but a never-closing NON-tool code fence (```python from a chatty or
+ * malformed model) is not held by the tool-intent cap (that only guards bare/json fences), so
+ * `rest` grew without limit and every subsequent delta re-parsed the whole thing: the quadratic
+ * freeze on fast self-hosted streams. clampTail only bounded the PAINTED preview, not this buffer.
+ */
+export const MAX_LIVE_REST_BYTES = 64 * 1024;
+
+/**
+ * Bound the retained live remainder (P1A-11). Once `rest` exceeds `maxBytes`, the OLDEST lines are
+ * force-committed: the returned `commit` goes to native scrollback as ordinary assistant text, and
+ * only the newest ~half-cap stays live (halving amortizes the clamp to one commit per ~32KB of
+ * growth instead of one per delta). If the split lands inside an open fence, the committed head is
+ * closed with a synthetic fence line and the retained tail re-opened with the ORIGINAL
+ * marker/width/lang (clampTail's exact rule), so both halves keep code styling and the eventual
+ * real close still renders as code. Never drops bytes: everything leaves through `commit` or stays
+ * in `rest` — the cap relocates text, it does not truncate it.
+ */
+export function clampLiveRest(
+  rest: string,
+  maxBytes: number = MAX_LIVE_REST_BYTES,
+): { commit: string | null; rest: string } {
+  if (rest.length <= maxBytes) return { commit: null, rest };
+  const cut = rest.length - Math.floor(maxBytes / 2);
+  // Split on a line boundary at/after the cut so lines stay whole; a single enormous line (no
+  // newline after the cut) splits raw — a display seam only, never byte loss.
+  const nl = rest.indexOf('\n', cut);
+  const at = nl >= 0 ? nl + 1 : cut;
+  const head = rest.slice(0, at);
+  let tail = rest.slice(at);
+  // Same shared width-correct fence scan as clampTail: only the COMMITTED head decides whether the
+  // tail begins inside an open fence.
+  let open: { char: '`' | '~'; width: number; lang: string } | null = null;
+  for (const line of head.split('\n')) {
+    if (open !== null) {
+      if (closesFence(line, open)) open = null;
+      continue;
+    }
+    const m = matchFence(line);
+    if (m) open = { char: m.char, width: m.width, lang: m.lang };
+  }
+  let commit = head.replace(/\n$/, '');
+  if (open) {
+    commit += '\n' + open.char.repeat(open.width);
+    tail = open.char.repeat(open.width) + open.lang + '\n' + tail;
+  }
+  return { commit, rest: tail };
+}
+
+/**
  * Bound `src` to its last `maxLines` lines so a still-open block (e.g. a long
  * code fence mid-stream) cannot grow the live region without limit. If the kept
  * tail begins INSIDE an open code fence, re-open the fence (with its language) so
@@ -207,17 +269,22 @@ export function clampTail(src: string, maxLines: number): string {
   const tail = lines.slice(-maxLines);
   // Only the DROPPED head lines determine whether the tail begins inside an open fence.
   // Scanning the tail too would double-count an opener that is still present in the tail
-  // and prepend a spurious second ``` (an empty code block + plain-text code).
+  // and prepend a spurious second fence (an empty code block + plain-text code).
   const head = lines.slice(0, lines.length - tail.length);
-  let open = false;
-  let lang = '';
+  // Track fences width-correctly (shared rule) so a 4-tick opener scrolled off the top is
+  // NOT considered closed by a 3-tick line that is still in the tail.
+  let open: { char: '`' | '~'; width: number; lang: string } | null = null;
   for (const line of head) {
-    const m = /^\s*```(.*)$/.exec(line);
-    if (m) {
-      open = !open;
-      lang = open ? m[1].trim() : '';
+    if (open !== null) {
+      if (closesFence(line, open)) open = null;
+      continue;
     }
+    const m = matchFence(line);
+    if (m) open = { char: m.char, width: m.width, lang: m.lang };
   }
-  return open ? '```' + lang + '\n' + tail.join('\n') : tail.join('\n');
+  // Re-open with the ORIGINAL marker and width so the dangling tail keeps code styling WITHOUT
+  // being prematurely closed by a narrower line (e.g. a 4-tick fence whose body contains 3-tick
+  // lines). Re-opening with 3 ticks would let such a line cut the styling short.
+  return open ? open.char.repeat(open.width) + open.lang + '\n' + tail.join('\n') : tail.join('\n');
 }
 

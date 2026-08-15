@@ -26,13 +26,14 @@ function sessionTsFromPath(path: string): string {
 export function listResumableSessions(workspaceRoot: string): ResumableSession[] {
   const out: ResumableSession[] = [];
   for (const path of SessionLog.list(workspaceRoot)) {
-    const snap = SessionLog.findLatestSnapshot(path);
-    if (!snap) continue;
-    const record = SessionLog.findLatestSnapshotRecord(path);
+    // Manifest-backed: one tail scan per file (cached, mtime-invalidated), and no snapshot
+    // PAYLOAD is read — just existence + ts. Previously this parsed every log TWICE per file.
+    const info = SessionLog.snapshotInfo(path);
+    if (!info.hasSnapshot) continue;
     out.push({
       path,
       id: SessionLog.sessionIdFromPath(path),
-      ts: (record?.ts as string | undefined) ?? sessionTsFromPath(path),
+      ts: info.ts ?? sessionTsFromPath(path),
     });
   }
   return out;
@@ -45,10 +46,11 @@ export function resumeSession(
   sessionPath: string,
   opts: ResumeSessionOpts,
 ): { context: Context; meta: ResumeMeta } {
-  const data = SessionLog.findLatestSnapshot(sessionPath);
-  if (!data) throw new Error(`No context snapshot in session: ${sessionPath}`);
+  // One read of the latest snapshot record — data + metadata together.
   const record = SessionLog.findLatestSnapshotRecord(sessionPath);
-  const context = hydrateContext(data as ContextSnapshotData, opts);
+  const data = record?.data as ContextSnapshotData | undefined;
+  if (!data) throw new Error(`No context snapshot in session: ${sessionPath}`);
+  const context = hydrateContext(data, opts);
   return {
     context,
     meta: {

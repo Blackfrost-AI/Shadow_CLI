@@ -93,8 +93,22 @@ test('the forward list is a deliberate whitelist, not an accidental blacklist', 
   // Named explicitly so ADDING an event type to events.ts defaults to NOT leaking into the parent.
   assert.deepEqual(
     [...SUBAGENT_FORWARDED_EVENTS].sort(),
-    ['error', 'subagent_usage', 'task_notification', 'tool_denied', 'tool_end', 'tool_start'],
+    ['error', 'finding', 'subagent_usage', 'task_notification', 'tool_denied', 'tool_end', 'tool_start'],
   );
+});
+
+test('F04-11: a sub-agent finding (degraded compaction, loop guard) reaches the parent, tagged', () => {
+  // The whole point of forwarding findings: a sub-loop whose summarizer fails must not degrade
+  // silently — the operator sees the warning card even though the work was delegated.
+  const parent = new EventBus();
+  const seen = collect(parent);
+  const sub = new SubagentBus(parent, undefined, { subagent: 'agent_123_sync' });
+
+  sub.emit({ type: 'finding', severity: 'warn', title: 'Compaction failed', body: 'no local reclamation possible' });
+  const fwd = seen.find((e) => e.type === 'finding');
+  assert.ok(fwd, 'the finding crossed to the parent bus');
+  assert.equal(fwd!.type === 'finding' && fwd!.severity, 'warn');
+  assert.equal((fwd as { subagent?: string }).subagent, 'agent_123_sync', 'tagged so the UI can route it');
 });
 
 test('BUG 3: sub-agent tool events are tagged with the taskId so the parent UI can route them to the panel, never the parent live row', () => {

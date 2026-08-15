@@ -10,6 +10,7 @@ import type { TodoList } from './todo.js';
 import type { PlanModeState } from './planMode.js';
 import type { SessionLog as SessionLogType } from '../state/session.js';
 import { resolveParallelTools } from '../config/familyProfiles.js';
+import { sandboxToolAvailable } from '../safety/sandbox.js';
 
 /**
  * The parts of `LoopDeps` that genuinely differ per call site. Everything else is
@@ -48,6 +49,8 @@ export interface LoopDepsInput {
   approvals?: SessionApprovals;
   continuityState?: string;
   resolveFallback?: LoopDeps['resolveFallback'];
+  /** The previous run's stop reason when the caller tracks it (honest empty-response diagnosis — P1A-08). */
+  priorStopReason?: LoopDeps['priorStopReason'];
 }
 
 /**
@@ -77,6 +80,7 @@ export function buildLoopDeps(input: LoopDepsInput): LoopDeps {
     approvals: input.approvals,
     continuityState: input.continuityState,
     resolveFallback: input.resolveFallback,
+    priorStopReason: input.priorStopReason,
 
     // --- derived from cfg; identical at every call site ---
     maxOutputTokens: cfg.maxOutputTokens,
@@ -90,6 +94,12 @@ export function buildLoopDeps(input: LoopDepsInput): LoopDeps {
     permissionRules: cfg.permissionRules,
     autoClassifier: cfg.autoClassifier,
     hooks: cfg.hooks,
+    diagnostics: cfg.diagnostics,
+    // P2-12 — confinement-aware approval escalation. `sandbox: 'off'` is set by index.ts for
+    // --no-sandbox/--yolo/unrestricted/full-autonomy (an EXPLICIT waiver → undefined, no
+    // escalation). Otherwise the truth is whether this host has the tool to confine with.
+    sandboxFailurePolicy: cfg.sandboxFailurePolicy,
+    shellConfined: cfg.sandbox === 'off' ? undefined : sandboxToolAvailable(),
     models: cfg.models,
     fallbackModel: cfg.fallbackModel,
     // explicit config > family profile > global default, resolved on the live model
