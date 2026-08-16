@@ -23,6 +23,13 @@ export class ReplGate implements ApprovalGate {
     process.stdout.write(
       `\n\x1b[1;33m${promptLabel(req.kind)}\x1b[0m ${req.preview}\n  [${req.risk}] ${req.reason}\n`,
     );
+    // F07-09: an acknowledge-only dialog offers NO approve/deny verbs — the call is already
+    // hard-blocked by the loop. We wait for one keystroke so the human SEES what was attempted,
+    // then return 'deny' (the loop discards the decision anyway; 'deny' is the honest value).
+    if (req.acknowledgeOnly) {
+      await this.rl.question('press Enter to acknowledge (the command is blocked either way): ');
+      return 'deny';
+    }
     const hint =
       req.kind === 'plan_enter'
         ? '(y)es / (n)o [n]: '

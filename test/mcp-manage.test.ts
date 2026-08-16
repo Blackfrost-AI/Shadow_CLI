@@ -41,6 +41,10 @@ test('enablePlaywrightBrowser adds the exact isolated Chrome preset', () => {
         '--output-max-size',
         '52428800',
       ],
+      // P3-08: the preset opts this ONE server out of the OS jail explicitly (a browsing browser
+      // needs sockets + broad fs access); its isolation is the `--isolated` profile + capped output.
+      network: true,
+      sandbox: false,
     },
   });
 });

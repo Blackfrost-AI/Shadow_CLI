@@ -44,6 +44,42 @@ test('sessionToMarkdown renders user, assistant, tool, and blocked rows', () => 
   assert.match(md, /Plan mode is active/);
 });
 
+test('sessionToMarkdown renders retry events as reason + attempt, never raw JSON (review F4)', () => {
+  // Retry events carry {attempt, delayMs, reason} — never `message`. The old code fell back to
+  // JSON.stringify and dumped `{"type":"retry","attempt":1,…}` into exported transcripts.
+  const events = [
+    { kind: 'user', task: 'go' },
+    { kind: 'event', type: 'retry', attempt: 1, delayMs: 0, reason: 'context overflow — compacted and retrying' },
+    { kind: 'event', type: 'retry', attempt: 0, delayMs: 250, reason: 'empty response' },
+  ];
+  const md = sessionToMarkdown(events, META);
+  assert.match(md, /Retry \(attempt 1\): context overflow — compacted and retrying/);
+  assert.match(md, /Retry: empty response/, 'attempt 0 renders without an attempt suffix');
+  assert.doesNotMatch(md, /\{"type":"retry"/, 'no raw JSON event dump');
+});
+
+test('sessionToMarkdown exports reasoning_done as a collapsed details block (F02-04)', () => {
+  // The old export silently DROPPED reasoning — a transcript that silently lost a whole section.
+  // Now it survives, collapsed so the readable answer stays front and center.
+  const events = [
+    { kind: 'user', task: 'think hard' },
+    { kind: 'event', type: 'reasoning_done', text: 'First consider the edge cases…' },
+    { kind: 'event', type: 'assistant_done', text: 'Here is the answer.' },
+    // empty reasoning exports nothing
+    { kind: 'event', type: 'reasoning_done', text: '   ' },
+  ];
+  const md = sessionToMarkdown(events, META);
+  assert.match(md, /## Reasoning/);
+  assert.match(md, /<details><summary>Reasoning \(collapsed\)<\/summary>/);
+  assert.match(md, /First consider the edge cases…/);
+  assert.match(md, /<\/details>/);
+  assert.match(md, /Here is the answer\./);
+  // reasoning appears BEFORE the assistant answer, matching the turn order
+  assert.ok(md.indexOf('## Reasoning') < md.indexOf('## Assistant'));
+  // the whitespace-only reasoning event added no second block
+  assert.equal(md.match(/## Reasoning/g)?.length, 1);
+});
+
 test('exportSession writes markdown file under workspace exports/', () => {
   const root = mkdtempSync(join(tmpdir(), 'shadow-export-'));
   try {

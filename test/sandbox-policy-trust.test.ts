@@ -15,7 +15,7 @@ import { isolateHome } from './helpers/isolateHome.js';
  * and globalStore captures GLOBAL_DIR from os.homedir() at module load — so the import is
  * dynamic, exactly like diagnostics.test.ts.
  */
-const { home: HOME, shadowDir } = isolateHome('sbxpol');
+const { shadowDir } = isolateHome('sbxpol');
 const { loadConfig } = await import('../src/config.js');
 
 function ws(): string {

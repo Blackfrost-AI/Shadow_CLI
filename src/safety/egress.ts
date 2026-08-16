@@ -9,7 +9,10 @@
  *                      is a deliberate operator choice and must stay reachable);
  *   3. DNS PIN       — the name is resolved ONCE and the socket is pinned to the validated
  *                      IP SET (not just ips[0], so provider failover across A records survives);
- *   4. RECEIPT       — host + purpose + verdict are recorded to the in-memory aggregate and
+ *   4. QUARANTINE    — (P3-08) tool-initiated fetches are checked against the egress allowlist
+ *                      (derived defaults + global-only `egress.allow`): observe flags misses,
+ *                      enforce denies them;
+ *   5. RECEIPT       — host + purpose + verdict are recorded to the in-memory aggregate and
  *                      appended to `~/.shadow/egress.log` (0600) — the runtime proof behind
  *                      `/connections` and `shadow egress`.
  *
@@ -62,6 +65,8 @@ export interface EgressHostStat {
   denied: number;
   lastSeen: number; // epoch ms
   purposes: Set<string>;
+  /** P3-08 Phase 2: tool fetches made OUTSIDE the egress allowlist (quarantine flags). */
+  flagged: number;
 }
 
 // ── In-memory aggregate + append-only log ─────────────────────────────────────
@@ -116,20 +121,24 @@ let bytesWritten = -1; // unknown until first stat
 /**
  * Record one egress decision. Updates the session aggregate and appends one JSON line to the
  * receipt file. BEST-EFFORT by design: a logging failure must never break the request itself.
+ * `flag` (P3-08) marks a decision made OUTSIDE the egress allowlist — currently the single
+ * value 'quarantine'; additive on the receipt line, so older readers ignore it.
  */
-export function recordEgress(host: string, purpose: string, verdict: EgressVerdict): void {
+export function recordEgress(host: string, purpose: string, verdict: EgressVerdict, flag?: string): void {
   const key = hostKey(host);
   let s = hosts.get(key);
   if (!s) {
-    s = { host: key, allowed: 0, denied: 0, lastSeen: 0, purposes: new Set() };
+    s = { host: key, allowed: 0, denied: 0, lastSeen: 0, purposes: new Set(), flagged: 0 };
     hosts.set(key, s);
   }
   if (verdict === 'allowed') s.allowed++;
   else s.denied++;
   s.lastSeen = Date.now();
   s.purposes.add(purpose);
-  const line = JSON.stringify({ ts: new Date().toISOString(), host: key, purpose, verdict }) + '\n';
-  void appendLogLine(line);
+  if (flag) s.flagged++;
+  const row: Record<string, string> = { ts: new Date().toISOString(), host: key, purpose, verdict };
+  if (flag) row.flag = flag;
+  void appendLogLine(JSON.stringify(row) + '\n');
 }
 
 /**
@@ -196,6 +205,8 @@ export interface EgressLogRow {
   host: string;
   purpose: string;
   verdict: EgressVerdict;
+  /** P3-08: 'quarantine' when the request was outside the egress allowlist. Absent on older lines. */
+  flag?: string;
 }
 
 /**
@@ -219,7 +230,7 @@ export async function readEgressLogAggregate(): Promise<EgressHostStat[]> {
       if (!row || typeof row.host !== 'string') continue;
       let s = agg.get(row.host);
       if (!s) {
-        s = { host: row.host, allowed: 0, denied: 0, lastSeen: 0, purposes: new Set() };
+        s = { host: row.host, allowed: 0, denied: 0, lastSeen: 0, purposes: new Set(), flagged: 0 };
         agg.set(row.host, s);
       }
       if (row.verdict === 'denied') s.denied++;
@@ -227,6 +238,7 @@ export async function readEgressLogAggregate(): Promise<EgressHostStat[]> {
       const t = Date.parse(row.ts);
       if (Number.isFinite(t) && t > s.lastSeen) s.lastSeen = t;
       if (row.purpose) s.purposes.add(row.purpose);
+      if (row.flag) s.flagged++;
     }
   }
   return [...agg.values()].sort((a, b) => b.lastSeen - a.lastSeen);
@@ -248,12 +260,24 @@ export function formatEgressReport(rows: EgressHostStat[], logPath: string): str
     for (const r of rows) {
       const host = r.host.length > hostW ? r.host.slice(0, hostW - 1) + '…' : r.host.padEnd(hostW);
       const seen = r.lastSeen > 0 ? new Date(r.lastSeen).toISOString().replace('T', ' ').replace(/\.\d+Z$/, 'Z') : 'never';
-      lines.push(`  ${host}  ${String(r.allowed).padStart(7)}  ${String(r.denied).padStart(6)}  ${[...r.purposes].sort().join(', ')} (${seen})`);
+      const flagNote = r.flagged > 0 ? `  ⚑ ${r.flagged} outside allowlist` : '';
+      lines.push(`  ${host}  ${String(r.allowed).padStart(7)}  ${String(r.denied).padStart(6)}  ${[...r.purposes].sort().join(', ')} (${seen})${flagNote}`);
     }
   }
   lines.push('', `Receipt: ${logPath}  (append-only, 0600, rotated at 256 KiB — one rotation kept as .1)`);
   lines.push('Every outbound HTTP request Shadow makes flows through the egress broker (shadowFetch);');
   lines.push('the same wall denies ALL non-local egress while --offline is active.');
+  if (rows.some((r) => r.flagged > 0)) {
+    lines.push('⚑ = a tool-initiated fetch (web_fetch/web_search/remote image) OUTSIDE the egress allowlist —');
+    if (egressPolicy.mode === 'enforce') {
+      // Don't advise switching to the mode that's already active — in enforce these rows were DENIED.
+      lines.push('    mode=enforce: these fetches were DENIED — widen "egress": {"allow": [...]} in ~/.shadow/config.json');
+      lines.push('    to admit them (quarantine, P3-08).');
+    } else {
+      lines.push('    widen it with "egress": {"allow": [...]} in ~/.shadow/config.json, or switch egress.mode');
+      lines.push('    to "enforce" to deny such fetches instead of flagging them (quarantine, P3-08).');
+    }
+  }
   return lines.join('\n');
 }
 
@@ -517,6 +541,83 @@ if (isBunRuntime) {
   globalThis.fetch = offlineFetchWall(globalThis.fetch);
 }
 
+// ── P3-08 Phase 2 · egress quarantine for tool-initiated fetches ──────────────
+//
+// The allowlist semantics of the filesystem jail applied to the network dimension (the
+// workspaceJail × netguard composition). Tool-initiated fetches — the ones whose URL the MODEL
+// authored (web_fetch, web_search, remote-image attachment fetches) — are checked against an
+// effective allowlist: derived defaults plus the operator's `egress.allow` (global-only config;
+// a cloned repo cannot widen its own quarantine). Everything else (provider, MCP, oauth,
+// updates, local probes) is operator-chosen traffic and is NOT quarantined.
+//
+//   observe (default) — off-allowlist fetches proceed but are FLAGGED on the receipt;
+//   enforce           — off-allowlist fetches are DENIED with a readable error.
+
+export interface EgressPolicy {
+  mode: 'observe' | 'enforce';
+  allow: string[];
+}
+
+let egressPolicy: EgressPolicy = { mode: 'observe', allow: [] };
+
+/** App wiring: install the resolved (global) egress policy once at startup. */
+export function setEgressPolicy(p: EgressPolicy): void {
+  egressPolicy = { mode: p.mode === 'enforce' ? 'enforce' : 'observe', allow: [...(p.allow ?? [])] };
+}
+
+/** Test seam: reset to the shipping default (observe, empty allow). */
+export function resetEgressPolicyForTests(): void {
+  egressPolicy = { mode: 'observe', allow: [] };
+}
+
+/**
+ * Hosts the tool tier may always reach without configuration. web_search speaks to DuckDuckGo's
+ * HTML endpoint; its result links bounce through duckduckgo.com/l/. (Provider hosts are NOT
+ * here: provider traffic is operator-tier, never quarantined.)
+ */
+export const EGRESS_DERIVED_ALLOW: readonly string[] = ['duckduckgo.com', '*.duckduckgo.com'];
+
+/**
+ * The purposes whose URL was authored by the MODEL — the quarantine applies to exactly these.
+ * (Provider/MCP/oauth/update/local-probe traffic is operator-chosen and stays ungated here;
+ * the SSRF tiers above still apply to all of it.)
+ */
+// 'image' deliberately errs toward flagging: it covers BOTH markdown-image fetches from model
+// output AND the operator's `/image <url>` attach flow. Over-flagging an operator-typed URL in
+// enforce mode is a documented convenience trade — allowlisting it is one line.
+const TOOL_PURPOSES: ReadonlySet<string> = new Set(['web', 'search', 'image']);
+
+/** Host-entry match: exact ("example.com") or wildcard ("*.example.com" = any subdomain, NOT the apex). */
+export function hostMatchesEntry(host: string, entry: string): boolean {
+  // Normalize BOTH sides. URL.hostname keeps the trailing dot of "example.com." (a legal form the
+  // model can author, same apex), and entries may arrive as "host:443" (a dead shape — the receipt
+  // host key is port-free). Strip both so operator intent is never silently lost to encoding noise.
+  const norm = (s: string) => s.replace(/\.$/, '');
+  const h = norm(hostKey(host));
+  let e = entry.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  const port = e.match(/^([^:]+):(\d+)$/); // [^:]+ keeps bare IPv6 ('::1') intact
+  if (port) e = port[1]!;
+  e = norm(e);
+  if (!e) return false;
+  // A bare wildcard admits NOTHING — a "*." typo must not degrade into a near-universal grant.
+  if (e === '*' || e === '*.') return false;
+  if (e.startsWith('*.')) return h.endsWith(e.slice(1)); // "*.x.com" matches "a.x.com" and "a.b.x.com", not "x.com"
+  return h === e;
+}
+
+/**
+ * The quarantine decision for one tool-initiated fetch. Pure — no I/O, so the matching rules are
+ * unit-testable without sockets. 'ok' = on the effective allowlist; 'flag' = observe-mode miss
+ * (proceed, marked); 'deny' = enforce-mode miss (refuse). Non-tool purposes are always 'ok'.
+ */
+export function quarantineVerdict(host: string, purpose: string): 'ok' | 'flag' | 'deny' {
+  if (!TOOL_PURPOSES.has(purpose)) return 'ok';
+  for (const entry of [...EGRESS_DERIVED_ALLOW, ...egressPolicy.allow]) {
+    if (hostMatchesEntry(host, entry)) return 'ok';
+  }
+  return egressPolicy.mode === 'enforce' ? 'deny' : 'flag';
+}
+
 // ── The chokepoint ────────────────────────────────────────────────────────────
 
 export interface ShadowFetchOptions {
@@ -604,12 +705,26 @@ export async function shadowFetch(url: string, init?: RequestInit, opts?: Shadow
     }
   }
 
-  // Netguard-tier callers validate per-hop and follow redirects themselves; auto-follow under
-  // a netguard pin would let a redirect escape to an unvalidated host.
+  // Netguard tier: every hop must RE-ENTER the broker (per-hop re-validation + quarantine), so
+  // auto-follow is forced off even when a caller asks for 'follow' — the invariant belongs to
+  // the chokepoint, not to each caller's convention. (pinnedIps = the caller already validated.)
   const effectiveInit: RequestInit =
-    ssrf === 'netguard' && !opts?.pinnedIps && !init?.redirect ? { ...init, redirect: 'manual' } : (init ?? {});
+    ssrf === 'netguard' && !opts?.pinnedIps && init?.redirect !== 'manual' ? { ...init, redirect: 'manual' } : (init ?? {});
 
-  recordEgress(host, purpose, 'allowed');
+  // 4. QUARANTINE (P3-08 Phase 2) — the egress allowlist over TOOL-INITIATED fetches (the URLs
+  //    the model authored), checked AFTER the SSRF tiers above. A redirect chain is covered
+  //    hop-by-hop because the web tools re-enter shadowFetch per hop. observe → proceed flagged;
+  //    enforce → deny with a readable error. Operator-tier purposes pass ungated.
+  const q = quarantineVerdict(host, purpose);
+  if (q === 'deny') {
+    recordEgress(host, purpose, 'denied', 'quarantine');
+    throw new Error(
+      `egress quarantine: ${host} is not on the egress allowlist (egress.mode='enforce') — ` +
+        `add "${host}" to "egress": {"allow": [...]} in ~/.shadow/config.json to permit it`,
+    );
+  }
+
+  recordEgress(host, purpose, 'allowed', q === 'flag' ? 'quarantine' : undefined);
   const dispatcher: Agent = ips && ips.length > 0 ? pinnedAgent(ips, host) : unpinnedAgent;
   // `dispatcher` is undici's init option; the DOM-flavored RequestInit type doesn't know it.
   return transport(url, { ...effectiveInit, dispatcher } as unknown as RequestInit);

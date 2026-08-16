@@ -270,6 +270,6 @@ test('source pins: the policy is wired through config, loop, deps, doctor, start
   assert.match(doctor, /sandbox-policy/, 'doctor reports the persistent confinement state');
   const index = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf8');
   assert.match(index, /unconfinedBanner\(/, 'startup prints the loud banner');
-  const tui = readFileSync(new URL('../src/tui.tsx', import.meta.url), 'utf8');
-  assert.match(tui, /sandboxConfinement\(opts\.cfg\.sandbox\)/, '/status shows the confinement state');
+  const slash = readFileSync(new URL('../src/tui/slash.ts', import.meta.url), 'utf8'); // P3-02: the /status handler lives in slash.ts
+  assert.match(slash, /sandboxConfinement\(opts\.cfg\.sandbox\)/, '/status shows the confinement state');
 });

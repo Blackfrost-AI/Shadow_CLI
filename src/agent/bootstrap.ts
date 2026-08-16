@@ -36,12 +36,13 @@ import {
   offlineEgressEnforced,
 } from '../safety/offline.js';
 import { osSandboxStatus, sandboxToolAvailable } from '../safety/sandbox.js';
-import { setOfflineMode } from '../safety/egress.js';
+import { setOfflineMode, setEgressPolicy } from '../safety/egress.js';
 import { registerSecret } from '../util/redact.js';
 import { lc } from '../util/lc.js';
 import { ProjectMemory } from '../state/memory.js';
 import { SessionLog } from '../state/session.js';
 import { resumeSession } from '../state/resume.js';
+import { applyRetention } from '../state/retention.js';
 import { makeMemoryTool } from '../tools/memory.js';
 import { TodoList } from './todo.js';
 import { PlanModeState } from './planMode.js';
@@ -345,6 +346,9 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   // P2-01: arm the egress broker's offline wall (and the dispatcher-layer backstop behind it)
   // BEFORE anything can touch the network — the wall is a hard invariant, not a banner promise.
   setOfflineMode(offline);
+  // P3-08 Phase 2: arm the tool-fetch quarantine (observe/enforce + allowlist) from the GLOBAL
+  // config — alongside the wall, before the first fetch.
+  setEgressPolicy(cfg.egress ?? { mode: 'observe', allow: [] });
   if (offline) {
     const decision = evaluateOffline({
       label: activeModelEntry?.label ?? `${cfg.provider}/${cfg.model}`,
@@ -455,9 +459,11 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   }
 
   // M4: project memory (known facts) — load, expose as a tool, inject into the prompt.
+  // F08-05: inject the one-line-per-fact INDEX, not full values — the model recalls full values
+  // on demand via the memory tool, so prompt cost stays flat as facts accumulate.
   const memory = ProjectMemory.load(workspaceRoot);
   registry.register(makeMemoryTool(memory));
-  const facts = memory.asContext();
+  const facts = memory.asIndex();
 
   // Agent-maintained todo list — externalizes "what's done / what's next" into a
   // tool. The loop renders the live list into the system prompt each turn (pinned,
@@ -483,6 +489,23 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   }
   const systemForStyle = (style: OutputStyle): string => buildStyledSystem(baseSystem, style, facts);
   const system = systemForStyle(activeStyle);
+
+  // P2-13: opt-in retention sweep — runs BEFORE this session's log is opened so a sweep can
+  // never archive the very session that is starting (even with sessionRetentionKeep: 0), and
+  // the explicit --resume target is excluded by id so hydration never reads a moved file.
+  // ARCHIVE only (never delete), one-line notice so the move is visible where it happens.
+  // Best-effort: a retention failure must never block startup. The dry-run twin lives in
+  // `/doctor` (see doctor.ts), surfaced BEFORE any pruning.
+  try {
+    const ret = applyRetention(workspaceRoot, cfg, {
+      excludeIds: opts.resumeSessionPath ? [SessionLog.sessionIdFromPath(opts.resumeSessionPath)] : undefined,
+    });
+    if (ret.archived.length) {
+      write(lc.gray(`Retention: archived ${ret.archived.length} session log(s) to ${ret.archiveDir} (recoverable — never deleted).`) + '\n');
+    }
+  } catch {
+    /* best-effort */
+  }
 
   // M4: append-only, redacted session log for this process.
   const sessionLog = SessionLog.open(workspaceRoot);
@@ -519,7 +542,13 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
       if (mcpCount > 0) write(lc.gray(`Offline: skipping ${mcpCount} MCP server(s).`) + '\n');
       return [];
     }
-    return await registerMcpServers(registry, cfg.mcpServers, workspaceRoot);
+    // P3-08 Phase 3: stdio children get the OS jail (network off unless granted per server).
+    return await registerMcpServers(registry, cfg.mcpServers, workspaceRoot, undefined, {
+      // The session's RESOLVED granted roots — same list run_shell receives (jails agree).
+      additionalRoots,
+      enabled: (cfg.sandbox ?? 'auto') !== 'off',
+      failurePolicy: cfg.sandboxFailurePolicy ?? 'auto',
+    });
   };
 
   const activateModel = async (

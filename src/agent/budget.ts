@@ -40,6 +40,15 @@ export class Budget {
   private cacheReadTokens = 0;
   private cacheWriteTokens = 0;
   private costUSD = 0;
+  // P3-09 (F04-08): the spend of finished sub-agents rolled up into THIS budget. Kept separate from
+  // the own-provider accumulators above so `snapshot()` — the source of the per-turn `usage` events
+  // that drive the TUI's delta-based session counters — stays own-only: a sub-agent's spend already
+  // reaches /cost through its own `subagent_usage` event, and folding it in here would double-count
+  // it. `checkSpending()` and `inheritableCeilings()` read BOTH, so the configured ceilings bound
+  // the entire delegation tree, not just this loop's own provider calls.
+  private subInputTokens = 0;
+  private subOutputTokens = 0;
+  private subCostUSD = 0;
   private startMs: number;
 
   constructor(
@@ -120,9 +129,13 @@ export class Budget {
    * anywhere, mid-batch included.
    */
   checkSpending(now: number): BudgetStop {
-    const total = this.inputTokens + this.outputTokens;
+    // P3-09 (F04-08): OWN + rolled-up sub-agent spend counts against the same ceilings — before
+    // this, a fleet of sub-agents could burn tokens/cost that never touched the parent's
+    // maxTotalTokens / maxCostUSD at all.
+    const total = this.inputTokens + this.outputTokens + this.subInputTokens + this.subOutputTokens;
     if (this.limits.maxTotalTokens != null && total >= this.limits.maxTotalTokens) return 'budget';
-    if (this.limits.maxCostUSD != null && this.costUSD >= this.limits.maxCostUSD) return 'budget';
+    const cost = this.costUSD + this.subCostUSD;
+    if (this.limits.maxCostUSD != null && cost >= this.limits.maxCostUSD) return 'budget';
     if (
       this.limits.maxWallClockSec != null &&
       (now - this.startMs) / 1000 >= this.limits.maxWallClockSec
@@ -130,6 +143,87 @@ export class Budget {
       return 'budget';
     }
     return null;
+  }
+
+  /**
+   * P3-09 (F04-08): roll a finished sub-agent's spend into this budget. The caller passes the
+   * sub-agent's TOTAL spend (its own provider calls plus any nested sub-agents it already rolled
+   * up — see `totalCostUSD` etc.), so accrual chains up a delegation tree one level at a time
+   * without any level being counted twice. Called on EVERY sub-agent exit path: the tokens and
+   * cost were spent regardless of whether the run ended done, cancelled, or in error.
+   */
+  accrueSubagent(u: { inputTokens?: number; outputTokens?: number; costUSD?: number }): void {
+    this.subInputTokens += u.inputTokens ?? 0;
+    this.subOutputTokens += u.outputTokens ?? 0;
+    this.subCostUSD += u.costUSD ?? 0;
+  }
+
+  /** Spend rolled up from finished sub-agents (P3-09). */
+  get accruedSubagentCostUSD(): number {
+    return this.subCostUSD;
+  }
+  get accruedSubagentInputTokens(): number {
+    return this.subInputTokens;
+  }
+  get accruedSubagentOutputTokens(): number {
+    return this.subOutputTokens;
+  }
+
+  /** This budget's OWN spend plus everything rolled up into it — the amount a parent must accrue
+   *  when this budget belongs to a finishing sub-agent, or the whole subtree's spend escapes the
+   *  parent's ceilings (P3-09). */
+  get totalCostUSD(): number {
+    return this.costUSD + this.subCostUSD;
+  }
+  get totalInputTokens(): number {
+    return this.inputTokens + this.subInputTokens;
+  }
+  get totalOutputTokens(): number {
+    return this.outputTokens + this.subOutputTokens;
+  }
+
+  /**
+   * P3-09 (F04-08): the REMAINING headroom on each configured spending ceiling, for a sub-agent to
+   * inherit as its own ceiling at admission. An axis the parent never configured inherits none
+   * (the sub-agent keeps its own iteration cap and wall-clock backstop on that axis). Never
+   * negative — an exhausted parent yields a zero ceiling, and the sub-agent's between-turns
+   * budget check (which runs BEFORE the first provider call) stops it immediately with zero spend.
+   */
+  inheritableCeilings(now: number): { maxTotalTokens?: number; maxCostUSD?: number; maxWallClockSec?: number } {
+    const out: { maxTotalTokens?: number; maxCostUSD?: number; maxWallClockSec?: number } = {};
+    if (this.limits.maxTotalTokens != null) {
+      out.maxTotalTokens = Math.max(
+        0,
+        this.limits.maxTotalTokens - (this.inputTokens + this.outputTokens + this.subInputTokens + this.subOutputTokens),
+      );
+    }
+    if (this.limits.maxCostUSD != null) {
+      out.maxCostUSD = Math.max(0, this.limits.maxCostUSD - (this.costUSD + this.subCostUSD));
+    }
+    if (this.limits.maxWallClockSec != null) {
+      out.maxWallClockSec = Math.max(0, this.limits.maxWallClockSec - (now - this.startMs) / 1000);
+    }
+    return out;
+  }
+
+  /**
+   * P3-09 (F04-08): AND a set of inherited ceilings into this budget's limits. An axis present on
+   * both sides takes the TIGHTER value; an axis only on the inherited side is adopted; an axis
+   * absent on the inherited side is left alone. Never widens a ceiling.
+   */
+  applyInheritedCeilings(l: { maxTotalTokens?: number; maxCostUSD?: number; maxWallClockSec?: number }): void {
+    if (l.maxTotalTokens != null) {
+      this.limits.maxTotalTokens =
+        this.limits.maxTotalTokens != null ? Math.min(this.limits.maxTotalTokens, l.maxTotalTokens) : l.maxTotalTokens;
+    }
+    if (l.maxCostUSD != null) {
+      this.limits.maxCostUSD =
+        this.limits.maxCostUSD != null ? Math.min(this.limits.maxCostUSD, l.maxCostUSD) : l.maxCostUSD;
+    }
+    if (l.maxWallClockSec != null) {
+      this.limits.maxWallClockSec =
+        this.limits.maxWallClockSec != null ? Math.min(this.limits.maxWallClockSec, l.maxWallClockSec) : l.maxWallClockSec;
+    }
   }
 
   snapshot(now: number): BudgetSnapshot {

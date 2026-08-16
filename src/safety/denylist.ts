@@ -1,6 +1,19 @@
 /**
- * Catastrophic-command guard. Even at `full` autonomy, a matching command must be
- * explicitly confirmed (the loop's forceConfirm hook consults this). Config-extendable.
+ * Catastrophic-command guard. The loop's forceConfirm hook consults this; config-extendable.
+ *
+ * CONTRACT (F07-09): a match is a HARD BLOCK, and its dialog is ACKNOWLEDGE-ONLY. The loop
+ * blocks the call unconditionally — no keypress, session grant, prefix grant, or autonomy raise
+ * can run a denylisted command — and the ApprovalRequest it raises carries `acknowledgeOnly:
+ * true` so every gate shows acknowledge-only affordances (Enter/Escape, never approve verbs).
+ * The old behavior asked y/n and then blocked inside run_shell anyway when the user pressed y:
+ * a dead-end dialog, and dead-end dialogs train users to stop reading the one path that must
+ * never be skimmed. The question is honest now: "do you see what the model tried?", never
+ * "should it run?"
+ *
+ * The loop's ONE exemption from forceConfirm — an approved plan-exit — is keyed to the
+ * exit_plan_mode call ITSELF (name + id), so it can never be inherited by a denylisted command,
+ * not even one that reuses the same provider id (positional `call_N` fallback ids are not
+ * unique across responses on OpenAI-compat servers).
  *
  * IMPORTANT: this is a FAT-FINGER guard, not a security boundary. It is a literal
  * regex match over the command string and is trivially bypassed by indirection
@@ -28,6 +41,14 @@ const RULES: Rule[] = [
   {
     why: 'recursive delete of an absolute, home, or glob target',
     test: (c) => /\brm\b/.test(c) && RM_RECURSIVE.test(c) && DANGER_TARGET.test(c),
+  },
+  {
+    // BYPASS review (P2-07): `find / -delete` is `rm -rf /` by another name, and it used to be
+    // in NEITHER tier. Scoped to roots that start at an absolute path, ~, or $HOME (right after
+    // `find`, optionally quoted) so workspace maintenance (`find . -name '*.tmp' -delete`) stays
+    // legal; the opt-in classifier separately hard-denies every `find … -delete`.
+    why: 'find -delete rooted at an absolute path, home, or $HOME',
+    test: (c) => /(?:^|\s)-delete\b/.test(c) && /\bfind\s+['"\\]?(\/|~|\$HOME)/.test(c),
   },
   { why: 'filesystem creation (mkfs) — destroys data', test: (c) => /\bmkfs(\.\w+)?\b/.test(c) },
   {

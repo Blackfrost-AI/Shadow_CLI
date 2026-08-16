@@ -57,6 +57,11 @@ test('parseTableInput: routes only whitelisted handles (the injection guard)', (
   assert.deepEqual(parseTableInput('/table done', handles), { kind: 'done' });
   assert.deepEqual(parseTableInput('/table', handles), { kind: 'done' });
   assert.deepEqual(parseTableInput('/table end', handles), { kind: 'done' });
+  // F02-06: every OTHER slash command is paused while the table holds the composer, and the
+  // command is NAMED so the user sees a deliberate pause rather than a swallowed keystroke.
+  assert.deepEqual(parseTableInput('/cost', handles), { kind: 'pausedSlash', command: '/cost' });
+  assert.deepEqual(parseTableInput('/theme shadow', handles), { kind: 'pausedSlash', command: '/theme' });
+  assert.deepEqual(parseTableInput('/resume abc', handles), { kind: 'pausedSlash', command: '/resume' });
   // plain text is a note (M1 hints rather than appending a bare human turn)
   assert.deepEqual(parseTableInput('just thinking out loud', handles), { kind: 'note' });
   // @handle with no question still routes (empty question)

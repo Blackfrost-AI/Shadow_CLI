@@ -9,6 +9,10 @@ export interface McpServerConfig {
   env?: Record<string, string>;
   url?: string;
   headers?: Record<string, string>;
+  /** P3-08 Phase 3: grant the confined stdio child outbound network (default: off). */
+  network?: boolean;
+  /** P3-08 Phase 3: false = run this ONE server outside the OS jail (explicit operator choice). */
+  sandbox?: boolean;
 }
 
 export type McpServers = Record<string, McpServerConfig>;
@@ -87,6 +91,13 @@ export function enablePlaywrightBrowser(servers: McpServers): McpChange {
           '--output-max-size',
           '52428800',
         ],
+        // P3-08 Phase 3: a browsing browser legitimately needs sockets AND broad filesystem
+        // access (the Chrome profile, the capped output dir INSIDE ~/.shadow), so the preset
+        // opts this one server out of the OS jail explicitly instead of shipping a jail that
+        // breaks it. Its own isolation story is separate: `--isolated` profile + output capped
+        // outside the workspace. stdio-only servers (the default) stay fully confined.
+        network: true,
+        sandbox: false,
       },
     },
     message: 'Enabled Playwright browser MCP.',
@@ -101,7 +112,12 @@ export function disableMcpServer(servers: McpServers, name: string): McpChange {
   return { ok: true, servers: next, message: `Disabled MCP server "${name}".` };
 }
 
-export function mcpServerLines(name: string, server: McpServerConfig): string[] {
+export function mcpServerLines(
+  name: string,
+  server: McpServerConfig,
+  /** Effective jail state at display time — so the row never claims "OS jail" when the child runs unconfined. */
+  jail?: { requested: boolean; toolAvailable: boolean },
+): string[] {
   if (server.url) {
     return [
       `${name}`,
@@ -116,6 +132,13 @@ export function mcpServerLines(name: string, server: McpServerConfig): string[] 
     `  command: ${server.command ?? 'unknown'}`,
     `  args: ${(server.args ?? []).join(' ') || 'none'}`,
     `  env: ${server.env ? Object.keys(server.env).join(', ') || 'none' : 'none'}`,
+    `  confinement (P3-08): ${
+      server.sandbox === false
+        ? 'OFF (explicit sandbox:false)'
+        : jail && (!jail.requested || !jail.toolAvailable)
+          ? `REQUESTED but ${jail.requested ? 'no OS sandbox tool on this host' : 'sandbox OFF this session'} — child runs UNCONFINED (network ${server.network ? 'GRANTED' : 'off'})`
+          : `OS jail, network ${server.network ? 'GRANTED' : 'off'}`
+    }`,
   ];
 }
 

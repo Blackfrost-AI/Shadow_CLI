@@ -139,7 +139,7 @@ export interface UserKeybindingsFile {
 
 /** A validation warning (never throws — bad input degrades to a warning + skip). */
 export interface KeybindingWarning {
-  kind: 'parse_error' | 'invalid_context' | 'invalid_keystroke' | 'duplicate' | 'reserved' | 'unmigrated';
+  kind: 'parse_error' | 'invalid_context' | 'invalid_keystroke' | 'duplicate' | 'reserved' | 'unmigrated' | 'unknown_action';
   message: string;
 }
 

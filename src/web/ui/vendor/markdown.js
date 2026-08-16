@@ -9,6 +9,10 @@
  * bold/italic/inline-code, links, bullet/ordered lists, blockquotes, fenced code,
  * and horizontal rules. Tables fall through to paragraphs for now.
  */
+// F05-07: width measurement lives in ONE table (util/width.ts). The local charWidth/visibleWidth
+// copies that used to sit here had drifted (no Ext-B wide, no ZWSP, no grapheme clustering) and
+// made table borders disagree with the transcript's own row measurement.
+import { chunksByWidth, displayWidth } from './width.js';
 // Exported: the streaming committer (extractCommittableUnits in tui.tsx) must use the EXACT same
 // line classifications as this parser — re-implemented copies drifted (looser fence opens, trimmed
 // list tests) and made streamed output disagree with the non-streamed render of the same text.
@@ -107,7 +111,7 @@ export function wrapSpans(spans, width) {
                 }
                 continue;
             }
-            const tw = visibleWidth(tok);
+            const tw = displayWidth(tok);
             if (w > 0 && w + tw > width) {
                 dropTrailingSpace();
                 lines.push(line);
@@ -237,47 +241,6 @@ export function parseMarkdown(src) {
     return blocks;
 }
 // ── GFM tables ────────────────────────────────────────────────────────────────
-/** Visible width: ANSI/control stripped, surrogate pairs counted as one cell. */
-/** Display width of one code point: 0 for zero-width marks, 2 for East-Asian-Wide + emoji, else 1.
- *  A compact wcwidth: the old ">BMP = wide" rule missed every BMP emoji (✅ U+2705, ⚠, ▶ …), so any
- *  table with a status column rendered crooked borders in a real terminal. */
-function charWidth(cp) {
-    // Zero-width: combining marks, ZWJ/ZWNJ, variation selectors, BOM.
-    if ((cp >= 0x0300 && cp <= 0x036f) ||
-        (cp >= 0x1ab0 && cp <= 0x1aff) ||
-        (cp >= 0x20d0 && cp <= 0x20ff) ||
-        cp === 0x200d || cp === 0x200c || cp === 0xfe0f || cp === 0xfe0e || cp === 0xfeff)
-        return 0;
-    // East Asian Wide / Fullwidth + BMP emoji-presentation symbols.
-    if ((cp >= 0x1100 && cp <= 0x115f) || // Hangul Jamo
-        cp === 0x231a || cp === 0x231b || cp === 0x2329 || cp === 0x232a ||
-        (cp >= 0x23e9 && cp <= 0x23f3) || (cp >= 0x25fd && cp <= 0x25fe) ||
-        (cp >= 0x2614 && cp <= 0x2615) || (cp >= 0x2648 && cp <= 0x2653) ||
-        cp === 0x267f || cp === 0x2693 || cp === 0x26a1 || (cp >= 0x26aa && cp <= 0x26ab) ||
-        (cp >= 0x26bd && cp <= 0x26be) || (cp >= 0x26c4 && cp <= 0x26c5) || cp === 0x26ce ||
-        cp === 0x26d4 || cp === 0x26ea || (cp >= 0x26f2 && cp <= 0x26f3) || cp === 0x26f5 ||
-        cp === 0x26fa || cp === 0x26fd || cp === 0x2705 || (cp >= 0x270a && cp <= 0x270b) ||
-        cp === 0x2728 || cp === 0x274c || cp === 0x274e || (cp >= 0x2753 && cp <= 0x2755) ||
-        cp === 0x2757 || (cp >= 0x2795 && cp <= 0x2797) || cp === 0x27b0 || cp === 0x27bf ||
-        (cp >= 0x2b1b && cp <= 0x2b1c) || cp === 0x2b50 || cp === 0x2b55 ||
-        (cp >= 0x2e80 && cp <= 0x303e) || // CJK radicals, punctuation
-        (cp >= 0x3041 && cp <= 0x33ff) || // kana, CJK symbols
-        (cp >= 0x3400 && cp <= 0x4dbf) || (cp >= 0x4e00 && cp <= 0x9fff) || // CJK ideographs
-        (cp >= 0xa000 && cp <= 0xa4cf) || (cp >= 0xac00 && cp <= 0xd7a3) || // Yi, Hangul syllables
-        (cp >= 0xf900 && cp <= 0xfaff) || (cp >= 0xfe30 && cp <= 0xfe4f) || // compat ideographs
-        (cp >= 0xff00 && cp <= 0xff60) || (cp >= 0xffe0 && cp <= 0xffe6) || // fullwidth forms
-        (cp >= 0x1f000 && cp <= 0x1fffd) // supplementary emoji/symbol planes
-    )
-        return 2;
-    return 1;
-}
-function visibleWidth(s) {
-    const stripped = s.replace(/\x1b\[[0-9;]*m/g, ''); // strip any ANSI we might inject later
-    let w = 0;
-    for (const ch of stripped)
-        w += charWidth(ch.codePointAt(0));
-    return w;
-}
 /** Split a `| a | b |` row into trimmed cells, honoring `\|` escapes. */
 function splitTableRow(line) {
     const placeholder = ' PIPE ';
@@ -365,7 +328,7 @@ function tryParseTable(lines, i) {
 /** Pad a cell string to `width`, applying column alignment ('auto' is resolved before here;
  *  defensively treated as left). */
 function padCell(text, width, align) {
-    const gap = Math.max(0, width - visibleWidth(text));
+    const gap = Math.max(0, width - displayWidth(text));
     if (align === 'right')
         return ' '.repeat(gap) + text;
     if (align === 'center') {
@@ -378,39 +341,16 @@ function padCell(text, width, align) {
  *  separators, optional decimal, optional trailing %. Conservative on purpose — "10.2s"
  *  or "3 files" stay text (left). */
 const NUMERIC_CELL = /^[+\-−]?[$€£¥]?\d[\d,. ]*%?$/;
-/**
- * Render a parsed table to plain text lines (bordered ASCII). Falls back to a
- * vertical key:value layout when the table would exceed `maxWidth` columns, so a
- * wide table never wraps mid-cell on a narrow terminal. Pure + testable.
- */
-/** Hard-split a token into chunks of at most `w` DISPLAY columns (emoji/CJK aware). */
-function splitByWidth(word, w) {
-    const chunks = [];
-    let cur = '';
-    let curW = 0;
-    for (const ch of word) {
-        const cw = charWidth(ch.codePointAt(0));
-        if (curW + cw > w && cur) {
-            chunks.push(cur);
-            cur = '';
-            curW = 0;
-        }
-        cur += ch;
-        curW += cw;
-    }
-    if (cur)
-        chunks.push(cur);
-    return chunks.length ? chunks : [''];
-}
-/** Word-wrap plain cell text to `w` display columns; an over-wide token hard-splits. Always ≥1 line. */
+/** Word-wrap plain cell text to `w` display columns; an over-wide token hard-splits
+ *  (grapheme-safe via chunksByWidth — never splits a ZWJ run or surrogate pair). Always ≥1 line. */
 function wrapCellText(text, w) {
     const lines = [];
     let cur = '';
     let curW = 0;
     for (const word of text.split(/\s+/).filter(Boolean)) {
-        const parts = visibleWidth(word) > w ? splitByWidth(word, w) : [word];
+        const parts = displayWidth(word) > w ? chunksByWidth(word, w) : [word];
         for (const part of parts) {
-            const pw = visibleWidth(part);
+            const pw = displayWidth(part);
             if (curW === 0) {
                 cur = part;
                 curW = pw;
@@ -429,6 +369,11 @@ function wrapCellText(text, w) {
     lines.push(cur);
     return lines;
 }
+/**
+ * Render a parsed table to plain text lines (bordered box-drawing chrome). Falls back to a
+ * vertical key:value layout when the table would exceed `maxWidth` columns, so a
+ * wide table never wraps mid-cell on a narrow terminal. Pure + testable.
+ */
 export function renderTableLines(table, maxWidth = 100) {
     const colCount = table.align.length;
     const headerText = table.header.map(spanText);
@@ -444,11 +389,11 @@ export function renderTableLines(table, maxWidth = 100) {
     });
     const natural = new Array(colCount).fill(0);
     for (let c = 0; c < colCount; c++) {
-        natural[c] = Math.max(natural[c], visibleWidth(headerText[c] ?? ''));
+        natural[c] = Math.max(natural[c], displayWidth(headerText[c] ?? ''));
     }
     for (const row of rowsText) {
         for (let c = 0; c < colCount; c++) {
-            natural[c] = Math.max(natural[c], visibleWidth(row[c] ?? ''));
+            natural[c] = Math.max(natural[c], displayWidth(row[c] ?? ''));
         }
     }
     // `│ cell │` chrome: 3 cols per column (`│ ` + ` `) plus the closing `│`.

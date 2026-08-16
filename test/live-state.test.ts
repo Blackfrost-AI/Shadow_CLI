@@ -33,7 +33,7 @@ test('D1: the /model clamp actually tells the Context, not just the HUD', () => 
 });
 
 test('D2: /clear exits plan mode for REAL, not just in React state', () => {
-  const src = readFileSync(new URL('../src/tui.tsx', import.meta.url), 'utf8');
+  const src = readFileSync(new URL('../src/tui/slash.ts', import.meta.url), 'utf8'); // P3-02: the /clear handler lives in slash.ts
   const i = src.indexOf("setPlanMode({ mode: 'implement' }); // drop any stale plan title");
   assert.ok(i > 0, 'the /clear reset exists');
   assert.match(

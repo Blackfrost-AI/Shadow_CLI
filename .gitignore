@@ -9,6 +9,14 @@ eval/models.json
 *.bak
 *.bak-*
 
+# F06-11 decision (2026-08-15, v6.26.0): dist/ is a DERIVED artifact — untracked, built at
+# release time only. The binary channel bundles src/index.ts directly (scripts/build-binary.sh);
+# the public mirror syncs src/ + test/ only, never dist/; and the npm path is rebuilt +
+# byte-verified by `npm run check:release-gate` (scripts/check-dist-fresh.mjs) before any
+# artifact ships. Committing dist/ churned ~2MB of rebuilt JS into every release commit for
+# zero shipping benefit — keep it out of the index, always.
+dist/
+
 # single-file binary build output
 dist-bin/
 *.bun-build
@@ -17,12 +25,12 @@ eval/models-*.json
 eval/RESULTS-*.md
 eval/FINDINGS-*.md
 research/
-dist/
 
 # other tools' session scratch
 .zcode/
 
-# Secrets that must never be committed by broad mirror staging.
+# Secrets that must never be committed. `.env` alone did NOT cover `.env.local` / `.env.*`,
+# and the mirror sync uses a broad `git add -A`.
 .env.*
 !.env.example
 *.key
@@ -30,4 +38,6 @@ dist/
 *.p12
 *.pfx
 .shadow-signing/
+
+# Local backup bundles (the ONLY off-machine-less backup — see deployment_instructions.md A5).
 *.bundle

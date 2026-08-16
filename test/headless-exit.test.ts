@@ -1,13 +1,48 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { resolve, dirname } from 'node:path';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { existsSync, realpathSync } from 'node:fs';
+import { basename, delimiter, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const CLI = resolve(ROOT, 'dist/index.js');
 
+/**
+ * Locate npm's real npm-cli.js — never the platform shell shim (same rule as
+ * scripts/check-dist-fresh.mjs, which test/build-hygiene.test.ts pins for the checker).
+ */
+function npmCli(): string {
+  const nodeDir = dirname(process.execPath);
+  const candidates = [
+    process.env.npm_execpath,
+    resolve(nodeDir, 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+    resolve(nodeDir, '..', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+    resolve(nodeDir, '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+    ...(process.env.PATH ?? '')
+      .split(delimiter)
+      .filter(Boolean)
+      .flatMap((d) => [resolve(d, 'npm'), resolve(d, 'npm-cli.js')]),
+  ];
+  for (const c of candidates) {
+    if (!c || !existsSync(c)) continue;
+    try {
+      if (basename(realpathSync(c)).toLowerCase() === 'npm-cli.js') return realpathSync(c);
+    } catch {
+      /* try the next candidate */
+    }
+  }
+  throw new Error("could not locate npm's npm-cli.js to build dist/ for the headless launch test");
+}
+
 test('headless --task --provider mock exits non-zero with provider_error when SHADOW_MOCK_ERROR=1', () => {
+  // F06-11: dist/ is UNTRACKED (built at release time), so a fresh clone starts without the
+  // artifact this test launches. Build it on demand instead of assuming it exists — the whole
+  // point of the test is that the BUILT entry point boots headless, not that dist/ pre-exists.
+  if (!existsSync(CLI)) {
+    execFileSync(process.execPath, [npmCli(), 'run', 'build'], { cwd: ROOT, stdio: 'pipe' });
+  }
+  assert.ok(existsSync(CLI), 'npm run build must produce dist/index.js');
   const r = spawnSync(process.execPath, [CLI, '--task', 'x', '--provider', 'mock'], {
     cwd: ROOT,
     env: { ...process.env, SHADOW_MOCK_ERROR: '1', SHADOW_PROVIDER: 'mock' },

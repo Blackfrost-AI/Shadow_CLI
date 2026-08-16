@@ -41,7 +41,7 @@ test('browser MCP public CLI persists the playwright preset and disables it by i
 
     const enabled = JSON.parse(readFileSync(configPath, 'utf8')) as {
       theme?: string;
-      mcpServers?: Record<string, { command?: string; args?: string[]; url?: string }>;
+      mcpServers?: Record<string, { command?: string; args?: string[]; url?: string; network?: boolean; sandbox?: boolean }>;
     };
     assert.equal(enabled.theme, 'dark', 'unrelated global configuration is preserved');
     assert.deepEqual(enabled.mcpServers?.existing, { url: 'https://example.test/mcp' });
@@ -58,6 +58,11 @@ test('browser MCP public CLI persists the playwright preset and disables it by i
         '--output-max-size',
         '52428800',
       ],
+      // P3-08 Phase 3: a browsing browser legitimately needs sockets AND broad filesystem access,
+      // so the preset opts this one server out of the OS jail explicitly. Its own isolation is the
+      // `--isolated` profile + capped output dir inside ~/.shadow.
+      network: true,
+      sandbox: false,
     });
 
     const disabledOutput = runShadow(home, 'mcp', 'disable', 'playwright');

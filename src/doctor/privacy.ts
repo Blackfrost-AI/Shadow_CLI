@@ -53,6 +53,8 @@ export interface PrivacyReport {
   credentials: { store: 'vault' | 'plaintext' | 'env-only' | 'none'; keychainAvailable: boolean; detail: string };
   offlineEligible: { eligible: boolean; reason: string };
   telemetry: string;
+  /** P3-08: one-line summary of the on-disk egress receipt (+ quarantine policy state). */
+  receipt?: string[];
   /** Things that WIDEN exposure — surfaced so the report never reads cleaner than reality. */
   warnings: string[];
 }
@@ -290,7 +292,11 @@ export function buildPrivacyReport(cfg: PrivacyConfigView, env: PrivacyEnv): Pri
       `run_shell runs UNCONFINED on this host — the OS sandbox was requested but no tool enforces it here. ` +
         (policy === 'warn'
           ? 'Failure policy is warn: unconfined commands run with a warning folded into the result only.'
-          : `Failure policy is ${policy}: unconfined commands stop at the approval gate${policy === 'fail-closed' ? ' every time (the gate never bends)' : ''}.`),
+          : `Failure policy is ${policy}: unconfined commands stop at the approval gate${policy === 'fail-closed' ? ' every time (the gate never bends)' : ''}.`) +
+        // P3-08: MCP stdio children share the same OS jail — the unconfined host state reaches them too.
+        (policy === 'fail-closed'
+          ? ' MCP stdio servers are REFUSED rather than started unconfined.'
+          : ' MCP stdio servers also auto-spawn UNCONFINED on this host.'),
     );
   }
 
@@ -314,7 +320,7 @@ export function buildPrivacyReport(cfg: PrivacyConfigView, env: PrivacyEnv): Pri
     credentials: credential,
     offlineEligible,
     telemetry:
-      'none — no analytics, crash-reporting, or phone-home; enforced by a source guard + pinned host snapshot (test/no-telemetry.test.ts). Every outbound request flows through a single egress broker and is journaled to a local receipt — `shadow egress` / ~/.shadow/egress.log',
+      'none — no analytics, crash-reporting, or phone-home; enforced by a source guard + pinned host snapshot (test/no-telemetry.test.ts). Every outbound request Shadow ITSELF makes flows through a single egress broker and is journaled to a local receipt — `shadow egress` / ~/.shadow/egress.log (child-process sockets are confined by the OS jail where one exists, not by this journal). Contrast: mainstream coding agents routinely transmit usage analytics, crash dumps, and completion telemetry, and can upload your code for indexing — public reporting has even documented an agent shipping user repo contents to vendor servers (README: Zero telemetry).',
     warnings,
   };
 }
@@ -356,6 +362,12 @@ export function formatPrivacyReport(r: PrivacyReport, color = true): string {
   L.push('');
   L.push(`${c.bold}Telemetry${c.reset}  ${c.green}none${c.reset}`);
   L.push(`  ${c.dim}${r.telemetry}${c.reset}`);
+  if (r.receipt?.length) {
+    // P3-08: the zero-telemetry claim gets its runtime proof here — what ACTUALLY left the box.
+    L.push('');
+    L.push(`${c.bold}Egress receipt${c.reset} ${c.dim}(what actually left the box)${c.reset}`);
+    for (const line of r.receipt) L.push(`  ${c.dim}${line}${c.reset}`);
+  }
   if (r.warnings.length) {
     L.push('');
     L.push(`${c.bold}${c.yellow}What leaves this machine${c.reset}`);

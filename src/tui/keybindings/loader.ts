@@ -18,7 +18,7 @@
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { GLOBAL_DIR } from '../../state/globalStore.js';
-import { buildDefaultBindings, UNMIGRATED_ACTIONS } from './defaultBindings.js';
+import { buildDefaultBindings, KNOWN_ACTION_IDS, UNMIGRATED_ACTIONS } from './defaultBindings.js';
 import { parseChord, keystrokeToString } from './parser.js';
 import { checkReserved } from './reserved.js';
 import { KEYBINDING_CONTEXTS, type ContextName, type KeybindingWarning, type LoadedBindings, type ParsedBinding, type UserKeybindingsFile } from './types.js';
@@ -96,6 +96,11 @@ function parseUserBlock(block: unknown, warnings: KeybindingWarning[]): ParsedBi
           'by its built-in key, so this binding will not take effect',
       });
     }
+    // F03-03 — a typo'd action id used to parse cleanly, match nothing at dispatch, and say
+    // nothing. The full known-id set (defaults + registered non-defaults) is cheap to check.
+    if (typeof action === 'string' && !KNOWN_ACTION_IDS.has(action)) {
+      warnings.push({ kind: 'unknown_action', message: `${ctx}: "${stroke}" → unknown action "${action}" — no such action exists (check spelling)` });
+    }
     out.push({ context: ctx, chord, action });
   }
   return out;
@@ -109,6 +114,25 @@ function parseUserBlock(block: unknown, warnings: KeybindingWarning[]): ParsedBi
 export function mergeKeybindings(userBlocks: readonly unknown[] | null): LoadedBindings {
   const { bindings: defaults, warnings } = buildDefaultBindings();
   const userBindings = (userBlocks ?? []).flatMap((b) => parseUserBlock(b, warnings));
+  // F03-03 — inert unbinds. `null` removes a binding from the resolver's table, but when the
+  // DEFAULT action for that chord is still dispatched BY KEY in the inline handler, the key keeps
+  // doing the same thing anyway — the unbind looks effective and isn't. Say so. An unbind that
+  // matches no default at all unbinds nothing; say that too instead of accepting it silently.
+  const strokeOf = (chord: ParsedBinding['chord']) => chord.map(keystrokeToString).join(' ');
+  const defaultAt = new Map(defaults.map((d) => [`${d.context}|${strokeOf(d.chord)}`, d.action]));
+  for (const b of userBindings) {
+    if (b.action !== null) continue;
+    const stroke = strokeOf(b.chord);
+    const def = defaultAt.get(`${b.context}|${stroke}`);
+    if (def === undefined) {
+      warnings.push({ kind: 'unknown_action', message: `${b.context}: "${stroke}" unbinds nothing — there is no default binding for that chord` });
+    } else if (def !== null && UNMIGRATED_ACTIONS.has(def)) {
+      warnings.push({
+        kind: 'unmigrated',
+        message: `${b.context}: unbinding "${stroke}" has no effect — ${def} is still dispatched by its built-in key`,
+      });
+    }
+  }
   return { bindings: [...defaults, ...userBindings], warnings };
 }
 
@@ -181,6 +205,7 @@ export function generateKeybindingsTemplate(): string {
     '{',
     '  "//": "Shadow keybindings — overrides the defaults. Last match per context+chord wins.",',
     '  "//": "Hardcoded keys (ctrl+c, ctrl+d, ctrl+m) cannot be reassigned. Set an action to null to disable it.",',
+    '  "//": "Unbinding an action that is not rebindable yet warns — its built-in key keeps handling it (see /keybindings).",',
     '  "bindings": [',
     blocks.join(',\n'),
     '  ]',

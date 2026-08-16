@@ -48,6 +48,16 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
   // rebuild providers, not tools) and bounds ALL sub-agent loops, sync AND background: no more
   // unbounded parallel provider streams when a model fans out a fleet of `agent` calls in one turn.
   const semaphore = new Semaphore(deps.subagentConcurrency ?? 4);
+  // P3-09 review fix (nested fan-out width): NESTED `agent` calls bypass the session semaphore —
+  // the F06-10 deadlock guard below — but must not be UNBOUNDED in width: one sub-agent emitting
+  // N agent calls in a single assistant message used to admit all N at once, each inheriting the
+  // enclosing budget's FULL remaining ceilings (multiplicative N× overshoot against the tree's
+  // maxCostUSD / maxTotalTokens, caught only after the fact). Each parent budget therefore gets
+  // its OWN admission gate capping its concurrent children at the same subagentConcurrency.
+  // Deadlock-free by construction: permits in a parent's gate are held only by that parent's
+  // children, so a child only ever queues behind its own SIBLINGS — never its own lineage — and
+  // queue waits are abortable like the session gate's.
+  const nestedGates = new WeakMap<Budget, Semaphore>();
   return {
     name: 'agent',
     description:
@@ -134,6 +144,10 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         workspaceRoot: subWorkspaceRoot,
         additionalRoots: base.additionalRoots, // ensure sub-agents inherit jail/sanbox state (full under yolo)
         nestedAgent: true, // F06-10: tools of THIS loop run inside a sub-agent (admission bypass marker)
+        // P3-09 (F04-08): thread the delegation tree's ROOT budget down to the sub-loop so a
+        // background agent at ANY depth rolls its spend up into the turn/run budget even after
+        // intermediate ancestors have finished (a top-level call's parent budget IS the root).
+        rootBudget: ctx.rootBudget ?? ctx.parentBudget ?? undefined,
       };
       const loop = new AgentLoop(loopDeps, deps.getAutonomy());
 
@@ -143,9 +157,63 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
       // behind its own lineage forever (budget checks never fire inside a tool await; headless
       // would simply hang). A parked ancestor is not streaming, so a chain is ONE active provider
       // stream: admitting the child separately would double-count it. Top-level fan-out — the
-      // fleet-in-one-turn case the cap exists for — stays fully gated, and every nested agent is
-      // still bounded by its own iteration + wall-clock budget.
+      // fleet-in-one-turn case the cap exists for — stays fully gated. P3-09 review fix: nested
+      // calls no longer bypass the width cap entirely — they go through a per-PARENT gate (see
+      // `gate` below) at the same subagentConcurrency, still deadlock-free.
       const nested = ctx.nestedAgent === true;
+
+      // P3-09 (F04-08): the parent Budget — the loop running THIS call, stamped onto the ToolContext
+      // as ctx.parentBudget. Before this, a sub-agent's Budget had NO token/cost ceilings at all and
+      // its spend never accrued to the parent, so a fleet of sub-agents could burn unbounded cost
+      // that the parent's maxCostUSD / maxTotalTokens never saw. Now:
+      //   - at ADMISSION the sub-agent inherits the parent's REMAINING ceilings (tokens / cost /
+      //     wall-clock); a zero remainder stops it at its first budget check, BEFORE any provider
+      //     call — an exhausted parent cannot be spent past;
+      //   - on EVERY exit path (done / cancelled / error) the sub-agent's TOTAL spend rolls up into
+      //     the parent budget, so the parent's spending checks see the whole delegation tree.
+      // Nested calls resolve to the enclosing sub-agent's OWN budget, so accrual chains upward one
+      // level at a time and no level is ever counted twice.
+      const parentBudget = ctx.parentBudget ?? null;
+      // P3-09 review fix (nested fan-out width): the admission gate for THIS call. Top-level calls
+      // use the session semaphore; NESTED calls bypass it (the deadlock guard above) but go through
+      // a per-PARENT gate keyed by the parent's own budget, so a sub-agent fanning out a fleet of
+      // its own is width-capped at subagentConcurrency instead of admitting the whole batch at
+      // once. A nested call with no parent budget (test harnesses only) bypasses both gates.
+      const gate = nested
+        ? parentBudget
+          ? nestedGates.get(parentBudget) ?? (() => {
+              const g = new Semaphore(deps.subagentConcurrency ?? 4);
+              nestedGates.set(parentBudget, g);
+              return g;
+            })()
+          : null
+        : semaphore;
+      // Applied immediately before the loop runs (after any queue wait + clock restart) so the
+      // wall-clock share reflects real remaining time. An axis the parent never configured inherits
+      // none — the sub-agent keeps its own iteration cap + 30-minute wall-clock backstop there.
+      const inheritCeilings = (): void => {
+        if (parentBudget) budget.applyInheritedCeilings(parentBudget.inheritableCeilings(Date.now()));
+      };
+      // Roll this agent's TOTAL spend (own provider calls + nested sub-agents already rolled up)
+      // into `target` — called on EVERY exit path; the spend is real whether the run ended done,
+      // cancelled, or in error.
+      const accrue = (target: Budget | null): void => {
+        target?.accrueSubagent({
+          inputTokens: budget.totalInputTokens,
+          outputTokens: budget.totalOutputTokens,
+          costUSD: budget.totalCostUSD,
+        });
+      };
+      // P3-09 review fix (late-arriving bg spend): a BACKGROUND agent can outlive its immediate
+      // parent loop — that is the point of background — so rolling its spend up into the parent
+      // budget could land it in a budget that is already dead and never checked again (e.g. the
+      // sync agent that spawned it has long since returned). A bg agent's spend instead rolls up
+      // into the ROOT budget of the delegation tree — the turn/run budget, stamped as
+      // ctx.rootBudget, alive for the whole turn/run. Sync agents keep rolling into their
+      // immediate parent: it is alive for their whole run, and its finish-time roll-up carries
+      // the combined total onward. No level is ever counted twice: the bg agent's own accrual is
+      // its total, and the intermediate parent already accrued WITHOUT it.
+      const bgAccrualTarget = ctx.rootBudget ?? parentBudget;
 
       if (isBg) {
         // record launch metadata via bus to main context (the real persisted one in outer scope); base.context here is throwaway from makeLoopDeps
@@ -153,10 +221,12 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         // F06-10: take a permit up front so a fleet of bg launches cannot exceed the cap; when none
         // is free announce as QUEUED — admission then happens INSIDE the fire-and-forget below, so
         // a full semaphore never blocks the launching turn. Nested calls bypass (see `nested`).
-        const bgPermit0 = nested ? null : semaphore.tryAcquire();
+        const bgPermit0 = gate ? gate.tryAcquire() : null;
         // surface the sub-agent in the TUI HUD immediately (BUG 3). `background:true` keeps it in
         // the panel after the launching turn ends (F10-02) instead of vanishing with the turn.
-        base.bus.emit({ type: 'subagent_start', taskId, subagentType: agentType, description: input.description, background: true, queued: !nested && bgPermit0 == null });
+        // `queued` only when there IS a gate and no permit — a gateless call (nested with no
+        // parent budget) never waits, so it must not announce as queued.
+        base.bus.emit({ type: 'subagent_start', taskId, subagentType: agentType, description: input.description, background: true, queued: gate != null && bgPermit0 == null });
 
         // Listen for a cancel request aimed at THIS agent (taskId or the '*' wildcard). The abort
         // stops the sub-loop at its next boundary; unsubscribed in finally so a completed agent's id
@@ -169,27 +239,41 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         (async () => {
           let permit = bgPermit0;
           try {
-            if (!nested && !permit) {
+            if (gate && !permit) {
               // loopDeps.signal = turn abort OR /agents-kill cancellation — either one must be able
               // to dequeue an agent that never got a slot (a cancelled turn cannot leak a permit).
-              permit = await semaphore.acquire(loopDeps.signal);
+              permit = await gate.acquire(loopDeps.signal);
               // F06-10: queue wait is not loop time — restart the wall-clock budget at admission.
               budget.restartClock(Date.now());
               // admitted — re-announce with queued cleared (nothing has run yet, so re-registration
               // is safe: the HUD counters for this taskId are still zero).
               base.bus.emit({ type: 'subagent_start', taskId, subagentType: agentType, description: input.description, background: true });
             }
+            inheritCeilings(); // P3-09: admission point — parent's remaining ceilings become this agent's
             const res = await loop.run();
+            // P3-09: roll the spend up even if the run ended in error/cancel — it was still spent.
+            // Bg target: the ROOT budget (see bgAccrualTarget) — this agent can outlive its parent.
+            accrue(bgAccrualTarget);
             // A cancelled bg agent returns via stop('interrupted') (it does NOT throw), so report it
             // as cancelled (ok:false) rather than a spurious "done" with a partial answer.
             const cancelled = res.stopReason === 'interrupted';
+            // P3-09: a ceiling-stopped agent must not masquerade as a completed one — say what stopped it.
+            const budgetStopped = res.stopReason === 'budget' || res.stopReason === 'max_iterations';
             if (base.hooks?.subagent_stop?.length) {
               runHookPhase('subagent_stop', base.hooks.subagent_stop, { workspaceRoot: subWorkspaceRoot, extra: { agentType, taskId, result: cancelled ? 'bg_cancelled' : 'bg_done' } });
             }
             { const snap = budget.snapshot(Date.now()); base.bus.emit({ type: 'subagent_usage', costUSD: budget.currentCostUSD, subagent: agentType, taskId, inputTokens: snap.inputTokens, outputTokens: snap.outputTokens }); }
             base.bus.emit({ type: 'subagent_end', taskId, ok: !cancelled, subagentType: agentType });
-            base.bus.emit({ type: 'task_notification', taskId: taskId!, answer: cancelled ? 'agent cancelled by user' : (res.finalAnswer || ''), fromSubagent: agentType });
+            base.bus.emit({
+              type: 'task_notification',
+              taskId: taskId!,
+              answer: cancelled
+                ? 'agent cancelled by user'
+                : res.finalAnswer || (budgetStopped ? `agent stopped by its ${res.stopReason} ceiling before producing an answer` : ''),
+              fromSubagent: agentType,
+            });
           } catch (e) {
+            accrue(bgAccrualTarget); // P3-09: a thrown run still spent tokens/cost — roll it up.
             if (base.hooks?.subagent_stop?.length) {
               runHookPhase('subagent_stop', base.hooks.subagent_stop, { workspaceRoot: subWorkspaceRoot, extra: { agentType, taskId, error: (e as Error).message } });
             }
@@ -214,14 +298,15 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
       // F06-10: admission via the session semaphore. Announce immediately so the HUD shows the
       // agent; when no permit is free, announce as QUEUED and wait. On admission re-announce —
       // safe because nothing has run yet (the HUD counters for this taskId are still zero).
-      // Nested calls bypass admission entirely (see `nested` above).
-      const permit0 = nested ? null : semaphore.tryAcquire();
-      // surface the sub-agent in the TUI HUD immediately (BUG 3)
-      base.bus.emit({ type: 'subagent_start', taskId, subagentType: agentType, description: input.description, background: false, queued: !nested && permit0 == null });
+      // Nested calls use the per-parent gate instead of the session semaphore (see `gate` above).
+      const permit0 = gate ? gate.tryAcquire() : null;
+      // surface the sub-agent in the TUI HUD immediately (BUG 3). `queued` only when there IS a
+      // gate and no permit — a gateless call (nested with no parent budget) never waits.
+      base.bus.emit({ type: 'subagent_start', taskId, subagentType: agentType, description: input.description, background: false, queued: gate != null && permit0 == null });
       let permit = permit0;
-      if (!nested && !permit) {
+      if (gate && !permit) {
         try {
-          permit = await semaphore.acquire(loopDeps.signal);
+          permit = await gate.acquire(loopDeps.signal);
           // F06-10: queue wait is not loop time — restart the wall-clock budget at admission.
           budget.restartClock(Date.now());
         } catch {
@@ -236,7 +321,12 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         base.bus.emit({ type: 'subagent_start', taskId, subagentType: agentType, description: input.description, background: false });
       }
       try {
+        inheritCeilings(); // P3-09: admission point — parent's remaining ceilings become this agent's
         const result = await loop.run();
+        // P3-09: roll the spend up even if the run ended in error/cancel — it was still spent.
+        // Sync target: the IMMEDIATE parent budget — alive for this agent's whole run, and its own
+        // finish-time roll-up carries the combined total onward.
+        accrue(parentBudget);
         if (base.hooks?.subagent_stop?.length) {
           runHookPhase('subagent_stop', base.hooks.subagent_stop, { workspaceRoot: subWorkspaceRoot, extra: { agentType, result: 'done' } });
         }
@@ -248,8 +338,17 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         if (worktreeCleanupPath) {
           try { removeWorktree(ctx.workspaceRoot, worktreeCleanupPath); } catch {}
         }
-        return ok('agent', 'read', Date.now() - start, result.finalAnswer || 'Sub-agent completed.', data);
+        // P3-09: a ceiling-stopped agent must not masquerade as a completed one — say what stopped it.
+        const budgetStopped = result.stopReason === 'budget' || result.stopReason === 'max_iterations';
+        return ok(
+          'agent',
+          'read',
+          Date.now() - start,
+          result.finalAnswer || (budgetStopped ? `Sub-agent stopped by its ${result.stopReason} ceiling before producing an answer.` : 'Sub-agent completed.'),
+          data,
+        );
       } catch (e) {
+        accrue(parentBudget); // P3-09: a thrown run still spent tokens/cost — roll it up.
         if (base.hooks?.subagent_stop?.length) {
           runHookPhase('subagent_stop', base.hooks.subagent_stop, { workspaceRoot: subWorkspaceRoot, extra: { agentType, error: (e as Error).message } });
         }
@@ -259,7 +358,7 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         }
         return fail('agent', 'read', Date.now() - start, 'agent_failed', (e as Error).message);
       } finally {
-        permit?.(); // null only on the nested bypass — no gate, nothing to release
+        permit?.(); // released back to whichever gate admitted this agent; null = gateless bypass
       }
     },
   };

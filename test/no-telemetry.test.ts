@@ -11,7 +11,9 @@ function read(rel: string): string {
 }
 
 test('CLI and TUI provider creation do not attach persistent user metadata', () => {
-  const runtimeSources = ['src/index.ts', 'src/tui.tsx'].map(read).join('\n');
+  // P3-02: the TUI's second createProvider site (the `/model test` probe) moved to src/tui/slash.ts
+  // with the runSlash extraction — it must stay inside this negative pin's coverage.
+  const runtimeSources = ['src/index.ts', 'src/tui.tsx', 'src/tui/slash.ts'].map(read).join('\n');
 
   assert.doesNotMatch(runtimeSources, /\bmetadataUserId\b/);
   assert.doesNotMatch(runtimeSources, /\binstallUserId\b|\bgetInstallId\b/);

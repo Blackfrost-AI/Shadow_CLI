@@ -90,6 +90,13 @@ export interface ApprovalRequest {
   /** Populated when kind === 'user_question'. */
   questions?: UserQuestion[];
   /**
+   * F07-09: this dialog is INFORMATIONAL — the call is hard-blocked regardless of the answer,
+   * and no decision grants anything (no session/prefix approval, no autonomy raise). The gate
+   * exists so the human SEES what the model attempted, not to offer a choice. Gates should show
+   * acknowledge-only affordances (a single "acknowledge" key), never approve/deny verbs.
+   */
+  acknowledgeOnly?: boolean;
+  /**
    * Aborts when the turn is interrupted. A gate that can wait indefinitely (a browser tab, a
    * terminal prompt) should stop waiting when this fires. The loop also races it — see
    * `settleWithAbort` — so a gate that ignores it still cannot hang the turn.

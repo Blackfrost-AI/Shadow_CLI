@@ -42,6 +42,19 @@ export class Context {
    */
   private rearmAtTokens = 0;
   /**
+   * F06-12 estimation cache. `provider.estimateTokens` re-stringifies every tool input
+   * (JSON.stringify on every tool_use block) on EACH call, and a single turn calls it several
+   * times over (microcompact gate → maybeSummarize → loop HUD). The result is a pure function
+   * of `msgs` and the estimator, so it is computed once per mutation and reused. EVERY site
+   * that mutates `msgs` — or a message inside it — must set `estimateDirty = true`. The
+   * output stays EXACTLY `max(heuristic(msgs), lastActualTokens)`: this is call elimination,
+   * not a new formula. The provider object is part of the cache key because adapters may
+   * override the char/4 default estimator.
+   */
+  private estimateCached = 0;
+  private estimateDirty = true;
+  private estimateProvider: Provider | null = null;
+  /**
    * F04-11 visibility without warn-spam: set on the first degraded compaction of an episode so
    * the loop warns ONCE, not once per turn while the summarizer stays broken. Cleared by a
    * successful compaction, reset(), and setPolicy() (a new model/budget is a new episode).
@@ -136,10 +149,12 @@ export class Context {
   pinTask(msg: Message): void {
     this.msgs.push(msg);
     this.pinnedPrefix = this.msgs.length;
+    this.estimateDirty = true; // F06-12
   }
 
   append(msg: Message): void {
     this.msgs.push(msg);
+    this.estimateDirty = true; // F06-12
   }
 
   /** Drop all history (used by the `/clear` command); the next pinTask re-seeds it. */
@@ -149,6 +164,7 @@ export class Context {
     this.lastActualTokens = 0;
     this.rearmAtTokens = 0;
     this.degradedReported = false;
+    this.estimateDirty = true; // F06-12
   }
 
   messages(): Message[] {
@@ -185,12 +201,23 @@ export class Context {
     this.lastActualTokens = data.lastActualTokens ?? 0;
     this.rearmAtTokens = data.rearmAtTokens ?? 0;
     (this as any)._subAgentTasks = data.subAgentTasks || [];
+    this.estimateDirty = true; // F06-12: history replaced wholesale
   }
 
   estimateTokens(provider: Provider): number {
     // Prefer the real last-request size when we have it (accounts for system + tools);
     // the heuristic still wins once history has grown beyond that last measurement.
-    return Math.max(provider.estimateTokens(this.msgs), this.lastActualTokens);
+    // F06-12: the heuristic pass re-runs only after a mutation (see the cache fields) — an
+    // unchanged history reuses the last computed pass instead of re-stringifying every tool
+    // input. `truncateLocally`'s stop line deliberately bypasses this cache and calls the
+    // provider directly: it measures the message-only heuristic, the one quantity
+    // tombstoning can move.
+    if (this.estimateDirty || this.estimateProvider !== provider) {
+      this.estimateCached = provider.estimateTokens(this.msgs);
+      this.estimateDirty = false;
+      this.estimateProvider = provider;
+    }
+    return Math.max(this.estimateCached, this.lastActualTokens);
   }
 
   /**
@@ -248,7 +275,81 @@ export class Context {
         cleared = true;
       }
     }
+    if (cleared) this.estimateDirty = true; // F06-12: tool_result bodies changed in place
     return cleared;
+  }
+
+  /**
+   * F08-06 overflow ladder rung 2 — replace EVERY image block in history with a small text
+   * placeholder. Images cost ~1k tokens each (flat in the estimator, often far more on the wire)
+   * and sit in the KEPT tail where summarization never touches them, so a vision-heavy session
+   * can stay over the window even after compaction. Losing the image is better than dying on a
+   * 400; the placeholder keeps turn structure (and tool_use↔tool_result pairing — images never
+   * carry tool ids) intact. Returns the number of image blocks removed (0 = nothing to strip).
+   */
+  stripImageBlocks(): number {
+    let removed = 0;
+    for (let i = 0; i < this.msgs.length; i++) {
+      const m = this.msgs[i]!;
+      if (!m.content.some((b) => b.type === 'image')) continue;
+      this.msgs[i] = {
+        ...m,
+        content: m.content.map((b) =>
+          b.type === 'image' ? ({ type: 'text', text: IMAGE_STRIPPED_SENTINEL } as ContentBlock) : b,
+        ),
+      };
+      removed += m.content.filter((b) => b.type === 'image').length;
+    }
+    if (removed > 0) {
+      this.lastActualTokens = 0; // the wire size just changed materially
+      this.estimateDirty = true; // F06-12
+    }
+    return removed;
+  }
+
+  /**
+   * F08-06 overflow ladder rung 2 — aggressive LOCAL reclamation for a session that is still over
+   * the window after a forced compaction. Two lossy-but-survivable cuts, neither requiring a
+   * summarizer round trip:
+   *  1. every tool_result body is capped HARD (envelope-safe) — much tighter than the normal
+   *     kept-tail cap — because at this rung survival beats fidelity;
+   *  2. thinking/redacted_thinking blocks are dropped from every assistant turn EXCEPT the last
+   *     one (the only turn whose thinking state can matter for continuation).
+   * A message whose content would become empty gets a text placeholder instead — providers reject
+   * empty assistant turns. Returns true when anything was reclaimed.
+   */
+  shrinkForOverflow(): boolean {
+    let lastAssistant = -1;
+    for (let i = this.msgs.length - 1; i >= 0; i--) {
+      if (this.msgs[i]!.role === 'assistant') {
+        lastAssistant = i;
+        break;
+      }
+    }
+    let changed = false;
+    for (let i = 0; i < this.msgs.length; i++) {
+      const m = this.msgs[i]!;
+      let content: ContentBlock[] = m.content.map((b) => {
+        if (b.type !== 'tool_result') return b;
+        if (b.content.length <= OVERFLOW_TOOL_RESULT_CAP) return b;
+        changed = true;
+        return {
+          ...b,
+          content: `${envelopeSafeSlice(b.content, OVERFLOW_TOOL_RESULT_CAP)}\n…[truncated for overflow recovery]`,
+        };
+      });
+      if (i !== lastAssistant && content.some((b) => b.type === 'thinking' || b.type === 'redacted_thinking')) {
+        content = content.filter((b) => b.type !== 'thinking' && b.type !== 'redacted_thinking');
+        if (content.length === 0) content = [{ type: 'text', text: '[earlier reasoning dropped for overflow recovery]' }];
+        changed = true;
+      }
+      if (changed && content !== m.content) this.msgs[i] = { ...m, content };
+    }
+    if (changed) {
+      this.lastActualTokens = 0;
+      this.estimateDirty = true; // F06-12
+    }
+    return changed;
   }
 
   /**
@@ -279,6 +380,11 @@ export class Context {
       temperature?: number;
       /** Invoked only once compaction is definitely going to call the summarizer. */
       beforeCompact?: () => void;
+      /**
+       * F08-06 overflow ladder rung 2: keep HALF the usual tail (floor 2). Used on the second
+       * overflow recovery, when a normal compaction already ran and the request is still too long.
+       */
+      aggressiveKeep?: boolean;
     },
   ): Promise<CompactResult> {
     if (signal?.aborted) return false;
@@ -321,10 +427,11 @@ export class Context {
     }
 
     // Small windows: keep a shorter tail so one compact actually frees space.
-    const keep =
+    let keep =
       this.opts.contextBudget <= 40_000
         ? Math.min(this.opts.keepLastTurns, 6)
         : this.opts.keepLastTurns;
+    if (countCtx?.aggressiveKeep) keep = Math.max(2, Math.floor(keep / 2));
     let end = this.msgs.length - keep;
     // Over budget but history too short to compact: a genuinely stuck state. Under the new
     // contract that must be a VISIBLE failure, not a no-op indistinguishable from health.
@@ -352,13 +459,19 @@ export class Context {
     // lose the Qwen continuation thread.
     {
       const keptModels = new Set<string>();
+      let strippedReasoning = false;
       for (let i = this.msgs.length - 1; i >= 0; i--) {
         const m = this.msgs[i]!;
         if (m.role !== 'assistant' || !m.providerReasoning?.text) continue;
         const model = m.providerReasoning.model;
-        if (keptModels.has(model)) delete m.providerReasoning;
-        else keptModels.add(model);
+        if (keptModels.has(model)) {
+          delete m.providerReasoning; // in-place mutation of a KEPT message
+          strippedReasoning = true;
+        } else keptModels.add(model);
       }
+      // F06-12: the estimator counts preserved reasoning char-for-char, so a strip moves the
+      // heuristic even though the message ARRAY was untouched.
+      if (strippedReasoning) this.estimateDirty = true;
     }
 
     const toSummarize = this.msgs.slice(this.pinnedPrefix, end);
@@ -488,11 +601,14 @@ export class Context {
     this.msgs = [objectiveMsg, progressMsg, ...kept];
     this.pinnedPrefix = 1; // only the objective carrier is protected
     this.lastActualTokens = 0;
+    this.estimateDirty = true; // F06-12: history replaced
 
     // Rearm hysteresis only when compact clearly freed room under the trigger.
     // If still near/over the trigger, rearmAt=0 so the next over-threshold check fires again
     // (with a shorter keep on small budgets) instead of sailing into a server 400.
-    const after = provider.estimateTokens(this.msgs);
+    // F06-12: route through the cached estimator — identical value (lastActualTokens was just
+    // zeroed, so max() collapses to the heuristic) and it seeds the cache for the next reads.
+    const after = this.estimateTokens(provider);
     const gap = Math.max(2_000, Math.floor(this.opts.contextBudget * 0.1));
     this.rearmAtTokens = after < trigger * 0.9 ? after + gap : 0;
     this.degradedReported = false; // a healthy compaction ends the degradation episode
@@ -566,7 +682,9 @@ export class Context {
     }
     if (droppedMessages === 0) return 'failed';
     this.lastActualTokens = 0;
-    const after = provider.estimateTokens(this.msgs);
+    this.estimateDirty = true; // F06-12: tombstoned bodies moved the heuristic
+    // Same value as the direct call (lastActualTokens was just zeroed), but seeds the cache.
+    const after = this.estimateTokens(provider);
     const gap = Math.max(2_000, Math.floor(this.opts.contextBudget * 0.1));
     this.rearmAtTokens = after < trigger * 0.9 ? after + gap : 0;
     return 'truncated';
@@ -579,6 +697,11 @@ const INSTR_HEADER =
 const SUMMARY_HEADER = '── PROGRESS SUMMARY ──';
 /** Cap tool_result bodies kept after compact so the kept tail does not re-fill the window. */
 const KEPT_TOOL_RESULT_CAP = 2_500;
+/** F08-06: much tighter cap applied across history on the overflow ladder's local rung. */
+const OVERFLOW_TOOL_RESULT_CAP = 500;
+
+/** F08-06: placeholder left where an image block was stripped during overflow recovery. */
+export const IMAGE_STRIPPED_SENTINEL = '[image removed to free context]';
 
 /** P1B-02: replacement body for a stale tool_result whose output was reclaimed in place. */
 const MICROCOMPACT_SENTINEL = '[Old tool result content cleared]';

@@ -102,3 +102,84 @@ test('h/l motions step over a whole cluster', () => {
   assert.equal(run('\u{1F680}ab', 0, 'l').cursor, 2, 'a surrogate pair is 2 code units — clear both');
   assert.equal(run('\u{1F680}ab', 2, 'h').cursor, 0);
 });
+
+// ── F03-06: hard-line keys in multiline drafts ────────────────────────────────────────────────
+// The composer is multiline (Shift+Enter). Line-bound keys used to treat the WHOLE buffer as the
+// line: $ jumped to the end of the draft, 0/I to its start, D deleted to the end of the draft,
+// and dd cleared everything. Every key below stops at the caret's hard line (composer
+// lineStart/lineEnd), never crossing a '\n'.
+
+//                f  o  o \n  b  a  r  _  b  a  z \n  q  u  x
+// indices:       0  1  2  3  4  5  6  7  8  9 10 11 12 13 14
+const ML = 'foo\nbar baz\nqux';
+
+test('hard-line motions: 0/$/I/A/h/l stop at the caret\'s line ends, not the buffer ends', () => {
+  assert.equal(run(ML, 6, '0').cursor, 4, '0 lands on the first char of "bar baz"');
+  assert.equal(run(ML, 6, '$').cursor, 10, '$ lands on the LAST char of "bar baz"');
+  assert.equal(run(ML, 6, 'I').cursor, 4, 'I inserts at the hard-line start');
+  assert.equal(run(ML, 6, 'A').cursor, 11, 'A inserts at the hard-line end');
+  assert.equal(run(ML, 4, 'h').cursor, 4, 'h at a line start cannot cross the newline');
+  assert.equal(run(ML, 10, 'l').cursor, 10, 'l at a line end cannot cross onto the newline');
+  // Single-line drafts degenerate to the whole buffer — old behavior preserved.
+  assert.equal(run('hello', 2, '$').cursor, 4);
+  assert.equal(run('hello', 2, '0').cursor, 0);
+});
+
+test('hard-line deletes: x/D never eat the line break', () => {
+  assert.equal(run(ML, 10, 'x').input, 'foo\nbar ba\nqux', 'x removes the "z", the newline stays');
+  assert.equal(run(ML, 11, 'x').input, ML, 'x while the caret sits ON a newline is a no-op');
+  assert.equal(run(ML, 6, 'D').input, 'foo\nba\nqux', 'D kills to the hard-line end only');
+  const c = run(ML, 6, 'C');
+  assert.equal(c.input, 'foo\nba\nqux');
+  assert.equal(c.mode, 'insert');
+});
+
+test('hard-line operator motions: d$/d0/dh/dl stay on the caret\'s line', () => {
+  assert.equal(run(ML, 6, 'd$').input, 'foo\nba\nqux');
+  assert.equal(run(ML, 6, 'd0').input, 'foo\nr baz\nqux', 'd0 keeps the char under the caret');
+  assert.equal(run(ML, 4, 'dh').input, ML, 'dh at a line start deletes nothing');
+  assert.equal(run(ML, 10, 'dl').input, 'foo\nbar ba\nqux', 'dl deletes the "z", not the newline');
+});
+
+test('dd/cc delete ONE hard line, swallowing one adjacent newline', () => {
+  assert.equal(run(ML, 6, 'dd').input, 'foo\nqux', 'an inner line vanishes with its own newline');
+  assert.equal(run(ML, 6, 'dd').cursor, 4, 'the caret lands where the line used to start');
+  assert.equal(run(ML, 13, 'dd').input, 'foo\nbar baz', 'the LAST line swallows the newline before it');
+  assert.equal(run(ML, 13, 'dd').cursor, 10, 'the caret clamps onto the new last char');
+  assert.equal(run(ML, 1, 'dd').input, 'bar baz\nqux', 'the FIRST line swallows its own newline');
+  const cc = run(ML, 6, 'cc');
+  assert.equal(cc.input, 'foo\nqux');
+  assert.equal(cc.mode, 'insert');
+  assert.equal(cc.cursor, 4);
+  assert.equal(run('abc', 1, 'dd').input, '', 'a one-line draft still collapses to empty');
+});
+
+// ── F03-06: charClass aligned with the composer ───────────────────────────────────────────────
+// The old charClass used \w — CJK counts as PUNCTUATION there, so vim and the composer disagreed
+// on where words are. One table (isWordChar: \p{L}\p{N}_) now drives both.
+
+test('word motions agree with the composer on CJK (isWordChar, not \\w)', () => {
+  const s = 'a太 b';
+  assert.equal(nextWordStart(s, 0), 3, 'w skips "a" AND "太" — one word class, not two');
+  assert.equal(run(s, 0, 'w').cursor, 3);
+  assert.equal(prevWordStart(s, 3), 0, 'b lands back on the a+太 run (old \\w charClass stopped at 1)');
+  assert.equal(wordEnd('太 郎', 0), 2, 'e still finds the end of the next CJK run');
+});
+
+// ── F03-06: j/k visual-row motion ─────────────────────────────────────────────────────────────
+
+test('j/k move between WRAPPED visual rows when given the composer width', () => {
+  // 'aaaaaaa' wraps into 'aaaa' + 'aaa' at width 4; lines = [aaaa, aaa, bb], starts = [0,4,8].
+  const buf = 'aaaaaaa\nbb';
+  assert.equal(vimNormalKey(buf, 1, '', 'j', 4).cursor, 5, 'j preserves the column across the wrap');
+  assert.equal(vimNormalKey(buf, 5, '', 'j', 4).cursor, 9, 'j again lands on the second hard line');
+  assert.equal(vimNormalKey(buf, 9, '', 'k', 4).cursor, 5);
+  assert.equal(vimNormalKey(buf, 9, '', 'j', 4).cursor, 9, 'j on the last visual row is a no-op');
+  assert.equal(vimNormalKey(buf, 1, '', 'k', 4).cursor, 1, 'k on the first visual row is a no-op');
+});
+
+test('j/k without a width fall back to HARD-line motion (unit-test default)', () => {
+  assert.equal(run('foo\nbar\nqux', 1, 'j').cursor, 5, 'same column on the next hard line');
+  assert.equal(run('foo\nbar\nqux', 5, 'k').cursor, 1);
+  assert.equal(run('foo\nb', 2, 'j').cursor, 5, 'column clamps to the shorter line');
+});

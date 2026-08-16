@@ -94,6 +94,17 @@ export function buildDefaultBindings(): { bindings: ParsedBinding[]; warnings: K
 export const KEYBINDING_ACTIONS: readonly string[] = Object.values(RAW_DEFAULTS).flatMap((m) => Object.values(m));
 
 /**
+ * Action ids registered in the TUI (via kbRegister) that are deliberately NOT defaults — see the
+ * Global comment above. The loader needs the FULL known-id set to warn on typo'd actions instead
+ * of accepting them silently; the keybinding-liveness test pins this list to the actual
+ * kbRegister sites so it cannot drift from the truth.
+ */
+export const REGISTERED_NON_DEFAULT_ACTIONS: readonly string[] = ['app:redraw'];
+
+/** Every action id the loader accepts without an unknown-action warning. */
+export const KNOWN_ACTION_IDS: ReadonlySet<string> = new Set([...KEYBINDING_ACTIONS, ...REGISTERED_NON_DEFAULT_ACTIONS]);
+
+/**
  * Action ids still dispatched by KEY in the legacy inline handler rather than through the
  * resolver (B6).
  *

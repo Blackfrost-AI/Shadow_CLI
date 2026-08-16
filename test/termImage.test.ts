@@ -36,9 +36,13 @@ test('supportsInlineImages: gated on TTY + known terminal (env-explicit, determi
   assert.equal(supportsInlineImages({ isTTY: true, env: { TERM: 'kitty' } }), true);
   assert.equal(supportsInlineImages({ isTTY: true, env: { TERM_PROGRAM: 'WezTerm' } }), true);
   assert.equal(supportsInlineImages({ isTTY: true, env: { TERM: 'xterm-256color' } }), false, 'unknown terminal');
-  // tmux forwards only when the outer terminal (LC_TERMINAL) is identifiable + capable.
-  assert.equal(supportsInlineImages({ isTTY: true, env: { TERM_PROGRAM: 'tmux', LC_TERMINAL: 'iTerm2' } }), true);
+  // F02-03: inside tmux the OSC 1337 / Kitty payloads never reach the outer terminal unless the
+  // user configured allow-passthrough — and there is no runtime signal for that. Claiming success
+  // used to suppress the save+open fallback too, so images SILENTLY vanished. Fail closed: under
+  // tmux we always take the durable placeholder + save/open path, regardless of the outer hint.
+  assert.equal(supportsInlineImages({ isTTY: true, env: { TERM_PROGRAM: 'tmux', LC_TERMINAL: 'iTerm2' } }), false, 'tmux + capable outer still fails closed');
   assert.equal(supportsInlineImages({ isTTY: true, env: { TERM_PROGRAM: 'tmux' } }), false, 'tmux with no outer hint');
+  assert.equal(supportsInlineImages({ isTTY: true, env: { TMUX: '/tmp/tmux-501/default,12345,0', TERM_PROGRAM: 'iTerm.app' } }), false, 'TMUX socket env also fails closed');
 });
 
 test('inlineImageEsc: iTerm2 → OSC 1337 with inline=1, width, name, and inlined base64', () => {

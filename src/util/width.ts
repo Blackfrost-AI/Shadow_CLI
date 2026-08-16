@@ -13,7 +13,9 @@
  * kind of thing that survives `npm test` and dies in the binary.
  *
  * NOTE: `src/web/ui/vendor/markdown.js` carries its own copy of this logic on purpose — it runs in
- * the browser and cannot import from `src/tui/`. That duplicate is legitimate; this one was not.
+ * the browser and cannot import from `src/`. That duplicate is legitimate; the TUI-side duplicates
+ * were not and are gone (F05-07: util/markdown.ts and util/chart.ts import from this file, which
+ * moved src/tui/ → src/util/ so util code never reaches up into the TUI layer).
  */
 
 /** Zero-width: combining marks, joiners, variation selectors, BOM. */
@@ -99,13 +101,22 @@ export function nextCluster(text: string, i: number): string {
 }
 
 /**
+ * SGR (rendition) spans occupy no columns. The grammar must EXACTLY match what
+ * sanitizeTerminalEscapes(keepSgr=true) preserves: `ESC[` + parameter bytes 0x20-0x3f + final `m`.
+ * That includes colon subparameters — truecolor `38:2::255:0:0m`, underline styles `4:3m` — which a
+ * narrower `[0-9;]` strip left in the measured text, so a styled row measured many columns "too
+ * wide" and wrapped/truncated early (F05-04 review defect). One shared regex for every width path.
+ */
+const SGR_RE = /\x1b\[[\x20-\x3f]*m/g;
+
+/**
  * Terminal columns a string occupies. A grapheme CLUSTER is measured by its widest code point, so
  * an emoji built from a ZWJ sequence (👨‍👩‍👧) counts once, not once per component. SGR escapes are
  * stripped — they occupy no columns but do occupy characters, which is how a styled row could
  * measure "too wide" and get needlessly split.
  */
 export function displayWidth(s: string): number {
-  const clean = s.replace(/\x1b\[[0-9;]*m/g, '');
+  const clean = s.replace(SGR_RE, '');
   if (isPlainAscii(clean)) return clean.length; // F06-06: fast path — no segmentation
   let w = 0;
   for (const g of graphemes(clean)) w += clusterWidth(g);
@@ -121,8 +132,6 @@ function isPlainAscii(s: string): boolean {
   }
   return true;
 }
-
-const SGR_RE = /\x1b\[[0-9;]*m/g;
 
 /** Width of one grapheme cluster: its widest code point. */
 function clusterWidth(cluster: string): number {

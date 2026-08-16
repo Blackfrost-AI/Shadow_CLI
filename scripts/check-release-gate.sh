@@ -56,7 +56,9 @@ fi
 
 # --- the packaged Node distribution must match source -----------------------------------
 # package.json publishes dist/, not src/. A green source typecheck is therefore insufficient:
-# stale tracked JavaScript can otherwise ship even though the current TypeScript is correct.
+# stale compiled JavaScript can otherwise ship even though the current TypeScript is correct.
+# (F06-11: dist/ is untracked — built at release time; the checker handles both an existing
+# stale dist/ and a fresh clone with none.)
 # The checker snapshots the current dist/, runs the real production build, and compares before
 # versus after. It does not use `git diff`, so unrelated or intentionally uncommitted work does
 # not make the gate impossible to run. The build script itself does not invoke this gate, so this

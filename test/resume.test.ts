@@ -64,6 +64,7 @@ test('rewindToTurn restores context and checkpointed files', () => {
 
     const { context, restoredFiles, turn } = rewindToTurn(log.path, 0, root, opts);
     assert.equal(turn, 0);
+    assert.ok(context, 'default scope hydrates the context');
     assert.equal(context.messages().length, 1);
     assert.deepEqual(restoredFiles, ['file.txt']);
     const body = readFileSync(join(root, 'file.txt'), 'utf8');

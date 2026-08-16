@@ -270,7 +270,8 @@ test('every createProvider-from-entry site spreads entryStreamContract (F10-01 d
   );
   for (const [file, sites] of [
     ['../src/agent/bootstrap.ts', 2],
-    ['../src/tui.tsx', 2],
+    ['../src/tui.tsx', 1], // the /model-switch site stayed here (extracted switch helper)
+    ['../src/tui/slash.ts', 1], // P3-02: the /model-test PROBE site moved here with runSlash
     ['../src/index.ts', 1],
   ] as const) {
     const src = readFileSync(new URL(file, import.meta.url), 'utf8');

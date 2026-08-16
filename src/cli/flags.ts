@@ -9,6 +9,8 @@ export interface Flags {
   model?: string;
   baseUrl?: string;
   effort?: string;
+  /** --profile <name>: activate a named profile from ~/.shadow/config.json (P2-11). */
+  profile?: string;
   maxOutputTokens?: number;
   maxIterations?: number;
   contextBudget?: number;
@@ -84,6 +86,9 @@ export function parseArgs(argv: string[]): Flags {
         break;
       case '--effort':
         f.effort = next();
+        break;
+      case '--profile':
+        f.profile = next();
         break;
       case '--max-output-tokens':
         f.maxOutputTokens = Number(next());

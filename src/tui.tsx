@@ -1,36 +1,19 @@
-import React, { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
 import { render, Box, Text, Static, useApp, useInput, useStdin, useStdout } from 'ink';
-import { flattenItem, itemIsCollapsible, computeToolRuns } from './tui/flatten.js';
+import { flattenItemCached, itemIsCollapsible, computeToolRunsAppendable, type ToolRunsCache } from './tui/flatten.js';
 import type { ToolRun } from './tui/rows.js';
-import {
-  collapseKind,
-  displayToolArg,
-  displayToolName,
-  formatReconSummary,
-  isCollapsibleTool,
-  isWriteTool,
-  reconCount,
-  type CollapseKind,
-} from './tui/toolDisplay.js';
+import { collapseKind, displayToolArg, displayToolName, formatReconSummary, isCollapsibleTool, isWriteTool, reconCount, type CollapseKind } from './tui/toolDisplay.js';
 import { renderSubAgentPanel, type SubAgentView } from './tui/subagentPanel.js';
 import { emitNotification, NOTIFY_MIN_TURN_MS, NOTIFY_APPROVAL_WAIT_MS } from './util/notify.js';
-import { discoverCustomCommands, expandCommandBody } from './tui/customCommands.js';
+import { discoverCustomCommands } from './tui/customCommands.js';
 import { resolveEditor, openEditorFile } from './tui/externalEditor.js';
 import { atMentionToken, walkWorkspaceFiles, rankFileCandidates, expandFileMentions } from './tui/fileMentions.js';
 import { supportsInlineImages, saveAndOpen, canOpenViewer } from './util/termImage.js';
-import {
-  extractCommittableUnits,
-  clampTail,
-  clampLiveRest,
-  stripTrailingNewlines,
-  dupKey,
-  repeatStep,
-  leadsWithBlock,
-} from './tui/streamCommit.js';
+import { extractCommittableUnits, clampTail, clampLiveRest, stripTrailingNewlines, dupKey, repeatStep, leadsWithBlock } from './tui/streamCommit.js';
 import { computeLayout, formatStatusStrip, pinnedMaxItems, composerMaxRows, fitHud } from './tui/layout.js';
 import { PendingOverlay, ModelPickerOverlay } from './tui/overlays.js';
 import { buildSeats, resolveTableEntries, parseTableInput, seatTag, MIN_SEATS, MAX_SEATS, type Seat, type SpeakerTag } from './tui/roundTable.js';
-import { execFileSync, spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import type { Message, Provider, ToolCall, ContentBlock, ImageBlock, Effort } from './provider/provider.js';
 import type { ToolRegistry } from './tools/registry.js';
@@ -41,46 +24,10 @@ import { parseMarkdown, renderTableLines, wrapSpans, type MdSpan } from './util/
 import { CHART_LANGS, parseChartSpec, renderChart } from './util/chart.js';
 import { fuzzyRank } from './util/fuzzy.js';
 import { providerErrorHint } from './util/errorHints.js';
-import {
-  isBigPaste,
-  expandPastes,
-  isPathLikeSlashToken,
-  pathExistsSafe,
-  layoutComposer,
-  moveCursorVertical,
-  cursorOnFirstRow,
-  cursorOnLastRow,
-  visibleComposerWindow,
-  clickToCursor,
-  parseSgrMouse,
-  hasSgrMouse,
-  stripSgrMouse,
-  wordLeft,
-  wordRight,
-  lineStart,
-  lineEnd,
-  deleteWordLeft,
-  deleteWordRight,
-  deleteCharRight,
-  prevGrapheme,
-  nextGrapheme,
-  killToLineEnd,
-  killToLineStart,
-  searchHistoryBack,
-  historySearchPrompt,
-  type HistorySearchState,
-  COMPOSER_MAX_VISIBLE_ROWS,
-  COMPOSER_GUTTER,
-} from './tui/composer.js';
+import { isBigPaste, expandPastes, prunePastes, dropConsumedPastes, PASTE_CAP, isPathLikeSlashToken, pathExistsSafe, layoutComposer, visibleComposerWindow, clickToCursor, parseSgrMouse, lastKeySequence, historySearchPrompt, type HistorySearchState, COMPOSER_MAX_VISIBLE_ROWS, COMPOSER_GUTTER } from './tui/composer.js';
 import { withSynchronizedOutput } from './tui/syncOutput.js';
 import type { BrandInfo, ToolInfo } from './tui/rows.js';
-import {
-  recommendedIndex,
-  defaultQuestionSelection,
-  buildQuestionAnswers,
-  buildAutoAnswers,
-  type QuestionSelection,
-} from './tui/questions.js';
+import { recommendedIndex, defaultQuestionSelection, buildQuestionAnswers, buildAutoAnswers, type QuestionSelection } from './tui/questions.js';
 import { fetchRemoteImage, imageMediaType, MAX_IMAGE_BYTES } from './util/image.js';
 import { highlight, type CodeRole } from './util/highlight.js';
 import { Context } from './agent/context.js';
@@ -89,125 +36,64 @@ import type { PlanModeState, PlanSnapshot } from './agent/planMode.js';
 import { AgentLoop } from './agent/loop.js';
 import { buildLoopDeps } from './agent/loopDeps.js';
 import { runLock, CLI_HOLDER } from './web/runLock.js';
-import {
-  type ApprovalDecision,
-  type ApprovalGate,
-  type ApprovalRequest,
-  AutoApproveGate,
-  SessionApprovals,
-} from './agent/approval.js';
-import { cycleAutonomy, raiseAutonomy, type AutonomyLevel } from './safety/permissions.js';
-import { applyPermissionCommand } from './safety/permissionCmd.js';
+import { type ApprovalDecision, type ApprovalGate, type ApprovalRequest, AutoApproveGate, SessionApprovals } from './agent/approval.js';
+import { raiseAutonomy, type AutonomyLevel } from './safety/permissions.js';
+
 import { isLocalBaseUrl, isLocalModelTarget } from './safety/offline.js';
-import { egressSummary } from './safety/egress.js';
-import { sandboxConfinement } from './safety/sandbox.js';
+
 import { clampLocalContextBudget, keepLastTurnsForBudget, triggerRatioForBudget } from './util/contextBudget.js';
 import { familyProfile } from './config/familyProfiles.js';
 import { SessionLog } from './state/session.js';
 import { createProvider, entryStreamContract, type ProviderName } from './provider/index.js';
-import {
-  disableMcpServer,
-  enableContextCooler,
-  enablePlaywrightBrowser,
-  loadGlobalMcpServers,
-  mcpListLines,
-  mcpServerLines,
-  saveGlobalMcpServers,
-  type McpServers,
-} from './mcp/manage.js';
+
 import { configuredContextWindow, detectServerContextWindow, ensureLocalServer, isLocalServedEntry, mlxOfflineReady } from './gguf.js';
-import { runModelCheck } from './doctor/modelCheck.js';
-import {
-  resolveApiKey,
-  resolveAuthToken,
-  resolveBaseUrl,
-  resolveEntryCredential,
-  type ShadowConfig,
-  type ModelEntry,
-} from './config.js';
+
+import { resolveBaseUrl, resolveEntryCredential, type ShadowConfig, type ModelEntry } from './config.js';
 import { vaultExists } from './auth/vault.js';
-import {
-  addModelPreset,
-  defaultModelPatch,
-  findModelPreset,
-  parseModelAddArgs,
-  removeModelPreset,
-  setModelPresetEnabled,
-  splitPresetArgs,
-} from './config/modelPresets.js';
-import {
-  addLocalModel,
-  formatLocalList,
-  listLocalModels,
-  parseLocalAddArgs,
-  removeLocalModel,
-} from './local/garage.js';
-import { runDoctor, formatDoctorReport } from './doctor.js';
-import { customStyleNames, type OutputStyle } from './styles.js';
-import {
-  groupedModelRows,
-  firstSelectableRow,
-  stepSelectableRow,
-  type PickerRow,
-} from './util/modelGroups.js';
-import { persistPermissionRules } from './config.js';
-import { GLOBAL_DIR, saveGlobalConfig, vaultUnlocked } from './state/globalStore.js';
-import { exportSession } from './state/chatExport.js';
-import { listResumableSessions, resumeSession } from './state/resume.js';
-import { rewindToTurn } from './state/rewind.js';
-import { ProjectMemory } from './state/memory.js';
-import { buildCodexAuthUrl, clearSubAuth, getSubAuth, importOfficialCredential, type SubProvider } from './auth/index.js';
-import { loadAgentDefs } from './agent/defs.js';
-import { existsSync, writeFileSync, statSync, readFileSync, readdirSync } from 'node:fs';
-import { join, resolve, isAbsolute, basename, dirname } from 'node:path';
-import { listPlugins, setPluginEnabled, enabledPluginDirs, PLUGIN_CONTENT_DIRS, displaySafe } from './plugins/manager.js';
+
+import { listLocalModels } from './local/garage.js';
+
+import { type OutputStyle } from './styles.js';
+import { firstSelectableRow, modelRows } from './util/modelGroups.js';
+
+import { saveGlobalConfig, vaultUnlocked } from './state/globalStore.js';
+
+import { listResumableSessions } from './state/resume.js';
+import { listRewindableTurns, type RewindableTurn } from './state/rewind.js';
+
+import { statSync, readFileSync } from 'node:fs';
+import { resolve, isAbsolute } from 'node:path';
+
 import { friendlyDeniedReason } from './util/deniedReason.js';
-import { vimNormalKey, type VimMode } from './tui/vim.js';
+import type { VimFind, VimMode } from './tui/vim.js';
 import { runHookPhase } from './hooks/runner.js';
-import { discoverSkills } from './skills/loader.js';
-import {
-  cycleEffort,
-  effortDescription,
-  effortOrDefault,
-  effortSymbol,
-  normalizeEffort,
-} from './agent/effort.js';
-import { categorizeContext, contextSuggestions } from './tui/contextViz.js';
+
+import { effortDescription, effortOrDefault, effortSymbol } from './agent/effort.js';
+
 import { copyToClipboard, hasClipboard, readClipboard } from './util/clipboard.js';
-import { redactString, redactConfig, isSecretKey, maskSecret } from './util/redact.js';
+import { redactString } from './util/redact.js';
 import { useKeybindings } from './tui/keybindings/useKeybinding.js';
-import { bindingsForDisplay, initKeybindingsFile } from './tui/keybindings/loader.js';
-import type { ContextName } from './tui/keybindings/types.js';
-import { claimMode, releaseMode, updateReset, restoreTerminal, installRestoreHandlers } from './tui/terminalState.js';
-import { scrubForDisplay } from './util/scrub.js';
+
+import { dispatchKey } from './tui/keys/router.js';
+import type { KeyEnv } from './tui/keys/types.js';
+import { claimMode, releaseMode, restoreTerminal, installRestoreHandlers } from './tui/terminalState.js';
+import { sanitizeTerminalEscapes, scrubForDisplay } from './util/scrub.js';
 import { stripTextualToolIntent } from './provider/textToolCalls.js';
 import { splitStreamToolIntentCapped } from './tui/streamIntent.js';
 import { extractPatchBlock } from './provider/applyPatch.js';
 import { scrubbedEnv } from './util/safeEnv.js';
-import { displayWidth, takeByWidth } from './tui/width.js';
+import { displayWidth, takeByWidth } from './util/width.js';
 import { stripCtl, formatUsage, shellCommandOf, agentAttr, oneLine, formatDiffStats, shortPath } from './tui/format.js';
-import {
-  THEMES,
-  THEME_NAMES,
-  THEME_DESCRIPTIONS,
-  C,
-  normalizeThemeName,
-  applyTheme,
-  paletteSnapshot,
-  backgroundSequence,
-  themeBackground,
-  type ThemeName,
-  type CanonicalThemeName,
-  type Palette,
-} from './tui/theme.js';
-
+import { THEMES, THEME_NAMES, THEME_DESCRIPTIONS, C, normalizeThemeName, applyTheme, paletteSnapshot, backgroundSequence, themeBackground, type ThemeName, type Palette } from './tui/theme.js';
+import { SLASH_COMMANDS, SLASH_NAME_WIDTH, findSlashCommand, runSlashCommand, slashDispatchName, type SlashCommand, type SlashCtx } from './tui/slash.js';
+export { parseSafeConfig } from './tui/slash.js';
+export type { SlashCommand } from './tui/slash.js';
 
 interface TuiStyleState {
   style: OutputStyle;
   setStyle: (style: OutputStyle) => void;
   systemForStyle?: (style: OutputStyle) => string;
 }
-
 
 // `imageMediaType` now lives in util/image.ts (shared with the view_image tool);
 // re-exported here so existing importers (and tui tests) keep working.
@@ -302,96 +188,21 @@ const CLAUDE_ORANGE = '#d97757'; // fallback only — prefer C.accent at render 
 // ('Shadowing…') instead of a rotating grab-bag of generic verbs. A CUSTOM per-action label (a tool
 // or the app setting a contextual verb) can override it in future; there is no such source today.
 const DEFAULT_STATUS_VERB = 'Shadowing';
-// Bracketed-paste markers (DECSET 2004, enabled at mount). The terminal wraps every paste in
-// these, and Ink hands the raw CSI through in `ch` — the same transport the SGR mouse reports
-// ride on — so the key handler can treat the whole paste as ONE atomic insert.
-const PASTE_START = '\x1b[200~';
-const PASTE_END = '\x1b[201~';
+// Bracketed-paste markers moved to src/tui/keys/reserved.ts (P3-01 focus-owner router).
 
 // ── Slash commands (the `/` dropdown) ────────────────────────────────────────
-interface SlashCommand {
-  name: string;
-  desc: string;
-  dispatch?: string;
-  /** F10-07: a user-defined command loaded from .shadow/commands or .claude/commands. Its body is
-   *  a prompt template submitted as a turn (with $ARGUMENTS/$1 substitution), not a builtin action. */
-  custom?: { body: string };
-  /** F08-04: an @-file candidate row. Accepting it REPLACES the `@partial` token with `@path`,
-   *  rather than running a command. `start` is the index of the `@` in the composer. */
-  mention?: { start: number; path: string };
-}
 /** A dropdown row: a command, or (when `base` is set) a completed first ARGUMENT of one —
  *  `name` then holds the full submission text ("/theme colorblind") and `base` the command. */
-interface SlashMenuItem extends SlashCommand {
+export interface SlashMenuItem extends SlashCommand {
   base?: string;
   /** An informational row ("no prior sessions yet") — shown, but never completed or run. */
   hint?: boolean;
 }
-const SLASH_COMMANDS: SlashCommand[] = [
-  { name: '/help', desc: 'Show keybindings and commands' },
-  { name: '/keybindings', desc: 'Show / customize keybindings (/keybindings init writes a starter config)' },
-  { name: '/clear', desc: 'Clear the screen and reset the conversation' },
-  { name: '/new', desc: 'Start a fresh conversation (alias for /clear)' },
-  { name: '/goal', desc: 'Set a standing goal the model works toward (/goal clear to remove)' },
-  { name: '/model', desc: 'Switch, list, add, remove, enable, disable, or test (capability check) model presets' },
-  { name: '/table', desc: 'Collaboration Mode (experimental): /table <model> <model> — a live round-table; @handle to route, /table done to end' },
-  { name: '/provider', desc: 'Show active provider, endpoint, auth status, and model presets' },
-  { name: '/local', desc: 'Add / test / switch a local model (.gguf or MLX)' },
-  { name: '/onboard', desc: 'Show provider setup guidance' },
-  { name: '/style', desc: 'Cycle output style' },
-  { name: '/output-style', desc: 'Cycle output style (alias for /style)', dispatch: '/style' },
-  { name: '/autonomy', desc: 'Cycle autonomy: manual → auto-read → auto-edit → full' },
-  { name: '/compact', desc: 'Summarize earlier turns to free up context' },
-  { name: '/summary', desc: 'Summarize earlier turns to free up context (alias for /compact)', dispatch: '/compact' },
-  { name: '/fast', desc: 'Toggle Anthropic fast mode (lower latency, no extended thinking)' },
-  { name: '/effort', desc: 'Set or cycle reasoning effort: low | medium | high | xhigh | max' },
-  { name: '/cost', desc: 'Show session token usage and cost' },
-  { name: '/usage', desc: 'Alias for /cost' },
-  { name: '/stats', desc: 'Show session token usage and cost (alias for /cost)', dispatch: '/cost' },
-  { name: '/context', desc: 'Show context-window usage' },
-  { name: '/connections', desc: 'Show the egress receipt: every host Shadow reached this session, why, allowed/denied' },
-  { name: '/export', desc: 'Export session to markdown (optional path)' },
-  { name: '/copy', desc: 'Copy the last answer to the clipboard (/copy code → last code block); Alt+C' },
-  { name: '/session', desc: 'Show current session id, log path, and message count' },
-  { name: '/resume', desc: 'Resume a prior session (optional session id/path)' },
-  { name: '/rewind', desc: 'Rewind to a turn index (e.g. /rewind 2)' },
-  { name: '/init', desc: 'Scaffold SHADOW.md in the workspace' },
-  { name: '/agents', desc: 'List running agents + definitions; /agents kill <id|all> cancels a background agent' },
-  { name: '/skills', desc: 'List discovered repo skills' },
-  { name: '/workflows', desc: 'List workflow files' },
-  { name: '/plugins', desc: 'List installed plugins; /plugins enable|disable <name>' },
-  { name: '/mcp', desc: 'List, inspect, enable, or disable MCP servers' },
-  { name: '/memory', desc: 'Show project memory facts' },
-  { name: '/tasks', desc: 'Show or clear the live task list (/tasks clear)' },
-  { name: '/permissions', desc: 'List or edit permission rules' },
-  { name: '/doctor', desc: 'Diagnose environment, credentials, and guardrails' },
-  { name: '/status', desc: 'Show session status (model, autonomy, context, goal)' },
-  { name: '/diff', desc: 'Show the working-tree git diff (--stat)' },
-  { name: '/files', desc: 'Show changed files from git status' },
-  { name: '/branch', desc: 'Show current git branch and status summary' },
-  { name: '/config', desc: 'Show or set safe config values (secrets hidden)' },
-  { name: '/hooks', desc: 'Show configured lifecycle hooks' },
-  { name: '/login', desc: 'Show/import supported auth credentials' },
-  { name: '/logout', desc: 'Clear supported subscription credentials' },
-  { name: '/version', desc: 'Show Shadow version' },
-  { name: '/color', desc: 'Switch color theme (alias for /theme)', dispatch: '/theme' },
-  { name: '/theme', desc: 'Switch color theme (list, preview <name>, or name; no arg cycles)' },
-  { name: '/terminal-setup', desc: 'Make Shift+Enter insert a newline (per-terminal instructions)' },
-  { name: '/vim', desc: 'Toggle modal (NORMAL/INSERT) editing in the composer' },
-  { name: '/statusline', desc: 'Set a shell command for a custom footer line (/statusline none to clear)' },
-  { name: '/add-dir', desc: 'Grant an extra directory to file tools for this session' },
-  { name: '/image', desc: 'Attach an image file to your next message (/image clear to drop)' },
-  { name: '/review', desc: 'Review the current uncommitted changes' },
-  { name: '/quit', desc: 'Exit Shadow' },
-  { name: '/exit', desc: 'Exit Shadow (alias for /quit)' },
-];
-const SLASH_NAME_WIDTH = Math.max(...SLASH_COMMANDS.map((c) => c.name.length)) + 1;
 
 // Enumerable FIRST arguments per command (keyed by dispatch name). Typing `/cmd ` opens a
 // second-level menu of these — users pick values instead of memorizing them. Only verified
 // vocabularies belong here (a completion that the command then rejects is worse than none).
 const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
-const AUTONOMY_LEVELS: AutonomyLevel[] = ['manual', 'auto-read', 'auto-edit', 'full'];
 
 /** One selectable argument row. */
 export interface ArgCompletion {
@@ -412,15 +223,16 @@ export interface ArgContext {
   /** Prior sessions, newest first (for /resume). */
   sessions: { id: string; label: string }[];
   /**
-   * How many rewindable SNAPSHOT turns this session has (for /rewind).
+   * The rewindable SNAPSHOT turns this session has (for /rewind), newest first, each carrying
+   * the prompt that produced its turn (F08-07 — the picker names turns by what the user asked,
+   * not just an index, and a rewind prefills that prompt back into the composer).
    *
    * NOT the composer-history length. `rewindToTurn` addresses context snapshots written by the
-   * loop, and the picker was fed `historyRef.current.length` — the count of submissions, which
-   * counts slash commands that never ran a turn and misses injected (wakeup) turns. The two
-   * numbers drift apart within minutes of normal use, so "Turn 3" in the menu reverted WORKSPACE
-   * FILES to a different point than the label named.
+   * loop — the submission count counts slash commands that never ran a turn and misses injected
+   * (wakeup) turns, so the two drift apart within minutes of normal use, and "Turn 3" in the
+   * menu would revert WORKSPACE FILES to a different point than the label named.
    */
-  turns: number;
+  turns: RewindableTurn[];
   /** Extra directories granted this session (for /add-dir remove). */
   extraRoots: string[];
 }
@@ -523,11 +335,19 @@ const SLASH_ARG_COMPLETIONS: Record<string, ArgProvider> = {
       : [{ value: '', desc: 'No prior sessions in this workspace yet' }],
   // Turn indexes are 0-based (`0` = the first assistant turn — see the /rewind handler), and the
   // newest is listed first because that is overwhelmingly the one you want.
+  // Rows are newest-first and name each turn by the prompt that produced it (F08-07) — "Turn 2"
+  // alone forced the user to remember their own history by index.
   '/rewind': (ctx) =>
-    ctx.turns > 0
-      ? Array.from({ length: ctx.turns }, (_, i) => ctx.turns - 1 - i).map((n) => ({
-          value: String(n),
-          desc: n === ctx.turns - 1 ? `Turn ${n} — the most recent` : n === 0 ? 'Turn 0 — the first turn' : `Turn ${n}`,
+    ctx.turns.length
+      ? ctx.turns.map((t, i) => ({
+          value: String(t.turn),
+          desc: t.label
+            ? `Turn ${t.turn} — ${t.label}`
+            : i === 0
+              ? `Turn ${t.turn} — the most recent`
+              : t.turn === 0
+                ? 'Turn 0 — the first turn'
+                : `Turn ${t.turn}`,
         }))
       : [{ value: '', desc: 'Nothing to rewind to yet — no turns this session' }],
   '/add-dir': (ctx) =>
@@ -610,14 +430,6 @@ function slashMatches(
   return fuzzyRank(items, partial, (i) => i.name.slice(cmd.name.length + 1)).map((r) => r.item);
 }
 
-function slashDispatchName(cmd: SlashCommand): string {
-  return cmd.dispatch ?? cmd.name;
-}
-
-function findSlashCommand(name: string, extra: SlashCommand[] = []): SlashCommand | undefined {
-  return SLASH_COMMANDS.find((c) => c.name === name) ?? extra.find((c) => c.name === name);
-}
-
 /** Levenshtein distance, early-exiting when it must exceed `max` — for did-you-mean on typos.
  *  Fuzzy subsequence matching can't see TRANSPOSITIONS (/modle ⊄ /model), so this fills that gap. */
 function editDistance(a: string, b: string, max: number): number {
@@ -662,16 +474,12 @@ function classifySlash(task: string, extra: SlashCommand[] = []): { cmd?: SlashC
   return { kind: 'typo', suggestion: suggestSlash(first) };
 }
 
-type QueuedTask = {
+export type QueuedTask = {
   text: string;
   /** Human messages steer the active agent; commands and scheduled wakeups wait for turn-end. */
   kind: 'steer' | 'deferred';
 };
-
-function queuedTaskKind(task: string): QueuedTask['kind'] {
-  if (!task.startsWith('/')) return 'steer';
-  return classifySlash(task).kind === 'message' ? 'steer' : 'deferred';
-}
+// queuedTaskKind moved to src/tui/keys/common.ts (P3-01 — the key router owns submit-classification).
 
 /** Display-safe assistant text. Textual/native-looking calls are execution intent, never prose. */
 function sanitizeAssistantText(text: string): string {
@@ -685,91 +493,8 @@ function sanitizeAssistantText(text: string): string {
   return scrubForDisplay(visible);
 }
 
-const SAFE_CONFIG_KEYS = [
-  'temperature',
-  'fastMode',
-  'effort',
-  'cacheTtl',
-  'maxIterations',
-  'maxOutputTokens',
-  'autoClassifier',
-  'parallelTools',
-  'costWarnUSD',
-] as const;
-type SafeConfigKey = (typeof SAFE_CONFIG_KEYS)[number];
-
-function parseBool(value: string): boolean | null {
-  const v = value.toLowerCase();
-  if (['on', 'true', 'yes', '1'].includes(v)) return true;
-  if (['off', 'false', 'no', '0'].includes(v)) return false;
-  return null;
-}
-
-export function parseSafeConfig(key: string, raw: string): { ok: true; key: SafeConfigKey; value: unknown } | { ok: false; message: string } {
-  if (!(SAFE_CONFIG_KEYS as readonly string[]).includes(key)) {
-    return { ok: false, message: `Config key "${key}" is not editable here. Editable: ${SAFE_CONFIG_KEYS.join(', ')}` };
-  }
-  const safeKey = key as SafeConfigKey;
-  if (safeKey === 'fastMode' || safeKey === 'autoClassifier' || safeKey === 'parallelTools') {
-    const value = parseBool(raw);
-    return value === null ? { ok: false, message: `Use on/off for ${safeKey}.` } : { ok: true, key: safeKey, value };
-  }
-  if (safeKey === 'effort') {
-    const allowed = ['low', 'medium', 'high', 'xhigh', 'max'];
-    return allowed.includes(raw) ? { ok: true, key: safeKey, value: raw } : { ok: false, message: `effort must be one of: ${allowed.join(', ')}` };
-  }
-  if (safeKey === 'cacheTtl') {
-    return raw === '5m' || raw === '1h' ? { ok: true, key: safeKey, value: raw } : { ok: false, message: 'cacheTtl must be 5m or 1h.' };
-  }
-  if (safeKey === 'costWarnUSD') {
-    const value = Number(raw);
-    return Number.isFinite(value) && value > 0
-      ? { ok: true, key: safeKey, value }
-      : { ok: false, message: 'costWarnUSD must be a positive number (e.g. 5).' };
-  }
-  if (safeKey === 'temperature') {
-    const value = Number(raw);
-    return Number.isFinite(value) && value >= 0 && value <= 2
-      ? { ok: true, key: safeKey, value }
-      : { ok: false, message: 'temperature must be a number from 0 to 2 (default 1.0).' };
-  }
-  if (safeKey === 'maxOutputTokens') {
-    const value = Number(raw);
-    return Number.isInteger(value) && value >= 256
-      ? { ok: true, key: safeKey, value }
-      : { ok: false, message: 'maxOutputTokens must be an integer ≥ 256 (e.g. 65536).' };
-  }
-  const value = Number(raw);
-  if (!Number.isInteger(value) || value < 0) return { ok: false, message: `${safeKey} must be a non-negative integer.` };
-  return { ok: true, key: safeKey, value };
-}
-
-function parseSubProvider(value: string | undefined): SubProvider | null {
-  return value === 'codex' || value === 'grok' ? value : null;
-}
-
 /** Informational slash commands safe to run mid-turn without interrupting the agent. */
-const SLASH_WHILE_RUNNING = new Set(['/help', '/cost', '/usage', '/context', '/connections', '/fast', '/effort', '/version', '/copy']);
-
-/**
- * The selectable model list for the `/model` picker: the configured `models`, or a
- * single synthesized entry from the active config so the picker is never empty.
- */
-function modelEntries(cfg: ShadowConfig): ModelEntry[] {
-  const entries =
-    cfg.models && cfg.models.length > 0
-      ? cfg.models.filter((m) => !m.disabled)
-      : [
-          {
-            label: cfg.model,
-            provider: cfg.provider,
-            model: cfg.model,
-            baseUrl: cfg.baseUrl,
-            selfHosted: cfg.selfHosted,
-          },
-        ];
-  return entries;
-}
+// SLASH_WHILE_RUNNING moved to src/tui/keys/composerOwner.ts (P3-01 focus-owner router).
 
 /** Resolve the active model's effective endpoint and whether it is a self-hosted target. */
 function activeModelTarget(
@@ -809,61 +534,6 @@ function activeModelTarget(
   };
 }
 
-/** Keep the documented default visibly `1.0` while preserving useful fractional precision. */
-function formatTemperature(value: number): string {
-  return Number.isInteger(value) ? value.toFixed(1) : String(value);
-}
-
-/** Grouped picker rows for a config: a category header per company/"Local", then its models. */
-function modelRows(cfg: ShadowConfig): PickerRow[] {
-  return groupedModelRows(modelEntries(cfg));
-}
-
-function modelPresetLines(entries: ModelEntry[], current: { provider: string; model: string }): string[] {
-  if (!entries.length) {
-    return [
-      'No model presets configured. Use /model add <label> <provider> <model> [baseUrl] [--self-hosted].',
-    ];
-  }
-  return entries.map((entry) => {
-    const active = entry.provider === current.provider && entry.model === current.model;
-    const baseUrl = entry.baseUrl ? ` · ${entry.baseUrl}` : '';
-    const selfHosted = entry.selfHosted ? ' · self-hosted' : '';
-    const disabled = entry.disabled ? ' [disabled]' : '';
-    const marker = active ? '* ' : '  ';
-    return `${marker}${entry.label}${disabled} — ${entry.provider}/${entry.model}${baseUrl}${selfHosted}`;
-  });
-}
-
-function listNamedEntries(dir: string): string[] {
-  try {
-    return readdirSync(dir, { withFileTypes: true })
-      .filter((d) => d.isFile() || d.isDirectory())
-      .map((d) => `${d.name}${d.isDirectory() ? '/' : ''}`)
-      .sort((a, b) => a.localeCompare(b));
-  } catch {
-    return [];
-  }
-}
-
-function workflowInventory(workspaceRoot: string): string[] {
-  const roots = [
-    { label: 'workspace', dir: join(workspaceRoot, '.shadow', 'workflows') },
-    // Enabled plugins contribute workflow runbooks too (P3-07); the dir is <plugin>/workflows.
-    ...enabledPluginDirs('workflows').map((dir) => ({ label: `plugin:${basename(dirname(dir))}`, dir })),
-    { label: 'global', dir: join(GLOBAL_DIR, 'workflows') },
-  ];
-  const lines: string[] = [];
-  for (const root of roots) {
-    const entries = listNamedEntries(root.dir);
-    if (!entries.length) continue;
-    lines.push(`${root.label}: ${shortPath(root.dir)}`);
-    for (const entry of entries.slice(0, 20)) lines.push(`  ${entry}`);
-    if (entries.length > 20) lines.push(`  ... ${entries.length - 20} more`);
-  }
-  return lines;
-}
-
 /** Human-readable elapsed time: `8s`, `2m 5s`, `1h 3m 12s` (the HUD "working…" timer). */
 function formatDuration(totalSec: number): string {
   if (totalSec < 60) return `${totalSec}s`;
@@ -874,13 +544,13 @@ function formatDuration(totalSec: number): string {
 }
 
 // ── Structured transcript items (printed once, never re-rendered) ─────────────
-interface BannerLine {
+export interface BannerLine {
   text: string;
   color?: string;
   dimColor?: boolean;
   bold?: boolean;
 }
-interface TranscriptBase {
+export interface TranscriptBase {
   id: number;
   kind: 'user' | 'assistant' | 'tool' | 'system' | 'blocked' | 'error' | 'banner' | 'reasoning' | 'finding' | 'image';
   text: string;
@@ -910,55 +580,6 @@ interface TranscriptBase {
 }
 type TranscriptItem = TranscriptBase;
 
-type HelpTopic = 'overview' | 'keys' | 'all';
-
-/** Progressive help: keep the default useful at a glance; put exhaustive reference one level down. */
-function helpLines(topic: HelpTopic): BannerLine[] {
-  if (topic === 'all') {
-    return [
-      { text: 'All commands', color: C.cyan, bold: true },
-      { text: 'Type / and a few letters to search this list interactively.', dimColor: true },
-      ...SLASH_COMMANDS.map((c) => ({
-        text: `  ${c.name.padEnd(SLASH_NAME_WIDTH)} ${c.desc}`,
-        dimColor: true,
-      })),
-      { text: 'Shortcuts: /help keys  ·  quick start: /help overview', dimColor: true },
-    ];
-  }
-
-  if (topic === 'keys') {
-    return [
-      { text: 'Keyboard shortcuts', color: C.cyan, bold: true },
-      { text: 'Compose', color: C.purple, bold: true },
-      { text: '  Enter send  ·  Option+Enter newline  ·  Ctrl+V paste  ·  Ctrl+R search history', dimColor: true },
-      { text: '  ↑/↓ move through a multi-line draft; at its edges they browse history.', dimColor: true },
-      { text: 'Navigate', color: C.purple, bold: true },
-      { text: '  / opens commands  ·  ↑/↓ select  ·  Tab completes  ·  Esc closes', dimColor: true },
-      { text: '  Shift+Tab changes mode  ·  Ctrl+O folds details  ·  Ctrl+T expands tasks', dimColor: true },
-      { text: 'While Shadow works', color: C.purple, bold: true },
-      { text: '  Keep typing and press Enter to steer the active turn  ·  Esc interrupts', dimColor: true },
-      { text: '  State-changing slash commands wait until the current turn ends.', dimColor: true },
-      { text: 'Approvals: y once · n deny · s session · f shell prefix · a raise autonomy', dimColor: true },
-      { text: 'Exit: Ctrl+C twice (or Ctrl+D on an empty composer)', dimColor: true },
-      { text: 'Customize bindings with /keybindings init.', dimColor: true },
-    ];
-  }
-
-  return [
-    { text: 'Shadow help', color: C.cyan, bold: true },
-    { text: 'Start here', color: C.purple, bold: true },
-    { text: '  Type what you want done, then press Enter. You can keep typing while Shadow works.', dimColor: true },
-    { text: '  /model switches models  ·  /doctor checks setup  ·  /status explains the current session', dimColor: true },
-    { text: 'Everyday commands', color: C.purple, bold: true },
-    { text: '  Session    /clear  /resume  /rewind  /export', dimColor: true },
-    { text: '  Model      /model  /local  /provider  /effort', dimColor: true },
-    { text: '  Agent      /goal  /autonomy  /permissions  /tasks', dimColor: true },
-    { text: '  Workspace  /diff  /files  /branch  /review', dimColor: true },
-    { text: 'Keys: Enter send · Option+Enter newline · Shift+Tab mode · Esc interrupt · Ctrl+C twice to quit', dimColor: true },
-    { text: 'Approvals: y once · n deny · s session · f shell prefix · a raise autonomy', dimColor: true },
-    { text: 'More: /help keys for shortcuts · /help all for every command · type / to search', dimColor: true },
-  ];
-}
 // Idle-countdown config: when the model asks a question and the user is away, auto-pick the
 // recommended answer after this many seconds — like every other TUI's "(default in Ns)" prompt.
 // `SHADOW_AUTO_ANSWER_SECS` overrides the delay; `SHADOW_NO_AUTO_ANSWER=1` turns it off (the
@@ -970,25 +591,7 @@ const AUTO_ANSWER_SECS = (() => {
 })();
 const AUTO_ANSWER_ENABLED = process.env.SHADOW_NO_AUTO_ANSWER !== '1';
 
-/**
- * How long a freshly-opened approval dialog ignores keystrokes as decisions (onKey §1).
- *
- * Sized to swallow only IN-FLIGHT input. Sustained fast typing is ~125 ms/key, so this covers the
- * couple of keys already travelling when the gate opens; a deliberate answer requires reading the
- * dialog first, which is several hundred milliseconds of human reaction time on top. Raising it
- * much further would start eating real answers, and lowering it reopens the leak.
- *
- * `SHADOW_DIALOG_ARM_MS` overrides it. Tests set 0 because a driver presses the key in the same
- * tick the dialog opens — a timing no human can produce, and the one case where "was this key
- * already in flight?" has no meaningful answer. Setting it to 0 in a real session re-opens the
- * type-ahead approval hole, so it is a test seam, not a preference.
- */
-// Read per-use, not once at module load: ESM hoists imports above a test file's env assignment, so
-// a module-level constant would always capture the default and the seam would silently not work.
-function dialogArmMs(): number {
-  const n = Number(process.env.SHADOW_DIALOG_ARM_MS);
-  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 275;
-}
+// dialogArmMs moved to src/tui/keys/reserved.ts (P3-01 focus-owner router).
 
 // ── Interactive approval gate ────────────────────────────────────────────────
 /**
@@ -1051,6 +654,13 @@ export interface TuiOpts {
   bus: EventBus;
   context: Context;
   sessionLog: SessionLog;
+  /**
+   * P2-11 (/fork): shared mutable holder for the live log, owned by the host (index.ts). The
+   * host's long-lived writers (the bus→recordEvent subscriber, the sub-agent loop-deps factory,
+   * the wakeup rate-limit recorder) read through it, and /fork re-points it at the fork so those
+   * writers follow the swap. Absent on standalone/test mounts, where a local ref suffices.
+   */
+  sessionLogBox?: { current: SessionLog };
   forceConfirm?: (call: ToolCall, risk: string) => string | null;
   system: string;
   workspaceRoot: string;
@@ -1165,25 +775,9 @@ const PROSE_MAX_COLS = 100;
 const PAGE_MARGIN = 4;
 /** Terminal answer to a DSR cursor-position query (CSI 6n). Ink strips a chunk-leading ESC. */
 const DSR_REPLY = /\x1b?\[(\d+);(\d+)R/;
-/** The same reply as a WHOLE stdin chunk — the shape a terminal actually delivers it in. */
-const DSR_REPLY_EXACT = /^\x1b?\[\d+;\d+R$/;
-// Keys Ink's `key` object has no field for (Home/End) or actively mis-reports (forward-delete,
-// which it collapses onto the same key.delete as Backspace). Matched against the RAW stdin chunk
-// (App.js emits it before parsing), so the leading ESC is required — without it `OH` would make a
-// typed capital H read as Home.
-const HOME_KEYS = /^\x1b(\[1~|\[7~|\[H|OH)$/;
-const END_KEYS = /^\x1b(\[4~|\[8~|\[F|OF)$/;
-const FORWARD_DELETE = /^\x1b\[3(;\d+)?~$/;
-/**
- * Shift+Enter, in the encodings terminals actually send once configured (A3).
- *
- * Out of the box Terminal.app, iTerm2 and the VS Code terminal all send a BARE `\r` for
- * Shift+Enter — indistinguishable from Enter — so the `key.shift` test could never be true and
- * the composer spent the whole 3.x line advertising a binding that did not work. A terminal
- * configured for CSI-u (kitty/foot/WezTerm natively; iTerm2 + VS Code via `/terminal-setup`)
- * sends `ESC [ 13 ; 2 u`; xterm's modifyOtherKeys sends `ESC [ 27 ; 2 ; 13 ~`.
- */
-const SHIFT_ENTER = /^\x1b\[(?:13;(\d+)u|27;(\d+);13~)$/;
+// DSR_REPLY_EXACT / HOME_KEYS / END_KEYS / FORWARD_DELETE / SHIFT_ENTER moved to the
+// focus-owner router (src/tui/keys/reserved.ts + composerOwner.ts, P3-01). DSR_REPLY stays —
+// the raw click tap still parses the cursor-position report itself.
 /** Collaboration Mode: the baton is always this warm orange (Shadow's brand ⏺ color) — never a seat color. */
 const BATON_ORANGE = '#d97757';
 const MARGIN_PAD = ' '.repeat(PAGE_MARGIN);
@@ -1636,8 +1230,13 @@ function FlatItem({
 }) {
   const inner = Math.max(20, cols - PAGE_MARGIN * 2);
   const w = item.kind === 'banner' ? inner : Math.min(inner, PROSE_MAX_COLS);
-  const lines = flattenItem(
-    item as Parameters<typeof flattenItem>[0],
+  // P3-03: epoch-independent memo — a <Static key={staticEpoch}> remount recreates every FlatItem
+  // (in-component useMemo would die with it), so the cache lives in flatten.ts, a WeakMap keyed on
+  // the ITEM OBJECT (ids restart at 0 per TuiApp mount and would collide across instances) with the
+  // layout inputs as the variant key. Ctrl-O at unchanged width reuses the wrap work; only items
+  // whose fold/layout actually changed re-flatten.
+  const lines = flattenItemCached(
+    item as Parameters<typeof flattenItemCached>[0],
     w,
     collapsed,
     PIN_THEME,
@@ -1677,6 +1276,15 @@ function FlatItem({
 export function TuiApp({ opts }: { opts: TuiOpts }) {
   const { exit } = useApp();
   const { bus, context, sessionLog } = opts;
+  // P2-11 (/fork): the session log is a MOUNT-TIME prop, but /fork must swap the live log to a
+  // new session id without remounting the app. Every read/write goes through this ref; /fork
+  // points it at the forked SessionLog and the next loop/banner/status reads pick it up.
+  // The ref object itself is stable, so it replaces `sessionLog` in useCallback dep arrays.
+  // When the host passes a SHARED `sessionLogBox` we alias it, so the long-lived writers that
+  // live in the host (bus→recordEvent, sub-agent loop deps, wakeup recorder) track the /fork
+  // swap too — otherwise events after a fork would keep landing in the SOURCE transcript.
+  const localSessionLogRef = useRef(sessionLog);
+  const sessionLogRef = opts.sessionLogBox ?? localSessionLogRef;
   const [style, setStyle] = useState<OutputStyle>(opts.styleState?.style ?? opts.cfg.lastStyle ?? 'proactive');
 
   const terminalSize = useTerminalSize();
@@ -1826,8 +1434,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   //   soft — clear the VISIBLE screen only (2J+H). Keeps native scrollback so PgUp history
   //          survives Ctrl-O. May leave one stale pre-fold copy above the re-emit — rare and
   //          user-initiated; far less of a flashbang than wiping the whole scrollback.
-  //   hard — also wipe scrollback (2J+3J+H). Used on resize /clear where a ghost composer or
-  //          stacked rewrap would otherwise stick around. Startup already cleared pre-launch history.
+  //   hard — also wipe scrollback (2J+3J+H). Used by app:redraw (explicit Ctrl+L), where a ghost
+  //          composer or stacked rewrap must be scrubbed on demand. Startup already cleared
+  //          pre-launch history. RESIZE deliberately never reflows — see below (P3-03).
   const reflow = useCallback((mode: 'soft' | 'hard' = 'hard') => {
     const out = process.stdout;
     if (out.isTTY) out.write(reflowSequence(mode));
@@ -1836,23 +1445,19 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // Ctrl-T only mutates LIVE chrome (PinnedState / one-line summary) — never the committed
   // Static transcript — so it must NOT reflow. A reflow on every task-list toggle was wiping
   // the screen for a pure live-height change.
-  // RESIZE → debounced HARD reflow. When cols/rows change, the terminal rewraps already-printed
-  // <Static> lines, but Ink erases its live frame against stale geometry and leaves a ghost
-  // composer. Hard wipe + remount repaints clean at the new width. Debounced so a click-drag
-  // reflows once after it settles. Mount is skipped (banner already drawn).
-  const didFirstSizeRef = useRef(false);
-  const resizeReflowTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  useEffect(() => {
-    if (!didFirstSizeRef.current) {
-      didFirstSizeRef.current = true;
-      return;
-    }
-    if (resizeReflowTimer.current) clearTimeout(resizeReflowTimer.current);
-    resizeReflowTimer.current = setTimeout(() => reflow('hard'), 120);
-    return () => {
-      if (resizeReflowTimer.current) clearTimeout(resizeReflowTimer.current);
-    };
-  }, [terminalSize.cols, terminalSize.rows, reflow]);
+  //
+  // RESIZE → deliberately NO reflow (P3-03). When COLUMNS change, the terminal NATIVELY rewraps
+  // the already-printed <Static> scrollback to the new width — the committed history reflows
+  // in place, so re-emitting it (epoch bump) would stack a second copy over the rewrapped one
+  // and wiping it (3J) would destroy it: the old resize bug was exactly that hard reflow
+  // wiping scrollback mid-stream. Rows-only resize never rewraps text at all, so it needs
+  // nothing. The setSize re-render repaints the live HUD/composer below. Known tradeoff: when
+  // NARROWING, the terminal reflows the last live frame's printed rows too, so Ink's tracked
+  // frame height goes stale and a few ghost rows can persist ABOVE the live region — they do
+  // not self-heal (later renders only erase the tracked height). Recovery is any explicit
+  // repaint: Ctrl-O/Ctrl-T soft reflow, app:redraw (opt-in ctrl+l binding), or /clear. That is
+  // strictly cheaper than the old behavior, which destroyed the entire scrollback on every
+  // resize including pure rows changes.
   const lastUsageRef = useRef<{ inputTokens: number; outputTokens: number; costUSD: number; contextPct: number } | null>(null);
   const costWarnedRef = useRef(false);
   // Session-level cost accumulation. The per-turn Budget resets each turn, so we
@@ -1893,10 +1498,44 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const asyncCommandRef = useRef(false);
 
   /**
-   * Rewindable snapshot turns, refreshed when a turn ends. Read from the session log rather than
-   * counted in the UI, so the /rewind menu is always in the same unit rewindToTurn consumes.
+   * Rewindable snapshot turns (F08-07: with each turn's prompt), refreshed when a turn ends.
+   * Read from the session log rather than counted in the UI, so the /rewind menu is always in
+   * the same unit rewindToTurn consumes.
    */
-  const rewindableTurnsRef = useRef(0);
+  const rewindableTurnsRef = useRef<RewindableTurn[]>([]);
+  /** Last (path, log size) the ref above was refreshed for — only re-read the log when a new
+   *  snapshot actually landed (or the session changed), never once per turn unconditionally. */
+  const rewindSeenRef = useRef<{ path: string; size: number } | null>(null);
+  /**
+   * Sync rewindableTurnsRef with the CURRENT session log. Called at turn end and after anything
+   * that moves the lineage (/resume, /fork, /clear, /rewind). The gate keys on path + file SIZE
+   * rather than countSnapshots (= max snapshot turn + 1): a same-turn snapshot APPEND — rewind
+   * durability, /resume re-seeding turn 0 — does not move the max turn but must still re-list.
+   * listRewindableTurns is incremental, so the reparse costs only the bytes appended since.
+   */
+  const refreshRewindTurns = (): void => {
+    try {
+      const rwPath = sessionLogRef.current?.path;
+      if (!rwPath) {
+        rewindableTurnsRef.current = [];
+        rewindSeenRef.current = null;
+        return;
+      }
+      let size = -1;
+      try {
+        size = statSync(rwPath).size;
+      } catch {
+        return; // unreadable — keep whatever list we had
+      }
+      const seen = rewindSeenRef.current;
+      if (!seen || seen.path !== rwPath || seen.size !== size) {
+        rewindSeenRef.current = { path: rwPath, size };
+        rewindableTurnsRef.current = listRewindableTurns(rwPath);
+      }
+    } catch {
+      /* an unreadable log must never break the caller */
+    }
+  };
 
   /**
    * Repaint the visible transcript from the loaded context.
@@ -1959,6 +1598,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       runLock.releaseFor(CLI_HOLDER);
     };
   }, [opts]);
+  /** The shared "press again to quit" latch, armed by Ctrl-C or Ctrl-D on an empty composer. */
   const ctrlCArmedRef = useRef(false);
   const historyRef = useRef<string[]>([]);
   const histIdxRef = useRef(0);
@@ -2066,7 +1706,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const [vimEnabled, setVimEnabled] = useState<boolean>(opts.cfg.vimMode === true);
   const vimModeRef = useRef<VimMode>('insert'); // start in INSERT so typing works immediately
   const [vimModeState, setVimModeState] = useState<VimMode>('insert');
-  const vimPendingRef = useRef(''); // operator awaiting a motion (d/c)
+  const vimPendingRef = useRef(''); // operator awaiting a motion (d/c/y/r) or a find target (f/F/t/T)
+  const vimFindRef = useRef<VimFind | null>(null); // last f/F/t/T — ; repeats, , repeats backwards
+  const vimCountRef = useRef(0); // numeric prefix being typed (0 = none)
+  const vimRegRef = useRef(''); // unnamed register: last yank/delete, pasted by p/P
   // Click-to-place-caret. OFF unless explicitly opted in — enabling mouse reporting takes the
   // WHEEL away from the terminal, and native scrollback is not negotiable here. Opt in per-run
   // with SHADOW_MOUSE=1 (or `"mouse": true` in config); there is deliberately no slash command,
@@ -2247,14 +1890,26 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // the current keypress; the composer consults them only to disambiguate. Declared ABOVE the
   // useInput(onKey) call so this listener is registered FIRST and the ref is fresh inside onKey.
   const rawKeyRef = useRef('');
-  const { internal_eventEmitter: inkInputEvents, setRawMode, stdin: inkStdin } = useStdin();
+  // The WHOLE raw chunk (untrimmed). rawKeyRef holds only the last ESC-led sequence (F03-05) for
+  // key disambiguation; the anchored DSR suppress in onKey must see the entire chunk so a cursor
+  // report batched with typed text swallows ONLY the report, not the text typed alongside it.
+  const rawChunkRef = useRef('');
+  const { internal_eventEmitter: inkInputEvents, setRawMode } = useStdin();
   // F08-10: Ctrl-X arms the external-editor chord; the next Ctrl-E opens $EDITOR on the draft.
   const ctrlXArmedRef = useRef(false);
   useEffect(() => {
     if (!inkInputEvents) return;
     const onData = (d: unknown): void => {
       const raw = typeof d === 'string' ? d : String(d);
-      rawKeyRef.current = raw;
+      // F03-05 — batched chunks. Ink dispatches the FIRST keypress of a merged stdin read and
+      // drops the rest, and the composer's raw-sequence tests are ^…$ anchored — so against the
+      // WHOLE batch they never matched and Home/End/forward-delete/Shift-Enter died whenever the
+      // terminal coalesced them with a neighbour. Keep the LAST complete ESC-led sequence (split
+      // on ESC boundaries) so the most recent key is the one the disambiguation tests see. The
+      // DSR match below keeps the whole chunk: that reply regex is deliberately unanchored so a
+      // position report batched with typed text still resolves the parked click.
+      rawKeyRef.current = lastKeySequence(raw);
+      rawChunkRef.current = raw; // the whole chunk, for the anchored DSR suppress in onKey
       // A cursor-position report answering our click DSR — resolve the parked click here, before
       // Ink's parser turns `[38;1R` into composer text (onKey drops it by the same test).
       const dsr = DSR_REPLY.exec(raw);
@@ -2293,12 +1948,18 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       pastesRef.current.push({ id, content: text, lines });
       const chip = `[Pasted text #${id} +${lines} lines]`;
       setComposer(s.slice(0, c) + chip + s.slice(c), c + chip.length);
+      // F02-06: keep the paste registry BOUNDED. Entries whose chip was deleted from the draft
+      // used to linger for the rest of the session; above the cap, only entries still referenced
+      // by the draft or a queued task survive.
+      if (pastesRef.current.length > PASTE_CAP) {
+        const queuedText = queuedTasksRef.current.map((q) => q.text ?? '').join('\n');
+        pastesRef.current = prunePastes(pastesRef.current, [inputRef.current, queuedText]);
+      }
     } else {
       setComposer(s.slice(0, c) + text + s.slice(c), c + text.length);
     }
     setMenuIndex(0);
   }, [setComposer]);
-
 
   const setQuestionIndex = useCallback((next: number) => {
     questionIndexRef.current = Math.max(0, next);
@@ -2657,7 +2318,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // B6 — `app:redraw` is the action loader.ts uses as ITS DOCUMENTED EXAMPLE
   // (`{"ctrl+l": "app:redraw"}`), but Global was `{}` and nothing registered the id — so a user
   // copying the doc's own example got a binding that parsed, warned about nothing, and never
-  // fired. Bound to the hard reflow the resize path already uses.
+  // fired. Bound to the hard reflow — as of P3-03 reachable ONLY via this explicit action.
   useEffect(() => kbRegister('app:redraw', () => reflow('hard')), [kbRegister, reflow]);
   useEffect(() => kbRegister('transcript:toggleTaskList', () => {
     // Works idle AND mid-turn — users hit Ctrl-T to inspect the list while the agent runs.
@@ -2761,13 +2422,21 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // request, autonomy, question cursor/selections) so a handler registered once always acts on
   // the current dialog. The legacy default keys remain as a fall-through (consume() returns false
   // for unbound/unregistered), so rebinding ADDS chords without ever stranding the defaults.
-  useEffect(() => kbRegister('confirm:yes', () => { igateRef.current?.respond('approve'); }), [kbRegister]);
+  // F07-09 guard on every rebindable confirm chord: an acknowledge-only dialog (catastrophic
+  // denylist) must never mint a grant — not even the side-effect autonomy raise of confirm:always.
+  useEffect(() => kbRegister('confirm:yes', () => {
+    if (pendingRef.current?.acknowledgeOnly) { igateRef.current?.respond('deny'); return; }
+    igateRef.current?.respond('approve');
+  }), [kbRegister]);
   useEffect(() => kbRegister('confirm:no', () => { igateRef.current?.respond('deny'); }), [kbRegister]);
   useEffect(() => kbRegister('confirm:session', () => {
-    if (pendingRef.current?.kind === 'permission') igateRef.current?.respond({ approveForSession: true });
+    const p = pendingRef.current;
+    if (p?.acknowledgeOnly) { igateRef.current?.respond('deny'); return; }
+    if (p?.kind === 'permission') igateRef.current?.respond({ approveForSession: true });
   }), [kbRegister]);
   useEffect(() => kbRegister('confirm:prefix', () => {
     const p = pendingRef.current;
+    if (p?.acknowledgeOnly) { igateRef.current?.respond('deny'); return; }
     if (p?.kind === 'permission' && p.call.name === 'run_shell') {
       const cmd = shellCommandOf(p.call.input) ?? '';
       const prefix = cmd.split(/\s+/).slice(0, 2).join(' ');
@@ -2776,6 +2445,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   }), [kbRegister]);
   useEffect(() => kbRegister('confirm:always', () => {
     const p = pendingRef.current;
+    if (p?.acknowledgeOnly) { igateRef.current?.respond('deny'); return; }
     if (p && p.kind !== 'plan_enter') {
       // raiseAutonomy, not cycleAutonomy — see the inline handler for why (full→manual wrap).
       const next = raiseAutonomy(autonomyRef.current);
@@ -2794,1594 +2464,34 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     if (qs?.length) setQuestionIndex(Math.min(qs.length - 1, Math.min(questionIndexRef.current, qs.length - 1) + 1));
   }), [kbRegister, setQuestionIndex]);
 
-  // Execute a slash command (not sent to the agent).
+  // Execute a slash command (not sent to the agent). The engine lives in src/tui/slash.ts
+  // (P3-02 / F06-04): the command table, its helpers, and the full dispatch body. This bridge
+  // re-assembles the live context on every render, so the engine reads the freshest state
+  // through the ref while `runSlash` itself keeps a stable identity (onKey depends on it).
+  const slashCtxRef = useRef<SlashCtx | null>(null);
+  slashCtxRef.current = {
+    setLine, setMenuIndex, setStreamNow, setThinkNow, setToolLine, setCommitted,
+    setShowAllExpanded, setStaticEpoch, setTodoItems, setAttachCount, setStatus,
+    setPlanMode, setGoal, setPickerIndex, setPickerOpen, setAutonomy, setEffort,
+    setStyle, setVimEnabled, setVimMode, setThemeTick, setCustomStatus, setComposer,
+    pushLine, showBanner, exit, refreshStatusLine, copyLast, refreshRewindTurns,
+    showResumeRecap, pushImage, loadCustomCommands,
+    startTurnRef, kbLoadedRef, firstRef, answerOpenRef, committedRef, attachmentsRef,
+    pastesRef, lastUsageRef, sessionCostRef, prevTurnCostRef, sessionInTokRef,
+    sessionOutTokRef, prevTurnInTokRef, prevTurnOutTokRef, sessionTurnsRef,
+    costWarnedRef, fileListLoadedRef, goalRef, startTableRef, currentRef,
+    selectModelRef, asyncCommandRef, providerRef, activeTargetRef, styleRef,
+    autonomyRef, loopRef, effortRef, runningRef, compactingRef, compactAbortRef,
+    sessionLogRef, sessionApprovalsRef, rewindableTurnsRef, additionalRootsRef,
+    statusLineRef, vimEnabledRef, vimPendingRef, vimFindRef, vimCountRef, vimRegRef,
+    flushQueueRef, runOneRef, repaintFromContextRef,
+    context, opts, bus, subAgents, todoItems,
+  };
   const runSlash = useCallback(
     (cmd: SlashCommand, rawLine?: string) => {
-      setLine('');
-      setMenuIndex(0);
-      const dispatch = slashDispatchName(cmd);
-      const arg = (rawLine ?? '').slice(cmd.name.length).trim();
-      // F10-07: a custom command isn't a builtin action — its body is a prompt template. Expand the
-      // arguments and submit it as a normal turn (goes through the same gate/steer path as typing).
-      if (cmd.custom) {
-        const prompt = expandCommandBody(cmd.custom.body, arg);
-        if (prompt.trim()) startTurnRef.current?.(prompt);
-        return;
-      }
-      switch (dispatch) {
-        case '/help': {
-          const topic = (arg || 'overview').toLowerCase();
-          if (topic !== 'overview' && topic !== 'keys' && topic !== 'all') {
-            pushLine({
-              text: `Unknown help topic "${arg}". Use /help overview, /help keys, or /help all.`,
-              color: C.red,
-            });
-            break;
-          }
-          pushLine({ kind: 'system', text: 'help', lines: helpLines(topic) });
-          break;
-        }
-        case '/keybindings': {
-          const loaded = kbLoadedRef.current;
-          if (arg === 'init') {
-            const res = initKeybindingsFile();
-            if (res.error) {
-              pushLine({ text: `Failed to write ${shortPath(res.path)}: ${res.error}`, color: C.red });
-              break;
-            }
-            pushLine({
-              text: res.created
-                ? `Wrote starter config → ${shortPath(res.path)} (edit it; changes hot-reload).`
-                : `Already exists: ${shortPath(res.path)}`,
-              color: C.cyan,
-            });
-            break;
-          }
-          const rows = bindingsForDisplay(loaded.bindings);
-          const lines: BannerLine[] = [
-            { text: 'Keybindings (customize: /keybindings init → edit ~/.shadow/keybindings.json):', bold: true },
-          ];
-          let lastCtx = '';
-          for (const r of rows) {
-            if (r.context !== lastCtx) {
-              lastCtx = r.context;
-              lines.push({ text: `  ${r.context}`, color: C.purple });
-            }
-            lines.push({ text: `    ${r.stroke.padEnd(16)} ${r.action}`, dimColor: true });
-          }
-          for (const w of loaded.warnings) lines.push({ text: `  ${w.kind}: ${w.message}`, color: C.yellow });
-          lines.push({ text: 'Hardcoded (not rebindable): ctrl+c, ctrl+d, ctrl+m.', dimColor: true });
-          pushLine({ kind: 'system', text: 'keybindings', lines });
-          break;
-        }
-        case '/new':
-        case '/clear':
-          // isTTY-gated like every sibling escape site (reflow, theme, paste, mouse, startupSequence
-          // all are). This one was not, so it leaked 2J/3J into pipes and files — and since several
-          // tests drive /clear, `npm test` could wipe the developer's own scrollback.
-          if (process.stdout.isTTY) process.stdout.write('\x1b[2J\x1b[3J\x1b[H'); // wipe screen + scrollback
-          context.reset();
-          firstRef.current = true;
-          answerOpenRef.current = false;
-          setStreamNow('');
-          setThinkNow('');
-          setToolLine(null);
-          setCommitted([]);
-          committedRef.current = [];
-          setShowAllExpanded(false);
-          setStaticEpoch((n) => n + 1); // remount <Static> so it forgets the wiped scrollback items
-          setTodoItems([]); // clear the task list (was persisting stale tasks after /clear)
-          opts.todoList?.write([]); // clear the backing source so the agent starts fresh
-          attachmentsRef.current = []; // drop any queued image attachments
-          setAttachCount(0);
-          // P1B-03: /clear resets the conversation, so reset the session usage readout too — the
-          // old code left stale token/cost totals (and the status line) attributed to a new session.
-          lastUsageRef.current = null;
-          sessionCostRef.current = 0;
-          prevTurnCostRef.current = 0;
-          sessionInTokRef.current = 0;
-          sessionOutTokRef.current = 0;
-          prevTurnInTokRef.current = 0;
-          prevTurnOutTokRef.current = 0;
-          sessionTurnsRef.current = 0;
-          costWarnedRef.current = false;
-          setStatus('0 tokens');
-          loadCustomCommands(); // F10-07: pick up any commands added since launch
-          fileListLoadedRef.current = false; // F08-04: re-walk for @-mentions on next use
-          // Exit plan mode for REAL, not just in React state (D2). setPlanMode alone changed the
-          // badge while PlanModeState stayed active — so plan.block() kept going into the system
-          // prompt and every write was denied afterwards with NO on-screen explanation, because
-          // the UI had already stopped saying plan mode was on. Drive the state object and let its
-          // bus event update the UI, so the two can't disagree again.
-          opts.planMode?.exit();
-          setPlanMode({ mode: 'implement' }); // drop any stale plan title
-          showBanner();
-          pushLine({ text: 'Cleared — conversation reset. (goal kept — use /goal clear to drop it)', dimColor: true });
-          break;
-        case '/goal': {
-          if (!arg) {
-            pushLine({ text: goalRef.current ? `Goal: ${goalRef.current}` : 'No goal set. Use /goal <text> to set one, /goal clear to remove.', dimColor: true });
-          } else if (arg.toLowerCase() === 'clear') {
-            setGoal(null);
-            pushLine({ text: 'Goal cleared.', dimColor: true });
-          } else {
-            setGoal(arg);
-            pushLine({ text: `Goal set: ${arg}`, color: C.purple });
-          }
-          break;
-        }
-        case '/table':
-          startTableRef.current?.(arg);
-          break;
-        case '/model': {
-          const parsed = splitPresetArgs(arg);
-          if (!parsed.ok) {
-            pushLine({ text: parsed.message, color: C.red });
-            break;
-          }
-          const parts = parsed.value;
-          const action = parts[0] ?? '';
-          const allEntries = opts.cfg.models ?? [];
-          if (action === 'list' || action === 'show') {
-            pushLine({
-              kind: 'system',
-              text: 'model',
-              lines: modelPresetLines(allEntries, currentRef.current).map((text, i) => ({
-                text,
-                color: i === 0 && text.startsWith('*') ? C.cyan : undefined,
-                dimColor: !text.startsWith('*'),
-              })),
-            });
-            break;
-          }
-          if (action === 'add') {
-            const add = parseModelAddArgs(parts);
-            if (!add.ok) {
-              pushLine({ text: add.message, color: C.red });
-              break;
-            }
-            const next = addModelPreset(allEntries, add.value);
-            if (!next.ok) {
-              pushLine({ text: next.message, color: C.red });
-              break;
-            }
-            opts.cfg.models = next.value;
-            saveGlobalConfig({ models: next.value });
-            pushLine({ text: `Added model preset: ${add.value.label}`, color: C.cyan });
-            break;
-          }
-          if (action === 'remove' || action === 'delete') {
-            const next = removeModelPreset(allEntries, parts[1] ?? '');
-            if (!next.ok) {
-              pushLine({ text: next.message, color: C.red });
-              break;
-            }
-            opts.cfg.models = next.value;
-            saveGlobalConfig({ models: next.value });
-            pushLine({ text: `Removed model preset: ${parts[1]}`, color: C.cyan });
-            break;
-          }
-          if (action === 'enable' || action === 'disable') {
-            const next = setModelPresetEnabled(allEntries, parts[1] ?? '', action === 'enable');
-            if (!next.ok) {
-              pushLine({ text: next.message, color: C.red });
-              break;
-            }
-            opts.cfg.models = next.value;
-            saveGlobalConfig({ models: next.value });
-            pushLine({ text: `${action === 'enable' ? 'Enabled' : 'Disabled'} model preset: ${parts[1]}`, color: C.cyan });
-            break;
-          }
-          if (action === 'default' || action === 'set-default') {
-            const entry = findModelPreset(allEntries, parts[1] ?? '');
-            if (!entry) {
-              pushLine({ text: parts[1] ? `No model preset named "${parts[1]}".` : 'Usage: /model default <label>', color: C.red });
-              break;
-            }
-            if (entry.disabled) {
-              pushLine({ text: `Cannot make disabled preset "${entry.label}" the default.`, color: C.red });
-              break;
-            }
-            const patch = defaultModelPatch(entry);
-            opts.cfg.provider = entry.provider;
-            opts.cfg.model = entry.model;
-            opts.cfg.baseUrl = entry.baseUrl;
-            opts.cfg.selfHosted = entry.selfHosted;
-            opts.cfg.lastModel = entry.label;
-            saveGlobalConfig(patch);
-            pushLine({ text: `Default model saved: ${entry.label}`, color: C.cyan });
-            break;
-          }
-          if (action === 'use' || action === 'switch') {
-            const entry = findModelPreset(allEntries.filter((m) => !m.disabled), parts[1] ?? '');
-            if (!entry) {
-              pushLine({ text: parts[1] ? `No enabled model preset named "${parts[1]}".` : 'Usage: /model use <label>', color: C.red });
-              break;
-            }
-            void selectModelRef.current?.(entry);
-            break;
-          }
-          if (action === 'test') {
-            // Capability triage: the ACTIVE model (no arg) reuses the live provider;
-            // a named preset is resolved + built (incl. gguf auto-serve) without swapping.
-            const targetName = parts[1];
-            asyncCommandRef.current = true;
-            void (async () => {
-              try {
-                let prov = providerRef.current;
-                let model = currentRef.current.model;
-                let isLocal = false;
-                let label = `${currentRef.current.provider}/${currentRef.current.model}`;
-                if (targetName) {
-                  const entry = findModelPreset(allEntries, targetName);
-                  if (!entry) {
-                    pushLine({ text: `No model preset named "${targetName}".`, color: C.red });
-                    return;
-                  }
-                  label = entry.label;
-                  model = entry.model;
-                  isLocal = isLocalServedEntry(entry);
-                  let p = entry.provider;
-                  let baseUrl = resolveBaseUrl(entry.provider, entry.baseUrl);
-                  const testCred = resolveEntryCredential(entry, {
-                    vaultIsLocked: vaultExists() && !vaultUnlocked(),
-                  });
-                  let apiKey = testCred.ok ? testCred.apiKey : undefined;
-                  if (!testCred.ok) {
-                    pushLine({
-                      text: `${entry.label}: vault slot "${testCred.slot}" is ${testCred.reason === 'locked' ? 'locked' : 'empty'} — cannot test.`,
-                      color: C.red,
-                    });
-                    return;
-                  }
-                  if (isLocalServedEntry(entry)) {
-                    try {
-                      const r = await ensureLocalServer(entry, (m) => pushLine({ text: m, dimColor: true }));
-                      p = 'openai';
-                      baseUrl = r.baseUrl;
-                      apiKey = entry.apiKey ?? 'sk-local';
-                    } catch (e) {
-                      pushLine({ text: `Local model failed: ${(e as Error).message}`, color: C.red });
-                      return;
-                    }
-                  }
-                  prov = createProvider({
-                    // F10-01: probe the entry with its real wire contract (idle knobs +
-                    // capability block) so /model test exercises what a session would use.
-                    ...entryStreamContract(entry),
-                    provider: p,
-                    model: entry.model,
-                    apiKey,
-                    authToken: testCred.authToken,
-                    baseUrl,
-                    selfHosted: p === 'openai' ? entry.selfHosted : undefined,
-                    reasoningRoundtrip: opts.cfg.reasoningRoundtrip,
-                  });
-                }
-                if (!prov) {
-                  pushLine({ text: 'No active provider to test.', color: C.red });
-                  return;
-                }
-                pushLine({ text: `Testing ${label} — running capability probes (this can take up to a minute)…`, dimColor: true });
-                try {
-                  const result = await runModelCheck(prov, {
-                    model,
-                    providerName: currentRef.current.provider,
-                    isLocal,
-                    temperature: opts.cfg.temperature,
-                    log: (m) => pushLine({ text: m, dimColor: true }),
-                  });
-                  const rows = [
-                    ...result.probes.map((pr) => ({
-                      text: `${pr.status === 'pass' ? '✓' : '✗'} [${pr.status}] ${pr.label}: ${pr.detail}`,
-                      color: pr.status === 'pass' ? C.green : C.red,
-                    })),
-                    { text: `Verdict: ${result.verdict.toUpperCase()}`, color: result.verdict === 'agentic' ? C.green : result.verdict === 'limited' ? C.cyan : C.red },
-                    { text: `  ${result.recommendation}`, dimColor: true },
-                    { text: `  (${(result.elapsedMs / 1000).toFixed(1)}s)`, dimColor: true },
-                  ];
-                  pushLine({ kind: 'system', text: 'model test', lines: rows });
-                } catch (e) {
-                  pushLine({ text: `Model test failed: ${(e as Error).message}`, color: C.red });
-                }
-              } finally {
-                asyncCommandRef.current = false;
-                flushQueueRef.current?.();
-              }
-            })();
-            break;
-          }
-          if (action) {
-            pushLine({
-              text: 'Usage: /model [list|add <label> <provider> <model> [baseUrl] [--self-hosted]|remove <label>|enable <label>|disable <label>|default <label>|use <label>|test [name]]',
-              dimColor: true,
-            });
-            break;
-          }
-          const entries = modelEntries(opts.cfg);
-          if (entries.length <= 1) {
-            pushLine({
-              kind: 'system',
-              text: 'model',
-              lines: [
-                { text: `${currentRef.current.provider} / ${currentRef.current.model}`, color: C.cyan },
-                { text: 'Use /model add <label> <provider> <model> [baseUrl] [--self-hosted] to add a preset.', dimColor: true },
-              ],
-            });
-            break;
-          }
-          const rows = modelRows(opts.cfg);
-          const active = rows.findIndex(
-            (r) =>
-              r.kind === 'model' &&
-              r.entry.provider === currentRef.current.provider &&
-              r.entry.model === currentRef.current.model,
-          );
-          setPickerIndex(active >= 0 ? active : firstSelectableRow(rows));
-          setPickerOpen(true);
-          break;
-        }
-        case '/local': {
-          const parsed = splitPresetArgs(arg);
-          if (!parsed.ok) {
-            pushLine({ text: parsed.message, color: C.red });
-            break;
-          }
-          const parts = parsed.value;
-          const action = parts[0] ?? '';
-          const allEntries = opts.cfg.models ?? [];
-          if (!action || action === 'list' || action === 'show') {
-            pushLine({
-              kind: 'system',
-              text: 'local',
-              lines: formatLocalList(allEntries).map((text) => ({ text, dimColor: true })),
-            });
-            break;
-          }
-          // `/local test` is advertised in the argument menu ("Launch it and check it answers") but
-          // was never handled — it fell through to the unknown-action branch. `/model test` already
-          // does exactly this (including ensureLocalServer for a local-served preset), so route to
-          // it rather than growing a second copy that would drift.
-          if (action === 'test') {
-            const target = parts.slice(1).join(' ').trim();
-            runSlash(findSlashCommand('/model')!, `/model test${target ? ` ${target}` : ''}`);
-            break;
-          }
-          if (action === 'add') {
-            const parsedAdd = parseLocalAddArgs(parts.slice(1));
-            if (!parsedAdd.ok) {
-              pushLine({ text: parsedAdd.message, color: C.red });
-              break;
-            }
-            const res = addLocalModel(allEntries, parsedAdd.value);
-            if (!res.ok) {
-              pushLine({ text: res.message, color: C.red });
-              break;
-            }
-            opts.cfg.models = res.value.models;
-            saveGlobalConfig({ models: res.value.models });
-            const e = res.value.entry;
-            pushLine({
-              kind: 'system',
-              text: 'local',
-              lines: [
-                { text: `Added local model: ${e.label}`, color: C.cyan },
-                { text: e.mlx ? `  ${e.mlx}  ·  mlx` : e.vllm ? `  ${e.vllm}  ·  vllm` : `  ${e.gguf}  ·  ctx ${e.ctx}  ·  gpu-layers ${e.gpuLayers}`, dimColor: true },
-                { text: `  Switch to it now: /local use ${e.label}`, dimColor: true },
-              ],
-            });
-            break;
-          }
-          if (action === 'remove' || action === 'delete') {
-            const res = removeLocalModel(allEntries, parts[1] ?? '');
-            if (!res.ok) {
-              pushLine({ text: res.message, color: C.red });
-              break;
-            }
-            opts.cfg.models = res.value;
-            saveGlobalConfig({ models: res.value });
-            pushLine({ text: `Removed local model: ${parts[1]}`, color: C.cyan });
-            break;
-          }
-          if (action === 'use' || action === 'switch') {
-            const entry = findModelPreset(
-              listLocalModels(allEntries).filter((m) => !m.disabled),
-              parts[1] ?? '',
-            );
-            if (!entry) {
-              pushLine({
-                text: parts[1] ? `No local model named "${parts[1]}".` : 'Usage: /local use <name>',
-                color: C.red,
-              });
-              break;
-            }
-            void selectModelRef.current?.(entry); // reuses /model's switch (server spawn + memory intact)
-            break;
-          }
-          pushLine({
-            text: 'Usage: /local [list | add <path-to.gguf | mlx-folder | mlx-community/model> [--name <n>] [--ctx <n>] [--gpu-layers <n>] | use <name> | remove <name>]',
-            dimColor: true,
-          });
-          break;
-        }
-        case '/provider': {
-          const target = activeTargetRef.current;
-          const baseUrl = target.baseUrl;
-          const hasApiKey = Boolean(resolveApiKey(currentRef.current.provider, { model: currentRef.current.model }));
-          const hasAuthToken = Boolean(resolveAuthToken(currentRef.current.provider));
-          const total = opts.cfg.models?.length ?? 0;
-          const disabled = opts.cfg.models?.filter((m) => m.disabled).length ?? 0;
-          pushLine({
-            kind: 'system',
-            text: 'provider',
-            lines: [
-              { text: `${currentRef.current.provider}/${currentRef.current.model}`, color: C.cyan },
-              { text: `endpoint: ${baseUrl || '(provider default)'}`, dimColor: true },
-              ...(target.selfHosted
-                ? [{ text: `temperature: ${formatTemperature(opts.cfg.temperature ?? 1.0)} · self-hosted sampling`, dimColor: true }]
-                : []),
-              { text: `auth: api key ${hasApiKey ? 'present' : 'missing'} · bearer ${hasAuthToken ? 'present' : 'missing'}`, dimColor: true },
-              { text: `presets: ${total} configured${disabled ? ` · ${disabled} disabled` : ''}`, dimColor: true },
-              { text: 'Commands: /model list · /model add · /model use <label> · /model default <label>', dimColor: true },
-            ],
-          });
-          break;
-        }
-        case '/onboard': {
-          pushLine({
-            kind: 'system',
-            text: 'onboard',
-            lines: [
-              { text: 'Run `shadow onboard` outside the TUI to edit provider credentials.', color: C.cyan },
-              { text: 'Onboarding supports `back`/`b` at prompts and saves only after the final connection check.', dimColor: true },
-              { text: 'Model presets can be managed live with /model add, /model remove, /model enable, /model disable, and /model default.', dimColor: true },
-            ],
-          });
-          break;
-        }
-        case '/style': {
-          // No arg: cycle (original behavior). With arg: set directly. F08-12: custom styles from
-          // .shadow/.claude output-styles dirs join the built-ins in the cycle + validation.
-          const styles: OutputStyle[] = ['proactive', 'explanatory', 'learning', 'procedural', ...(customStyleNames() as OutputStyle[])];
-          const req = arg.toLowerCase();
-          if (req && !(styles as readonly string[]).includes(req)) {
-            pushLine({ text: `Unknown style "${arg}". Styles: ${styles.join(', ')}.`, color: C.red });
-            break;
-          }
-          const next = req
-            ? (req as OutputStyle)
-            : styles[(styles.indexOf(styleRef.current) + 1) % styles.length] ?? 'proactive';
-          styleRef.current = next;
-          setStyle(next);
-          opts.styleState?.setStyle(next);
-          void saveGlobalConfig({ lastStyle: next });
-          pushLine({ text: `Style → ${next}`, color: C.purple });
-          break;
-        }
-        case '/autonomy': {
-          // No arg: cycle (original behavior). With arg: jump straight to a level.
-          const req = arg.toLowerCase();
-          if (req && !(AUTONOMY_LEVELS as readonly string[]).includes(req)) {
-            pushLine({ text: `Unknown autonomy "${arg}". Levels: ${AUTONOMY_LEVELS.join(', ')}.`, color: C.red });
-            break;
-          }
-          const next = req ? (req as AutonomyLevel) : cycleAutonomy(autonomyRef.current);
-          setAutonomy(next);
-          loopRef.current?.setAutonomy(next);
-          pushLine({ text: `Autonomy → ${next}`, color: C.purple });
-          break;
-        }
-        case '/fast': {
-          // `/fast on` / `/fast off` are documented and were silently ignored — the handler always
-          // toggled, so a user scripting "make sure fast is on" turned it OFF half the time.
-          const want = arg.trim().toLowerCase();
-          if (want && want !== 'on' && want !== 'off') {
-            pushLine({ text: 'Usage: /fast [on|off] — no argument toggles.', dimColor: true });
-            break;
-          }
-          const next = want === 'on' ? true : want === 'off' ? false : !opts.cfg.fastMode;
-          opts.cfg.fastMode = next;
-          void saveGlobalConfig({ fastMode: next });
-          pushLine({
-            text: `Fast mode → ${next ? 'on' : 'off'} (applies on the next model turn)`,
-            color: C.cyan,
-          });
-          break;
-        }
-        case '/effort': {
-          // No arg: cycle. With arg: set (validated). Live-applies next turn + persists.
-          // A garbage argument used to fall through to the CYCLE, so `/effort hgih` silently set
-          // some unrelated level and reported success. Only a bare /effort cycles.
-          const parsed = normalizeEffort(arg);
-          if (arg.trim() && !parsed) {
-            pushLine({ text: `Unknown effort "${arg.trim()}". Use: low, medium, high, xhigh, max — or /effort alone to cycle.`, color: C.red });
-            break;
-          }
-          const next = parsed ?? cycleEffort(effortRef.current);
-          setEffort(next);
-          pushLine({
-            text: `Effort → ${next} ${effortSymbol(next)} — ${effortDescription(next)} (applies next turn)`,
-            color: C.cyan,
-          });
-          break;
-        }
-        case '/compact': {
-          if (runningRef.current) {
-            pushLine({ text: 'Finish the current turn before compacting.', dimColor: true });
-            break;
-          }
-          if (compactingRef.current) {
-            pushLine({ text: 'Already compacting — Esc to cancel.', dimColor: true });
-            break;
-          }
-          pushLine({ text: 'Compacting context… (Esc cancels)', dimColor: true });
-          compactingRef.current = true;
-          compactAbortRef.current = new AbortController();
-          void (async () => {
-            const ctl = compactAbortRef.current;
-            try {
-              const did = await context.maybeSummarize(
-                providerRef.current,
-                currentRef.current.model,
-                true,
-                ctl?.signal,
-                { temperature: opts.cfg.temperature },
-              );
-              if (ctl?.signal.aborted) {
-                pushLine({ text: 'Compaction cancelled — context unchanged.', dimColor: true });
-              } else if (did === 'summarized') {
-                pushLine({ text: 'Context compacted — earlier turns summarized.', color: C.cyan });
-              } else if (did === 'truncated') {
-                sessionLog.record({ kind: 'compaction_degraded', mode: 'truncated', source: 'manual' });
-                pushLine({
-                  text:
-                    'Summarizer unavailable — context reclaimed by dropping the oldest tool results ' +
-                    '(re-read any file you still need).',
-                  color: C.yellow,
-                });
-              } else if (did === 'failed') {
-                sessionLog.record({ kind: 'compaction_degraded', mode: 'failed', source: 'manual' });
-                pushLine({
-                  text:
-                    'Compaction failed — summarizer unavailable and nothing left to reclaim. ' +
-                    'Try /clear, or /model to a larger window.',
-                  color: C.red,
-                });
-              } else {
-                pushLine({ text: 'Nothing to compact yet.', dimColor: true });
-              }
-            } catch (e) {
-              pushLine(
-                ctl?.signal.aborted
-                  ? { text: 'Compaction cancelled — context unchanged.', dimColor: true }
-                  : { text: `Compact failed: ${(e as Error).message}`, color: C.red },
-              );
-            } finally {
-              compactingRef.current = false;
-              compactAbortRef.current = null;
-              // Anything typed while the lock was held is queued but has no turn-end to flush it —
-              // compaction finishing IS that moment.
-              flushQueueRef.current?.();
-            }
-          })();
-          break;
-        }
-        case '/cost':
-        case '/usage': {
-          const u = lastUsageRef.current;
-          const sIn = sessionInTokRef.current;
-          const sOut = sessionOutTokRef.current;
-          if (!u && sIn === 0 && sOut === 0) {
-            pushLine({ text: 'No usage recorded yet this session.', dimColor: true });
-            break;
-          }
-          // P1B-03: SESSION totals (summed across every turn + sub-agents) are the headline; the
-          // last turn is a separate line. The old readout showed only the last turn but labeled it
-          // "(session)" — a mislabel that undercounted multi-turn sessions.
-          const lines: BannerLine[] = [
-            { text: `Session (${sessionTurnsRef.current} turn${sessionTurnsRef.current === 1 ? '' : 's'}): ${sIn.toLocaleString()} in · ${sOut.toLocaleString()} out · ${(sIn + sOut).toLocaleString()} total` },
-            // Local / unpriced models never accrue cost — say so instead of a fake-precision
-            // $0.0000 (founder decision 2026-07-16: no dollar readouts on local models).
-            sessionCostRef.current > 0
-              ? { text: `Session cost: $${sessionCostRef.current.toFixed(4)}`, color: C.cyan }
-              : { text: 'Session cost: none — local/unpriced model', dimColor: true },
-          ];
-          if (u) {
-            lines.push({ text: `Last turn:    ${u.inputTokens.toLocaleString()} in · ${u.outputTokens.toLocaleString()} out${u.costUSD > 0 ? ` · $${u.costUSD.toFixed(4)}` : ''}`, dimColor: true });
-          }
-          pushLine({ kind: 'system', text: 'cost', lines });
-          break;
-        }
-        case '/connections': {
-          // P2-01: the session-scoped view of the egress receipt (`shadow egress` reads the
-          // persistent log from a fresh process; this shows the live in-memory aggregate).
-          const rows = egressSummary();
-          if (rows.length === 0) {
-            pushLine({ text: 'No egress recorded yet this session — nothing has left the box.', dimColor: true });
-            break;
-          }
-          const lines: BannerLine[] = [
-            { text: `Connections this session (${rows.length} host${rows.length === 1 ? '' : 's'}) — full receipt: \`shadow egress\``, bold: true },
-          ];
-          for (const r of rows) {
-            const counts = [
-              r.allowed > 0 ? `${r.allowed} allowed` : '',
-              r.denied > 0 ? `${r.denied} denied` : '',
-            ]
-              .filter(Boolean)
-              .join(' · ');
-            const seen = new Date(r.lastSeen).toLocaleTimeString();
-            lines.push({
-              text: `  ${r.host}  —  ${counts} · ${[...r.purposes].sort().join(', ')} · ${seen}`,
-              color: r.denied > 0 ? C.yellow : undefined,
-              dimColor: r.denied === 0,
-            });
-          }
-          lines.push({ text: 'Every outbound request flows the egress broker; --offline denies all non-local egress.', dimColor: true });
-          pushLine({ kind: 'system', text: 'connections', lines });
-          break;
-        }
-        case '/resume': {
-          if (runningRef.current) {
-            pushLine({ text: 'Finish the current turn before resuming.', dimColor: true });
-            break;
-          }
-          const sessions = listResumableSessions(opts.workspaceRoot);
-          if (!sessions.length) {
-            pushLine({ text: 'No resumable sessions found.', dimColor: true });
-            break;
-          }
-          const pick = arg
-            ? sessions.find((s) => s.id === arg || s.path === arg || s.path.endsWith(arg))
-            : sessions[0];
-          if (!pick) {
-            pushLine({ text: `No session matching "${arg}".`, dimColor: true });
-            break;
-          }
-          try {
-            const { context: resumed } = resumeSession(pick.path, {
-              contextBudget: opts.cfg.contextBudget,
-              triggerRatio: opts.cfg.summarizeTriggerRatio,
-              keepLastTurns: opts.cfg.keepLastTurns,
-            });
-            context.loadState(resumed.exportState());
-            firstRef.current = context.messages().length === 0;
-            // Repaint BEFORE the confirmation line, so the notice sits at the bottom of the
-            // conversation it is describing rather than above a stale one.
-            repaintFromContextRef.current?.();
-            // Seed THIS session's log with the restored context. `/export` reads the CURRENT log
-            // file, which is brand new after a resume — so exporting a resumed session produced a
-            // file containing nothing but frontmatter, silently losing the very conversation the
-            // user had just restored in order to keep working on it.
-            try {
-              sessionLog.recordSnapshot(context, 0);
-              sessionLog.record({ kind: 'resumed_from', sessionId: pick.id, path: pick.path });
-            } catch {
-              /* a log that cannot be written must not fail the resume itself */
-            }
-            pushLine({
-              text: `Resumed ${pick.id} (${context.messages().length} messages).`,
-              color: C.cyan,
-            });
-            // A different session is a different grant scope: "approve run_shell for this session"
-            // must not silently carry into the one just loaded.
-            sessionApprovalsRef.current.clear();
-            // F08-11: "While you were away" recap — one non-streaming summary of the restored
-            // conversation via the CURRENT provider. Opt-in (cfg.resumeRecap), silent on any error
-            // or if there's too little to summarize; never blocks the resume itself.
-            if (opts.cfg.resumeRecap && context.messages().length >= 6) void showResumeRecap();
-          } catch (e) {
-            pushLine({ text: `Resume failed: ${(e as Error).message}`, color: C.red });
-          }
-          break;
-        }
-        case '/rewind': {
-          if (runningRef.current) {
-            pushLine({ text: 'Finish the current turn before rewinding.', dimColor: true });
-            break;
-          }
-          const turnArg = arg;
-          const turnIndex = turnArg ? Number(turnArg) : NaN;
-          if (!Number.isFinite(turnIndex) || turnIndex < 0) {
-            pushLine({ text: 'Usage: /rewind <turn-index> (0 = first assistant turn).', dimColor: true });
-            break;
-          }
-          try {
-            const { context: rewound, restoredFiles, deletedFiles, turn } = rewindToTurn(
-              sessionLog.path,
-              turnIndex,
-              opts.workspaceRoot,
-              {
-                contextBudget: opts.cfg.contextBudget,
-                triggerRatio: opts.cfg.summarizeTriggerRatio,
-                keepLastTurns: opts.cfg.keepLastTurns,
-              },
-            );
-            context.loadState(rewound.exportState());
-            firstRef.current = context.messages().length === 0;
-            repaintFromContextRef.current?.();
-            pushLine({
-              kind: 'system',
-              text: 'rewind',
-              lines: [
-                { text: `Rewound to turn ${turn} (${context.messages().length} messages).`, color: C.cyan },
-                ...(restoredFiles.length
-                  ? [{ text: `Restored ${restoredFiles.length} file(s): ${restoredFiles.join(', ')}`, dimColor: true }]
-                  : []),
-                ...(deletedFiles.length
-                  ? [{ text: `Removed ${deletedFiles.length} file(s) created after that turn: ${deletedFiles.join(', ')}`, dimColor: true }]
-                  : []),
-                ...(!restoredFiles.length && !deletedFiles.length
-                  ? [{ text: 'No file checkpoints to restore for that turn.', dimColor: true }]
-                  : []),
-              ],
-            });
-          } catch (e) {
-            pushLine({ text: `Rewind failed: ${(e as Error).message}`, color: C.red });
-          }
-          break;
-        }
-        case '/init': {
-          const target = join(opts.workspaceRoot, 'SHADOW.md');
-          if (existsSync(target)) {
-            pushLine({ text: 'SHADOW.md already exists — not overwritten.', dimColor: true });
-            break;
-          }
-          const seed =
-            'You are Shadow working in this project.\n\n' +
-            'Add project-specific conventions, build commands, and hard rules here.\n';
-          // An unwritable workspace (read-only mount, permissions, a full disk) threw straight out
-          // of the slash dispatcher and took the whole TUI down — losing the session over a failed
-          // file write. Report it like every other command failure instead.
-          try {
-            writeFileSync(target, seed, 'utf8');
-            pushLine({ text: `Created ${target}`, color: C.cyan });
-          } catch (e) {
-            pushLine({ text: `Could not create ${shortPath(target)}: ${(e as Error).message}`, color: C.red });
-          }
-          break;
-        }
-        case '/agents': {
-          // `/agents kill <id|all>` cancels a running BACKGROUND sub-agent (F10-02 cancellation);
-          // bare `/agents` lists LIVE agents (running now) then the available definitions.
-          const parts = arg.split(/\s+/).filter(Boolean);
-          if (parts[0] === 'kill') {
-            const target = parts[1];
-            const live = [...subAgents.values()].filter((a) => a.background && !a.done);
-            if (!live.length) {
-              pushLine({ text: 'No background agents are running.', dimColor: true });
-              break;
-            }
-            if (!target) {
-              pushLine({ text: 'Usage: /agents kill <id|all>. Running: ' + live.map((a) => a.taskId).join(', '), dimColor: true });
-              break;
-            }
-            if (target === 'all') {
-              bus.emit({ type: 'cancel_subagent', taskId: '*' });
-              pushLine({ text: `Cancelling ${live.length} background agent${live.length === 1 ? '' : 's'}…`, color: C.yellow });
-              break;
-            }
-            const match = live.find((a) => a.taskId === target || a.taskId.endsWith(target));
-            if (!match) {
-              pushLine({ text: `No running background agent matches "${target}".`, color: C.red });
-              break;
-            }
-            bus.emit({ type: 'cancel_subagent', taskId: match.taskId });
-            pushLine({ text: `Cancelling ${match.subagentType} (${match.taskId})…`, color: C.yellow });
-            break;
-          }
-          const live = [...subAgents.values()];
-          const defs = loadAgentDefs(opts.workspaceRoot);
-          const lines: BannerLine[] = [];
-          if (live.length) {
-            lines.push({ text: 'Running now:', color: C.cyan });
-            for (const a of live) {
-              // F06-10: a queued agent is NOT running — it holds no slot and runs no tools.
-              const state = a.done
-                ? a.ok === false ? 'failed' : 'done'
-                : a.queued
-                  ? 'queued (waiting for a slot)'
-                  : a.tool
-                    ? `${a.tool}`
-                    : 'running';
-              lines.push({ text: `  ${a.subagentType.padEnd(14)} ${a.taskId}${a.background ? ' [bg]' : ''} · ${state}`, dimColor: true });
-            }
-            lines.push({ text: `  (/agents kill <id|all> to cancel a background agent)`, dimColor: true });
-            lines.push({ text: 'Definitions:', color: C.cyan });
-          }
-          for (const d of defs) {
-            lines.push({ text: `  ${d.name.padEnd(14)} ${d.description}${d.builtin ? ' (built-in)' : ''}`, dimColor: true });
-          }
-          pushLine({ kind: 'system', text: 'agents', lines });
-          break;
-        }
-        case '/skills': {
-          const skills = discoverSkills(opts.workspaceRoot);
-          pushLine({
-            kind: 'system',
-            text: 'skills',
-            lines: skills.length
-              ? skills.slice(0, 30).map((s) => ({
-                  text: `  ${s.name.padEnd(18)} ${shortPath(s.path)} — ${s.description}`,
-                  dimColor: true,
-                }))
-              : [{ text: 'No repo skills found under skills/ or .shadow/skills/.', dimColor: true }],
-          });
-          break;
-        }
-        case '/workflows': {
-          const lines = workflowInventory(opts.workspaceRoot);
-          pushLine({
-            kind: 'system',
-            text: 'workflows',
-            lines: lines.length
-              ? lines.map((text, i) => ({ text, color: i === 0 ? C.cyan : undefined, dimColor: i !== 0 }))
-              : [{ text: 'No workflow files found under .shadow/workflows or ~/.shadow/workflows.', dimColor: true }],
-          });
-          break;
-        }
-        case '/plugins': {
-          const sub = arg.trim().split(/\s+/);
-          if (sub[0] === 'enable' || sub[0] === 'disable') {
-            const name = sub[1] ?? '';
-            if (!name) {
-              pushLine({ text: `usage: /plugins ${sub[0]} <name>`, dimColor: true });
-              break;
-            }
-            try {
-              const info = setPluginEnabled(name, sub[0] === 'enable');
-              pushLine({
-                text:
-                  sub[0] === 'enable'
-                    ? `enabled plugin "${info.name}" — start a new session (or restart) to load its content.`
-                    : `disabled plugin "${info.name}" — start a new session (or restart) to unload its content.`,
-                color: sub[0] === 'enable' ? C.green : C.yellow,
-              });
-            } catch (err) {
-              pushLine({ text: (err as Error).message, color: C.red });
-            }
-            break;
-          }
-          const plugins = listPlugins();
-          const lines: BannerLine[] = [];
-          if (!plugins.length) {
-            lines.push({ text: 'No plugins installed. `shadow plugin add <git-url | path>` installs one (disabled until enabled).', dimColor: true });
-          }
-          for (const p of plugins) {
-            const counts =
-              PLUGIN_CONTENT_DIRS.filter((k) => p.counts[k] > 0)
-                .map((k) => `${p.counts[k]} ${k}`)
-                .join(' · ') || 'no content';
-            const prov =
-              p.meta.source.kind === 'git'
-                ? `${p.meta.source.url}${p.meta.source.commit ? ` @ ${p.meta.source.commit.slice(0, 12)}` : ''}`
-                : p.meta.source.path;
-            lines.push({
-              text: `${p.meta.enabled ? '●' : '○'} ${p.name} v${displaySafe(p.manifest.version, 64)} [${p.meta.enabled ? 'enabled' : 'disabled'}] — ${displaySafe(p.manifest.description, 300)}`,
-              color: p.meta.enabled ? C.green : C.yellow,
-            });
-            lines.push({ text: `    ${counts} · from ${displaySafe(prov, 320)}`, dimColor: true });
-          }
-          const offers = listNamedEntries(join(opts.workspaceRoot, '.shadow', 'plugins'));
-          if (offers.length) {
-            lines.push({
-              text: `workspace offers: ${offers.join(', ')} — a repo can only OFFER a plugin; install it with \`shadow plugin add <path>\`.`,
-              dimColor: true,
-            });
-          }
-          lines.push({ text: 'plugins are DATA-only bundles: commands · output-styles · skills · agents · workflows (never hooks/MCP).', dimColor: true });
-          lines.push({ text: '/plugins enable <name> · /plugins disable <name> · CLI: shadow plugin add|list|remove|search', dimColor: true });
-          pushLine({ kind: 'system', text: 'plugins', lines });
-          break;
-        }
-        case '/memory': {
-          const mem = ProjectMemory.load(opts.workspaceRoot);
-          const facts = mem.all();
-          const keys = Object.keys(facts);
-          if (!keys.length) {
-            pushLine({ text: 'No memory facts stored yet.', dimColor: true });
-            break;
-          }
-          pushLine({
-            kind: 'system',
-            text: 'memory',
-            lines: keys.map((k) => ({ text: `  ${k}: ${facts[k]}`, dimColor: true })),
-          });
-          break;
-        }
-        case '/tasks': {
-          if (arg.toLowerCase() === 'clear') {
-            opts.todoList?.write([]);
-            setTodoItems([]);
-            pushLine({ text: 'Task list cleared.', dimColor: true });
-            break;
-          }
-          const items = opts.todoList?.snapshot() ?? todoItems;
-          if (!items.length) {
-            pushLine({ text: 'No live tasks. The agent will create a task list for larger jobs.', dimColor: true });
-            break;
-          }
-          const mark = (status: TodoItem['status']) => (status === 'completed' ? 'done' : status === 'in_progress' ? 'active' : 'todo');
-          pushLine({
-            kind: 'system',
-            text: 'tasks',
-            lines: items.map((item, i) => ({
-              text: `${String(i + 1).padStart(2)}. [${mark(item.status)}] ${item.subject}${item.description ? ` — ${item.description}` : ''}`,
-              color: item.status === 'in_progress' ? C.yellow : undefined,
-              dimColor: item.status === 'completed',
-            })),
-          });
-          break;
-        }
-        case '/permissions': {
-          const argLine = arg;
-          const result = applyPermissionCommand(opts.cfg.permissionRules ?? [], argLine);
-          if (!result.ok) {
-            pushLine({ text: result.message, color: C.red });
-            break;
-          }
-          if (argLine.trim()) {
-            opts.cfg.permissionRules = result.rules;
-            persistPermissionRules(opts.workspaceRoot, result.rules);
-            loopRef.current?.setPermissionRules(result.rules);
-          }
-          pushLine({
-            kind: 'system',
-            text: 'permissions',
-            lines: result.message.split('\n').map((line) => ({ text: `  ${line}`, dimColor: true })),
-          });
-          break;
-        }
-        case '/context': {
-          // Category breakdown of the context window: which message type is
-          // consuming tokens, plus actionable token-saving suggestions.
-          const total = context.estimateTokens(providerRef.current);
-          const breakdown = categorizeContext(context.messages(), total, opts.cfg.contextBudget);
-          const pct = Math.round(breakdown.pct * 100);
-          const barLen = 24;
-          const filled = Math.min(barLen, Math.round(breakdown.pct * barLen));
-          const bar = '█'.repeat(filled) + '░'.repeat(barLen - filled);
-          const fmt = (n: number): string => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`);
-          const tips = contextSuggestions(breakdown);
-          pushLine({
-            kind: 'system',
-            text: 'context',
-            lines: [
-              { text: `Context  ${bar}  ${pct}% · ${fmt(breakdown.total)} / ${fmt(opts.cfg.contextBudget)} tokens`, color: breakdown.pct > 0.75 ? C.yellow : C.cyan },
-              ...breakdown.categories.map((c) => ({
-                text: `  ${c.label.padEnd(14)} ${fmt(c.tokens)}`.trimEnd(),
-                dimColor: true,
-              })),
-              ...(breakdown.overheadTokens > 0
-                ? [{ text: `  ${'system + tools'.padEnd(14)} ${fmt(breakdown.overheadTokens)}`, dimColor: true }]
-                : []),
-              ...tips.map((t) => ({
-                text: `${t.severity === 'critical' ? '✖' : t.severity === 'warn' ? '⚠' : '›'} ${t.title}${t.savings ? ` — save ~${fmt(t.savings)}` : ''}`,
-                color: t.severity === 'critical' ? C.red : t.severity === 'warn' ? C.yellow : undefined,
-                dimColor: t.severity === 'info',
-              })),
-            ],
-          });
-          break;
-        }
-        case '/export': {
-          const outArg = arg;
-          try {
-            const { path, bytes } = exportSession({
-              sessionPath: sessionLog.path,
-              workspaceRoot: opts.workspaceRoot,
-              outPath: outArg || undefined,
-              meta: {
-                version: opts.version,
-                workspaceRoot: opts.workspaceRoot,
-                provider: currentRef.current.provider,
-                model: currentRef.current.model,
-                style: styleRef.current,
-                autonomy: autonomyRef.current,
-                sessionPath: sessionLog.path,
-                exportedAt: new Date().toISOString(),
-              },
-            });
-            pushLine({ text: `Exported ${bytes} bytes → ${shortPath(path)}`, color: C.cyan });
-          } catch (e) {
-            pushLine({ text: `Export failed: ${(e as Error).message}`, color: C.red });
-          }
-          break;
-        }
-        case '/copy': {
-          // Copy the last assistant answer (or `/copy code` → its last fenced code
-          // block) to the system clipboard. Read-only and safe mid-turn. Also on
-          // Alt+C. (Per-message keyboard nav + selection needs the owned viewport —
-          // see reports; this delivers the 80% copy value without it.)
-          copyLast(arg.toLowerCase() === 'code' ? 'code' : 'answer');
-          break;
-        }
-        case '/session': {
-          const messages = context.messages().length;
-          const id = sessionLog.path ? SessionLog.sessionIdFromPath(sessionLog.path) : 'unknown';
-          pushLine({
-            kind: 'system',
-            text: 'session',
-            lines: [
-              { text: `id: ${id}`, color: C.cyan },
-              { text: `messages: ${messages.toLocaleString()} · style ${styleRef.current} · autonomy ${autonomyRef.current}`, dimColor: true },
-              { text: `log: ${sessionLog.path ? shortPath(sessionLog.path) : 'not available'}`, dimColor: true },
-              { text: 'Use /export to save a markdown transcript, /resume to load an earlier session.', dimColor: true },
-            ],
-          });
-          break;
-        }
-        case '/doctor': {
-          // `/doctor model` is advertised in the argument menu ("Probe the active model: tools,
-          // vision, context window") and its argument was silently ignored — you got the generic
-          // environment report and no indication the probe had not run. The real implementation is
-          // `/model test`, so route to it rather than shipping a second copy.
-          if (arg.trim().toLowerCase() === 'model') {
-            runSlash(findSlashCommand('/model')!, '/model test');
-            break;
-          }
-          if (arg.trim()) {
-            pushLine({ text: `Unknown /doctor argument "${arg.trim()}". Use /doctor or /doctor model.`, color: C.red });
-            break;
-          }
-          const report = runDoctor(opts.workspaceRoot);
-          pushLine({
-            kind: 'system',
-            text: 'doctor',
-            lines: formatDoctorReport(report, opts.version)
-              .split('\n')
-              .map((text) => ({ text, dimColor: !text.startsWith('  ✗') && !text.includes('failed') })),
-          });
-          break;
-        }
-        case '/status': {
-          const u = lastUsageRef.current;
-          const pct = u ? Math.round(u.contextPct * 100) : 0;
-          const target = activeTargetRef.current;
-          pushLine({
-            kind: 'system',
-            text: 'status',
-            lines: [
-              { text: `${currentRef.current.provider}/${currentRef.current.model} · ${autonomyRef.current}${opts.bypass ? ' (yolo)' : ''} · style ${styleRef.current}`, color: C.cyan },
-              // The `· $…` tail only when real cost accrued — local/unpriced sessions stay clean
-              // (same rule as formatUsage in the status strip).
-              { text: `context ${pct}% of ${opts.cfg.contextBudget.toLocaleString()} · ${u ? (u.inputTokens + u.outputTokens).toLocaleString() : 0} tokens${u && u.costUSD > 0 ? ` · $${u.costUSD.toFixed(4)}` : ''}`, dimColor: true },
-              ...(target.selfHosted
-                ? [{ text: `temperature ${formatTemperature(opts.cfg.temperature ?? 1.0)} · self-hosted only`, dimColor: true }]
-                : []),
-              { text: `workspace ${opts.workspaceRoot}`, dimColor: true },
-              // P2-12 — the confinement state is session-critical security context; keep it visible.
-              sandboxConfinement(opts.cfg.sandbox) === 'unconfined'
-                ? {
-                    text: `sandbox UNAVAILABLE on this host — run_shell ${
-                      opts.cfg.sandboxFailurePolicy === 'warn'
-                        ? 'runs UNCONFINED (policy: warn)'
-                        : `gates at approval (policy: ${opts.cfg.sandboxFailurePolicy})`
-                    }`,
-                    color: C.yellow,
-                  }
-                : { text: `sandbox ${sandboxConfinement(opts.cfg.sandbox)}`, dimColor: true },
-              ...(goalRef.current ? [{ text: `goal: ${goalRef.current}`, color: C.purple }] : []),
-            ],
-          });
-          break;
-        }
-        case '/diff': {
-          try {
-            const out = execFileSync('git', ['-C', opts.workspaceRoot, 'diff', '--stat'], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
-            pushLine({
-              kind: 'system',
-              text: 'diff',
-              lines: out ? out.split('\n').map((text) => ({ text, dimColor: true })) : [{ text: 'No uncommitted changes.', dimColor: true }],
-            });
-          } catch (e) {
-            pushLine({ text: `git diff failed: ${(e as Error).message.split('\n')[0]}`, color: C.red });
-          }
-          break;
-        }
-        case '/files': {
-          try {
-            const out = execFileSync('git', ['-C', opts.workspaceRoot, 'status', '--short'], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
-            pushLine({
-              kind: 'system',
-              text: 'files',
-              lines: out
-                ? out.split('\n').slice(0, 40).map((text) => ({ text, dimColor: true }))
-                : [{ text: 'No changed files.', dimColor: true }],
-            });
-          } catch (e) {
-            pushLine({ text: `git status failed: ${(e as Error).message.split('\n')[0]}`, color: C.red });
-          }
-          break;
-        }
-        case '/branch': {
-          try {
-            const branch = execFileSync('git', ['-C', opts.workspaceRoot, 'branch', '--show-current'], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
-            const status = execFileSync('git', ['-C', opts.workspaceRoot, 'status', '--short', '--branch'], { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
-            pushLine({
-              kind: 'system',
-              text: 'branch',
-              lines: [
-                { text: branch ? `branch: ${branch}` : 'branch: detached HEAD', color: C.cyan },
-                ...(status ? status.split('\n').slice(0, 20).map((text) => ({ text, dimColor: true })) : [{ text: 'Working tree clean.', dimColor: true }]),
-              ],
-            });
-          } catch (e) {
-            pushLine({ text: `git branch failed: ${(e as Error).message.split('\n')[0]}`, color: C.red });
-          }
-          break;
-        }
-        case '/config': {
-          const c = opts.cfg;
-          const parts = arg.split(/\s+/).filter(Boolean);
-          if (parts[0] === 'set') {
-            const key = parts[1] ?? '';
-            const valueRaw = parts[2] ?? '';
-            if (!key || !valueRaw) {
-              pushLine({ text: `Usage: /config set <${SAFE_CONFIG_KEYS.join('|')}> <value>`, dimColor: true });
-              break;
-            }
-            const parsed = parseSafeConfig(key, valueRaw);
-            if (!parsed.ok) {
-              pushLine({ text: parsed.message, color: C.red });
-              break;
-            }
-            (opts.cfg as unknown as Record<string, unknown>)[parsed.key] = parsed.value;
-            saveGlobalConfig({ [parsed.key]: parsed.value });
-            pushLine({
-              text: `Config saved: ${parsed.key} = ${parsed.key === 'temperature' ? formatTemperature(parsed.value as number) : String(parsed.value)}${parsed.key === 'temperature' ? ' (self-hosted models only)' : ''}`,
-              color: C.cyan,
-            });
-            break;
-          }
-          if (parts[0] === 'get') {
-            const key = parts[1] ?? '';
-            if (!key) {
-              pushLine({ text: 'Usage: /config get <key>', dimColor: true });
-              break;
-            }
-            const value = (opts.cfg as unknown as Record<string, unknown>)[key];
-            // The command advertises "API keys hidden", and it did not hide them: `/config get
-            // models` printed every inline apiKey/authToken verbatim onto a screen that gets
-            // screen-shared and recorded. Mask by KEY NAME (deep, so nested models[] and
-            // mcpServers[].env are covered) — a locally-served key has no recognisable SHAPE, so
-            // the pattern scrubber alone returned it untouched.
-            const shown = isSecretKey(key) && value != null && value !== ''
-              ? maskSecret(value)
-              : JSON.stringify(redactConfig(value));
-            pushLine({ text: `${key}: ${value === undefined ? '(unset)' : shown}`, dimColor: true });
-            break;
-          }
-          if (parts.length && parts[0] !== 'show') {
-            pushLine({ text: 'Usage: /config [show|get <key>|set <key> <value>]', dimColor: true });
-            break;
-          }
-          pushLine({
-            kind: 'system',
-            text: 'config',
-            lines: [
-              { text: `provider/model: ${c.provider}/${c.model}`, color: C.cyan },
-              { text: `autonomy ${autonomyRef.current} · autoClassifier ${c.autoClassifier ? 'on' : 'off'} · fastMode ${c.fastMode ? 'on' : 'off'}`, dimColor: true },
-              { text: `effort ${c.effort} · cacheTtl ${c.cacheTtl} · parallelTools ${c.parallelTools ? 'on' : 'off'}${c.costWarnUSD != null ? ` · costWarn $${c.costWarnUSD}` : ''}`, dimColor: true },
-              { text: `temperature ${formatTemperature(c.temperature ?? 1.0)} · self-hosted models only`, dimColor: true },
-              { text: `maxIterations ${c.maxIterations || 'unlimited'} · contextBudget ${c.contextBudget.toLocaleString()}`, dimColor: true },
-              { text: `${c.models?.length ?? 0} models configured · edit ~/.shadow/config.json (API keys hidden)`, dimColor: true },
-              { text: `Editable here: ${SAFE_CONFIG_KEYS.join(', ')}`, dimColor: true },
-            ],
-          });
-          break;
-        }
-        case '/login': {
-          const parts = arg.split(/\s+/).filter(Boolean);
-          const action = parts[0] ?? 'status';
-          if (action === 'codex') {
-            const { url } = buildCodexAuthUrl();
-            pushLine({
-              kind: 'system',
-              text: 'login',
-              lines: [
-                { text: 'Open this URL to sign in with ChatGPT/Codex:', color: C.cyan },
-                { text: url, dimColor: true },
-                { text: 'After authorization, exchange support is still CLI-side work; API keys remain available through `shadow onboard`.', dimColor: true },
-              ],
-            });
-            break;
-          }
-          if (action === 'import') {
-            const target = parts[1] ?? 'all';
-            const providers: SubProvider[] = target === 'all' ? ['codex', 'grok'] : parseSubProvider(target) ? [parseSubProvider(target)!] : [];
-            if (!providers.length) {
-              pushLine({ text: 'Usage: /login import codex|grok|all', dimColor: true });
-              break;
-            }
-            const outcomes = providers.map((p) => importOfficialCredential(p));
-            pushLine({
-              kind: 'system',
-              text: 'login',
-              lines: outcomes.map((o) => ({
-                text: o.imported
-                  ? `${o.provider}: imported ${o.kind}${o.hasRefresh ? ' with refresh token' : ''}`
-                  : `${o.provider}: no official CLI credential found`,
-                color: o.imported ? C.cyan : undefined,
-                dimColor: !o.imported,
-              })),
-            });
-            break;
-          }
-          if (action !== 'status' && action !== 'show') {
-            pushLine({ text: 'Usage: /login [status|codex|import codex|grok|all]', dimColor: true });
-            break;
-          }
-          const codex = getSubAuth('codex');
-          const grok = getSubAuth('grok');
-          pushLine({
-            kind: 'system',
-            text: 'login',
-            lines: [
-              { text: 'API keys: run `shadow onboard` to save provider credentials.', color: C.cyan },
-              { text: `codex subscription: ${codex ? codex.kind : 'not stored'}`, dimColor: !codex, color: codex ? C.cyan : undefined },
-              { text: `grok subscription: ${grok ? grok.kind : 'not stored'}`, dimColor: !grok, color: grok ? C.cyan : undefined },
-              { text: 'Codex subscription: run `shadow login codex` outside the TUI, then follow the printed URL.', dimColor: true },
-              { text: 'Import official CLI credentials with: /login import codex|grok|all', dimColor: true },
-              { text: 'Grok: use an xAI API key through `shadow onboard`; consumer OAuth is not supported.', dimColor: true },
-              { text: 'Anthropic: API-key only in Shadow.', dimColor: true },
-            ],
-          });
-          break;
-        }
-        case '/logout': {
-          const target = arg.trim();
-          if (target) {
-            const providers: SubProvider[] = target === 'all' ? ['codex', 'grok'] : parseSubProvider(target) ? [parseSubProvider(target)!] : [];
-            if (!providers.length) {
-              pushLine({ text: 'Usage: /logout codex|grok|all', dimColor: true });
-              break;
-            }
-            for (const provider of providers) clearSubAuth(provider);
-            pushLine({ text: `Cleared subscription credentials: ${providers.join(', ')}`, color: C.cyan });
-            break;
-          }
-          pushLine({
-            kind: 'system',
-            text: 'logout',
-            lines: [
-              { text: 'Shadow stores provider API credentials in ~/.shadow/credentials.json.', color: C.cyan },
-              { text: 'Subscription credentials, when used, live in ~/.shadow/subscription-auth.json.', dimColor: true },
-              { text: 'Remove the relevant file or rerun `shadow onboard` to replace credentials.', dimColor: true },
-            ],
-          });
-          break;
-        }
-        case '/hooks': {
-          const hooks = (opts.cfg.hooks ?? {}) as Record<string, unknown[]>;
-          const phases = Object.keys(hooks).filter((k) => Array.isArray(hooks[k]) && hooks[k].length > 0);
-          pushLine({
-            kind: 'system',
-            text: 'hooks',
-            lines: phases.length
-              ? phases.map((p) => ({ text: `  ${p}: ${hooks[p].length} hook(s)`, dimColor: true }))
-              : [{ text: 'No hooks configured (set "hooks" in ~/.shadow/config.json).', dimColor: true }],
-          });
-          break;
-        }
-        case '/version': {
-          pushLine({ text: `Shadow ${opts.version}`, color: C.cyan });
-          break;
-        }
-        case '/mcp': {
-          const parts = arg.split(/\s+/).filter(Boolean);
-          const action = parts[0] ?? 'list';
-          const effectiveServers = (opts.cfg.mcpServers ?? {}) as McpServers;
-          if (action === 'get') {
-            const name = parts[1] ?? '';
-            const server = effectiveServers[name];
-            if (!name || !server) {
-              pushLine({ text: name ? `No MCP server "${name}" configured.` : 'Usage: /mcp get <name>', dimColor: true });
-              break;
-            }
-            pushLine({
-              kind: 'system',
-              text: 'mcp',
-              lines: mcpServerLines(name, server).map((text, i) => ({ text, color: i === 0 ? C.cyan : undefined, dimColor: i !== 0 })),
-            });
-            break;
-          }
-          if (action === 'enable') {
-            const preset = parts[1];
-            if (preset !== 'browser' && preset !== 'context-cooler') {
-              pushLine({ text: 'Usage: /mcp enable <browser | context-cooler [--path <dir|server.js>]>', dimColor: true });
-              break;
-            }
-            const servers = loadGlobalMcpServers();
-            const pathIndex = parts.indexOf('--path');
-            const pathArg = pathIndex >= 0 ? parts[pathIndex + 1] : undefined;
-            const change = preset === 'browser'
-              ? enablePlaywrightBrowser(servers)
-              : enableContextCooler(servers, pathArg);
-            if (change.ok) {
-              saveGlobalMcpServers(change.servers);
-              opts.cfg.mcpServers = change.servers;
-            }
-            const restart = preset === 'browser'
-              ? ' Restart Shadow to load browser tools. Uses an isolated Chrome profile; requires Node.js, npm, and npx.'
-              : ' Restart Shadow to load new MCP tools.';
-            pushLine({
-              text: `${change.message}${change.ok ? restart : ''}`,
-              color: change.ok ? C.cyan : C.red,
-            });
-            break;
-          }
-          if (action === 'disable') {
-            const servers = loadGlobalMcpServers();
-            const change = disableMcpServer(servers, parts[1] ?? '');
-            if (change.ok) {
-              saveGlobalMcpServers(change.servers);
-              opts.cfg.mcpServers = change.servers;
-            }
-            pushLine({ text: change.message, color: change.ok ? C.cyan : C.red });
-            break;
-          }
-          if (action !== 'list' && action !== 'show') {
-            pushLine({ text: 'Usage: /mcp [list|get <name>|enable browser|enable context-cooler [--path <path>]|disable <name>]', dimColor: true });
-            break;
-          }
-          pushLine({
-            kind: 'system',
-            text: 'mcp',
-            lines: [
-              ...mcpListLines(effectiveServers).map((text) => ({ text, dimColor: true })),
-              { text: 'Browser: /mcp enable browser (isolated Chrome; requires Node/npm+npx)', dimColor: true },
-              { text: 'Commands: /mcp get <name> · /mcp enable context-cooler --path <path> · /mcp disable <name>', dimColor: true },
-            ],
-          });
-          break;
-        }
-        case '/review': {
-          if (runningRef.current) {
-            pushLine({ text: 'Finish the current turn before /review.', dimColor: true });
-            break;
-          }
-          runOneRef.current?.(
-            'Review the current uncommitted changes for bugs, regressions, and issues. Run git diff yourself to see them, then report concrete findings (file:line) and any fixes you recommend.',
-          );
-          break;
-        }
-        case '/theme': {
-          const themeArg = arg.toLowerCase();
-          const parts = themeArg.split(/\s+/).filter(Boolean);
-          const currentTheme = normalizeThemeName(opts.cfg.lastTheme as string | undefined) ?? 'og';
-          if (parts[0] === 'list' || parts[0] === 'show') {
-            pushLine({
-              kind: 'system',
-              text: 'themes',
-              lines: [
-                { text: 'Themes:', bold: true },
-                ...THEME_NAMES.map((name) => ({
-                  text: `  ${name.padEnd(12)} ${THEME_DESCRIPTIONS[name]}${name === currentTheme ? ' (current)' : ''}`,
-                  color: name === currentTheme ? C.cyan : undefined,
-                  dimColor: name !== currentTheme,
-                })),
-                { text: 'Aliases: dark → og, pink → coder-chick. Use /theme preview <name> to sample.', dimColor: true },
-              ],
-            });
-            break;
-          }
-          if (parts[0] === 'preview') {
-            const preview = normalizeThemeName(parts[1]);
-            if (!preview) {
-              pushLine({ text: `Usage: /theme preview <${THEME_NAMES.join('|')}>`, dimColor: true });
-              break;
-            }
-            const palette = THEMES[preview];
-            pushLine({
-              kind: 'system',
-              text: 'theme preview',
-              lines: [
-                { text: `Theme preview: ${preview}`, color: palette.cyan, bold: true },
-                { text: 'Foreground text: readable transcript body', color: palette.fg },
-                { text: 'Success/action: tool completed or model switched', color: palette.green },
-                { text: 'Warning: approval, budget, or attention needed', color: palette.yellow },
-                { text: 'Error: failed command or blocked operation', color: palette.red },
-                { text: 'Accent: goals, modes, and selected controls', color: palette.purple },
-                { text: `Use /theme ${preview} to apply.`, dimColor: true },
-              ],
-            });
-            break;
-          }
-          let next: CanonicalThemeName;
-          if (!themeArg) {
-            next = THEME_NAMES[(THEME_NAMES.indexOf(currentTheme) + 1) % THEME_NAMES.length] ?? 'og';
-          } else {
-            const resolved = normalizeThemeName(parts[0]);
-            if (!resolved) {
-              pushLine({ text: `Unknown theme "${themeArg}". Available: ${THEME_NAMES.join(', ')}.`, color: C.red });
-              break;
-            }
-            next = resolved;
-          }
-          applyTheme(next);
-          // Push (or release) the terminal background the theme asserts. Switching AWAY from a
-          // background theme resets to the user's own — the palette is swapped in place, so this
-          // has to fire on every switch, not just when the new theme has a bg.
-          if (process.stdout.isTTY) {
-            process.stdout.write(backgroundSequence(THEMES[next].bg, true));
-            // Keep the EXIT reset in step with the live theme. runTui captured the launch theme in
-            // a const, so `/theme shadow` mid-session pushed OSC 11 with no matching OSC 111 — a
-            // clean exit then left the terminal permanently black, while the confirmation line
-            // promised it would be "restored on exit".
-            updateReset('theme-bg', THEMES[next].bg ? backgroundSequence(null, true) : null);
-          }
-          opts.cfg.lastTheme = next; // keep the in-memory cfg in sync for the next cycle
-          saveGlobalConfig({ lastTheme: next });
-          setThemeTick((t) => t + 1); // repaint with the new palette
-          pushLine({
-            text: THEMES[next].bg
-              ? `Theme: ${next} — the terminal background is now ${THEMES[next].bg} (restored on exit; SHADOW_NO_BG=1 opts out).`
-              : `Theme: ${next}`,
-            color: C.cyan,
-          });
-          break;
-        }
-        case '/add-dir': {
-          if (!arg) {
-            const roots = additionalRootsRef.current;
-            pushLine({
-              kind: 'system',
-              text: 'add-dir',
-              lines: roots.length
-                ? roots.map((d) => ({ text: `  ${d}`, dimColor: true }))
-                : [{ text: 'No extra directories granted. Use /add-dir <path> to grant one.', dimColor: true }],
-            });
-            break;
-          }
-          const abs = isAbsolute(arg) ? arg : resolve(opts.workspaceRoot, arg);
-          try {
-            if (!statSync(abs).isDirectory()) {
-              pushLine({ text: `Not a directory: ${abs}`, color: C.red });
-              break;
-            }
-          } catch {
-            pushLine({ text: `No such directory: ${abs}`, color: C.red });
-            break;
-          }
-          if (abs === opts.workspaceRoot || additionalRootsRef.current.includes(abs)) {
-            pushLine({ text: `Already accessible: ${abs}`, dimColor: true });
-            break;
-          }
-          additionalRootsRef.current = [...additionalRootsRef.current, abs];
-          pushLine({ text: `Granted (this session): ${abs}`, color: C.green });
-          break;
-        }
-        case '/image': {
-          if (!arg) {
-            const n = attachmentsRef.current.length;
-            pushLine({
-              text: n ? `${n} image(s) queued for the next message. /image clear to drop them.` : 'Usage: /image <path> — attaches an image to your next message (png/jpg/gif/webp).',
-              dimColor: true,
-            });
-            break;
-          }
-          if (/^(clear|none|off)$/i.test(arg)) {
-            attachmentsRef.current = [];
-            setAttachCount(0);
-            pushLine({ text: 'Image attachments cleared.', dimColor: true });
-            break;
-          }
-          const abs = isAbsolute(arg) ? arg : resolve(opts.workspaceRoot, arg);
-          const mediaType = imageMediaType(abs);
-          if (!mediaType) {
-            pushLine({ text: `Unsupported image type: ${arg} (use png/jpg/gif/webp).`, color: C.red });
-            break;
-          }
-          try {
-            const info = statSync(abs);
-            if (!info.isFile()) {
-              pushLine({ text: `Not a file: ${abs}`, color: C.red });
-              break;
-            }
-            if (info.size > MAX_IMAGE_BYTES) {
-              pushLine({ text: `Image is too large: ${arg} (${(info.size / 1024 / 1024).toFixed(1)} MiB; max 20 MiB).`, color: C.red });
-              break;
-            }
-            const data = readFileSync(abs).toString('base64');
-            attachmentsRef.current = [...attachmentsRef.current, { type: 'image', mediaType, data }];
-            setAttachCount(attachmentsRef.current.length);
-            pushLine({ text: `Attached ${arg} — sent with your next message (${attachmentsRef.current.length} queued).`, color: C.green });
-            // Echo the attached image inline so the user sees what they're sending.
-            pushImage(data, mediaType, arg, 'attach');
-          } catch (e) {
-            pushLine({ text: `Cannot read ${abs}: ${(e as Error).message.split('\n')[0]}`, color: C.red });
-          }
-          break;
-        }
-        case '/statusline': {
-          if (!arg) {
-            pushLine({
-              text: statusLineRef.current ? `Status line: ${statusLineRef.current}` : 'No status line set. Use /statusline <shell command>, /statusline none to clear.',
-              dimColor: true,
-            });
-            break;
-          }
-          if (/^(none|off|clear|remove)$/i.test(arg)) {
-            statusLineRef.current = '';
-            opts.cfg.statusLine = '';
-            saveGlobalConfig({ statusLine: '' });
-            setCustomStatus('');
-            pushLine({ text: 'Status line cleared.', dimColor: true });
-            break;
-          }
-          statusLineRef.current = arg;
-          opts.cfg.statusLine = arg;
-          saveGlobalConfig({ statusLine: arg });
-          refreshStatusLine();
-          pushLine({ text: `Status line set: ${arg}`, color: C.cyan });
-          break;
-        }
-        case '/terminal-setup': {
-          // Terminal.app, iTerm2 and the VS Code terminal all send a BARE \r for Shift+Enter, so
-          // no application can distinguish it from Enter. Shadow understands the CSI-u and
-          // modifyOtherKeys encodings; this tells you how to make your terminal send one.
-          // Deliberately PRINTS rather than writes: these are files outside the workspace
-          // (iTerm2 prefs, VS Code keybindings.json) and silently editing them is not something a
-          // CLI should do on its own.
-          const tp = process.env.TERM_PROGRAM ?? '';
-          const term = process.env.TERM ?? '';
-          const native = /kitty|wezterm|ghostty|foot/i.test(term) || /WezTerm|ghostty/i.test(tp);
-          const lines: { text: string; color?: string; dimColor?: boolean }[] = [];
-          lines.push({ text: 'Shift+Enter — insert a newline instead of sending', color: C.cyan });
-          lines.push({ text: '' });
-          if (native) {
-            lines.push({ text: `Your terminal (${tp || term}) speaks CSI-u natively — Shift+Enter should already work.`, dimColor: true });
-            lines.push({ text: 'If it does not, check that no keybinding overrides it.', dimColor: true });
-          } else if (tp === 'iTerm.app') {
-            lines.push({ text: 'iTerm2:', color: C.green });
-            lines.push({ text: '  Settings → Profiles → Keys → Key Mappings → +', dimColor: true });
-            lines.push({ text: '  Shortcut: Shift+Enter   Action: Send Escape Sequence', dimColor: true });
-            lines.push({ text: '  Esc+:  [13;2u', dimColor: true });
-          } else if (tp === 'vscode') {
-            lines.push({ text: 'VS Code — add to keybindings.json (⌘⇧P → "Open Keyboard Shortcuts (JSON)"):', color: C.green });
-            lines.push({ text: '  {', dimColor: true });
-            lines.push({ text: '    "key": "shift+enter",', dimColor: true });
-            lines.push({ text: '    "command": "workbench.action.terminal.sendSequence",', dimColor: true });
-            lines.push({ text: '    "when": "terminalFocus",', dimColor: true });
-            lines.push({ text: '    "args": { "text": "\\u001b[13;2u" }', dimColor: true });
-            lines.push({ text: '  }', dimColor: true });
-          } else if (tp === 'Apple_Terminal') {
-            lines.push({ text: 'Terminal.app cannot send CSI-u — it has no per-key escape mapping.', color: C.yellow });
-            lines.push({ text: 'Use Option+Enter (works today), or switch to iTerm2/WezTerm/kitty.', dimColor: true });
-          } else {
-            lines.push({ text: `Terminal not recognised (TERM_PROGRAM=${tp || 'unset'}, TERM=${term || 'unset'}).`, dimColor: true });
-            lines.push({ text: 'Bind Shift+Enter to send the escape sequence:  ESC [ 1 3 ; 2 u', dimColor: true });
-          }
-          lines.push({ text: '' });
-          lines.push({ text: 'Working today with no setup: Option+Enter, Ctrl+J, or a trailing \\ then Enter.', dimColor: true });
-          pushLine({ kind: 'system', text: 'terminal-setup', lines });
-          break;
-        }
-        case '/vim': {
-          const vimArg = arg.toLowerCase();
-          const next = vimArg === 'on' ? true : vimArg === 'off' ? false : !vimEnabledRef.current;
-          vimEnabledRef.current = next;
-          setVimEnabled(next);
-          opts.cfg.vimMode = next;
-          saveGlobalConfig({ vimMode: next });
-          if (next) setVimMode('insert'); // enable starts in INSERT so typing works at once
-          else vimPendingRef.current = '';
-          pushLine({
-            text: next
-              ? 'Vim mode ON — Esc for NORMAL, i/a to insert. Motions: h l 0 $ w b e · edits: x dd dw D C.'
-              : 'Vim mode OFF — standard composer editing restored.',
-            dimColor: true,
-          });
-          break;
-        }
-        case '/exit':
-        case '/quit':
-          exit();
-          break;
-      }
+      runSlashCommand(slashCtxRef.current!, cmd, rawLine);
     },
-    [pushLine, showBanner, setAutonomy, exit, context, opts, setLine, sessionLog, refreshStatusLine, copyLast],
+    [],
   );
 
   // Apply a picked model: rebuild the provider, hot-swap it into the running loop
@@ -4835,7 +2945,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           // Short bodies (≤ threshold) stay inline under ⎿. Cap huge bodies before commit so
           // React state + Static never hold multi-MB dumps.
           const sd = e.result.data as { stdout?: string; stderr?: string } | undefined;
-          const shellOut = [sd?.stdout ?? '', sd?.stderr ?? ''].join('\n').replace(/^\n+|\n+$/g, '');
+          // F05-04: shell output is real terminal output — keep SGR color spans (colors are the
+          // only escapes that can't move the cursor or flip modes) but strip everything else
+          // before this text reaches <Text>. See sanitizeTerminalEscapes for the documented choice.
+          const shellOut = sanitizeTerminalEscapes([sd?.stdout ?? '', sd?.stderr ?? ''].join('\n'), true).replace(/^\n+|\n+$/g, '');
           const diff = e.result.meta?.diff;
           let bodyLines: BannerLine[] | undefined;
           let bodyMeta: string | undefined;
@@ -4860,7 +2973,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             const ans = (e.result.data as { answer?: string } | undefined)?.answer;
             if (ans && ans.trim()) {
               bodyMeta = 'answer';
-              bodyLines = capTranscriptBody(ans.split('\n')).map((l) => ({ text: l, color: C.dim }));
+              // Model text, not terminal output — no legitimate SGR source, so strip every
+              // escape before render (F05-04).
+              bodyLines = capTranscriptBody(sanitizeTerminalEscapes(ans, false).split('\n')).map((l) => ({ text: l, color: C.dim }));
             }
           }
           // Diff headers: just the calm `+N −M` stats (redesign: Update(path) — +12 −3). The
@@ -5067,7 +3182,16 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           setToolLine((prev) => {
             // Strip our own display prefix before merging so a chunk that CONTINUES the same output
             // line glues onto the raw text, not onto the decorated line (no "⚙ ⚙" compounding).
-            const merged = `${(prev ?? '').replace(/^ {2}⚙ /, '')}${e.chunk}`.slice(-2000);
+            // Sanitize the MERGED text (not just the raw chunk): keepSgr appends a per-line `\x1b[0m`
+            // reset at end-of-input, so per-chunk sanitizing would plant a reset at every chunk
+            // boundary and split a color run mid-line when two chunks glue onto the same output line;
+            // re-sanitizing the merged text moves the reset to the line's true end. Re-sanitizing
+            // already-clean text is otherwise a no-op (keepSgr keeps legit colors, drops everything
+            // else), and it keeps the stored value fully clean even after the `.slice(-2000)` cap.
+            // NOTE: a sequence split ACROSS two chunks is NOT reassembled — the earlier pass already
+            // dropped the incomplete head, so the continuation degrades to harmless literal parameter
+            // bytes (e.g. `1m`), never an interpreted escape (fail-closed) — F05-04.
+            const merged = sanitizeTerminalEscapes(`${(prev ?? '').replace(/^ {2}⚙ /, '')}${e.chunk}`, true).slice(-2000);
             const last = merged.split('\n').reverse().find((l) => l.trim() !== '');
             return last ? `  ⚙ ${last.trim().slice(0, 160)}` : prev;
           });
@@ -5099,11 +3223,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         case 'stop':
           lastStopReasonRef.current = e.reason;
           // Keep the /rewind menu honest: a turn just produced (or failed to produce) a snapshot.
-          try {
-            rewindableTurnsRef.current = sessionLog.path ? SessionLog.countSnapshots(sessionLog.path) : 0;
-          } catch {
-            /* an unreadable log must never break the turn-end path */
-          }
+          refreshRewindTurns();
           // Interrupted mid-answer (Esc/Ctrl-C) before assistant_done? Commit whatever
           // streamed so the partial reply lands in scrollback instead of vanishing. On a
           // clean turn the buffer is already empty here, so this is a no-op.
@@ -5166,6 +3286,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           queueMicrotask(() => flushQueueRef.current?.());
           return;
         }
+        // F08-09: an exit-0 hook may contribute additional context — it joins what the model sees
+        // (the echoed prompt line stays clean, exactly like @-file inlining).
+        if (h.context) task = `${task}\n\nAdditional context (user_prompt_submit hook):\n${h.context}`;
       }
       runningRef.current = true;
       setRunning(true);
@@ -5217,7 +3340,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       } else {
         context.append(userMsg);
       }
-      sessionLog.record({ kind: 'user', task });
+      sessionLogRef.current.record({ kind: 'user', task });
       // For non-terminal subscribers (the `--web` mirror). The TUI has already echoed this
       // locally via pushLine, and its own bus switch has no case for 'user', so this cannot
       // double-render here.
@@ -5257,7 +3380,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         todoList: opts.todoList,
         planMode: opts.planMode,
         streamShell: true,
-        sessionLog,
+        // P2-11 (/fork): read through the ref so a turn that runs AFTER a /fork writes to the
+        // forked session log, not the pre-fork one the app was mounted with.
+        sessionLog: sessionLogRef.current,
         // One instance for the whole SESSION. A new AgentLoop is built for every user message, so
         // grants held on the loop itself expired as soon as the user typed again — "(s) approve for
         // session" re-prompted one message later.
@@ -5330,7 +3455,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         flushQueueRef.current?.();
       }
     },
-    [opts, context, sessionLog, bus, pushLine],
+    // sessionLogRef (not sessionLog) — the ref is stable across the /fork swap, and the log is
+    // read at call time through it, so a fork never needs to rebuild this callback.
+    [opts, context, sessionLogRef, bus, pushLine],
   );
   runOneRef.current = (task: string) => {
     void runOne(task);
@@ -5502,6 +3629,14 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         case 'note':
           pushLine({ text: `Address a model with @${t.seats[0]!.handle} <question>, or /table done to end.`, dimColor: true });
           break;
+        case 'pausedSlash':
+          // F02-06: the composer belongs to the table while it is active — name the pause instead
+          // of answering an unrelated hint, which read as a swallowed keystroke.
+          pushLine({
+            text: `${cmd.command} is paused while the round-table is active — /table done ends it.`,
+            color: C.yellow,
+          });
+          break;
         case 'unknownHandle':
           pushLine({ text: `No seat "@${cmd.handle}". Seats: ${t.seats.map((s) => '@' + s.handle).join(' ')}.`, color: C.yellow });
           break;
@@ -5551,856 +3686,123 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         // 'message' — a path — fall through to startTurn
       }
       startTurn(expandPastes(task, pastesRef.current)); // starts a turn; its completion resumes the drain
+      pastesRef.current = dropConsumedPastes(pastesRef.current, task); // F02-06: spent chips leave the registry
       return;
     }
   }, [setQueued, runSlash, pushLine, startTurn]);
   flushQueueRef.current = flushQueue;
 
-  // Key handling — uses Ink's `key` object (NOT raw control bytes in `input`).
+  // Key handling — P3-01 focus-owner router. The old ~900-line ordered if-chain is now an
+  // explicit owner table (src/tui/keys/router.ts): exactly one owner per frame claims the
+  // keystream (dialog → picker → search → vim → composer; table order = precedence, snapshot-
+  // pinned), reserved chords (Ctrl-C/Ctrl-D exit arming, Ctrl-X editor arming) resolve BEFORE
+  // routing, and mouse/DSR/bracketed-paste are transports ABOVE the owners (P1A-14). Each
+  // owner module is a verbatim extraction of its old if-chain section — the byte-level TUI
+  // suites are the acceptance witness for "no behavior change".
   const onKey = useCallback(
     (ch: string, key: import('ink').Key) => {
-      // Mouse-tracking CSI (\x1b[< … ) never reaches the Esc/abort or composer-typing paths — a
-      // report is not typed text. It IS routed to the click-to-caret handler first (which returns
-      // for everything it doesn't use). Before 3.5.2 this branch returned unconditionally, which
-      // made the click handler further down dead code: mouse mode did nothing but eat the wheel.
-      if (ch && hasSgrMouse(ch)) {
-        handleMouse(ch);
-        return;
-      }
-      // Cursor-position report (the answer to our own click DSR, already consumed by the raw tap).
-      // Ink would otherwise insert it as the literal text `[38;1R`. Matched against the WHOLE raw
-      // chunk so the same digits appearing inside a paste can't swallow the paste.
-      if (DSR_REPLY_EXACT.test(rawKeyRef.current)) return;
-      // Any key other than a second Ctrl-C disarms the "press again to quit" latch, so an old
-      // Ctrl-C never lingers to make a later one quit unexpectedly.
-      if (ctrlCArmedRef.current && !(key.ctrl && ch === 'c')) ctrlCArmedRef.current = false;
-
-      // 0) RESERVED CHORD — Ctrl-C is dispatched before ANY focus owner claims the keystream.
-      //
-      // It used to sit below the dialog and picker branches, both of which `return` on every key,
-      // so Ctrl-C was dead for the entire life of an approval dialog, a question dialog, or the
-      // model picker — on frames whose own hint row still advertises "Ctrl-C ×2 quits". A modal
-      // you cannot escape is the worst possible place to lose the escape hatch, and the type-ahead
-      // guard added directly below would otherwise widen the dead zone rather than narrow it.
-      //
-      // Two-stage always, so a stray press can never kill the session: the first press arms (and,
-      // if a turn is running, interrupts it and drops the queue); a second quits. Esc remains the
-      // dedicated interrupt that KEEPS the session.
-      if (key.ctrl && ch === 'c') {
-        if (ctrlCArmedRef.current) {
-          exit();
-          return;
-        }
-        ctrlCArmedRef.current = true;
-        if (runningRef.current) {
-          controllerRef.current?.abort();
-          if (queuedTasksRef.current.length > 0) setQueued([]);
-        }
-        pushLine({ text: '  ^C — press Ctrl-C again to quit (Esc just interrupts)', dimColor: true });
-        return;
-      }
-      // 0.5) EXTERNAL EDITOR CHORD — Ctrl-X arms, then Ctrl-E opens $EDITOR on the draft (F08-10).
-      // Resolved above the composer so the armed Ctrl-E isn't swallowed by the move-to-end binding.
-      // Idle-only: the editor blocks the event loop, so never while a turn runs or a modal is open.
-      if (ctrlXArmedRef.current) {
-        ctrlXArmedRef.current = false;
-        if (key.ctrl && ch === 'e') {
-          openExternalEditor();
-          return;
-        }
-        // Ctrl-X was not followed by Ctrl-E — fall through and handle this key normally.
-      }
-      if (key.ctrl && ch === 'x' && !runningRef.current && !pendingRef.current && !pickerOpenRef.current && !searchRef.current) {
-        ctrlXArmedRef.current = true;
-        return;
-      }
-      // 0.8) BRACKETED PASTE is a TRANSPORT, not a focus owner (P1A-14, F03-01). It is resolved
-      // ABOVE the dialog/picker owners below, because a paste is never a decision: before this
-      // hoist, a paste into an open approval dialog had its \x1b[200~ start marker swallowed by the
-      // dialog branch's unconditional return, and the paste CONTENT then flowed into the decision
-      // path chunk-by-chunk — a newline arriving as its own chunk parsed as key.return and could
-      // APPROVE the pending call, and a multi-chunk paste whose end marker landed after the dialog
-      // closed stranded pastingRef set → permanent input lockout. Now the markers are consumed here
-      // first; the completed paste is inserted by insertPastable, which routes to the composer draft
-      // regardless of which owner has focus (the same place type-ahead sends keys during a dialog),
-      // so a paste can never resolve a modal and can never strand paste state across a modal edge.
-      //
-      // Ink mangles the raw stream two ways this block undoes (see use-input.js): a chunk-LEADING
-      // \x1b is stripped, so the start marker arrives as '[200~' (inner markers keep their ESC) —
-      // restore it before matching; and a chunk that IS a named key ('\r'→return, '\t'→tab) arrives
-      // with input '' and only the flag set — mid-paste those are literal bytes, re-materialize them.
-      const chp = ch && (ch.startsWith('[200~') || ch.startsWith('[201~')) ? `\x1b${ch}` : ch;
-      if (pastingRef.current) {
-        const piece = chp || (key.return ? '\n' : key.tab ? '\t' : '');
-        if (!piece) return; // unrepresentable key mid-paste (arrows etc.) — drop
-        const endIdx = piece.indexOf(PASTE_END);
-        if (endIdx < 0) {
-          pasteBufRef.current += piece;
-          // Runaway guard: no end marker after 8 MB means the marker was lost (or a
-          // hostile stream) — bail out of paste mode rather than buffer forever.
-          if (pasteBufRef.current.length > 8 * 1024 * 1024) {
-            pastingRef.current = false;
-            pasteBufRef.current = '';
-          }
-          return;
-        }
-        const content = pasteBufRef.current + piece.slice(0, endIdx);
-        pastingRef.current = false;
-        pasteBufRef.current = '';
-        insertPastable(content.replace(/\r\n?/g, '\n'));
-        return;
-      }
-      if (chp && chp.includes(PASTE_START)) {
-        const startIdx = chp.indexOf(PASTE_START);
-        // Text typed in the same stdin read BEFORE the paste began inserts normally first.
-        const prefix = chp.slice(0, startIdx);
-        if (prefix) insertPastable(prefix.replace(/\r\n?/g, '\n'));
-        const after = chp.slice(startIdx + PASTE_START.length);
-        const endIdx = after.indexOf(PASTE_END);
-        if (endIdx >= 0) {
-          // Whole paste in one chunk — the common case.
-          insertPastable(after.slice(0, endIdx).replace(/\r\n?/g, '\n'));
-        } else {
-          pastingRef.current = true;
-          pasteBufRef.current = after;
-        }
-        return;
-      }
-
-      // 1) Approval dialog has focus.
-      if (pendingRef.current) {
-        const g = igateRef.current;
-        if (!g) return;
-        const kind = pendingRef.current.kind;
-        // Enter with composer text means "send my follow-up", never "approve whatever dialog
-        // happened to open over my typing". Queue before resolving the gate so the loop's promise
-        // continuation cannot outrun us; explicitly deny the pending action, then steer model work.
-        if (key.return && inputRef.current.trim()) {
-          const task = inputRef.current.trim();
-          const taskKind = queuedTaskKind(task);
-          setQueued([...queuedTasksRef.current, { text: task, kind: taskKind }]);
-          historyRef.current.push(task);
-          histIdxRef.current = historyRef.current.length;
-          setLine('');
-          dialogTypeaheadRef.current = false;
-          // P1A-15: an Enter that lands inside the arm window was almost certainly the user
-          // finishing their sentence just as the dialog popped — NOT a decision on a dialog they
-          // have not seen. Do not g.respond('deny') an unseen gate; steer instead (the steer's
-          // abort resolves the pending gate through settleWithAbort), so the message is queued and
-          // model work redirected without a phantom denial the user never chose.
-          if (Date.now() - dialogShownAtRef.current < dialogArmMs()) {
-            loopRef.current?.requestSteer();
-            pushLine({ text: '  ↪ pending message — steering (dialog not yet seen)', dimColor: true });
-            return;
-          }
-          g.respond('deny');
-          const steered = taskKind === 'steer' ? (loopRef.current?.requestSteer() ?? false) : false;
-          pushLine({
-            text: steered
-              ? '  ↪ pending message — current action denied; steering now'
-              : '  ↪ pending input — current action denied; queued in order',
-            dimColor: true,
-          });
-          return;
-        }
-        // ── Type-ahead guard ──────────────────────────────────────────────────────────────────
-        // "Type your next message while the agent works" is an advertised workflow, and the gate
-        // can open MID-SENTENCE. Every keystroke already in flight was then routed straight into
-        // the dialog as a decision: typing "also fix the failing test" while a run_shell gate
-        // opened hit (f)=approve-for-prefix on `rm -rf` — a session-wide grant — and (a)=raise
-        // autonomy, with the tool running and the dialog gone before the user saw it.
-        //
-        // A key can only be a decision if it was pressed AFTER the dialog was on screen. Anything
-        // sooner is text the user was already typing, so it goes to the composer where they aimed
-        // it. The window only has to cover in-flight input: reading a dialog and reacting takes far
-        // longer than this, so no deliberate keypress is ever swallowed.
-        const printable = Boolean(ch && !key.ctrl && !key.meta && !key.escape && !key.return && ch >= ' ');
-        if (Date.now() - dialogShownAtRef.current < dialogArmMs()) {
-          if (printable) {
-            dialogTypeaheadRef.current = true;
-            insertPastable(ch); // keep the user's sentence intact
-          }
-          return;
-        }
-        // Latch the diversion for the whole burst. A fixed time window alone failed whenever the
-        // gate appeared near the start of a sentence: the early letters went to the composer and
-        // a later `y`/`a`/`f` became a privilege decision. Printable input can no longer decide
-        // until a non-printable key explicitly re-focuses the dialog; that first key is consumed.
-        if (dialogTypeaheadRef.current) {
-          if (printable) insertPastable(ch);
-          else dialogTypeaheadRef.current = false;
-          return;
-        }
-        // Any key during a question dialog means a human is handling it → CANCEL the idle
-        // auto-answer for good (not merely restart it). Done BEFORE the resolver routing so bound
-        // keys (enter/arrows/escape) count as engagement too.
-        if (kind === 'user_question' && AUTO_ANSWER_ENABLED && !autoAnswerEngagedRef.current) {
-          autoAnswerEngagedRef.current = true;
-          autoAnswerSecsRef.current = null;
-          setAutoAnswerSecs(null);
-        }
-        // Route bound approval/question keys through the keybinding resolver FIRST, so
-        // ~/.shadow/keybindings.json can rebind y/n/s/f/a (Confirmation) and question-dialog
-        // nav (QuestionDialog). Unbound keys (number-jump, space-toggle, Tab) and any key the
-        // user has unbound fall through to the legacy handling below — defaults never strand you.
-        const dialogCtx: ContextName[] = kind === 'user_question' ? ['QuestionDialog', 'Global'] : ['Confirmation', 'Global'];
-        if (kbConsume(ch, key, dialogCtx)) return;
-        if (kind === 'user_question' && pendingRef.current.questions?.length) {
-          const qs = pendingRef.current.questions;
-          const idx = Math.min(questionIndexRef.current, qs.length - 1);
-          const q = qs[idx];
-          if (!q) return;
-          const cursor = questionCursorRef.current[idx] ?? recommendedIndex(q);
-          // ↑/↓ move the option cursor. Single-select follows it (radio); multi just moves.
-          if (key.upArrow) {
-            const pos = Math.max(0, cursor - 1);
-            setQuestionCursor(idx, pos);
-            if (!q.multiSelect) chooseAtQuestion(idx, pos);
-            return;
-          }
-          if (key.downArrow) {
-            const pos = Math.min(q.options.length - 1, cursor + 1);
-            setQuestionCursor(idx, pos);
-            if (!q.multiSelect) chooseAtQuestion(idx, pos);
-            return;
-          }
-          // ←/→ (and Tab) switch between questions in a multi-question dialog.
-          if (key.leftArrow) {
-            setQuestionIndex(Math.max(0, idx - 1));
-            return;
-          }
-          if (key.rightArrow || key.tab) {
-            setQuestionIndex(Math.min(qs.length - 1, idx + 1));
-            return;
-          }
-          // Space toggles the highlighted option (multi-select).
-          if (ch === ' ' && q.multiSelect) {
-            chooseAtQuestion(idx, cursor);
-            return;
-          }
-          // Number keys jump straight to an option.
-          if (ch >= '1' && ch <= '9') {
-            const pos = Number(ch) - 1;
-            if (q.options[pos]) {
-              setQuestionCursor(idx, pos);
-              chooseAtQuestion(idx, pos);
-            }
-            return;
-          }
-          if (key.return) {
-            confirmQuestion();
-            return;
-          }
-          if (key.escape) g.respond('deny');
-          return;
-        }
-        if (ch === 'y' || (key.return && kind !== 'user_question')) g.respond('approve');
-        else if (ch === 'n' || key.escape) g.respond('deny');
-        else if (ch === 's' && kind === 'permission') g.respond({ approveForSession: true });
-        else if (ch === 'f' && kind === 'permission' && pendingRef.current?.call.name === 'run_shell') {
-          const cmd = shellCommandOf(pendingRef.current.call.input) ?? '';
-          const prefix = cmd.split(/\s+/).slice(0, 2).join(' ');
-          g.respond({ approveForPrefix: prefix || cmd.slice(0, 24) });
-        } else if (ch === 'a' && kind !== 'plan_enter') {
-          // raiseAutonomy, NOT cycleAutonomy: the cycle WRAPS full→manual, so pressing "(a)lways"
-          // on the one dialog a full-autonomy session ever sees (a denylisted call) both ran the
-          // catastrophic call AND flipped the session to ask-about-everything. replGate.ts:33 got
-          // this right; the TUI kept the cycling version. Shift+Tab is still the cycle.
-          const next = raiseAutonomy(autonomyRef.current);
-          setAutonomy(next);
-          g.respond({ setAutonomy: next });
-        }
-        return;
-      }
-
-      // 1.5) Model picker has focus — capture navigation, swallow the rest (mirrors
-      // the approval-dialog gating above so composer/menu keys can't leak through).
-      if (pickerOpenRef.current) {
-        const rows = modelRows(opts.cfg);
-        let sel = Math.min(pickerIndexRef.current, rows.length - 1);
-        if (rows[sel]?.kind !== 'model') sel = firstSelectableRow(rows); // never land on a header
-        if (key.upArrow) setPickerIndex(stepSelectableRow(rows, sel, -1));
-        else if (key.downArrow) setPickerIndex(stepSelectableRow(rows, sel, 1));
-        else if (key.return) {
-          const row = rows[sel];
-          if (row?.kind === 'model') selectModel(row.entry);
-        } else if (key.escape) {
-          setPickerOpen(false);
-          pushLine({ text: 'Model unchanged.', dimColor: true });
-        }
-        return;
-      }
-
-      // Scrolling the transcript is the terminal's job again: the committed history
-      // lives in an Ink <Static> (native scrollback), so PgUp/PgDn, the scrollbar, and
-      // the mouse wheel all work without the app intercepting them. (The old in-app
-      // scroll viewport detached native scrollback, which broke once the pinned task
-      // list claimed rows from the fixed-height layout.)
-
-      // 2) Ctrl-C is handled as a RESERVED CHORD at the top of this handler (§0), above every
-      // focus owner, so it works while a dialog or the picker holds the keystream.
-      // 2.8) Bracketed paste is handled as a TRANSPORT at §0.8, above the dialog/picker owners
-      // (P1A-14) — it is not a focus owner, so it cannot be trapped behind a modal's return.
-
-      // 2.9) Reverse history search (Ctrl+R). While open it OWNS typing, backspace, Enter and Esc.
-      //
-      // Ordered ABOVE vim deliberately. Vim's block claims `key.escape` and returns, so with /vim
-      // enabled Esc could never close an open search: the only exit was gone, and every subsequent
-      // keystroke was then eaten by NORMAL mode as a motion instead of extending the query, which
-      // corrupted the composer. A focus owner has to be consulted before a MODE that merely
-      // reinterprets keys.
-      if (searchRef.current) {
-        const st = searchRef.current;
-        if (key.escape) {
-          const saved = st.saved;
-          applySearch(null);
-          setLine(saved); // Esc restores exactly what was there before the search opened
-          // P1A-15: if a turn is running under an open search, one Esc closes the search AND
-          // interrupts — otherwise the user's reflexive "Esc to stop" was eaten by the search owner
-          // and the turn kept going with no visible reason.
-          if (runningRef.current) {
-            controllerRef.current?.abort();
-            loopRef.current?.requestSteer();
-          }
-          return;
-        }
-        if (key.return) {
-          applySearch(null); // accept the hit that is already in the composer
-          return;
-        }
-        if (key.ctrl && ch === 'r') {
-          const next = searchHistoryBack(historyRef.current, st.query, st.index - 1);
-          applySearch({ ...st, index: next >= 0 ? next : st.index }); // stick at the oldest hit
-          return;
-        }
-        if (key.backspace || key.delete) {
-          const query = st.query.slice(0, -1);
-          applySearch({ ...st, query, index: searchHistoryBack(historyRef.current, query, historyRef.current.length - 1) });
-          return;
-        }
-        if (!key.ctrl && !key.meta && ch && !hasSgrMouse(ch)) {
-          const query = st.query + ch;
-          applySearch({ ...st, query, index: searchHistoryBack(historyRef.current, query, historyRef.current.length - 1) });
-          return;
-        }
-        return; // swallow everything else while the search owns the line
-      }
-      // P1A-15: do NOT open reverse-search while a turn is running. An open search OWNS Esc and
-      // Enter, so opening it mid-turn captured the very keys the user needs to interrupt or steer.
-      if (key.ctrl && ch === 'r' && historyRef.current.length > 0 && !runningRef.current) {
-        applySearch({ query: '', index: -1, saved: inputRef.current });
-        return;
-      }
-
-      // 2.92) Vim modal editing (when enabled via /vim). ESC enters NORMAL mode; in
-      // NORMAL, keys are motions/operators (never text). INSERT is the default composer.
-      if (vimEnabledRef.current && !runningRef.current) {
-        if (key.escape) {
-          vimPendingRef.current = '';
-          if (vimModeRef.current !== 'normal') setVimMode('normal');
-          // Vim NORMAL keeps the caret on a char, not past the end of the line.
-          const clamped = Math.min(cursorRef.current, Math.max(0, inputRef.current.length - 1));
-          if (clamped !== cursorRef.current) {
-            cursorRef.current = clamped;
-            setCursor(clamped);
-          }
-          return;
-        }
-        if (vimModeRef.current === 'normal') {
-          if (key.backspace || key.delete) {
-            // Backspace moves left (vim), it does not delete.
-            const next = Math.max(0, cursorRef.current - 1);
-            cursorRef.current = next;
-            setCursor(next);
-            return;
-          }
-          // Enter (submit), Tab, arrows, paging, and Ctrl/Meta chords keep their handlers.
-          const structural =
-            key.return || key.tab || key.ctrl || key.meta || key.upArrow || key.downArrow || key.leftArrow || key.rightArrow || key.pageUp || key.pageDown;
-          if (!structural && ch) {
-            // Ink batches fast typing / paste into one `ch`, so step through it key by key.
-            // If an edit switches to INSERT mid-batch, the rest is inserted literally.
-            let text = inputRef.current;
-            let cur = cursorRef.current;
-            let pend = vimPendingRef.current;
-            let mode: VimMode = vimModeRef.current;
-            for (const c of ch) {
-              if (mode === 'insert') {
-                text = text.slice(0, cur) + c + text.slice(cur);
-                cur += c.length;
-                continue;
-              }
-              const r = vimNormalKey(text, cur, pend, c);
-              text = r.input;
-              cur = r.cursor;
-              pend = r.pendingOp;
-              mode = r.mode;
-            }
-            vimPendingRef.current = pend;
-            setComposer(text, cur);
-            if (mode !== vimModeRef.current) setVimMode(mode);
-            return; // consume every non-structural key in NORMAL (unknown keys never insert)
-          }
-          if (!structural) return; // swallow any other non-structural key in NORMAL
-        }
-      }
-
-      // 3) Esc — the interrupt key. While a turn runs, Esc stops it (and pending input then
-      // flushes, so a steering message runs next). When idle, Esc cancels pending input,
-      // else clears the composer. Session always survives — only Ctrl-C quits.
-      if (key.escape) {
-        if (compactingRef.current) {
-          compactAbortRef.current?.abort();
-          return;
-        }
-        if (runningRef.current) {
-          controllerRef.current?.abort();
-          // Commit the streamed tail BEFORE the interrupt notice. The `stop` handler also commits
-          // it, but `stop` arrives after this line has already been printed — so the partial answer
-          // landed BELOW "⎋ interrupted" and read as a second, post-interrupt reply. Clearing the
-          // buffer here makes this the sole commit; `stop` then finds it empty and no-ops.
-          if (streamBufRef.current.trim()) {
-            const display = sanitizeAssistantText(streamBufRef.current);
-            if (display.trim()) {
-              pushLine({
-                kind: 'assistant',
-                text: stripTrailingNewlines(display),
-                color: C.fg,
-                meta: 'assistant',
-                tight: answerOpenRef.current && !padCarryRef.current && !leadsWithBlock(display),
-              });
-            }
-            streamBufRef.current = '';
-            answerOpenRef.current = false;
-            padCarryRef.current = false;
-          }
-          pushLine({ text: '  ⎋ interrupted', dimColor: true });
-        } else if (queuedTasksRef.current.length > 0) {
-          setQueued([]);
-          pushLine({ text: '  queued input cleared', dimColor: true });
-        } else if (inputRef.current !== '') {
-          // Snapshot first: Esc-to-clear was the ONLY kill in the composer that Ctrl+Z could not
-          // undo, so a mis-aimed Esc destroyed a long draft outright. Every other kill (word, line,
-          // to-end) already pushes undo; this one silently did not.
-          pushUndo();
-          setLine('');
-        }
-        return;
-      }
-
-      // 3.25) Keybinding resolver — first dispatch for discrete action keys. Migrated
-      // here from the old imperative chain: app:redraw (ctrl+l), transcript:toggleFoldLatest
-      // (ctrl+o), transcript:toggleTaskList (ctrl+t), plus any user-defined chords. A
-      // match with a registered handler consumes the key; everything else (incl. matched
-      // but not-yet-migrated actions, and all char-level composer editing) falls through.
-      const kbContexts: ContextName[] = [];
-      // (A pending approval/question dialog is handled above and always returns, so
-      // by here no dialog is open — the resolver only sees the normal editing view.)
-      if (pickerOpenRef.current) kbContexts.push('ModelPicker');
-      if (slashMatches(inputRef.current, undefined, argCtxRef.current ?? undefined, customCommandsRef.current).length > 0) kbContexts.push('Autocomplete');
-      kbContexts.push('Transcript', 'Chat', 'Global');
-      if (kbConsume(ch, key, kbContexts)) return;
-
-      // 3.5) Slash-command menu: while "/word" has matches it captures ↑/↓/Tab/Enter — including
-      // mid-turn, so you can still pick a command while the model works.
-      //
-      // Suppressed while a round-table is active: the composer belongs to the TABLE then (it routes
-      // to seats), and the menu claiming Enter made the feature inescapable — typing the documented
-      // exit `/table done` matched the menu, so Enter re-dispatched `/table` through runSlash
-      // instead of reaching handleTableInput, which answered with instructions to type the very
-      // thing that had just been swallowed. Suppressing the menu lets Enter fall through to the
-      // submit path, where the table router already parses `/table done` correctly.
-      // F08-04: the key handler recomputes the menu from live refs (not the render `menu`), so the
-      // @-mention picker must be recomputed here too or Tab/Enter can't accept a file candidate.
-      const keyMentionTok = tableRef.current ? null : atMentionToken(inputRef.current, cursorRef.current);
-      const keyMentionMenu: SlashMenuItem[] = keyMentionTok
-        ? rankFileCandidates(ensureFileList(), keyMentionTok.partial, 8).map((p) => ({
-            name: `@${p}`,
-            desc: 'file',
-            mention: { start: keyMentionTok.start, path: p },
-          }))
-        : [];
-      const menu = keyMentionMenu.length
-        ? keyMentionMenu
-        : tableRef.current
-        ? []
-        : slashMatches(inputRef.current, undefined, argCtxRef.current ?? undefined, customCommandsRef.current);
-      if (menu.length > 0) {
-        const sel = Math.min(menuIndexRef.current, menu.length - 1);
-        if (key.upArrow) {
-          setMenuIndex(Math.max(0, sel - 1));
-          return;
-        }
-        if (key.downArrow) {
-          setMenuIndex(Math.min(menu.length - 1, sel + 1));
-          return;
-        }
-        // Tab autocompletes; Shift+Tab must NOT. Without the guard the slash menu swallowed
-        // Shift+Tab and autocompleted instead, so the autonomy ring was unreachable for as long as
-        // the menu was open — the one moment a user is most likely to reach for it.
-        // F08-04: an @-file candidate — Tab OR Enter inserts the path (replacing the @partial),
-        // never runs a command. A trailing space closes the token so the picker dismisses.
-        const acceptMention = (item: SlashMenuItem): void => {
-          const m = item.mention!;
-          const before = inputRef.current.slice(0, m.start);
-          const after = inputRef.current.slice(cursorRef.current);
-          const insert = `@${m.path} `;
-          setComposer(before + insert + after, m.start + insert.length);
-          setMenuIndex(0);
-        };
-        if ((key.tab && !key.shift) || key.return) {
-          if (menu[sel]?.mention) {
-            acceptMention(menu[sel]!);
-            return;
-          }
-        }
-        if (key.tab && !key.shift) {
-          if (menu[sel]!.hint) return; // informational row — nothing to complete to
-          setLine(menu[sel]!.name); // autocomplete to the selected command
-          setMenuIndex(0);
-          return;
-        }
-        if (key.return) {
-          const item = menu[sel]!;
-          // Argument rows are HINTS until the user commits to one: right after "/cmd " (no
-          // partial typed, no ↑/↓ navigation) Enter must submit the text as typed — never
-          // auto-run the first completion ("/tasks " + Enter firing "clear" would be a
-          // destructive surprise). A typed partial or an arrow press = explicit intent.
-          const spIdx = inputRef.current.indexOf(' ');
-          const argPartial = item.base && spIdx >= 0 ? inputRef.current.slice(spIdx + 1) : '';
-          const argHintOnly = !!item.base && argPartial === '' && sel === 0 && menuIndexRef.current === 0;
-          // `item.hint` is the other kind of hint: a row with no value at all ("no prior sessions
-          // yet"). Running it would fire the bare command, which is not what the row says.
-          if (!argHintOnly && !item.hint) {
-            // An argument row ("/theme colorblind") resolves to its BASE command; runSlash slices
-            // the arg off item.name by the base's name length, so the completed value flows through.
-            const cmd = (item.base ? findSlashCommand(item.base) : item) ?? item;
-            // Mid-turn, a command that isn't live-safe is QUEUED (runs when the turn ends); a
-            // live-safe one (/help, /cost, …) and any command when idle runs immediately.
-            if (runningRef.current && !SLASH_WHILE_RUNNING.has(slashDispatchName(cmd))) {
-              setQueued([...queuedTasksRef.current, { text: item.name, kind: 'deferred' }]);
-              setLine('');
-              setMenuIndex(0);
-            } else {
-              runSlash(cmd, item.name);
-            }
-            return;
-          }
-          // fall through: submit the composer text verbatim (section 8 below)
-        }
-        // typing / backspace fall through below to re-filter the menu
-      }
-
-      // 4) Tab / Shift+Tab — cycle the working mode (applies live to a running loop too).
-      //    Ring (reference-client style): manual → auto-read → auto-edit → full → plan → (wraps).
-      //    Plan mode is the last stop; leaving it restarts the ring at the most cautious level.
-      if (key.tab) {
-        const pm = opts.planMode;
-        if (pm?.active) {
-          pm.exit(); // leave plan mode → back to the start of the autonomy ring
-          setAutonomy('manual');
-          loopRef.current?.setAutonomy('manual');
-        } else if (pm && autonomyRef.current === 'full') {
-          pm.enter(); // top of the autonomy ring → step into plan mode
-        } else {
-          const next = cycleAutonomy(autonomyRef.current);
-          setAutonomy(next);
-          loopRef.current?.setAutonomy(next);
-        }
-        return;
-      }
-
-      // 4.5) Word- and line-wise editing — the readline/macOS set every native text field has.
-      // Ink gives us `key` flags plus the raw bytes (rawKeyRef) for the keys it can't express.
-      // Sequence notes (macOS Terminal.app + iTerm2 defaults, and what Ink makes of them):
-      //   Option+Delete  \x1b\x7f      → key.delete + key.meta      (the user's "delete faster")
-      //   Option+←/→     \x1b[1;3D/C or \x1bb / \x1bf → arrow+meta, or input 'b'/'f' + meta
-      //   Ctrl+←/→       \x1b[1;5D/C   → arrow + key.ctrl
-      //   Home/End       \x1b[H \x1b[F \x1b[1~ \x1b[4~ \x1bOH \x1bOF → NO Ink field at all: raw only
-      //   fwd-Delete     \x1b[3~       → Ink collapses onto key.delete (same as Backspace) — raw only
-      const rawSeq = rawKeyRef.current;
-      const editText = inputRef.current;
-      const editCur = cursorRef.current;
-      // Shift+Enter via CSI-u / modifyOtherKeys. Ink has no field for it and its parser does not
-      // recognise the shape, so without this branch the literal text `[13;2u` was inserted into
-      // the draft on any terminal properly configured to send it.
-      if (SHIFT_ENTER.test(rawSeq)) {
-        setComposer(editText.slice(0, editCur) + '\n' + editText.slice(editCur), editCur + 1);
-        setMenuIndex(0);
-        return;
-      }
-      const isHome = HOME_KEYS.test(rawSeq);
-      const isEnd = END_KEYS.test(rawSeq);
-      const isForwardDelete = FORWARD_DELETE.test(rawSeq);
-      // Delete word LEFT — Option/Alt+Delete, Ctrl+W, Ctrl+Backspace.
-      if (((key.backspace || key.delete) && (key.meta || key.ctrl) && !isForwardDelete) || (key.ctrl && ch === 'w')) {
-        applyEdit(deleteWordLeft(editText, editCur));
-        return;
-      }
-      // Delete word RIGHT — Option/Alt+D, or a modified forward-delete.
-      if ((key.meta && (ch === 'd' || ch === 'D')) || (isForwardDelete && (key.meta || key.ctrl))) {
-        applyEdit(deleteWordRight(editText, editCur));
-        return;
-      }
-      // Forward-delete (the key above the arrows / fn+Delete) and Ctrl+D on a non-empty draft.
-      if (isForwardDelete || (key.ctrl && ch === 'd' && editText.length > 0)) {
-        applyEdit(deleteCharRight(editText, editCur));
-        return;
-      }
-      // Word motion — Option/Alt or Ctrl with ←/→, and the emacs aliases Option+B / Option+F.
-      if ((key.leftArrow || key.rightArrow) && (key.meta || key.ctrl)) {
-        moveCaret(key.leftArrow ? wordLeft(editText, editCur) : wordRight(editText, editCur));
-        return;
-      }
-      if (key.meta && (ch === 'b' || ch === 'B')) {
-        moveCaret(wordLeft(editText, editCur));
-        return;
-      }
-      if (key.meta && (ch === 'f' || ch === 'F')) {
-        moveCaret(wordRight(editText, editCur));
-        return;
-      }
-      // Line ends — Ctrl+A / Ctrl+E and the Home / End keys.
-      if (isHome || (key.ctrl && ch === 'a')) {
-        moveCaret(lineStart(editText, editCur));
-        return;
-      }
-      if (isEnd || (key.ctrl && ch === 'e')) {
-        moveCaret(lineEnd(editText, editCur));
-        return;
-      }
-      // Kills — Ctrl+K to end of line, Ctrl+U to start of line. Both feed the Ctrl+Y kill ring.
-      if (key.ctrl && ch === 'k') {
-        applyEdit(killToLineEnd(editText, editCur));
-        return;
-      }
-      if (key.ctrl && ch === 'u') {
-        applyEdit(killToLineStart(editText, editCur));
-        return;
-      }
-      // Yank — paste back whatever the last kill removed.
-      if (key.ctrl && ch === 'y') {
-        const kill = killRingRef.current;
-        if (kill) {
-          pushUndo();
-          setComposer(editText.slice(0, editCur) + kill + editText.slice(editCur), editCur + kill.length);
-          setMenuIndex(0);
-        }
-        return;
-      }
-      // Char motion — Ctrl+B / Ctrl+F (emacs), so a hand already on Ctrl doesn't have to move.
-      if (key.ctrl && (ch === 'b' || ch === 'f')) {
-        moveCaret(ch === 'b' ? editCur - 1 : editCur + 1);
-        return;
-      }
-      // Undo the last DESTRUCTIVE edit (word/line kills, history swaps) — Ctrl+Z or Ctrl+_.
-      if ((key.ctrl && ch === 'z') || rawSeq === '\x1f' || ch === '\x1f') {
-        const prev = undoRef.current.pop();
-        if (prev) setComposer(prev.text, prev.cursor);
-        return;
-      }
-
-      // 5) Caret movement within the (possibly multi-row) composer.
-      // Inner width must match Composer paint (cols − gutter − page margins).
-      const editInner = Math.max(8, (process.stdout.columns ?? 80) - COMPOSER_GUTTER - PAGE_MARGIN * 2);
-      if (key.leftArrow) {
-        moveCaret(prevGrapheme(inputRef.current, cursorRef.current));
-        return;
-      }
-      if (key.rightArrow) {
-        moveCaret(nextGrapheme(inputRef.current, cursorRef.current));
-        return;
-      }
-
-      // 6) ↑/↓ — multi-row drafts move the caret by visual row; history only at the edges
-      // (first row + ↑, last row + ↓) or when the draft is a single visual row.
-      if (key.upArrow) {
-        const text = inputRef.current;
-        if (!cursorOnFirstRow(text, cursorRef.current, editInner)) {
-          const next = moveCursorVertical(text, cursorRef.current, -1, editInner);
-          cursorRef.current = next;
-          setCursor(next);
-          return;
-        }
-        if (historyRef.current.length && histIdxRef.current > 0) {
-          // Park an unsent draft before stepping off it, so ↑ out of habit can't destroy three
-          // paragraphs of spec with no way back (↓ past the newest entry restores it — bash/
-          // readline behavior). Only the FIRST step stashes; walking further up must not clobber it.
-          if (histIdxRef.current === historyRef.current.length) draftRef.current = inputRef.current;
-          histIdxRef.current -= 1;
-          setLine(historyRef.current[histIdxRef.current] ?? '');
-        }
-        return;
-      }
-      if (key.downArrow) {
-        const text = inputRef.current;
-        if (!cursorOnLastRow(text, cursorRef.current, editInner)) {
-          const next = moveCursorVertical(text, cursorRef.current, 1, editInner);
-          cursorRef.current = next;
-          setCursor(next);
-          return;
-        }
-        if (histIdxRef.current < historyRef.current.length) {
-          histIdxRef.current += 1;
-          // Past the newest entry we're back on the user's own unsent draft, not an empty box.
-          setLine(
-            histIdxRef.current === historyRef.current.length
-              ? draftRef.current
-              : (historyRef.current[histIdxRef.current] ?? ''),
-          );
-        }
-        return;
-      }
-
-      // 7) Backspace — delete the visual character before the caret. (macOS Delete reports as
-      //    key.delete; the real forward-delete key is separated out by raw sequence in 4.5.)
-      //    Grapheme-safe: one press removes a whole emoji/flag/combining cluster, never half of it.
-      if (key.backspace || key.delete) {
-        const c = cursorRef.current;
-        const s = inputRef.current;
-        if (c > 0) setComposer(s.slice(0, prevGrapheme(s, c)) + s.slice(c), prevGrapheme(s, c));
-        setMenuIndex(0);
-        return;
-      }
-
-      // 8) Submit — or insert a newline (Shift+Enter / Alt+Enter / trailing `\`).
-      if (key.return) {
-        // `key.shift` alone is not enough: most terminals send a bare \r for Shift+Enter, and
-        // the ones that don't send a CSI-u/modifyOtherKeys sequence Ink reports as neither.
-        const shiftEnterRaw = SHIFT_ENTER.test(rawKeyRef.current);
-        const wantNewline = key.shift || key.meta || shiftEnterRaw || inputRef.current.endsWith('\\');
-        if (wantNewline) {
-          const s = inputRef.current;
-          const c = cursorRef.current;
-          // Trailing `\` line-continuation: drop the backslash, insert `\n` at end.
-          if (s.endsWith('\\') && !key.shift && !key.meta) {
-            const next = s.slice(0, -1) + '\n';
-            setComposer(next, next.length);
-          } else {
-            setComposer(s.slice(0, c) + '\n' + s.slice(c), c + 1);
-          }
-          return;
-        }
-        const task = inputRef.current.trim();
-        if (!task && !attachmentsRef.current.length) return; // allow an image-only message
-        if (modelSwitchingRef.current) {
-          pushLine({ text: 'Model switch is still initializing — your draft is preserved.', dimColor: true });
-          return;
-        }
-        if (asyncCommandRef.current) {
-          if (!task) return;
-          setQueued([...queuedTasksRef.current, { text: task, kind: queuedTaskKind(task) }]);
-          historyRef.current.push(task);
-          histIdxRef.current = historyRef.current.length;
-          setLine('');
-          pushLine({ text: '  queued — model capability check in progress', dimColor: true });
-          return;
-        }
-        // Collaboration Mode: while a round-table is active, the composer routes to seats instead of
-        // starting a normal turn. `/table` START (no table yet) falls through to the slash dispatch below.
-        if (tableRef.current) {
-          if (!task) { setLine(''); return; }
-          if (runningRef.current || routeInFlightRef.current) {
-            pushLine({ text: 'A model is answering — wait for the baton to return, or Esc to interrupt.', dimColor: true });
-            setLine('');
-            return;
-          }
-          historyRef.current.push(task);
-          histIdxRef.current = historyRef.current.length;
-          setLine('');
-          if (vimEnabledRef.current) setVimMode('insert');
-          handleTableInputRef.current?.(task);
-          return;
-        }
-        // Compaction is REWRITING the shared context — a turn started now would read it mid-rebuild.
-        // Queue instead of racing; the queue flushes when compaction finishes.
-        if (compactingRef.current) {
-          setQueued([...queuedTasksRef.current, { text: task, kind: queuedTaskKind(task) }]);
-          historyRef.current.push(task);
-          histIdxRef.current = historyRef.current.length;
-          setLine('');
-          pushLine({ text: '  queued — compaction in progress (Esc cancels it)', dimColor: true });
-          return;
-        }
-        if (runningRef.current) {
-          // Informational slash commands run live. State-changing commands remain deferred, but
-          // a human message requests a model-only interrupt and resumes at the next safe history
-          // boundary (an in-flight tool is allowed to settle first).
-          if (task.startsWith('/')) {
-            const cmdName = task.split(/\s+/)[0] ?? '';
-            const cmd = findSlashCommand(cmdName);
-            if (cmd && SLASH_WHILE_RUNNING.has(slashDispatchName(cmd))) {
-              runSlash(cmd, task);
-              return;
-            }
-          }
-          if (!task) return; // image-only can't be queued (attachments flush with the next typed message)
-          const kind = queuedTaskKind(task);
-          // Queue FIRST: requestSteer may unwind the loop synchronously enough for finally to flush.
-          setQueued([...queuedTasksRef.current, { text: task, kind }]);
-          historyRef.current.push(task);
-          histIdxRef.current = historyRef.current.length;
-          setLine('');
-          if (kind === 'steer') {
-            // Ask the CURRENT loop every time. A queued message left over from an earlier loop must
-            // not suppress steering a newer active loop. If no loop exists yet we are only waiting
-            // for the process run lock: preserve A→B FIFO instead of aborting and silently dropping A.
-            const steered = loopRef.current?.requestSteer() ?? false;
-            pushLine({
-              text: steered
-                ? '  ↪ pending message — steering at the next safe boundary'
-                : '  ↪ pending message — queued in order',
-              dimColor: true,
-            });
-          }
-          return;
-        }
-        if (task.startsWith('/')) {
-          const s = classifySlash(task, customCommandsRef.current);
-          if (s.kind === 'command') {
-            runSlash(s.cmd!, task);
-            return;
-          }
-          if (s.kind === 'typo') {
-            const hint = s.suggestion ? ` Did you mean ${s.suggestion}?` : '';
-            pushLine({ text: `Unknown command: ${task.split(/\s+/)[0]} —${hint} (type / for the list)`, color: C.red });
-            setLine('');
-            return;
-          }
-          // 'message' — a path like /Users/… — fall through and send it to the agent
-        }
-        if (task === 'exit' || task === 'quit') {
-          exit();
-          return;
-        }
-        historyRef.current.push(task);
-        histIdxRef.current = historyRef.current.length;
-        setLine('');
-        if (vimEnabledRef.current) setVimMode('insert'); // next prompt starts ready to type
-        startTurn(expandPastes(task, pastesRef.current));
-        return;
-      }
-
-      // (Mouse clicks are routed to handleMouse at the TOP of this handler — see the SGR branch
-      // there. They used to be handled here, unreachably, behind that same early return.)
-
-      // 10) Printable input — insert at the caret (unbracketed pastes land here too).
-      if (!key.ctrl && !key.meta && ch) {
-        // Strip any accidental CSI mouse fragments glued to typed text, then normalize
-        // carriage returns: terminals paste line ends as \r (not \n), which defeated the
-        // paste-chip line count and rendered as invisible garbage in the composer. A lone
-        // typed Enter arrives as key.return (handled above), so any \r here IS a paste.
-        // Control bytes are dropped too: 0x1c–0x1f (Ctrl+\ ] ^ _) fall through every branch of
-        // Ink's parser with NO flags set, so they used to splice an invisible C0 byte into the
-        // draft — shifting every later caret index and riding out to the provider on submit.
-        // Tab and newline survive; nothing else unprintable does.
-
-        const clean = stripSgrMouse(ch).replace(/\r\n?/g, '\n').replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
-        if (!clean) return;
-        insertPastable(clean);
-      }
+      // The env is the compile-checked bridge between the component and the key modules:
+      // stable refs + useCallback actions, built per keystroke so every owner reads live
+      // state exactly as the old inline chain did.
+      const env: KeyEnv = {
+        rawChunkRef,
+        rawKeyRef,
+        ctrlCArmedRef,
+        ctrlXArmedRef,
+        pastingRef,
+        pasteBufRef,
+        pendingRef,
+        igateRef,
+        dialogShownAtRef,
+        dialogTypeaheadRef,
+        autoAnswerEngagedRef,
+        autoAnswerSecsRef,
+        questionIndexRef,
+        questionCursorRef,
+        pickerOpenRef,
+        pickerIndexRef,
+        searchRef,
+        vimEnabledRef,
+        vimModeRef,
+        vimPendingRef,
+        vimCountRef,
+        vimFindRef,
+        vimRegRef,
+        inputRef,
+        cursorRef,
+        historyRef,
+        histIdxRef,
+        draftRef,
+        menuIndexRef,
+        killRingRef,
+        undoRef,
+        pastesRef,
+        attachmentsRef,
+        autonomyRef,
+        argCtxRef,
+        customCommandsRef,
+        tableRef,
+        handleTableInputRef,
+        runningRef,
+        controllerRef,
+        loopRef,
+        queuedTasksRef,
+        compactingRef,
+        compactAbortRef,
+        streamBufRef,
+        thinkBufRef,
+        thinkStartedAtRef,
+        pendingStreamRef,
+        pendingThinkRef,
+        answerOpenRef,
+        padCarryRef,
+        routeInFlightRef,
+        modelSwitchingRef,
+        asyncCommandRef,
+        cfg: opts.cfg,
+        planMode: opts.planMode,
+        autoAnswerEnabled: AUTO_ANSWER_ENABLED,
+        composerInnerWidth: () => Math.max(8, (process.stdout.columns ?? 80) - COMPOSER_GUTTER - PAGE_MARGIN * 2),
+        exit,
+        pushLine,
+        setQueued,
+        setLine,
+        setComposer,
+        setCursor,
+        setMenuIndex,
+        setPickerOpen,
+        setPickerIndex,
+        setVimMode,
+        setQuestionCursor,
+        setQuestionIndex,
+        setAutoAnswerSecs,
+        setAutonomy,
+        insertPastable,
+        setStreamNow,
+        setThinkNow,
+        applyEdit,
+        moveCaret,
+        pushUndo,
+        handleMouse,
+        openExternalEditor,
+        applySearch,
+        kbConsume,
+        chooseAtQuestion,
+        confirmQuestion,
+        selectModel,
+        runSlash,
+        startTurn,
+        ensureFileList,
+        slashMatches,
+        findSlashCommand,
+        classifySlash,
+        slashDispatchName,
+        modelRows,
+        sanitizeAssistantText,
+      };
+      dispatchKey(env, ch, key);
     },
-    [exit, pushLine, runOne, runSlash, selectModel, setAutonomy, setComposer, setLine, setQuestionIndex, setQuestionSelection, opts, startTurn, setQueued, kbConsume, insertPastable, applyEdit, moveCaret, pushUndo, handleMouse],
+    [exit, pushLine, runSlash, selectModel, setAutonomy, setComposer, setLine, setQuestionIndex, opts, startTurn, setQueued, kbConsume, insertPastable, setStreamNow, setThinkNow, applyEdit, moveCaret, pushUndo, handleMouse, openExternalEditor, applySearch, chooseAtQuestion, confirmQuestion, setCursor, setMenuIndex, setPickerOpen, setPickerIndex, setVimMode, setQuestionCursor, setAutoAnswerSecs, ensureFileList],
   );
 
   useInput(onKey);
@@ -6456,8 +3858,17 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // chrome math never clips it; todo/plan render as a pinned block above the composer.
   const layout = computeLayout(terminalSize.cols, terminalSize.rows);
   // Tool-call stacking: group consecutive committed tools into runs so a tool-heavy turn collapses
-  // to one summary row instead of flooding scrollback. One O(n) pass per render; Ctrl-O expands all.
-  const toolRuns = computeToolRuns(committed, showAllExpanded);
+  // to one summary row instead of flooding scrollback. P3-02: memoized on the append-only committed
+  // array via the appendable cache — a pure spinner tick (setTick, no new lines) re-renders but
+  // scans ZERO transcript slots (deps unchanged → useMemo skips; the cache ref extends the previous
+  // run-map on append and is invalidated wholesale by Ctrl-O / repaint). The flatten.ts counters
+  // (toolRunsStats.itemsScanned) are the instrumented proof.
+  const toolRunsCacheRef = useRef<ToolRunsCache | undefined>(undefined);
+  const toolRuns = useMemo(() => {
+    const { runs, cache } = computeToolRunsAppendable(committed, showAllExpanded, toolRunsCacheRef.current);
+    toolRunsCacheRef.current = cache;
+    return runs;
+  }, [committed, showAllExpanded]);
   // ── Turn-HUD frame budget ─────────────────────────────────────────────────────
   // While a turn runs, the live region is a CONSTANT-HEIGHT HUD (fixed stream window + exactly one
   // status line + at most one pinned-tasks line) so the composer never moves mid-turn — the Claude
@@ -7115,7 +4526,6 @@ const A = {
   cyan: c('\x1b[36m'),
 };
 
-
 export function attachRenderer(bus: EventBus, _opts?: { animate: boolean }): () => void {
   // Sub-agent taskId → type, so a delegated tool line can name its agent instead of a bare taskId.
   const subagentType = new Map<string, string>();
@@ -7198,10 +4608,6 @@ export function attachRenderer(bus: EventBus, _opts?: { animate: boolean }): () 
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-
-
-
-
 function previewOf(input: unknown): string {
   const o = input as Record<string, unknown> | undefined;
   if (o && typeof o === 'object') {
@@ -7217,10 +4623,6 @@ function previewOf(input: unknown): string {
   }
   return '';
 }
-
-
-
-
 
 // Re-exported so existing importers (tests, scripts/demo-tui.ts) keep working after the
 // theme table moved to tui/theme.ts.

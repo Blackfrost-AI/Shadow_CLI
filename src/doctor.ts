@@ -6,6 +6,8 @@ import { loadConfig, resolveApiKey, resolveAuthToken } from './config.js';
 import { DEV_UNRESTRICTED } from './buildProfile.js';
 import { GLOBAL_DIR } from './state/globalStore.js';
 import { sandboxConfinement } from './safety/sandbox.js';
+import { SessionLog } from './state/session.js';
+import { planRetention, formatBytes, ARCHIVE_DIRNAME } from './state/retention.js';
 
 export type DoctorSeverity = 'error' | 'warn' | 'info';
 
@@ -182,6 +184,45 @@ export function runDoctor(cwd: string): DoctorReport {
               ? '(runs unconfined with a warning only)'
               : '(unconfined run_shell stops at the approval gate)'),
   });
+
+  // P2-13 — session-log retention: DRY-RUN, so the user sees exactly what a sweep would move
+  // BEFORE any pruning happens. Opt-in (no keys set → retention is off and nothing is touched);
+  // the real sweep runs at session start and only ever ARCHIVES to sessions/.archive — never
+  // deletes — so this check is informational (ok: true) rather than a pass/fail gate.
+  {
+    const days = cfg.sessionRetentionDays;
+    const keep = cfg.sessionRetentionKeep;
+    const configured = days != null || keep != null;
+    let detail: string;
+    if (!configured) {
+      detail = 'session retention off — logs kept forever (set sessionRetentionDays / sessionRetentionKeep in ~/.shadow/config.json to enable)';
+    } else {
+      const rules = [
+        days != null ? `older than ${days}d` : null,
+        keep != null ? `keep newest ${keep}` : null,
+      ]
+        .filter(Boolean)
+        .join(', ');
+      let plan: ReturnType<typeof planRetention> = [];
+      try {
+        plan = planRetention(cwd, cfg);
+      } catch {
+        /* a sessions dir that cannot be read just reports zero candidates */
+      }
+      const bytes = plan.reduce((a, c) => a + c.size, 0);
+      const total = (() => {
+        try {
+          return SessionLog.list(cwd).length;
+        } catch {
+          return 0;
+        }
+      })();
+      detail = plan.length
+        ? `session retention (${rules}): ${plan.length} of ${total} log(s), ${formatBytes(bytes)}, would ARCHIVE to sessions/${ARCHIVE_DIRNAME}/ on next session start (never deleted)`
+        : `session retention (${rules}): nothing to archive right now (${total} log(s) on disk)`;
+    }
+    checks.push({ id: 'retention', ok: true, severity: 'info', detail });
+  }
 
   return finalize(checks);
 }

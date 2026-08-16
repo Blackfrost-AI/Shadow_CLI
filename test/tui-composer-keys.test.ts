@@ -54,7 +54,7 @@ async function mount(t: { after: (fn: () => void) => void }, cfg: Record<string,
     return body.includes('Send a message…') ? '' : body;
   };
   t.after(() => unmount()); // runs even when an assertion throws — a mounted Ink app holds handles
-  return { send, draft };
+  return { send, draft, lastFrame };
 }
 
 test('Option+Delete (\\x1b\\x7f) deletes a WORD, not a character', async (t) => {
@@ -182,4 +182,122 @@ test('a click OUTSIDE the composer rows leaves the caret alone', async (t) => {
   send('\x1b[13;1R'); // same geometry: the input row is 10, so this click misses it
   send('X');
   assert.equal(await draft(), 'hello worldX', 'caret stayed at the end of the draft');
+});
+
+// ── F03-05: composer robustness ──────────────────────────────────────────────
+
+test('Ctrl+B / Ctrl+F jump a WHOLE grapheme cluster — never land inside one', async (t) => {
+  const { send, draft } = await mount(t);
+  const EMOJI = String.fromCodePoint(0x1f600); // 😀 — one cluster, two UTF-16 units
+  send('a' + EMOJI); // caret parks after the emoji
+  send('\x02'); // Ctrl+B — one visual step left must clear the whole cluster
+  send('X');
+  assert.equal(await draft(), 'aX' + EMOJI, 'Ctrl+B crossed the whole cluster; the old ±1 code-unit move parked the caret between the surrogates');
+  send('\x06'); // Ctrl+F — one visual step right, across the whole cluster again
+  send('\x06'); // already at the end — the end is a fixed point, no stray step
+  send('Y');
+  assert.equal(await draft(), 'aX' + EMOJI + 'Y', 'Ctrl+F crossed the cluster and stopped at the end');
+});
+
+test('batched chunks: forward-delete still deletes RIGHT when the key repeats into one read', async (t) => {
+  const { send, draft } = await mount(t);
+  send('abcd');
+  send('\x1b[H'); // Home → caret 0
+  send('\x1b[3~\x1b[3~'); // key auto-repeat lands in ONE stdin read
+  // Ink keeps only the first keypress of a merged read; lastKeySequence recovers it for the
+  // raw-sequence test. The old whole-chunk match died on the $ anchor, and Ink's key.delete
+  // flag then deleted BACKWARDS (or did nothing at column 0) instead.
+  assert.equal(await draft(), 'bcd', 'the forward-delete landed (Ink itself drops the repeat)');
+});
+
+test('batched chunks: Home still homes when held (two \\x1b[H in one read)', async (t) => {
+  const { send, draft } = await mount(t);
+  send('hello');
+  send('\x1b[H\x1b[H');
+  send('X');
+  assert.equal(await draft(), 'Xhello', 'Home fired despite the batched repeat');
+});
+
+test('batched chunks: a typed byte right after Home in one read must not defeat the Home match', async (t) => {
+  const { send, draft } = await mount(t);
+  send('world');
+  send('\x1b[Hq'); // Home + 'q' in ONE read: Ink dispatches Home and drops the q itself
+  send('Y');
+  assert.equal(await draft(), 'Yworld', 'the sequence was trimmed of trailing text before matching');
+});
+
+test('Ctrl+D on an EMPTY composer warns first (two-stage arm) and any other key disarms it', async (t) => {
+  const { send, draft, lastFrame } = await mount(t);
+  assert.equal(await draft(), '');
+  send('\x04'); // Ctrl+D once, idle + empty
+  await new Promise((r) => setTimeout(r, FLUSH_MS));
+  assert.match(lastFrame() ?? '', /press Ctrl\+D again to quit/, 'the first ^D arms instead of quitting');
+  assert.match(lastFrame() ?? '', /❯/, 'the app is still mounted after one ^D');
+  // Any other key disarms the latch, so a later ^D starts over instead of quitting.
+  send('x');
+  assert.equal(await draft(), 'x');
+  send('\x15'); // Ctrl+U — back to an empty draft
+  assert.equal(await draft(), '');
+  send('\x04');
+  await new Promise((r) => setTimeout(r, FLUSH_MS));
+  assert.match(lastFrame() ?? '', /❯/, 'still mounted: the intervening key disarmed the first press');
+});
+
+test('Ctrl+D on a NON-EMPTY draft keeps its forward-delete meaning (never arms exit)', async (t) => {
+  const { send, draft, lastFrame } = await mount(t);
+  send('ab');
+  send('\x1b[H'); // caret 0
+  send('\x04');
+  assert.equal(await draft(), 'b', 'forward-delete, exactly as before F03-05');
+  assert.doesNotMatch(lastFrame() ?? '', /press Ctrl\+D again/, 'no exit hint while the draft has text');
+});
+
+// ── F03-06: vim multiline drafts ─────────────────────────────────────────────
+
+test('vim NORMAL edits (x, dw) are undoable via Ctrl+Z (F03-06 applyEdit routing)', async (t) => {
+  const { send, draft } = await mount(t, { vimMode: true });
+  send('hello world');
+  send('\x1b');        // ESC → NORMAL, caret clamps onto the last char
+  send('x');           // delete 'd'
+  assert.equal(await draft(), 'hello worl');
+  send('0');           // hard-line start (cursor-only — must NOT push an undo frame)
+  send('dw');          // kill 'hello '
+  assert.equal(await draft(), 'worl');
+  send('\x1a');        // Ctrl+Z — undoes the dw batch
+  assert.equal(await draft(), 'hello worl');
+  send('\x1a');        // Ctrl+Z — undoes the x
+  assert.equal(await draft(), 'hello world');
+});
+
+test('vim hard-line keys operate on the caret\'s line in a multiline draft (F03-06)', async (t) => {
+  const { send, lastFrame } = await mount(t, { vimMode: true });
+  send('foo');
+  send('\x1b[13;2u');  // Shift+Enter → newline
+  send('bar baz');
+  send('\x1b');        // → NORMAL, caret onto 'z'
+  send('x');           // delete 'z' — stops at the line end
+  send('0');           // hard-line start → 'b', NOT the buffer start
+  send('i');           // insert there
+  send('X');
+  await new Promise((r) => setTimeout(r, FLUSH_MS));
+  const plain = (lastFrame() ?? '').replace(/\x1b\[[0-9;]*m/g, '');
+  assert.ok(plain.includes('-- NORMAL --') === false, 'i brought the composer back to INSERT');
+  assert.ok(plain.includes('Xbar ba'), 'x killed the z and i typed at the hard-line start');
+  assert.ok(plain.includes('foo'), 'line one untouched — no key crossed the newline');
+});
+
+test('two consecutive Ctrl+D on an EMPTY composer quit — the second advertised exit path', async (t) => {
+  const { send, lastFrame } = await mount(t);
+  send('\x04');
+  await new Promise((r) => setTimeout(r, FLUSH_MS));
+  send('\x04');
+  await new Promise((r) => setTimeout(r, FLUSH_MS));
+  // The app exits through the same latch as Ctrl-C×2. ink-testing-library keeps the last
+  // painted frame, so assert DEATH directly: nothing renders afterwards and typed text never
+  // lands (a still-mounted app would repaint the composer with the keystrokes).
+  const atExit = lastFrame() ?? '';
+  send('zombie');
+  await new Promise((r) => setTimeout(r, FLUSH_MS));
+  assert.equal(lastFrame() ?? '', atExit, 'no further frame rendered after the exit');
+  assert.doesNotMatch(lastFrame() ?? '', /zombie/, 'the exited app no longer accepts input');
 });

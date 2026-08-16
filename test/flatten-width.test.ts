@@ -7,7 +7,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { wrapSpans, wrapSpansWord, truncateSpans, type StyledSpan } from '../src/tui/flatten.js';
-import { displayWidth } from '../src/tui/width.js';
+import { displayWidth } from '../src/util/width.js';
 
 const rowWidth = (row: StyledSpan[]): number => displayWidth(row.map((s) => s.text).join(''));
 const textOf = (rows: StyledSpan[][]): string => rows.map((r) => r.map((s) => s.text).join('')).join('');

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { mkdirSync, readFileSync, writeFileSync, readdirSync, existsSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, writeFileSync, readdirSync, existsSync } from 'node:fs';
 import { join, isAbsolute, relative, resolve } from 'node:path';
 import { atomicWrite } from '../tools/util.js';
 
@@ -34,7 +34,9 @@ function readIndex(dir: string): CheckpointEntry[] {
 }
 
 function writeIndex(dir: string, entries: CheckpointEntry[]): void {
-  atomicWrite(join(dir, INDEX_FILE), JSON.stringify(entries, null, 2) + '\n');
+  // Checkpoint trees mirror file CONTENT from the workspace — keep them private (0600 index,
+  // like the .bak payloads and the session log they pair with), not the default umask 0644.
+  atomicWrite(join(dir, INDEX_FILE), JSON.stringify(entries, null, 2) + '\n', 0o600);
 }
 
 /**
@@ -68,7 +70,14 @@ export function saveCheckpoint(
 ): string {
   const key = checkpointKey(workspaceRoot, relPath);
   const dir = turnDir(workspaceRoot, sessionId, turn);
-  mkdirSync(dir, { recursive: true });
+  // 0700 tree: checkpoint .bak payloads are workspace file CONTENT. recursive mkdir only applies
+  // the mode to dirs it CREATES, so also tighten the leaf (catches legacy 0755 trees lazily).
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try {
+    chmodSync(dir, 0o700);
+  } catch {
+    /* best-effort */
+  }
   const file = `${hashRelPath(key)}.bak`;
   const absPath = join(dir, file);
 
@@ -76,7 +85,12 @@ export function saveCheckpoint(
   const existing = entries.find((e) => e.relPath === key);
   if (existing && existsSync(existing.absPath)) return existing.absPath; // first write wins
 
-  writeFileSync(absPath, content, 'utf8');
+  writeFileSync(absPath, content, { encoding: 'utf8', mode: 0o600 });
+  try {
+    chmodSync(absPath, 0o600); // mode is ignored for a pre-existing file (crash-recovery case)
+  } catch {
+    /* best-effort */
+  }
   if (!existing) {
     entries.push({ relPath: key, file, absPath });
     writeIndex(dir, entries);
@@ -93,7 +107,14 @@ export function saveCheckpointAbsent(
 ): void {
   const key = checkpointKey(workspaceRoot, relPath);
   const dir = turnDir(workspaceRoot, sessionId, turn);
-  mkdirSync(dir, { recursive: true });
+  // 0700 tree: checkpoint .bak payloads are workspace file CONTENT. recursive mkdir only applies
+  // the mode to dirs it CREATES, so also tighten the leaf (catches legacy 0755 trees lazily).
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try {
+    chmodSync(dir, 0o700);
+  } catch {
+    /* best-effort */
+  }
   const entries = readIndex(dir);
   if (entries.some((e) => e.relPath === key)) return; // first write wins
   entries.push({ relPath: key, file: '', absPath: '', absent: true });

@@ -47,17 +47,24 @@ const PermissionRuleSchema = z.object({
   action: z.enum(['deny', 'ask', 'allow']),
 });
 
+// F08-09 hooks v2: an entry is either the v1 bare command string, or `{ command, matcher? }`
+// where `matcher` filters the tool phases (pre/post_tool_use) by tool-name glob/pipe list. The
+// runner normalizes both forms; see src/hooks/runner.ts for the matcher + stdout-verdict contract.
+const HookEntrySchema = z.union([
+  z.string().min(1),
+  z.object({ command: z.string().min(1), matcher: z.string().optional() }),
+]);
 const HooksSchema = z.object({
-  pre_tool_use: z.array(z.string()).default([]),
-  post_tool_use: z.array(z.string()).default([]),
-  session_start: z.array(z.string()).default([]),
-  session_end: z.array(z.string()).default([]),
-  user_prompt_submit: z.array(z.string()).default([]),
-  pre_compact: z.array(z.string()).default([]),
-  post_compact: z.array(z.string()).default([]),
-  stop: z.array(z.string()).default([]),
-  subagent_stop: z.array(z.string()).default([]),
-  notification: z.array(z.string()).default([]),
+  pre_tool_use: z.array(HookEntrySchema).default([]),
+  post_tool_use: z.array(HookEntrySchema).default([]),
+  session_start: z.array(HookEntrySchema).default([]),
+  session_end: z.array(HookEntrySchema).default([]),
+  user_prompt_submit: z.array(HookEntrySchema).default([]),
+  pre_compact: z.array(HookEntrySchema).default([]),
+  post_compact: z.array(HookEntrySchema).default([]),
+  stop: z.array(HookEntrySchema).default([]),
+  subagent_stop: z.array(HookEntrySchema).default([]),
+  notification: z.array(HookEntrySchema).default([]),
 });
 
 // An MCP server is reached over stdio (`command`) OR HTTP (`url`, Streamable HTTP).
@@ -68,6 +75,13 @@ const McpServerSchema = z
     env: z.record(z.string()).optional(),
     url: z.string().optional(),
     headers: z.record(z.string()).optional(),
+    // P3-08 Phase 3 — stdio children are confined to the OS sandbox (writes to workspace+/tmp,
+    // credential stores denied, network OFF). `network: true` grants the child outbound access
+    // inside the jail (a server that legitimately fetches/browses); `sandbox: false` drops the
+    // jail entirely for this one server (explicit operator choice, surfaced by /mcp). Both are
+    // global-only by inheritance — `mcpServers` itself is stripped from project files.
+    network: z.boolean().optional(),
+    sandbox: z.boolean().optional(),
   })
   .refine((s) => Boolean(s.command) || Boolean(s.url), {
     message: 'mcp server needs a `command` (stdio) or a `url` (http)',
@@ -220,6 +234,23 @@ const ProjectEntrySchema = z.object({
   addedAt: z.string().optional(),
 });
 
+/**
+ * P2-11 (F09-08) — a named profile: the handful of knobs a workload switch actually touches,
+ * so "run the deep-reasoning box" is one flag, not five edits. Every field is optional —
+ * a profile can be just `{ model }` or the full model+effort+autonomy+sandbox+context bundle;
+ * unset fields fall through to the normal layered config. Keys are deliberately limited to
+ * NON-exec, non-credential fields: a profile cannot carry `baseUrl`, `hooks`, `permissionRules`,
+ * or anything else command-/key-bearing (those stay top-level, global/env/CLI-only).
+ */
+const ProfileSchema = z.object({
+  model: z.string().min(1).optional(),
+  effort: z.enum(['low', 'medium', 'high', 'xhigh', 'max']).optional(),
+  autonomy: z.enum(['manual', 'auto-read', 'auto-edit', 'full']).optional(),
+  sandbox: z.enum(['auto', 'off']).optional(),
+  contextBudget: z.number().int().positive().optional(),
+  summarizeTriggerRatio: z.number().positive().max(1).optional(),
+});
+
 const ConfigSchema = z.object({
   provider: z.enum(['anthropic', 'openai', 'mock']).default('anthropic'),
   model: z.string().default('claude-opus-4-8'),
@@ -350,6 +381,24 @@ const ConfigSchema = z.object({
   // on powerful machines; 1 serializes sub-agents entirely.
   subagentConcurrency: z.number().int().min(1).max(16).default(4),
 
+  // P2-11 (F09-08) — named profiles (Codex `[profiles.NAME]` parity). A profile bundles a model
+  // with its matching effort/autonomy/sandbox/context knobs; activate with `--profile <name>`
+  // or `SHADOW_PROFILE=<name>`. GLOBAL-ONLY (`profiles` is in PROJECT_UNTRUSTED_KEYS): a profile
+  // can raise autonomy and widen context, and a cloned repo must not be able to plant one —
+  // definitions live in ~/.shadow/config.json, activation via flag/env. The active profile slots
+  // in ABOVE the project file and BELOW env/CLI (see loadConfig), so a single env var or flag
+  // still wins one key while the profile switches the rest ATOMICALLY.
+  // Deliberately LENIENT at the schema level: a typo in one profile entry (or `"profiles": null`
+  // / `[]`) must not make every `loadConfig` call throw — including runs with NO profile and
+  // subcommands that cannot take `--profile` (export/local/doctor). The entry being ACTIVATED is
+  // strictly validated against ProfileSchema in loadConfig; everything else parses as-is here.
+  profiles: z
+    .preprocess(
+      (v) => (v && typeof v === 'object' && !Array.isArray(v) ? v : {}),
+      z.record(z.string(), z.unknown()),
+    )
+    .default({}),
+
   sandbox: z.enum(['auto', 'off']).default('auto'), // OS sandbox for run_shell (auto = on where supported)
   sandboxNetwork: z.boolean().default(true), // allow network inside the sandbox (installs/fetches need it)
   // P2-12 — what happens when the OS sandbox was REQUESTED but the host has no tool to enforce it
@@ -360,6 +409,22 @@ const ConfigSchema = z.object({
   //   fail-closed    — same gate, but it NEVER bends: every unconfined call asks, every time.
   //   warn           — pre-P2-12 behavior: run unconfined, warning folded into the tool result.
   sandboxFailurePolicy: z.enum(['auto', 'fail-closed', 'warn']).default('auto'),
+  // P3-08 Phase 2 — egress quarantine for TOOL-INITIATED fetches (web_fetch / web_search /
+  // remote images: the URLs the model authored). The allowlist semantics of the filesystem jail
+  // applied to the network dimension (the workspaceJail × netguard composition):
+  //   mode: observe (default) — an off-allowlist tool fetch proceeds but is FLAGGED on the
+  //         receipt (`shadow egress` / /connections show it), nothing silently;
+  //         enforce — an off-allowlist tool fetch is DENIED with a readable error.
+  //   allow: host entries ("example.com", "*.example.com") granted on top of the derived
+  //         defaults (duckduckgo.com for web_search).
+  // GLOBAL-ONLY (`egress` is in PROJECT_UNTRUSTED_KEYS): a cloned repo must not be able to
+  // widen its own quarantine — the same trust asymmetry as additionalDirectories.
+  egress: z
+    .object({
+      mode: z.enum(['observe', 'enforce']).default('observe'),
+      allow: z.array(z.string()).default([]),
+    })
+    .default({}),
   shellTimeoutMs: z.number().int().positive().default(60_000),
   shellEnvAllowlist: z
     .array(z.string())
@@ -387,6 +452,15 @@ const ConfigSchema = z.object({
     'gemini-flash-latest': { input: 0.3, output: 2.5 },
   }),
 
+  // P2-13 — session log retention. Opt-in; the sweep runs at session start and only ever
+  // ARCHIVES (moves logs into sessions/.archive) — never deletes. `sessionRetentionDays`
+  // archives logs whose mtime is older than N days; `sessionRetentionKeep` always protects the
+  // newest M sessions, and set ALONE archives everything beyond M. Both are global-only
+  // (PROJECT_UNTRUSTED_KEYS): a cloned repo must not be able to plant config that sweeps away
+  // session history it has never seen.
+  sessionRetentionDays: z.number().int().positive().optional(),
+  sessionRetentionKeep: z.number().int().nonnegative().optional(),
+
   logLevel: z.enum(['silent', 'error', 'info', 'debug']).default('info'),
 });
 
@@ -394,6 +468,10 @@ export type ShadowConfig = z.infer<typeof ConfigSchema> & {
   /** Top-level keys the user explicitly wrote (any source) — recorded by loadConfig BEFORE zod
    *  defaults erase the distinction. Family profiles defer to explicit settings (familyProfiles.ts). */
   explicitKeys?: string[];
+  /** Name of the activated named profile (--profile / SHADOW_PROFILE), when one was resolved. */
+  activeProfile?: string;
+  /** Activated profile definition (already validated), for display — e.g. /status (P2-11). */
+  profile?: z.infer<typeof ProfileSchema>;
 };
 export type ModelEntry = z.infer<typeof ModelEntrySchema>;
 
@@ -425,10 +503,27 @@ const CONFIG_FILE = 'shadow.config.json';
 // gate for every matching call at default autonomy — AND persistPermissionRules would write that
 // very file, so an injected model could plant the config that later discloses the gate. Strip the
 // whole key from the project file; allow/deny/ask grants belong in ~/.shadow (global) only.
-const PROJECT_UNTRUSTED_KEYS = ['baseUrl', 'selfHosted', 'shellEnvAllowlist', 'autonomy', 'denylistExtra', 'systemPromptPath', 'sandbox', 'sandboxNetwork', 'sandboxFailurePolicy', 'additionalDirectories', 'projects', 'offline', 'hooks', 'statusLine', 'vision', 'permissionRules', 'diagnostics', 'pluginIndexUrl', 'pluginIndexKey'];
+// `profiles` is global-only (P2-11): a profile can raise `autonomy` to `full` and widen
+// `contextBudget`, and activation happens at startup from a flag/env — so a cloned repo shipping a
+// crafted `profiles` map would be a stored grant the user never wrote. Definitions live in
+// ~/.shadow/config.json; only `--profile`/`SHADOW_PROFILE` may activate one.
+// `sessionRetentionDays`/`sessionRetentionKeep` are global-only (P2-13): retention ARCHIVES
+// session history (never deletes), but a cloned repo planting `{"sessionRetentionKeep": 0}`
+// could still sweep every log into .archive the moment a session starts in it — history a
+// user may want must not be movable by an untrusted file, so the keys come only from
+// ~/.shadow (global), env, or CLI flags.
+const PROJECT_UNTRUSTED_KEYS = ['baseUrl', 'selfHosted', 'shellEnvAllowlist', 'autonomy', 'denylistExtra', 'systemPromptPath', 'sandbox', 'sandboxNetwork', 'sandboxFailurePolicy', 'egress', 'additionalDirectories', 'projects', 'offline', 'hooks', 'statusLine', 'vision', 'permissionRules', 'diagnostics', 'pluginIndexUrl', 'pluginIndexKey', 'profiles', 'sessionRetentionDays', 'sessionRetentionKeep'];
 
-/** Layered precedence: CLI flags > env > project config file (de-fanged) > global > defaults. */
-export function loadConfig(cwd: string, cliOverrides: Record<string, unknown> = {}): ShadowConfig {
+/**
+ * Layered precedence: CLI flags > env > active profile > project config file (de-fanged) >
+ * global > defaults. `profileName` comes from `--profile` (falls back to `SHADOW_PROFILE`);
+ * profile DEFINITIONS always come from the global config (P2-11, F09-08).
+ */
+export function loadConfig(
+  cwd: string,
+  cliOverrides: Record<string, unknown> = {},
+  profileName?: string,
+): ShadowConfig {
   let fromFile: Record<string, unknown> = {};
   const path = resolve(cwd, CONFIG_FILE);
   if (existsSync(path)) {
@@ -506,11 +601,78 @@ export function loadConfig(cwd: string, cliOverrides: Record<string, unknown> = 
   // carry baseUrl+apiKey unstripped regardless. ONLY the project file above is untrusted.
   const fromGlobal = loadGlobalConfig();
 
+  // P2-11 (F09-08) — resolve the activated named profile. The NAME comes from --profile, else
+  // SHADOW_PROFILE; the DEFINITION always comes from the global config (`profiles` is global-only —
+  // a project file's copy was already stripped above). The profile layers in ABOVE the project file
+  // and BELOW env/CLI, so switching profiles changes model+effort+autonomy atomically while a
+  // single env var or flag can still win one key. Fail LOUDLY on an unknown name (listing what
+  // exists) and on a malformed entry — a silent no-op would leave the user on the wrong model.
+  const profileRequests = fromGlobal.profiles;
+  const profileMap =
+    profileRequests && typeof profileRequests === 'object' && !Array.isArray(profileRequests)
+      ? (profileRequests as Record<string, unknown>)
+      : {};
+  const requestedProfile = profileName ?? process.env.SHADOW_PROFILE;
+  // An EXPLICIT --profile is a deliberate choice → fail loudly on an unknown/malformed name.
+  // A stale SHADOW_PROFILE env var (e.g. left in a shell rc after renaming a profile) must NOT
+  // brick every loadConfig call site — several subcommands (export/local/doctor) read the env
+  // internally but cannot take --profile — so for env-sourced names we warn and run unprofiled.
+  const explicitProfile = profileName != null && profileName !== '';
+  let profileLayer: Record<string, unknown> = {};
+  let activeProfileName: string | undefined;
+  if (requestedProfile != null && requestedProfile !== '') {
+    // hasOwnProperty, not `in`: `in` sees the prototype chain, so `--profile toString` would
+    // classify as "invalid profile" instead of "unknown".
+    if (!Object.prototype.hasOwnProperty.call(profileMap, requestedProfile)) {
+      const available = Object.keys(profileMap);
+      const msg =
+        `unknown profile "${requestedProfile}"${
+          available.length > 0 ? ` — available: ${available.join(', ')}` : ' — none defined'
+        } (define profiles under "profiles" in ~/.shadow/config.json, activate with --profile).`;
+      if (explicitProfile) throw new Error(msg);
+      process.stderr.write(`shadow: ${msg} — ignoring SHADOW_PROFILE.\n`);
+    } else {
+      const parsed = ProfileSchema.safeParse(profileMap[requestedProfile]);
+      if (!parsed.success) {
+        const detail = parsed.error.issues
+          .map((i) => `  ${i.path.join('.') || '(root)'}: ${i.message}`)
+          .join('\n');
+        const msg = `invalid profile "${requestedProfile}" in ~/.shadow/config.json:\n${detail}`;
+        if (explicitProfile) throw new Error(msg);
+        process.stderr.write(`shadow: ${msg}\nshadow: ignoring SHADOW_PROFILE.\n`);
+      } else {
+        profileLayer = prune(parsed.data as Record<string, unknown>);
+        activeProfileName = requestedProfile;
+      }
+    }
+  }
+
+  // P2-11 (adversarial-review fix): a profile's `model` must carry its provider/endpoint along,
+  // otherwise a cross-provider profile (e.g. an OpenAI model while the default provider is
+  // Anthropic) leaves cfg.provider unchanged, the preset lookup at bootstrap misses, and the first
+  // request 400s at the wrong API. Resolve the model against the effective preset list and apply
+  // the same provider/model/baseUrl/selfHosted patch that lastModel-recall and `shadow local use`
+  // already apply — so the switch is atomic. A model that names no preset is left alone (it is
+  // served by whatever provider is already configured). This layer still sits BELOW env/CLI, so
+  // SHADOW_PROVIDER / --provider override it.
+  if (activeProfileName != null && typeof profileLayer.model === 'string' && profileLayer.model !== '') {
+    const entry = findProfileModelPreset(fromFile.models, fromGlobal.models, profileLayer.model);
+    if (entry) {
+      profileLayer = {
+        ...profileLayer,
+        model: entry.model,
+        provider: entry.provider,
+        ...(entry.baseUrl != null ? { baseUrl: entry.baseUrl } : {}),
+        ...(entry.selfHosted != null ? { selfHosted: entry.selfHosted } : {}),
+      };
+    }
+  }
+
   const fromEnv = readEnvOverrides();
   // Precedence (low → high): defaults < ~/.shadow/config.json (onboarding) < project
-  // shadow.config.json < env < CLI flags.
+  // shadow.config.json < active profile < env < CLI flags.
   const merged = deepMerge(
-    deepMerge(deepMerge(fromGlobal, fromFile), fromEnv),
+    deepMerge(deepMerge(deepMerge(fromGlobal, fromFile), profileLayer), fromEnv),
     prune(cliOverrides),
   );
 
@@ -522,15 +684,19 @@ export function loadConfig(cwd: string, cliOverrides: Record<string, unknown> = 
     throw new Error(`invalid configuration:\n${msg}`);
   }
   const cfg = result.data;
-  // Record which keys the user ACTUALLY wrote — from TRUSTED sources only (global file, env,
-  // CLI), before zod's .default() erased the distinction. Family profiles use this for
-  // precedence: an explicit setting beats a profile default (config/familyProfiles.ts).
+  // Record which keys the user ACTUALLY wrote — from TRUSTED sources only (global file, active
+  // profile, env, CLI), before zod's .default() erased the distinction. Family profiles use this
+  // for precedence: an explicit setting beats a profile default (config/familyProfiles.ts).
   // The UNTRUSTED project file is deliberately excluded: a cloned repo must not be able to
   // mark a safety-relevant default (e.g. parallelTools) as "explicit" and thereby out-rank a
   // family profile. Its VALUES still apply per normal precedence; it just can't claim intent.
   (cfg as ShadowConfig).explicitKeys = Object.keys(
-    deepMerge(deepMerge(fromGlobal, fromEnv), prune(cliOverrides)),
+    deepMerge(deepMerge(deepMerge(fromGlobal, profileLayer), fromEnv), prune(cliOverrides)),
   );
+  if (activeProfileName != null) {
+    (cfg as ShadowConfig).activeProfile = activeProfileName;
+    (cfg as ShadowConfig).profile = profileLayer as ShadowConfig['profile'];
+  }
   // Safety backstop: `maxIterations: 0` ("unlimited") is only safe while SOME budget cap exists. If the
   // user opted into 0 with no token/cost/wall-clock limit, a model looping on slightly-varying tool args
   // (dodging the consecutive-identical loop guard) would run forever on paid requests. Inject a wall-clock
@@ -689,12 +855,55 @@ function prune(obj: Record<string, unknown>): Record<string, unknown> {
   return out;
 }
 
+/**
+ * P2-11 (adversarial-review fix): resolve a profile's `model` against the effective model-preset
+ * list so the profile switch can carry the model's provider/endpoint along. Mirrors the lookup the
+ * /model picker's choices use (label OR model id, case-insensitive). The project file's `models`
+ * array REPLACES the global one when present (arrays overwrite in deepMerge — same as the final
+ * cfg.models), so search whichever list is effective. Returns undefined when nothing matches.
+ */
+function findProfileModelPreset(
+  fileModels: unknown,
+  globalModels: unknown,
+  target: string,
+): { model: string; provider: string; baseUrl?: string; selfHosted?: boolean } | undefined {
+  const want = target.trim().toLowerCase();
+  if (!want) return undefined;
+  const effective: unknown[] = Array.isArray(fileModels)
+    ? fileModels
+    : Array.isArray(globalModels)
+      ? globalModels
+      : [];
+  for (const raw of effective) {
+    if (!raw || typeof raw !== 'object') continue;
+    const m = raw as Record<string, unknown>;
+    const provider = typeof m.provider === 'string' ? m.provider : '';
+    const model = typeof m.model === 'string' ? m.model : '';
+    if (!provider || !model) continue;
+    const label = typeof m.label === 'string' ? m.label : '';
+    if (model.trim().toLowerCase() === want || label.trim().toLowerCase() === want) {
+      return {
+        model,
+        provider,
+        ...(typeof m.baseUrl === 'string' && m.baseUrl !== '' ? { baseUrl: m.baseUrl } : {}),
+        ...(typeof m.selfHosted === 'boolean' ? { selfHosted: m.selfHosted } : {}),
+      };
+    }
+  }
+  return undefined;
+}
+
 function deepMerge(
   a: Record<string, unknown>,
   b: Record<string, unknown>,
 ): Record<string, unknown> {
   const out: Record<string, unknown> = { ...a };
   for (const [k, v] of Object.entries(b)) {
+    // Prototype-pollution guard: JSON.parse keeps "__proto__" as an OWN enumerable key, and
+    // `out["__proto__"] = v` would invoke the setter and pollute the merged object's prototype —
+    // which zod then reads back, letting `{"nested": {"__proto__": {...}}}` in an untrusted
+    // project file smuggle keys past the PROJECT_UNTRUSTED_KEYS strip. Never merge these keys.
+    if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
     if (
       v &&
       typeof v === 'object' &&

@@ -3,12 +3,16 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { isolateHome, assertStoreIsolated } from './helpers/isolateHome.js';
+// Type-only: the dynamic import below yields a VALUE binding (fine for `new`, not for type
+// positions — TS2749), so the annotation form comes from this erased import.
+import type { SessionApprovals as SessionApprovalsT } from '../src/agent/approval.js';
 
 // Isolate ~/.shadow before importing anything that pulls in globalStore (GLOBAL_DIR is derived at
 // module load). resolveJail + loadConfig read the global config. `npm test`, never `bun test`.
 const { home: HOME } = isolateHome('jail');
 
 const { buildTurnDeps } = await import('../src/web/runTurn.js');
+const { SessionApprovals } = await import('../src/agent/approval.js');
 const { makeAgentBuilder } = await import('../src/web/sessionAgent.js');
 const { loadConfig } = await import('../src/config.js');
 const store = await import('../src/state/globalStore.js');
@@ -50,6 +54,7 @@ function fakeBuiltSession(opts: {
     displayPath: opts.displayPath,
     bus: new EventBus(),
     abort: new AbortController(),
+    approvals: new SessionApprovals(),
     agent,
     jail: opts.jail,
     model: () => 'mock',
@@ -63,6 +68,15 @@ test('the jail reaching buildLoopDeps is the JailCapability root, never the disp
 
   assert.equal(deps.workspaceRoot, '/private/tmp/pinned-jail', 'the pinned jail root reaches buildLoopDeps');
   assert.notEqual(deps.workspaceRoot, '/some/other/DISPLAY/path', 'NOT the display path (trap #5)');
+});
+
+test("the session's SessionApprovals reach the loop — grants survive the per-turn AgentLoop", () => {
+  const jail: JailCapability = Object.freeze({ workspaceRoot: '/private/tmp/j', additionalRoots: [] });
+  const session = fakeBuiltSession({ jail, displayPath: '/x' });
+  const deps = buildTurnDeps(session);
+  // IDENTITY, not shape: the loop must share the session's instance, so an "allow for this
+  // session" grant recorded by turn 1's loop is still honoured by turn 2's fresh loop.
+  assert.equal(deps.approvals, (session as unknown as { approvals: SessionApprovalsT }).approvals);
 });
 
 test('additionalRoots is the jail\'s [], never cfg.additionalDirectories', () => {

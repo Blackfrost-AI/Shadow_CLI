@@ -40,11 +40,9 @@ test('buildOpenAIBody emits tool_choice:"none" when the endpoint is known to rej
 test('the provider retries a tool_choice 400 with "none" and then remembers it (no second 400)', async () => {
   const bodies: Array<Record<string, unknown>> = [];
   const orig = globalThis.fetch;
-  let call = 0;
   globalThis.fetch = (async (_url: Parameters<typeof fetch>[0], init?: RequestInit) => {
     const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
     bodies.push(body);
-    call += 1;
     // First request (tool_choice:auto) → the real vLLM 400. Any "none" request → a clean stream.
     if (body.tool_choice === 'auto') {
       return new Response(JSON.stringify({ error: { message: REAL_400 } }), { status: 400, headers: { 'content-type': 'application/json' } });

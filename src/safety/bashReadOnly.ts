@@ -105,8 +105,13 @@ function uniqWritesOutput(head: string): boolean {
   return operands.length >= 2;
 }
 
-/** Commands whose operands are FILES TO READ — the ones worth scoping to the workspace. */
-const READS_FILE_OPERANDS = /^(?:cat|head|tail|less|more|od|xxd|hexdump|strings|file|stat|wc|nl|base64)\b/i;
+/** Commands whose operands are FILES TO READ — the ones worth scoping to the workspace.
+ *  BYPASS review (P2-07): `sort` and `uniq` print their input file's FULL CONTENT and were on
+ *  the read-only fast path without operand scoping (`sort /etc/shadow` auto-ran). Their write
+ *  forms never reach the scoping check: `sort -o` / `tree -o` / git `--output` fail
+ *  `segmentWrites` first, and `uniq IN OUT` (two positionals write the second) fails
+ *  `uniqWritesOutput` — so the operand scan below only ever sees the read-only shapes. */
+const READS_FILE_OPERANDS = /^(?:cat|head|tail|less|more|od|xxd|hexdump|strings|file|stat|wc|nl|base64|sort|uniq)\b/i;
 
 /**
  * GNU/BSD grep-family options that CONSUME the following token as a VALUE (not a path operand).
@@ -141,7 +146,7 @@ const VALUE_TAKING_OPTS = new Set([
  *    leading positional operands (before the first `-test`) as search roots.
  *  - `git grep`: paths come after `--` (pathspec). We scope only the tokens after the separator.
  *
- * Ambiguity refuses to vouch: a glob/tilde/var/URI operand already bails in `outsideRoots` (regex
+ * Ambiguity refuses to vouch: a glob/tilde/var operand already bails in `outsideRoots` (regex
  * `[*?[\]$~]`), so a misread pattern becomes a gate, never an auto-allow.
  */
 function searchReadsOutsideRoots(head: string, roots: readonly string[]): boolean {
@@ -215,6 +220,13 @@ function readsOutsideRoots(head: string, roots: readonly string[]): boolean {
 function outsideRoots(operand: string, roots: readonly string[]): boolean {
   // A glob or a variable can expand to anything; refuse to vouch for it.
   if (/[*?[\]$~]/.test(operand)) return true;
+  // BYPASS review (P2-07): the shell strips quotes and backslashes BEFORE the program reads, but
+  // this layer sees the raw tokens — `cat "/etc/passwd"` reads /etc/passwd, yet the operand
+  // `"/etc/passwd"` is not absolute, so it resolved "inside" the workspace and auto-ran (likewise
+  // `cat \/etc/passwd`, `cat ""/etc/passwd`, quoted-anywhere variants). Any quoting or escaping
+  // defeats literal path analysis; refuse to vouch, same fail-closed posture as globs (demotion
+  // to the gate, never a hard block).
+  if (/["'\\]/.test(operand)) return true;
   if (operand === '-' || operand === '/dev/null' || operand === '/dev/stdin') return false;
   try {
     resolveWithin(roots as string[], operand);
@@ -276,18 +288,67 @@ export function isBashReadOnly(command: string, roots: readonly string[] = []): 
   return true;
 }
 
-function isReadOnlySegment(head: string): boolean {
-  if (/^find\b/i.test(head) && FIND_DENY_RE.test(head)) return false;
+/**
+ * F07-05: the read-only fast path is not the only auto-run route — a session PREFIX approval
+ * (`(f)` on the gate) also auto-runs matching commands, and it used to ignore path scoping
+ * entirely: approve `cat` once and `cat ~/.aws/credentials` rode the grant out of the jail.
+ * This is the same per-segment demotion `isBashReadOnly` applies, factored out so ANY auto-run
+ * path can ask "does this command read outside the granted roots?" True = demote to the gate
+ * (never a hard block — the user can still approve the specific command deliberately).
+ *
+ * BYPASS review (P2-07): the same demotion guards the whole-session tool grant (`(s)`) — a
+ * grant that shell commands may run is not a grant of WHERE they read — and the write-flag
+ * screen (`segmentWrites`) is applied here too, so a granted `git log` cannot smuggle
+ * `git log --output=/etc/cron.d/x` past the jail either.
+ *
+ * Walks chains and pipelines exactly like `isBashReadOnly` so a scoped answer covers the whole
+ * command, not just its head. Non-viewer/non-search segments contribute nothing (their operands
+ * are not file reads this layer can vouch for) — callers layer their own rules on top.
+ */
+export function commandReadsOutsideRoots(command: string, roots: readonly string[]): boolean {
+  if (!roots.length) return false;
+  if (/[\r\n]/.test(command)) return true; // same shape rule as the fast path: refuse to vouch
+  const normalized = normalizeCommand(command);
+  if (!normalized) return false;
+  for (const part of normalized.split(/\s*(?:&&|\|\||;|&)\s*/)) {
+    for (const segment of part.split(/\s*\|\s*/)) {
+      const head = segment.trim();
+      if (!head) continue;
+      if (segmentWrites(head)) return true;
+      if (readsOutsideRoots(head, roots)) return true;
+      if (searchReadsOutsideRoots(head, roots)) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Segments that LOOK read-only by prefix but are not: they WRITE a file they name, or read
+ * arbitrary paths by explicit construction. Shared by the fast path (`isReadOnlySegment`) and
+ * `commandReadsOutsideRoots` — a session/prefix grant must not vouch for these either (BYPASS
+ * review: `git log --output=/etc/cron.d/x` rode a granted `git log` prefix into an out-of-root
+ * write; the fast path screened it, the grant path did not).
+ */
+function segmentWrites(head: string): boolean {
+  if (/^find\b/i.test(head) && FIND_DENY_RE.test(head)) return true;
   // A read-looking command carrying a write flag is a write.
   for (const { cmd, flags } of WRITE_FLAGS) {
-    if (cmd.test(head) && flags.test(head)) return false;
+    if (cmd.test(head) && flags.test(head)) return true;
   }
-  if (uniqWritesOutput(head)) return false;
+  if (uniqWritesOutput(head)) return true;
   // `git branch` is read-only only for LISTING — a delete/move/copy/force flag mutates refs
   // (branch deletion, history-losing renames) and must not auto-run.
   if (/^git\s+branch\b/.test(head) && /(?:^|\s)(?:-[dDmMcC]|-f|--(?:delete|move|copy|force))\b/.test(head)) {
-    return false;
+    return true;
   }
+  // `git diff --no-index A B` reads the TWO named files verbatim and prints them — arbitrary
+  // paths, unlike normal git diff (repo objects only). Not a repo-scoped read; refuse to vouch.
+  if (/^git\s+diff\b/i.test(head) && /(?:^|\s)--no-index\b/.test(head)) return true;
+  return false;
+}
+
+function isReadOnlySegment(head: string): boolean {
+  if (segmentWrites(head)) return false;
   for (const prefix of READ_ONLY_PREFIXES) {
     if (head === prefix) return true;
     if (!head.startsWith(prefix)) continue;

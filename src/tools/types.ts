@@ -2,6 +2,7 @@ import type { z } from 'zod';
 import type { ReadTracker } from './readTracker.js';
 import type { DiffLine } from '../util/diff.js';
 import type { ImageBlock } from '../provider/provider.js';
+import type { Budget } from '../agent/budget.js';
 
 export type ToolRisk = 'read' | 'write' | 'exec' | 'network';
 
@@ -52,6 +53,19 @@ export interface ToolContext {
   /** F06-10: true when this tool runs inside a sub-agent loop. A nested `agent` call uses it
    *  to bypass the session admission gate — queuing behind its own parent's permit deadlocks. */
   nestedAgent?: boolean;
+  /** P3-09 (F04-08): the Budget of the loop that is running THIS tool call — the immediate parent
+   *  of any sub-agent the call spawns. The `agent` tool reads its remaining ceilings into the
+   *  sub-agent at admission and rolls the sub-agent's final spend back up into it, so the parent's
+   *  maxCostUSD / maxTotalTokens bound the whole delegation tree. In a nested call this is the
+   *  enclosing sub-agent's own budget, so accrual chains upward one level at a time. */
+  parentBudget?: Budget;
+  /** P3-09 (F04-08): the turn/run budget at the ROOT of this call's delegation tree — the parent
+   *  budget itself for a top-level call. A BACKGROUND sub-agent rolls its spend up here rather
+   *  than into its immediate parent: it can outlive that parent's loop (that is the point of
+   *  background), and a late accrual into an already-finished budget would never be checked again —
+   *  the root budget stays alive for the whole turn/run, so the spend still reaches a living
+   *  ceiling check. Threaded down through the sub-loop deps and re-stamped by every loop. */
+  rootBudget?: Budget;
 }
 
 export interface Tool<I = unknown, O = unknown> {

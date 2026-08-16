@@ -3,6 +3,7 @@ import { AgentLoop } from '../agent/loop.js';
 import { Budget } from '../agent/budget.js';
 import { makeDenylist } from '../safety/denylist.js';
 import { WebDenyGate } from './webGate.js';
+import type { ApprovalGate } from '../agent/approval.js';
 import type { LoopDeps } from '../agent/loop.js';
 import type { ShadowConfig } from '../config.js';
 import type { ToolCall } from '../provider/provider.js';
@@ -15,8 +16,12 @@ import { resolveJail } from './projects.js';
  * buildLoopDeps → LoopDeps.workspaceRoot → ToolContext → resolveWithin in every file tool.
  * Exported so a test can assert on THESE options (asserting on createAgentSession's proves
  * nothing — it discards the jail).
+ *
+ * `gate` is injectable: the web console keeps the fail-closed WebDenyGate default; the ACP
+ * adapter passes its editor-mediated AcpPermissionGate (src/acp/gate.ts). Same enforcement
+ * point either way.
  */
-export function buildTurnDeps(session: WebSession): LoopDeps {
+export function buildTurnDeps(session: WebSession, gate?: ApprovalGate): LoopDeps {
   const agent = session.agent;
   const jail = session.jail;
   if (!agent || !jail) throw new Error('runTurn called before the session was built');
@@ -38,8 +43,12 @@ export function buildTurnDeps(session: WebSession): LoopDeps {
     provider: agent.provider,
     registry: agent.registry,
     // Q1 default: fail-closed. run_shell/network at auto-edit deny immediately with a finding.
-    gate: new WebDenyGate(session.bus),
+    // The ACP adapter injects its editor-mediated gate instead (see `gate` param).
+    gate: gate ?? new WebDenyGate(session.bus),
     bus: session.bus,
+    // Session-lifetime approval grants (TUI parity): the ACP gate's "Allow for this session"
+    // lands on the session's ONE SessionApprovals, so it survives the per-turn AgentLoop.
+    approvals: session.approvals,
     budget,
     context: agent.context,
     // The registry sets session.abort before calling us; interrupt aborts the turn through it.
@@ -68,7 +77,10 @@ export function buildTurnDeps(session: WebSession): LoopDeps {
  * The real `TurnRunner`: record the user's turn, assemble deps (the jail enforcement above), and
  * run one loop. The run lock is held by the registry around this call.
  */
-export function makeTurnRunner(resolve: (root: string) => JailCapability = resolveJail): TurnRunner {
+export function makeTurnRunner(
+  resolve: (root: string) => JailCapability = resolveJail,
+  gateFor?: (s: WebSession) => ApprovalGate,
+): TurnRunner {
   return async (session: WebSession, prompt: string) => {
     const agent = session.agent;
     if (!agent) throw new Error('runTurn called before the session was built');
@@ -87,7 +99,7 @@ export function makeTurnRunner(resolve: (root: string) => JailCapability = resol
     agent.context.append({ role: 'user', content: [{ type: 'text', text: prompt }] });
     session.bus.emit({ type: 'user', text: prompt });
 
-    const deps = buildTurnDeps(session);
+    const deps = buildTurnDeps(session, gateFor?.(session));
     await new AgentLoop(deps, session.autonomy()).run();
   };
 }

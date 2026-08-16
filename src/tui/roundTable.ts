@@ -87,6 +87,8 @@ export type TableCommand =
   | { kind: 'pass'; handle: string }
   | { kind: 'done' }
   | { kind: 'unknownHandle'; handle: string }
+  /** F02-06: any other slash command while the table holds the composer — paused, named for the user. */
+  | { kind: 'pausedSlash'; command: string }
   | { kind: 'note' };
 
 /**
@@ -103,6 +105,10 @@ export function parseTableInput(input: string, handles: string[]): TableCommand 
     const h = pass[1]!.toLowerCase();
     return handles.includes(h) ? { kind: 'pass', handle: h } : { kind: 'unknownHandle', handle: h };
   }
+  // F02-06: every other slash command is PAUSED while the table holds the composer. Name it
+  // explicitly — the old `note` fallback answered "address a model with @handle" to a user who had
+  // typed /cost, which read as a swallowed keystroke rather than a deliberate pause.
+  if (t.startsWith('/')) return { kind: 'pausedSlash', command: t.split(/\s+/)[0]! };
   const at = t.match(/^@(\S+)\s*([\s\S]*)$/);
   if (at) {
     const h = at[1]!.toLowerCase();

@@ -15,6 +15,7 @@ import {
   parseSgrMouse,
   hasSgrMouse,
   stripSgrMouse,
+  lastKeySequence,
 } from '../src/tui/composer.js';
 
 // A caret marker makes these readable: '|' is where the cursor sits.
@@ -146,4 +147,34 @@ test('hasSgrMouse / stripSgrMouse cover both forms', () => {
   assert.ok(!hasSgrMouse('plain text'));
   assert.equal(stripSgrMouse('ab[<0;1;1Mcd'), 'abcd');
   assert.equal(stripSgrMouse('ab\x1b[<0;1;1Mcd'), 'abcd');
+});
+
+test('lastKeySequence (F03-05): a single sequence passes through unchanged', () => {
+  assert.equal(lastKeySequence('\x1b[H'), '\x1b[H');
+  assert.equal(lastKeySequence('\x1b[3~'), '\x1b[3~');
+  assert.equal(lastKeySequence('\x1b[13;2u'), '\x1b[13;2u', 'CSI-u Shift+Enter');
+  assert.equal(lastKeySequence('\x1bOH'), '\x1bOH', 'SS3 Home keeps all three bytes');
+  assert.equal(lastKeySequence('\x1b\x7f'), '\x1b\x7f', 'two-byte Option+Delete form');
+  assert.equal(lastKeySequence('\x1b(B'), '\x1b(B', 'two-byte charset designator');
+  assert.equal(lastKeySequence('plain text'), 'plain text', 'no ESC at all → the chunk itself');
+});
+
+test('lastKeySequence (F03-05): batched chunks keep the LAST ESC-led sequence', () => {
+  // A held key repeats into one stdin read — the ^…$ anchored raw tests only match one sequence.
+  assert.equal(lastKeySequence('\x1b[D\x1b[D\x1b[D'), '\x1b[D');
+  assert.equal(lastKeySequence('\x1b[H\x1b[H'), '\x1b[H');
+  // Home landing in the same read as the key pressed right after it, and vice versa.
+  assert.equal(lastKeySequence('\x1b[Hq'), '\x1b[H', 'trailing typed text is not part of the sequence');
+  assert.equal(lastKeySequence('q\x1b[H'), '\x1b[H');
+  assert.equal(lastKeySequence('ab\x1b[3~cd'), '\x1b[3~', 'CSI trimmed at its final byte');
+  // Option+Up arrives as ESC ESC [ A — the last ESC-led sequence is the arrow itself.
+  assert.equal(lastKeySequence('\x1b\x1b[A'), '\x1b[A');
+});
+
+test('lastKeySequence (F03-05): OSC and degenerate inputs never throw', () => {
+  assert.equal(lastKeySequence('\x1b]0;title\x07tail'), '\x1b]0;title\x07', 'OSC trimmed at BEL');
+  assert.equal(lastKeySequence('\x1b]8;;url\x1b\\x'), '\x1b]8;;url\x1b\\', 'OSC trimmed at ST');
+  assert.equal(lastKeySequence('\x1b'), '\x1b', 'bare ESC stays bare');
+  assert.equal(lastKeySequence('\x1b[3'), '\x1b[3', 'incomplete CSI kept as-is (matches nothing, hurts nothing)');
+  assert.equal(lastKeySequence(''), '');
 });

@@ -32,6 +32,11 @@
  * roles to the active palette.
  */
 
+// F05-07: every column measurement/pad/truncate here goes through the ONE width table
+// (util/width.ts). The old UTF-16 .length/padEnd paths split surrogate pairs on truncation and
+// over-counted CJK/emoji labels, skewing bar geometry and ragged-right value columns.
+import { displayWidth, takeByWidth } from './width.js';
+
 export type ChartRole = 'title' | 'label' | 'bar' | 'value' | 'axis';
 
 export interface ChartSpan {
@@ -162,7 +167,15 @@ function trim1(n: number): string {
 }
 
 function truncLabel(s: string, max: number): string {
-  return s.length <= max ? s : `${s.slice(0, Math.max(1, max - 1))}…`;
+  if (max <= 0) return '';
+  const fit = takeByWidth(s, max);
+  if (fit.rest === '') return s;
+  return `${takeByWidth(s, Math.max(1, max - 1)).head}…`;
+}
+
+/** Pad `s` with spaces UP TO `cols` display columns (no-op when already ≥ cols). */
+function padTo(s: string, cols: number): string {
+  return s + ' '.repeat(Math.max(0, cols - displayWidth(s)));
 }
 
 /** Resample `values` to exactly `n` points by linear interpolation (n ≥ 2). */
@@ -186,8 +199,8 @@ function renderBar(spec: ChartSpec, width: number): ChartSpan[][] {
   const rows: ChartSpan[][] = [];
   if (spec.title) rows.push([{ text: spec.title, role: 'title' }]);
 
-  const labelW = Math.min(24, Math.max(0, ...spec.points.map((p) => p.label.length)));
-  const valueW = Math.max(...spec.points.map((p) => p.display.length));
+  const labelW = Math.min(24, Math.max(0, ...spec.points.map((p) => displayWidth(p.label))));
+  const valueW = Math.max(...spec.points.map((p) => displayWidth(p.display)));
   // label + space + bar + space + value must fit `width`; bars get what's left.
   const barW = Math.max(4, width - labelW - valueW - (labelW > 0 ? 2 : 1));
   const maxAbs = Math.max(...spec.points.map((p) => Math.abs(p.value)), 0);
@@ -201,11 +214,14 @@ function renderBar(spec: ChartSpec, width: number): ChartSpan[][] {
     let bar = '█'.repeat(full) + EIGHTHS[rem]!;
     if (bar === '' && p.value !== 0) bar = '▏';
     const row: ChartSpan[] = [];
-    if (labelW > 0) row.push({ text: `${truncLabel(p.label, labelW).padEnd(labelW)} `, role: 'label' });
+    if (labelW > 0) row.push({ text: `${padTo(truncLabel(p.label, labelW), labelW)} `, role: 'label' });
     row.push({ text: bar, role: 'bar' });
     // Values right-align on a shared edge (ledger style): pad to the bar column's end,
     // then padStart within the value column.
-    row.push({ text: `${' '.repeat(Math.max(1, barW - bar.length + 1))}${p.display.padStart(valueW)}`, role: 'value' });
+    row.push({
+      text: `${' '.repeat(Math.max(1, barW - displayWidth(bar) + 1))}${' '.repeat(Math.max(0, valueW - displayWidth(p.display)))}${p.display}`,
+      role: 'value',
+    });
     rows.push(row);
   }
   return rows;
@@ -220,7 +236,7 @@ function renderSpark(spec: ChartSpec, width: number): ChartSpan[][] {
   const lo = Math.min(...values);
   const hi = Math.max(...values);
   const tail = ` ${fmtAxis(lo)}…${fmtAxis(hi)}`;
-  const room = Math.max(4, width - tail.length);
+  const room = Math.max(4, width - displayWidth(tail));
   const vs = values.length > room ? resample(values, room) : values;
   const glyphs = vs
     .map((v) => (hi === lo ? SPARKS[3] : SPARKS[Math.min(7, Math.floor(((v - lo) / (hi - lo)) * 8))]))
@@ -253,7 +269,7 @@ function renderLine(spec: ChartSpec, width: number): ChartSpan[][] {
   const hi = Math.max(...values);
   const maxLbl = fmtAxis(hi);
   const minLbl = fmtAxis(lo);
-  const gutterW = Math.max(maxLbl.length, minLbl.length);
+  const gutterW = Math.max(displayWidth(maxLbl), displayWidth(minLbl));
   const plotW = Math.max(10, width - gutterW - 1);
 
   const dotW = plotW * 2;

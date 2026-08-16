@@ -19,7 +19,7 @@ import { inlineImageEsc, formatBytes, supportsInlineImages } from '../util/termI
 import { renderBrand, renderToolResult, renderToolChild, renderReasoning, renderToolStack } from './rows.js';
 import type { BrandInfo, ToolInfo, ToolRun } from './rows.js';
 import { collapseKind, isCollapsibleTool, type CollapseKind } from './toolDisplay.js';
-import { displayWidth, takeByWidth, nextCluster } from './width.js';
+import { displayWidth, takeByWidth, nextCluster } from '../util/width.js';
 
 export { TABLE_COLLAPSE_THRESHOLD };
 
@@ -405,7 +405,9 @@ function wrapHanging(
   body: StyledSpan[],
   cols: number,
 ): ViewportLine[] {
-  const prefixW = first.reduce((n, s) => n + s.text.length, 0);
+  // F05-07: measure the prefix in DISPLAY columns, not UTF-16 units — a bullet like '▪ ' or a
+  // wide marker counted double/too little via .length and shifted every wrapped continuation row.
+  const prefixW = first.reduce((n, s) => n + displayWidth(s.text), 0);
   const inner = Math.max(4, cols - prefixW);
   return wrapSpansWord(body, inner).map((rowSpans, i) => ({
     key: `${keyPrefix}.${i}`,
@@ -877,16 +879,33 @@ export function flattenItem(
 }
 
 /**
- * Group consecutive COLLAPSIBLE tool items (reads/greps/globs/views) into runs for stacking.
- * Writes, edits, shell, agents, and network tools BREAK the group and always render as their
- * own row — so a long recon burst collapses to `⏺ Read 5 files, Grep 2 patterns` while an
- * `Update(src/foo.ts) — +12 −3` never gets buried. Returns a map keyed by item index → the run
- * descriptor, but ONLY for items in a run of ≥2 (single tools never stack).
- * `allExpanded` (Ctrl-O) flips every run's `collapsed` false at once. One pass, O(n).
+ * P3-02 instrumentation — how much transcript work tool-run grouping actually does. The
+ * acceptance criterion ("a spinner tick must not run transcript logic") is a claim about these
+ * numbers: while a turn runs with no NEW committed lines, the memoized TUI call site hits the
+ * appendable cache below and `itemsScanned` does not move. Tests snapshot deltas, never absolutes
+ * (the counters are process-global and other suites share them).
  */
-export function computeToolRuns(items: FlattenItem[], allExpanded: boolean): Map<number, ToolRun> {
-  const runs = new Map<number, ToolRun>();
-  let i = 0;
+export const toolRunsStats = {
+  /** Full O(n) passes (first computation, Ctrl-O toggle, resets, cache invalidation). */
+  full: 0,
+  /** Append-extensions that reused a cache (only the tail stretch re-scanned; 0 items on a pure hit). */
+  incremental: 0,
+  /** Cumulative item slots scanned across both paths. */
+  itemsScanned: 0,
+};
+
+/**
+ * Scan `items` from `start` to the end, grouping runs into `runs`. Callers must pick a `start`
+ * that sits on a run boundary (index 0, or an index whose PREVIOUS item is not a collapsible
+ * tool) — then the forward walk sees exactly the same maximal stretches as a from-scratch pass.
+ */
+function groupRunsFrom(
+  items: FlattenItem[],
+  start: number,
+  allExpanded: boolean,
+  runs: Map<number, ToolRun>,
+): void {
+  let i = start;
   while (i < items.length) {
     const item = items[i]!;
     const name = item.kind === 'tool' ? item.tool?.name : undefined;
@@ -934,7 +953,92 @@ export function computeToolRuns(items: FlattenItem[], allExpanded: boolean): Map
     }
     i = j;
   }
+}
+
+/**
+ * Group consecutive COLLAPSIBLE tool items (reads/greps/globs/views) into runs for stacking.
+ * Writes, edits, shell, agents, and network tools BREAK the group and always render as their
+ * own row — so a long recon burst collapses to `⏺ Read 5 files, Grep 2 patterns` while an
+ * `Update(src/foo.ts) — +12 −3` never gets buried. Returns a map keyed by item index → the run
+ * descriptor, but ONLY for items in a run of ≥2 (single tools never stack).
+ * `allExpanded` (Ctrl-O) flips every run's `collapsed` false at once. One pass, O(n).
+ */
+export function computeToolRuns(items: FlattenItem[], allExpanded: boolean): Map<number, ToolRun> {
+  toolRunsStats.full++;
+  toolRunsStats.itemsScanned += items.length;
+  const runs = new Map<number, ToolRun>();
+  groupRunsFrom(items, 0, allExpanded, runs);
   return runs;
+}
+
+/**
+ * Append-only incremental state for `computeToolRunsAppendable`.
+ *
+ * `tailStart` is the first index of the trailing contiguous stretch of collapsible tool items
+ * (`items.length` when the array does not END with one). That stretch is the ONLY region an
+ * append can change: everything before it is closed by a non-collapsible item (or the start of
+ * the array), so its descriptors are final until a reset replaces the whole array.
+ */
+export interface ToolRunsCache {
+  items: readonly FlattenItem[];
+  allExpanded: boolean;
+  runs: Map<number, ToolRun>;
+  tailStart: number;
+}
+
+/** Index of the trailing collapsible-tool stretch (items.length when the tail is not one). */
+function tailStretchStart(items: FlattenItem[]): number {
+  let s = items.length;
+  while (s > 0) {
+    const it = items[s - 1]!;
+    const name = it.kind === 'tool' ? it.tool?.name : undefined;
+    if (!name || !isCollapsibleTool(name)) break;
+    s--;
+  }
+  return s;
+}
+
+/**
+ * Incremental variant of `computeToolRuns` for an APPEND-ONLY transcript (the TUI's `committed`
+ * array: pushLine appends; /clear and context repaints replace the array wholesale). Reuses the
+ * previous cache when `items` is an extension of it — validity is an O(1) identity check at the
+ * old boundary (plus the head), which is exact under the append-only invariant: a wholesale
+ * replacement necessarily changes element identity and falls back to the full pass. Extending
+ * only re-scans from `cache.tailStart`, so a long session pays O(new tail) per committed line
+ * instead of O(transcript), and a render with NO new lines pays zero scanning. A change of
+ * `allExpanded` touches every descriptor's `collapsed` flag → always a full pass.
+ *
+ * The returned `runs` map is the cache's own map (mutated in place on extension) — callers get
+ * ONE live object, so memoized consumers never hold a stale snapshot.
+ */
+export function computeToolRunsAppendable(
+  items: FlattenItem[],
+  allExpanded: boolean,
+  cache?: ToolRunsCache,
+): { runs: Map<number, ToolRun>; cache: ToolRunsCache } {
+  const n = cache?.items.length ?? 0;
+  if (
+    cache &&
+    cache.allExpanded === allExpanded &&
+    n <= items.length &&
+    (n === 0 || (items[0] === cache.items[0] && items[n - 1] === cache.items[n - 1]))
+  ) {
+    toolRunsStats.incremental++;
+    if (n === items.length) return { runs: cache.runs, cache }; // nothing appended: zero scanning
+    toolRunsStats.itemsScanned += items.length - cache.tailStart;
+    for (const k of [...cache.runs.keys()]) {
+      if (k >= cache.tailStart) cache.runs.delete(k);
+    }
+    groupRunsFrom(items, cache.tailStart, allExpanded, cache.runs);
+    const next: ToolRunsCache = { items, allExpanded, runs: cache.runs, tailStart: tailStretchStart(items) };
+    return { runs: cache.runs, cache: next };
+  }
+  toolRunsStats.full++;
+  toolRunsStats.itemsScanned += items.length;
+  const runs = new Map<number, ToolRun>();
+  groupRunsFrom(items, 0, allExpanded, runs);
+  const next: ToolRunsCache = { items, allExpanded, runs, tailStart: tailStretchStart(items) };
+  return { runs, cache: next };
 }
 
 /** True when this item has a foldable body (reasoning always; tool bodies over the threshold). */
@@ -973,4 +1077,69 @@ export function flattenTranscript(
     all.push(...flattenItem(item, cols, collapsed, theme, false, true));
   }
   return all;
+}
+
+// ── P3-03 · epoch-independent flatten memo (F05-05) ───────────────────────────
+// A <Static key={staticEpoch}> remount (Ctrl-O fold toggle, editor return, app:redraw) recreates
+// EVERY FlatItem instance, so an in-component useMemo cannot survive it — before this cache the
+// whole transcript was re-flattened synchronously on every remount even when nothing about the
+// layout changed. This memo lives OUTSIDE the component so a remount reuses the wrap work
+// whenever the layout inputs are unchanged ("Ctrl-O at unchanged width reuses wrap work").
+//
+// Keyed on the ITEM OBJECT, not item.id: ids restart at 0 for every TuiApp mount (lineId is a
+// per-instance ref), so id keys would collide across instances in one process (tests, probes)
+// and serve one transcript's rows for another's. Object identity never collides, and committed is
+// append-only with entries never mutated in place, so the identity is stable for the item's whole
+// lifetime and the cached rows stay valid. A WeakMap means /clear and context-repaint need no
+// reset call at all — once the items leave committed and are GC'd, their entries go with them.
+//
+// Per item, EVERY layout variant stays cached (the inner key includes cols + collapsed), so
+// Ctrl-O toggling back and forth and repainting at unchanged width re-wrap nothing either way.
+export const flattenCacheStats = { hits: 0, misses: 0 };
+
+const flattenCache = new WeakMap<FlattenItem, Map<string, ViewportLine[]>>();
+
+function toolRunCacheKey(r: ToolRun): string {
+  return `${r.pos}.${r.len}.${r.okCount}.${r.failCount}.${r.totalMs}.${r.collapsed ? 1 : 0}.${r.hint ?? ''}.${JSON.stringify(r.kinds)}`;
+}
+
+/** Snapshot the palette VALUES into the variant key. The theme object handed in (tui.tsx's
+ *  PIN_THEME) is a bundle of getters over the mutable `C` palette — `/theme` is an in-place
+ *  Object.assign(C, …), so the theme REFERENCE never changes while its colors do. A
+ *  reference-compare (`hit.theme === theme`) would therefore serve pre-switch rows forever after
+ *  a theme change; reading the values at key time makes a palette swap invalidate every variant. */
+function themeSig(t: ViewportTheme): string {
+  return `${t.fg},${t.dim},${t.green},${t.cyan},${t.yellow},${t.red},${t.purple},${t.codeBg ?? ''},${t.bright ?? ''},${t.user ?? ''},${t.accent ?? ''}`;
+}
+
+/**
+ * `flattenItem` with the epoch-independent memo. The variant key covers every input that changes
+ * the wrapped output: (tight, cols, collapsed, continuation, foldLargeTables, toolRun descriptor,
+ * palette values). Returns the SAME array instance on a hit.
+ */
+export function flattenItemCached(
+  item: FlattenItem,
+  cols: number,
+  collapsed: boolean,
+  theme: ViewportTheme,
+  continuation = false,
+  foldLargeTables = false,
+  toolRun?: ToolRun,
+): ViewportLine[] {
+  const sig = `${item.tight ? 1 : 0}|${cols}|${collapsed ? 1 : 0}|${continuation ? 1 : 0}|${foldLargeTables ? 1 : 0}|${toolRun ? toolRunCacheKey(toolRun) : ''}|${themeSig(theme)}`;
+  let variants = flattenCache.get(item);
+  if (variants) {
+    const hit = variants.get(sig);
+    if (hit) {
+      flattenCacheStats.hits++;
+      return hit;
+    }
+  } else {
+    variants = new Map();
+    flattenCache.set(item, variants);
+  }
+  flattenCacheStats.misses++;
+  const lines = flattenItem(item, cols, collapsed, theme, continuation, foldLargeTables, toolRun);
+  variants.set(sig, lines);
+  return lines;
 }

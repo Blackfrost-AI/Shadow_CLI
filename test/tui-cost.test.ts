@@ -77,6 +77,34 @@ test('/cost sums session tokens (delta-safe), accrues sub-agent tokens, and sepa
   }
 });
 
+test('P3-09: sub-agent spend accrues once — a later parent usage delta never re-counts it', async () => {
+  const ws = mkdtempSync(join(tmpdir(), 'cost-p309-'));
+  const opts = baseOpts({ workspaceRoot: ws });
+  const { stdin, lastFrame, unmount } = render(React.createElement(TuiApp, { opts }));
+  try {
+    await tick();
+    // Parent's own cumulative spend so far: 100 in / 40 out / $0.50.
+    opts.bus.emit({ type: 'usage', inputTokens: 100, outputTokens: 40, costUSD: 0.5, contextPct: 0.1 });
+    // A sub-agent reports its OWN spend exactly once (its budget snapshots are own-only — the
+    // parent's rolled-up accrual never leaks back into these events).
+    opts.bus.emit({ type: 'subagent_usage', costUSD: 0.25, subagent: 'explore', taskId: 'a1', inputTokens: 200, outputTokens: 80 });
+    // The parent's next usage event reflects ONLY its own budget having grown (+60 in / +20 out /
+    // +$0.30) — if sub-agent spend had leaked into the parent's usage numbers, the delta math here
+    // would add it a second time.
+    opts.bus.emit({ type: 'usage', inputTokens: 160, outputTokens: 60, costUSD: 0.8, contextPct: 0.1 });
+    await runSlash(stdin, '/cost');
+    assert.ok(await until(() => /Session \(/.test(strip(lastFrame() ?? ''))), '/cost prints a session line');
+    const f = strip(lastFrame() ?? '');
+    // 100 + 200 + 60 = 360 in · 40 + 80 + 20 = 140 out · $0.50 + $0.25 + $0.30 = $1.0500.
+    assert.match(f, /360 in/, 'session input counts the sub-agent once');
+    assert.match(f, /140 out/, 'session output counts the sub-agent once');
+    assert.match(f, /Session cost: \$1\.0500/, 'session cost = parent own + sub-agent, no double-count');
+  } finally {
+    unmount();
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
 test('/clear resets the session usage readout', async () => {
   const ws = mkdtempSync(join(tmpdir(), 'cost-clear-'));
   const opts = baseOpts({ workspaceRoot: ws });

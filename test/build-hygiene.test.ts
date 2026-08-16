@@ -43,6 +43,9 @@ test('the release gate runs from the artifact producer, not only from an unreach
   assert.match(build, /check-release-gate\.sh/, 'build-binary.sh must invoke the gate');
   // prepublishOnly is unreachable because the package is private — that was the whole problem.
   assert.equal(pkg.scripts.prepublishOnly?.includes('check-release-gate'), true);
+  // F06-11: `npm pack` runs prepack, NOT prepublishOnly. Since dist/ is untracked it must be
+  // rebuilt by the gate before packing, or pack silently produces a tarball missing the bin target.
+  assert.equal(pkg.scripts.prepack?.includes('check-release-gate'), true);
 });
 
 test('the production build starts from a clean dist directory', () => {

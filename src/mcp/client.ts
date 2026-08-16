@@ -5,6 +5,7 @@ import { z } from 'zod';
 import { ok, fail } from '../tools/types.js';
 import { scrubbedEnv } from '../util/safeEnv.js';
 import { shadowFetch } from '../safety/egress.js';
+import { wrapMcpArgv } from '../safety/sandbox.js';
 import { envelopUntrusted, fitPayload } from '../safety/envelope.js';
 import { readCapped } from '../tools/webFetch.js';
 import { SseAssembler, parseSseData, nonEmptyParts, type SseEvent } from '../provider/sse.js';
@@ -26,12 +27,84 @@ function nameSafe(s: string): string {
   return s.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, 64);
 }
 
+/**
+ * F07-12: an MCP tool's NAME and DESCRIPTION are server-controlled and enter the tool schema —
+ * the instruction surface the model reads on EVERY request, not only when a result arrives (the
+ * P3-05 envelope covers tool RESULTS only). The name is therefore collapsed to the identifier
+ * alphabet: a tool cannot be named "ignore previous instructions…", and providers that constrain
+ * tool names to [A-Za-z0-9_-] never see an illegal character. Registration passes the EXACT
+ * registered name (including any collision suffix) into callTool so result metadata matches; the
+ * reconstruction inside callTool is the fallback for direct callers. The WIRE call still uses
+ * the server's original name — only the display id is sanitized.
+ */
+export function mcpSafeNamePart(part: string): string {
+  const s = part
+    .replace(/[^A-Za-z0-9_-]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 64);
+  return s || 'tool';
+}
+
+/** Retained budget for a server-supplied tool description inside its containment envelope. */
+const MCP_DESCRIPTION_CAP = 8_192;
+
+/**
+ * Byte cap for a server-supplied input schema (BYPASS review, P2-07). The schema rides EVERY
+ * request once converted, so a multi-MB schema is a context-bloat DoS; a legitimate tool schema
+ * is a handful of KB at most. Enforced at registration — an oversized tool is skipped, not
+ * truncated (a truncated schema would reject the server's own valid inputs).
+ */
+const MCP_SCHEMA_CAP = 32_768;
+
+const CONTROL_CHARS = /[\u0000-\u001f\u007f]/;
+
+/**
+ * BYPASS review (P2-07): jsonSchemaToZod drops `description`/`title`, but object KEYS and ENUM
+ * string values survive verbatim into the per-request tool schema — a residual server-controlled
+ * text channel (plus a terminal-injection surface if the schema is ever printed). They cannot be
+ * enveloped (the model must reproduce them verbatim to call the tool), so fail closed instead:
+ * reject any schema carrying control characters in a key or an enum value.
+ */
+function mcpSchemaTextSafe(node: unknown): boolean {
+  if (node == null || typeof node !== 'object') return true;
+  if (Array.isArray(node)) return node.every(mcpSchemaTextSafe);
+  for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+    if (CONTROL_CHARS.test(k)) return false;
+    if (k === 'enum' && Array.isArray(v)) {
+      for (const item of v) if (typeof item === 'string' && CONTROL_CHARS.test(item)) return false;
+    }
+    if (!mcpSchemaTextSafe(v)) return false;
+  }
+  return true;
+}
+
 interface McpServerConfig {
   command?: string;
   args?: string[];
   env?: Record<string, string>;
   url?: string; // Streamable-HTTP endpoint (alternative to command/stdio)
   headers?: Record<string, string>;
+  /** P3-08 Phase 3: grant the confined child outbound network (default: off — stdio = pipes). */
+  network?: boolean;
+  /** P3-08 Phase 3: set false to run this ONE server outside the OS jail (explicit choice). */
+  sandbox?: boolean;
+}
+
+/**
+ * P3-08 Phase 3 — the OS-jail inputs for stdio children. `enabled` is the session's sandbox
+ * request state (sandbox !== 'off', not --yolo); per-server `network`/`sandbox` live on the
+ * server config. Constructed once at registration and shared by every stdio client.
+ */
+export interface McpJail {
+  workspaceRoot: string;
+  additionalRoots?: string[];
+  enabled: boolean;
+  /**
+   * P3-08: mirrors run_shell's `sandboxFailurePolicy` for the jail-unavailable case — when the
+   * jail is REQUESTED but the host has no sandbox tool, 'fail-closed' refuses to start the child
+   * unconfined instead of silently spawning it.
+   */
+  failurePolicy?: 'auto' | 'fail-closed' | 'warn';
 }
 
 /** Shared surface of the stdio and HTTP MCP clients. */
@@ -40,8 +113,18 @@ interface McpConnection {
   listTools(): Promise<McpToolInfo[]>;
   /** `signal` (P2-01): user interrupt — aborting it cancels the in-flight MCP call.
    *  `resultCap` (P3-05): the loop's tool-result budget; the reply payload is clamped to it
-   *  BEFORE enveloping so the envelope's END marker always survives into the context. */
-  callTool(name: string, args: unknown, risk: ToolRisk, signal?: AbortSignal, resultCap?: number): Promise<ToolResult>;
+   *  BEFORE enveloping so the envelope's END marker always survives into the context.
+   *  `registeredName` (BYPASS review): the exact registry name the caller registered — including
+   *  any collision suffix — so result metadata matches. Without it, callTool reconstructs the
+   *  sanitized name, which cannot reproduce a disambiguation suffix. */
+  callTool(
+    name: string,
+    args: unknown,
+    risk: ToolRisk,
+    signal?: AbortSignal,
+    resultCap?: number,
+    registeredName?: string,
+  ): Promise<ToolResult>;
   stop(): void;
 }
 
@@ -88,12 +171,46 @@ export class McpClient implements McpConnection {
   constructor(
     private readonly name: string,
     private readonly cfg: McpServerConfig,
+    private readonly jail?: McpJail,
   ) {}
 
   async start(): Promise<void> {
     if (this.child) return;
     if (!this.cfg.command) throw new Error('stdio MCP server requires a `command`');
-    this.child = spawn(this.cfg.command, this.cfg.args ?? [], {
+    // P3-08 Phase 3: confine the child (workspace+/tmp writes, credential stores denied,
+    // network OFF unless granted). Stdio servers speak over their pipes — a server that needs
+    // sockets gets `network: true`; a server that can't live in the jail gets `sandbox: false`.
+    // The in-process broker can never see a child's sockets (THREAT_MODEL §3.8's honest
+    // residual) — this OS layer is what actually closes it.
+    const wrapped = wrapMcpArgv({
+      command: this.cfg.command,
+      args: this.cfg.args ?? [],
+      workspaceRoot: this.jail?.workspaceRoot ?? process.cwd(),
+      additionalRoots: this.jail?.additionalRoots,
+      allowNetwork: Boolean(this.cfg.network),
+      enabled: (this.jail?.enabled ?? true) && this.cfg.sandbox !== false,
+    });
+    if (this.jail?.enabled && this.cfg.sandbox !== false) {
+      if (wrapped.sandboxed) {
+        process.stderr.write(
+          `shadow: MCP server "${nameSafe(this.name)}" confined` +
+            `${this.cfg.network ? ' (network granted)' : ' (network off — grant with "network": true)'}\n`,
+        );
+      } else if (wrapped.note) {
+        // Requested but no tool on this host — the unconfined state must not be silent.
+        // P3-08: run_shell's fail-closed policy extends to MCP children — an auto-spawned child
+        // that can't be jailed is REFUSED, not silently unconfined. (Explicit `sandbox: false`
+        // or session-wide sandbox-off never reaches here: the jail wasn't requested then.)
+        if (this.jail?.failurePolicy === 'fail-closed') {
+          process.stderr.write(
+            `shadow: MCP server "${nameSafe(this.name)}": refusing to start UNCONFINED — ${wrapped.note} (sandboxFailurePolicy: fail-closed)\n`,
+          );
+          return;
+        }
+        process.stderr.write(`shadow: MCP server "${nameSafe(this.name)}": ⚠ ${wrapped.note}\n`);
+      }
+    }
+    this.child = spawn(wrapped.argv[0]!, wrapped.argv.slice(1), {
       // MCP config may explicitly opt individual variables in, but the child must
       // never inherit the agent process's provider credentials by default.
       env: scrubbedEnv(undefined, this.cfg.env),
@@ -145,13 +262,21 @@ export class McpClient implements McpConnection {
     return res.tools ?? [];
   }
 
-  async callTool(name: string, args: unknown, risk: ToolRisk, signal?: AbortSignal, resultCap?: number): Promise<ToolResult> {
+  async callTool(
+    name: string,
+    args: unknown,
+    risk: ToolRisk,
+    signal?: AbortSignal,
+    resultCap?: number,
+    registeredName?: string,
+  ): Promise<ToolResult> {
     const start = Date.now();
-    const toolName = `mcp_${this.name}_${name}`;
+    // F07-12: registration passes the exact registered name (any collision suffix included); the
+    // reconstruction is the fallback for direct callers. The WIRE request below uses `name`.
+    const toolName = registeredName ?? `mcp_${mcpSafeNamePart(this.name)}_${mcpSafeNamePart(name)}`;
     // The envelope header/source sit OUTSIDE the markers — sanitize the server-controlled names
-    // there (a CR/LF would split the header line = framing forgery). The toolName passed to
-    // ok()/fail() stays exact: it must match the registered tool name.
-    const headerTool = nameSafe(`mcp_${this.name}_${name}`);
+    // there too (a CR/LF would split the header line = framing forgery).
+    const headerTool = nameSafe(toolName);
     const source = `mcp server "${nameSafe(this.name)}" · tool "${nameSafe(name)}"`;
     const cap = resultCap ?? MCP_DEFAULT_RESULT_CAP;
     try {
@@ -346,10 +471,19 @@ export class McpHttpClient implements McpConnection {
     return res.tools ?? [];
   }
 
-  async callTool(name: string, args: unknown, risk: ToolRisk, signal?: AbortSignal, resultCap?: number): Promise<ToolResult> {
+  async callTool(
+    name: string,
+    args: unknown,
+    risk: ToolRisk,
+    signal?: AbortSignal,
+    resultCap?: number,
+    registeredName?: string,
+  ): Promise<ToolResult> {
     const start = Date.now();
-    const toolName = `mcp_${this.name}_${name}`;
-    const headerTool = nameSafe(`mcp_${this.name}_${name}`);
+    // F07-12: registration passes the exact registered name (wire call keeps the original name);
+    // the reconstruction is the fallback for direct callers.
+    const toolName = registeredName ?? `mcp_${mcpSafeNamePart(this.name)}_${mcpSafeNamePart(name)}`;
+    const headerTool = nameSafe(toolName);
     const source = `mcp server "${nameSafe(this.name)}" · tool "${nameSafe(name)}"`;
     const cap = resultCap ?? MCP_DEFAULT_RESULT_CAP;
     try {
@@ -465,6 +599,8 @@ export async function registerMcpServers(
   /** F06-09: receives each client the moment it is CONSTRUCTED (before connect), so the caller's
    *  shutdown handler can kill in-flight children even if the process exits mid-connect. */
   onClient?: (client: McpConnection) => void,
+  /** P3-08 Phase 3: OS-jail inputs for stdio children (defaults: enabled, no extra roots). */
+  jail?: Omit<McpJail, 'workspaceRoot'>,
 ): Promise<McpConnection[]> {
   const clients: McpConnection[] = [];
   // Connect all servers in PARALLEL, each bounded by MCP_CONNECT_TIMEOUT_MS, so one slow/broken stdio
@@ -473,7 +609,14 @@ export async function registerMcpServers(
   // skipped with a warning; the rest still load.
   await Promise.all(
     Object.entries(servers).map(async ([name, cfg]) => {
-      const client: McpConnection = cfg.url ? new McpHttpClient(name, cfg.url, cfg.headers) : new McpClient(name, cfg);
+      const client: McpConnection = cfg.url
+        ? new McpHttpClient(name, cfg.url, cfg.headers)
+        : new McpClient(name, cfg, {
+            workspaceRoot,
+            additionalRoots: jail?.additionalRoots,
+            enabled: jail?.enabled ?? true, // omitted jail = jail ON (fail closed)
+            failurePolicy: jail?.failurePolicy,
+          });
       onClient?.(client);
       const connect = (async () => {
         await client.start();
@@ -482,20 +625,60 @@ export async function registerMcpServers(
       connect.catch(() => {}); // swallow a late rejection if the timeout already fired
       try {
         const tools = await withTimeout(connect, MCP_CONNECT_TIMEOUT_MS, `did not respond within ${MCP_CONNECT_TIMEOUT_MS / 1000}s`);
+        const safeServer = mcpSafeNamePart(name);
         for (const t of tools) {
-          const toolName = `mcp_${name}_${t.name}`;
+          // BYPASS review (P2-07): a tool with no usable name cannot be called — skip it alone
+          // instead of registering it as `mcp_<server>_tool` (or throwing, which would drop the
+          // whole server's registration).
+          if (typeof t.name !== 'string' || t.name.length === 0) {
+            process.stderr.write(`shadow: MCP server "${nameSafe(name)}" listed a tool with no name — skipped.\n`);
+            continue;
+          }
+          // F07-12: the tool NAME is server-controlled and enters the schema the model reads on
+          // every request — collapse it to the identifier alphabet (mcpSafeNamePart). Sanitizing
+          // can collide two distinct wire tools (`foo.bar` vs `foo_bar`); disambiguate with a
+          // suffix instead of letting registry.register throw and abort the whole server.
+          const safeTool = mcpSafeNamePart(t.name);
+          // BYPASS review (P2-07): property KEYS and ENUM string values survive jsonSchemaToZod
+          // into the per-request tool schema — the same every-request surface F07-12 closed for
+          // names and descriptions. Enveloping is impossible there (the model must reproduce keys
+          // and enum values VERBATIM to call the tool), so fail closed instead: skip tools whose
+          // schema is oversized (context-bloat DoS — it rides every request) or carries control
+          // characters. Instruction-shaped enum TEXT remains a residual surface — noted, and
+          // bounded by the size cap.
+          const schemaJson = JSON.stringify(t.inputSchema ?? {});
+          if (schemaJson.length > MCP_SCHEMA_CAP || !mcpSchemaTextSafe(t.inputSchema)) {
+            process.stderr.write(
+              `shadow: MCP tool "${nameSafe(t.name)}" from server "${nameSafe(name)}" has an oversized or unsafe input schema — skipped.\n`,
+            );
+            continue;
+          }
+          let toolName = `mcp_${safeServer}_${safeTool}`;
+          for (let n = 2; registry.get(toolName); n++) toolName = `mcp_${safeServer}_${safeTool}_${n}`;
           // Server annotations are untrusted hints. Every MCP tool remains `exec` (needs
           // approval until `full`) because a compromised server could label a destructive
           // browser/filesystem action read-only to bypass the operator.
           const risk = mcpRisk(t.annotations);
+          // F07-12: the DESCRIPTION is untrusted text too, and it rode the schema into context on
+          // EVERY request — the one injection surface the P3-05 result envelope never touched.
+          // Envelop it with the same machinery (fitPayload clamp BEFORE enveloping so the END
+          // marker always survives; description payloads never approach the cap in practice).
+          const rawDescription = t.description ?? `MCP tool ${safeTool} from server ${name}`;
           const tool: Tool = {
             name: toolName,
-            description: t.description ?? `MCP tool ${t.name} from server ${name}`,
+            description: envelopUntrusted({
+              tool: nameSafe(toolName),
+              source: `mcp server "${nameSafe(name)}" — tool description (present on every request, not a result)`,
+              content: fitPayload(rawDescription, MCP_DESCRIPTION_CAP),
+            }),
             risk,
             inputSchema: jsonSchemaToZod(t.inputSchema),
             async run(input, ctx) {
               void workspaceRoot;
-              return client.callTool(t.name, input, risk, ctx.signal, ctx.maxToolResultChars);
+              // Pass the EXACT registered name so a collision-suffixed tool's result metadata
+              // matches its registry entry (BYPASS review — the reconstruction inside callTool
+              // cannot know about the suffix).
+              return client.callTool(t.name, input, risk, ctx.signal, ctx.maxToolResultChars, toolName);
             },
           };
           registry.register(tool);
@@ -503,7 +686,9 @@ export async function registerMcpServers(
         clients.push(client);
       } catch (e) {
         client.stop();
-        process.stderr.write(`shadow: MCP server "${name}" unavailable — skipped (${(e as Error).message}).\n`);
+        // Both the config key and the error message can be hostile text (a server may answer
+        // tools/list with a crafted JSON-RPC error) — sanitize before writing to the terminal.
+        process.stderr.write(`shadow: MCP server "${nameSafe(name)}" unavailable — skipped (${nameSafe((e as Error).message)}).\n`);
       }
     }),
   );

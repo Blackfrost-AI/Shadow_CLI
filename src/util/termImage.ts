@@ -33,14 +33,18 @@ export function supportsInlineImages(opts: ImageTermOpts = {}): boolean {
   const isTTY = opts.isTTY ?? !!process.stdout.isTTY;
   if (!isTTY) return false;
   const env = opts.env ?? process.env;
+  // F02-03: INSIDE tmux the OSC 1337 / Kitty payloads only reach the outer terminal when the user
+  // has explicitly configured allow-passthrough — otherwise tmux swallows them, so nothing renders
+  // AND (because this function had claimed success) the save+open fallback was suppressed too:
+  // silent failure. There is no reliable runtime signal for passthrough being on, so under tmux
+  // we claim nothing — the durable placeholder + save/open fallback always runs instead.
+  if (env.TMUX || env.TERM_PROGRAM === 'tmux') return false;
   const tp = env.TERM_PROGRAM;
   if (tp && INLINE_IMAGE_TERMINALS.has(tp)) return true;
   const lc = env.LC_TERMINAL;
   if (lc && INLINE_IMAGE_TERMINALS.has(lc)) return true;
   const term = env.TERM ?? '';
   if (term.includes('kitty') || term.includes('wezterm') || term.includes('ghostty')) return true;
-  // tmux passthrough can forward graphics to a capable outer terminal.
-  if (tp === 'tmux' && lc && INLINE_IMAGE_TERMINALS.has(lc)) return true;
   return false;
 }
 

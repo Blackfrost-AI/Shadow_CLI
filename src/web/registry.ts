@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import { EventBus } from '../agent/events.js';
+import { SessionApprovals } from '../agent/approval.js';
 import type { AgentSession } from '../agent/bootstrap.js';
 import type { AutonomyLevel } from '../safety/permissions.js';
 import { redactString } from '../util/redact.js';
@@ -19,7 +20,7 @@ import { runLock } from './runLock.js';
  * reserved session, and the read path (GET /api/sessions).
  */
 
-/** Hard ceiling on browser-created sessions — see create(). */
+/** Hard ceiling on externally-created sessions (browser 'web' + editor 'acp') — see create(). */
 export const MAX_WEB_SESSIONS = 8;
 
 export const CLI_SESSION_ID = 'cli';
@@ -46,8 +47,9 @@ export type SessionStatus =
  * 'mirror' = the live `shadow --web` terminal session, observed and never driven.
  * 'local'  = the inert reserved session under standalone `shadow web` (no CLI behind it).
  * 'web'    = created by the browser.
+ * 'acp'    = created by an ACP editor via `shadow acp` (src/acp/server.ts).
  */
-export type SessionOrigin = 'mirror' | 'local' | 'web';
+export type SessionOrigin = 'mirror' | 'local' | 'web' | 'acp';
 
 /** Thrown by the lazy build. Message is ANSI-stripped and redacted before it escapes. */
 export class SessionStartupError extends Error {
@@ -92,6 +94,11 @@ export interface WebSession {
   building: Promise<AgentSession> | null;
   /** Set while a turn is in flight, so interrupt cancels it. */
   abort: AbortController | null;
+  /** Session-lifetime "allow for this session" grants — ONE instance shared by every turn's
+   *  AgentLoop. Each turn builds a fresh loop; grants held on the loop die with it (the exact
+   *  alarm-fatigue bug approval.ts exists to fix — see the TUI's sessionApprovalsRef pattern).
+   *  The ACP editor's "Allow for this session" option lands here. */
+  readonly approvals: SessionApprovals;
 
   close(): Promise<void>;
 }
@@ -121,6 +128,8 @@ export interface CreateSessionSpec {
   title?: string;
   model?: string;
   autonomy?: AutonomyLevel;
+  /** Who is driving the session. Defaults to 'web' (the browser). */
+  origin?: 'web' | 'acp';
 }
 
 /** Injected so the registry is unit-testable with no credentials, MCP or model server. */
@@ -202,6 +211,7 @@ export function createSessionRegistry(deps: { builder: AgentBuilder; runTurn: Tu
       mcpClients: [],
       building: null,
       abort: null,
+      approvals: new SessionApprovals(),
       getAbort: init.getAbort,
       async close(): Promise<void> {
         this.status = 'closed';
@@ -357,17 +367,17 @@ export function createSessionRegistry(deps: { builder: AgentBuilder; runTurn: Tu
     },
 
     create(spec: CreateSessionSpec): WebSession {
-      // E2b — a hard ceiling. Each web session costs an agent context, its own MCP stdio
-      // children and a 2 MB SSE replay ring, and (before the DELETE route) nothing ever freed
-      // one — so "+ new session" was an unbounded allocation driven by a mouse click.
+      // E2b — a hard ceiling. Each externally-created session costs an agent context, its own
+      // MCP stdio children and a 2 MB SSE replay ring — so "+ new session" was an unbounded
+      // allocation driven by a mouse click (web) or an editor RPC (acp). Both count.
       let live = 0;
-      for (const existing of sessions.values()) if (existing.origin === 'web') live++;
+      for (const existing of sessions.values()) if (existing.origin === 'web' || existing.origin === 'acp') live++;
       if (live >= MAX_WEB_SESSIONS) {
         throw new Error(`session limit reached (${MAX_WEB_SESSIONS}) — close one first`);
       }
       const s = makeSession({
         id: randomBytes(8).toString('hex'),
-        origin: 'web',
+        origin: spec.origin ?? 'web',
         title: spec.title ?? 'New session',
         displayPath: spec.projectRoot,
         bus: new EventBus(),

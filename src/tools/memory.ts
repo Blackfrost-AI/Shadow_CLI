@@ -2,6 +2,7 @@ import { z } from 'zod';
 import type { Tool, ToolResult } from './types.js';
 import { ok, fail } from './types.js';
 import type { ProjectMemory } from '../state/memory.js';
+import { MEMORY_KEY_MAX } from '../state/memory.js';
 
 // A tool the agent calls to manage its own project-memory KV
 // (<workspaceRoot>/.shadow/memory.json). remember/forget MUTATE that store, and
@@ -20,8 +21,12 @@ const inputSchema = z.object({
   key: z
     .string()
     .min(1)
+    .max(MEMORY_KEY_MAX)
     .optional()
-    .describe('Short stable identifier for the fact, e.g. "build_command". Required for remember/recall/forget.'),
+    .describe(
+      `Short stable identifier for the fact, e.g. "build_command" (max ${MEMORY_KEY_MAX} chars). ` +
+        'Required for remember/recall/forget.',
+    ),
   value: z
     .string()
     .optional()
@@ -48,6 +53,7 @@ export function makeMemoryTool(mem: ProjectMemory): Tool<MemoryInput, MemoryData
       'Remember things future-you needs — the build command, the test command, where key modules live, ' +
       'project conventions — and recall them later instead of re-discovering them. ' +
       'Actions: remember (key+value), recall (key), forget (key), list. ' +
+      'The system prompt carries only a one-line INDEX of stored facts — recall a key to fetch its full value. ' +
       'This stores facts in Shadow’s own memory, not the workspace files. Never store secrets or passwords.',
     risk: 'write', // remember/forget mutate the store + feed future system prompts — gate as a write
     inputSchema,

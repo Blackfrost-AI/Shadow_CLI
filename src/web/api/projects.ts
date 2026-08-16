@@ -34,7 +34,7 @@ export function registerProjectsRoutes(route: RouteFn, ctx: ApiContext): void {
     // E1 — revocation must CASCADE. Removing the entry alone edited config.json and returned 200
     // while every already-open session kept its frozen jail and carried on reading and writing
     // the directory at auto-edit. Look the entry up BEFORE deleting (removeProject returns only a
-    // boolean), then close every WEB session rooted at or under it.
+    // boolean), then close every externally-driven session (web AND acp) rooted at or under it.
     const entry = listProjects().find((e) => e.id === body.id);
     const removed = removeProject(body.id);
     let closed = 0;
@@ -49,8 +49,11 @@ export function registerProjectsRoutes(route: RouteFn, ctx: ApiContext): void {
         // Collect ids first: each() walks the live map, and remove() mutates it.
         const doomed: string[] = [];
         ctx.registry.each((s) => {
-          if (s.origin !== 'web') return; // never the reserved CLI mirror, which may legitimately
-          try {                            // sit inside a removed project
+          // Enumerate the RESERVED origins (never the CLI mirror/local session, which may
+          // legitimately sit inside a removed project) — so any FUTURE externally-driven origin
+          // is closed by default instead of silently skipped.
+          if (s.origin === 'mirror' || s.origin === 'local') return;
+          try {
             if (contains(root!, normalizeProjectPath(s.displayPath))) doomed.push(s.id);
           } catch {
             /* unresolvable session path — leave it alone */

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Verify that the tracked Node distribution matches a fresh `npm run build`.
+ * Verify that the Node distribution (dist/) matches a fresh `npm run build`.
  *
  * Compare the bytes that existed immediately before the build with the bytes after it. This is
  * deliberately independent of Git status: a developer can validate an uncommitted source change
@@ -135,7 +135,8 @@ async function main() {
       console.error('RELEASE BLOCKED: dist/ was stale relative to the current source.');
       for (const line of differences.slice(0, 20)) console.error(`  - ${line}`);
       if (differences.length > 20) console.error(`  - …and ${differences.length - 20} more change(s)`);
-      console.error('The build regenerated dist/. Review and commit the generated artifacts, then rerun the gate.');
+      console.error('The build regenerated dist/ in place. Review the change against the source, then rerun the gate.');
+      console.error('(dist/ is untracked — F06-11: it is built at release time and never committed, so no git step is needed.)');
       return false;
     }
 

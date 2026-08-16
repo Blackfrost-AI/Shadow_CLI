@@ -17,7 +17,7 @@ test('E1: the jail is re-resolved from the allowlist on EVERY turn', () => {
       'writable by any already-open session at auto-edit',
   );
   const i = src.indexOf('session.jail = resolve(');
-  const j = src.indexOf('buildTurnDeps(session)');
+  const j = src.indexOf('buildTurnDeps(session, gateFor?.(session))');
   assert.ok(i > 0 && j > i, 'the re-resolve must happen BEFORE deps are assembled from the jail');
 });
 
@@ -26,7 +26,7 @@ test('E1: removing a project cascades to the sessions rooted in it', () => {
   assert.match(src, /ctx\.registry\.each\(/, 'the remove route must inspect live sessions');
   assert.match(src, /ctx\.registry\.remove\(id\)/, 'and close the ones it revoked');
   assert.match(src, /contains\(root!, normalizeProjectPath\(s\.displayPath\)\)/, 'matching by containment');
-  assert.match(src, /s\.origin !== 'web'/, 'never the reserved CLI mirror — it may legitimately sit inside');
+  assert.match(src, /s\.origin === 'mirror' \|\| s\.origin === 'local'/, 'never the reserved CLI mirror — it may legitimately sit inside');
   assert.match(src, /sessionsClosed/, 'and it reports what it closed');
 });
 

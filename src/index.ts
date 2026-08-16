@@ -71,6 +71,8 @@ import { AutoApproveGate, AutoDenyGate, type ApprovalGate } from './agent/approv
 import { ReplGate } from './replGate.js';
 import { loadGlobalConfig, saveGlobalConfig, ensureShadowLayout } from './state/globalStore.js';
 import { listResumableSessions } from './state/resume.js';
+import { isDumbTerm, queryTerminalBackground, themeForBackground } from './util/themeDetect.js';
+import { normalizeThemeName } from './tui/theme.js';
 import { buildCodexAuthUrl } from './auth/oauth.js';
 import { type OutputStyle } from './styles.js';
 import { runDoctor, formatDoctorReport } from './doctor.js';
@@ -81,22 +83,15 @@ import { unconfinedBanner } from './safety/sandbox.js';
 import { runTui, attachRenderer } from './tui.js';
 import { runOnboard } from './onboard/onboard.js';
 import { INSTALL_DIR } from './installDir.js';
+import { readVersion } from './version.js';
+import { runAcp } from './acp/cli.js';
 import { runHookPhase } from './hooks/runner.js';
 import { parseArgs } from './cli/flags.js';
 
 // INSTALL_DIR (package root) is imported from ./installDir.js at the top — its own module so
 // src/web/* can share it without pulling in this file's top-level main().
-/** Single source of truth: the version comes from package.json, never hard-coded.
- * The compiled single-file binary has no package.json on disk, so the build injects
- * the version via `--define process.env.SHADOW_BUILD_VERSION=...` (see scripts/build-binary.sh). */
-function readVersion(): string {
-  if (process.env.SHADOW_BUILD_VERSION) return process.env.SHADOW_BUILD_VERSION;
-  try {
-    return (JSON.parse(readFileSync(resolve(INSTALL_DIR, 'package.json'), 'utf8')) as { version: string }).version;
-  } catch {
-    return '0.0.0';
-  }
-}
+// The version's single source of truth (package.json, or the build-injected env) lives in
+// ./version.js so non-index entry points (the ACP adapter) share it.
 const VERSION = readVersion();
 
 /** Sentinel raced against rl.question so an interactive REPL exits cleanly on EOF. */
@@ -152,6 +147,7 @@ function helpText(): string {
     '  egress               show the outbound-connection receipt (~/.shadow/egress.log) — who Shadow talked to, why, allowed/denied',
     '  resume [--session]   resume a prior session from its latest context snapshot',
     '  login codex|grok     OAuth login (codex only; grok uses API key)',
+    '  acp                  ACP agent for editors (Zed et al.) — JSON-RPC 2.0 over stdio; --add-project',
     '',
     'Options:',
     '  --system <path>      external system prompt markdown',
@@ -160,6 +156,8 @@ function helpText(): string {
     '                       (catastrophic-command denylist stays on; use --yolo to drop that too).',
     '  --provider <name>    anthropic | openai | mock',
     '  --model <id>         model id (default claude-opus-4-8)',
+    '  --profile <name>     activate a named profile from ~/.shadow/config.json — bundles model +',
+    '                       effort + autonomy + sandbox + context in one switch (also SHADOW_PROFILE)',
     '  --style <name>       proactive | explanatory | learning | procedural',
     '  --base-url <url>     override provider base URL (also ANTHROPIC_BASE_URL / OPENAI_BASE_URL)',
     '  --effort <level>     reasoning depth on Claude 4.6+: low | medium | high | xhigh | max  (default high)',
@@ -899,6 +897,12 @@ async function main(): Promise<void> {
     await runWeb({ write: (s) => stdout.write(s), port, open });
     return;
   }
+  if (argv[0] === 'acp') {
+    // ACP (Agent Client Protocol) agent for editors — JSON-RPC 2.0 over stdio. RPC owns
+    // stdout; everything else goes to stderr (see src/acp/cli.ts).
+    await runAcp(argv.slice(1));
+    return;
+  }
   if (argv[0] === 'update') {
     await runUpdate();
     return;
@@ -925,6 +929,21 @@ async function main(): Promise<void> {
       // checks whether a vault exists, never reads it). `--offline` shows the offline posture.
       const cfg = loadConfig(process.cwd(), {});
       const report = buildPrivacyReport(cfg as unknown as PrivacyConfigView, gatherPrivacyEnv(argv.includes('--offline')));
+      // P3-08: the zero-telemetry claim backed by its RUNTIME receipt — aggregate the egress journal
+      // from disk (pure local read) + surface quarantine policy state, so the report never reads
+      // cleaner than reality.
+      const { readEgressLogAggregate, egressLogPath } = await import('./safety/egress.js');
+      const rows = await readEgressLogAggregate();
+      const denied = rows.reduce((n, r) => n + r.denied, 0);
+      const flagged = rows.reduce((n, r) => n + r.flagged, 0);
+      const eg = cfg.egress ?? { mode: 'observe', allow: [] };
+      report.receipt = [
+        rows.length
+          ? `${rows.length} host${rows.length === 1 ? '' : 's'} journaled — current journal + one kept rotation (${denied} denied, ${flagged} flagged ⚑ outside allowlist) — full table: shadow egress`
+          : 'no egress journaled yet — the table appears after the first outbound request',
+        `quarantine: mode=${eg.mode}${eg.mode === 'observe' ? ' (flags, does not block)' : ' (blocks)'}; allowlist: ${eg.allow.length} user entr${eg.allow.length === 1 ? 'y' : 'ies'} (duckduckgo defaults always included)${eg.allow.length ? '' : ' — set "egress": {"allow": [...]} in ~/.shadow/config.json'}`,
+        `journal: ${egressLogPath()} (local file, 0600 — never leaves this machine)`,
+      ];
       stdout.write(formatPrivacyReport(report, stdout.isTTY) + '\n');
       return;
     }
@@ -981,7 +1000,8 @@ async function main(): Promise<void> {
     contextBudget: flags.contextBudget,
   };
   if (flags.maxWallSec != null) overrides.budget = { maxWallClockSec: flags.maxWallSec };
-  let cfg = loadConfig(cwd, overrides);
+  // `flags.profile` falls back to SHADOW_PROFILE inside loadConfig (P2-11 named profiles).
+  let cfg = loadConfig(cwd, overrides, flags.profile);
 
   // Unlock the encrypted credential vault (or migrate a legacy plaintext credentials.json into it)
   // BEFORE any credential is resolved — needsOnboarding() below and the provider build later both
@@ -994,10 +1014,17 @@ async function main(): Promise<void> {
   }
 
   // Default to the last model picked via `/model`, unless the user explicitly
-  // chose one this run (--model / SHADOW_MODEL always win) or the saved label no
-  // longer matches a configured entry (ignore it gracefully).
+  // chose one this run (--model / SHADOW_MODEL always win), an active profile declares a
+  // model (P2-11: the profile switch must stay atomic — a stale lastModel recall must not
+  // silently win the model key back from the profile), or the saved label no longer matches
+  // a configured entry (ignore it gracefully).
   const lastPicked =
-    !flags.model && !flags.provider && !process.env.SHADOW_MODEL && !process.env.SHADOW_PROVIDER && cfg.lastModel
+    !flags.model &&
+    !flags.provider &&
+    !process.env.SHADOW_MODEL &&
+    !process.env.SHADOW_PROVIDER &&
+    cfg.profile?.model == null &&
+    cfg.lastModel
       ? cfg.models.find((m) => m.label === cfg.lastModel)
       : undefined;
   if (lastPicked) {
@@ -1022,7 +1049,7 @@ async function main(): Promise<void> {
     }
     const ok = await runOnboard();
     if (!ok) return;
-    cfg = loadConfig(cwd, overrides); // pick up the freshly-saved provider/model/credentials
+    cfg = loadConfig(cwd, overrides, flags.profile); // pick up the freshly-saved provider/model/credentials
   }
 
   // Resolve unrestricted now that cfg.autonomy is final (from --autonomy OR the saved config
@@ -1131,11 +1158,19 @@ async function main(): Promise<void> {
   void skills;
   void facts;
 
+  // P2-11 (/fork): the transcript target is swappable at runtime — /fork replaces the live log
+  // with the fork's. Every writer that outlives a single turn (the bus→recordEvent subscriber
+  // below, the sub-agent loop-deps factory, the wakeup rate-limit recorder) MUST read through
+  // this holder rather than capture the bootstrap-scope `sessionLog`, otherwise post-fork turns
+  // would keep appending events to the SOURCE transcript. The holder is passed to the TUI as
+  // `sessionLogBox` and /fork re-points it, so one rebind fixes every long-lived writer at once.
+  const sessionLogBox = { current: sessionLog };
+
   const bus = new EventBus();
   // recordEvent drops the per-token stream deltas (text/thinking/shell_output) that used to
   // trigger a redact+stringify+write on EVERY token; the committed assistant_done/reasoning_done
   // events carry the same text for resume/replay (P1B-06).
-  bus.on((e) => sessionLog.recordEvent(e));
+  bus.on((e) => sessionLogBox.current.recordEvent(e));
 
   // P1A-10: warn once at startup when the active model's reasoning-replay contract is
   // alias-ambiguous — a self-hosted endpoint whose id carries no known reasoning marker and that
@@ -1272,7 +1307,15 @@ async function main(): Promise<void> {
     // CONSTRUCTION (onClient) so the exit handler below kills in-flight children too. Headless
     // runs still await the settle before the first turn (a one-shot task gets its full toolbox);
     // only the interactive TUI starts painting immediately.
-    const connecting = registerMcpServers(registry, cfg.mcpServers, workspaceRoot, (c) => mcpClients.push(c));
+    // P3-08 Phase 3: stdio children get the OS jail (network off unless a server is granted
+    // `network: true`); the session's sandbox request state decides whether the jail is armed.
+    const connecting = registerMcpServers(registry, cfg.mcpServers, workspaceRoot, (c) => mcpClients.push(c), {
+      // S4 (P3-08 review): pass the RESOLVED granted roots (cwd-absolute, deduped, incl. --add-dir)
+      // so the MCP jail and the run_shell jail never disagree about what's writable.
+      additionalRoots,
+      enabled: (cfg.sandbox ?? 'auto') !== 'off',
+      failurePolicy: cfg.sandboxFailurePolicy ?? 'auto',
+    });
     mcpSettled = connecting.then(
       () => undefined,
       () => undefined, // per-server failures are warned by registerMcpServers itself
@@ -1325,7 +1368,11 @@ async function main(): Promise<void> {
   } as any);
 
   const interactive = !!process.stdin.isTTY && !!process.stdout.isTTY;
-  const headless = !!flags.task || !!flags.repl || !interactive;
+  // F02-05: TERM=dumb terminals can't drive a raw-mode UI (no cursor addressing, often no color).
+  // Force the plain readline renderer instead of a half-broken TUI; interactive stays true so the
+  // user keeps the question-loop REPL rather than being treated like a one-shot pipe.
+  const dumbTerm = interactive && isDumbTerm(process.env);
+  const headless = !!flags.task || !!flags.repl || !interactive || dumbTerm;
 
   const wakeupHandler = {
     fire: (_task: string, _reason: string) => {},
@@ -1343,7 +1390,7 @@ async function main(): Promise<void> {
         `${MAX_WAKEUPS_PER_WINDOW} wakeups within the rate window. This protects against a ` +
         `runaway self-rescheduling loop. Schedule with a longer delay if this task is still needed.`,
     });
-    sessionLog.record({ kind: 'wakeup_rate_limited', task: job.task, reason: job.reason });
+    sessionLogBox.current.record({ kind: 'wakeup_rate_limited', task: job.task, reason: job.reason });
   };
   registry.register(
     makeScheduleWakeupTool(wakeup, (task, reason) => wakeupHandler.fire(task, reason)),
@@ -1392,7 +1439,10 @@ async function main(): Promise<void> {
           streamShell: false,
           // F04-11: a sub-agent's degraded compaction must leave a durable trace — without the
           // session log its compaction_degraded record is a no-op and the failure is invisible.
-          sessionLog,
+          // P2-11 (/fork): read the holder at LAUNCH time (this factory runs per agent launch),
+          // so a sub-agent launched after a fork writes its snapshots/checkpoints to the fork,
+          // not back to the source. A sub-agent launched pre-fork correctly stays on the source.
+          sessionLog: sessionLogBox.current,
         }),
       getAutonomy: () => autonomy,
       contextBudget: cfg.contextBudget,
@@ -1418,6 +1468,10 @@ async function main(): Promise<void> {
       if (!h.ok) {
         bus.emit({ type: 'error', message: `user_prompt_submit hook denied: ${h.message}` });
         promptDenied = true;
+      } else if (h.context) {
+        // F08-09: exit-0 hook context joins what the model sees — and therefore what the session
+        // log records as the prompt (honest transcript: it is what entered context).
+        task = `${task}\n\nAdditional context (user_prompt_submit hook):\n${h.context}`;
       }
     }
 
@@ -1522,6 +1576,10 @@ async function main(): Promise<void> {
 
   // Headless: one-shot --task, --repl, or piped/redirected stdio (no TTY for the raw-mode UI).
   if (headless) {
+    // F02-05: tell the user WHY they are looking at the plain renderer when they expected the TUI.
+    if (dumbTerm) {
+      process.stdout.write('TERM=dumb detected — running the plain renderer (the raw-mode TUI needs a capable terminal).\n');
+    }
     // F06-09: headless runs keep the old contract — the full toolbox is present before the first
     // turn. Only the interactive TUI paints ahead of the MCP settle.
     if (mcpSettled) await mcpSettled;
@@ -1631,6 +1689,17 @@ async function main(): Promise<void> {
     setStyle: (_next: OutputStyle) => {},
     systemForStyle: fullSystemForStyle,
   };
+  // F02-05: follow the terminal's background when the user has NEVER explicitly chosen a theme
+  // (`/theme` persists lastTheme — any valid value, including 'og', counts as a choice). A light
+  // background with the default dark-on-light palettes is unreadable, so ask the terminal for its
+  // background color (OSC 11, bounded wait, never throws) and pick the 'light' theme on light.
+  // Deliberately IN-MEMORY ONLY: never persisted, so detection re-runs every launch until the
+  // user makes an explicit choice — a wrong guess is never sticky, and a moved laptop (docked
+  // light monitor → undocked dark) corrects itself.
+  if (!normalizeThemeName(cfg.lastTheme as string | undefined)) {
+    const bg = await queryTerminalBackground();
+    if (bg && themeForBackground(bg) !== 'og') cfg.lastTheme = themeForBackground(bg);
+  }
   try {
     await runTui({
       provider,
@@ -1640,6 +1709,9 @@ async function main(): Promise<void> {
       bus,
       context,
       sessionLog,
+      // P2-11 (/fork): shared holder the TUI re-points on /fork, so the long-lived writers
+      // above (bus→recordEvent, sub-agent deps, wakeup recorder) follow the swap into the fork.
+      sessionLogBox,
       forceConfirm,
       system: fullSystem,
       workspaceRoot,

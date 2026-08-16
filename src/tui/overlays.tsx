@@ -11,7 +11,7 @@ import type { UserQuestion } from '../agent/approval.js';
 import { recommendedIndex } from './questions.js';
 import type { QuestionSelection } from './questions.js';
 import type { PickerRow } from '../util/modelGroups.js';
-import { displayWidth, takeByWidth, nextCluster } from './width.js';
+import { displayWidth, takeByWidth, nextCluster } from '../util/width.js';
 import { diffLines, type DiffLine } from '../util/diff.js';
 import { formatDiffStats, stripCtl } from './format.js';
 import { isWriteTool } from './toolDisplay.js';
@@ -414,6 +414,12 @@ export function PendingOverlay({
               </>
             ) : null}
             · <Text color={C.red}>Esc</Text> skip
+          </>
+        ) : pending.acknowledgeOnly ? (
+          // F07-09: no approve verbs on an acknowledge-only dialog — the command is already
+          // hard-blocked. The legend must not offer a choice that does not exist.
+          <>
+            <Text color={C.red}>⛔ blocked</Text> — <Text color={C.green}>any key</Text> acknowledges
           </>
         ) : pending.kind === 'plan_enter' ? (
           <>

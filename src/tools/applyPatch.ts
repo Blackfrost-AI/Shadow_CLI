@@ -273,6 +273,17 @@ export const applyPatch: Tool<ApplyPatchInput, ApplyPatchData> = {
         added += 1;
       } else if (op.kind === 'delete') {
         if (!plannedExists(abs)) return F('not_found', `Delete File: "${op.path}" does not exist`);
+        // F07-11: deleting a file that exists ON DISK is a destructive write on that file and
+        // gets the same read-before-write contract as edit_file. (A file created earlier in
+        // THIS patch is exempt — the patch authored it, so it is already known.) The old code
+        // ran check() on updates and nothing on deletes, so apply_patch could blind-delete a
+        // file the model had never read.
+        if (!pending.has(abs) && ctx.readTracker && !ctx.readTracker.hasSeen(abs)) {
+          return F(
+            'read_required',
+            'You must use the read_file tool on this file before deleting it. (Exact string match alone is not sufficient — read it in this conversation first.)',
+          );
+        }
         actions.push({ kind: 'delete', abs, rel: op.path });
         pending.set(abs, null);
         deleted += 1;
@@ -288,6 +299,17 @@ export const applyPatch: Tool<ApplyPatchInput, ApplyPatchData> = {
             before = readFileSync(abs, 'utf8');
           } catch (e) {
             return F('not_found', `Update File: "${op.path}" could not be read: ${(e as Error).message}`);
+          }
+          // F07-11: the same read-before-write contract edit_file enforces — hasSeen BEFORE the
+          // mtime check, edit_file's exact error shape. The old code called check() only, which
+          // catches a file that CHANGED since it was read but not one that was NEVER read: an
+          // apply_patch hunk could rewrite a file the model had never seen this run. Files the
+          // patch itself created earlier (the `pending.has(abs)` branch above) stay exempt.
+          if (ctx.readTracker && !ctx.readTracker.hasSeen(abs)) {
+            return F(
+              'read_required',
+              'You must use the read_file tool on this file before patching it. (Exact string match alone is not sufficient — read it in this conversation first.)',
+            );
           }
           const guard = ctx.readTracker?.check(abs);
           if (guard && !guard.ok) return F('read_required', guard.reason);

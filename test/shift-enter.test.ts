@@ -66,7 +66,11 @@ test("xterm's modifyOtherKeys encoding works too", async (t) => {
 });
 
 test('the hint text no longer advertises a binding that does not work', () => {
-  const src = readFileSync(new URL('../src/tui.tsx', import.meta.url), 'utf8');
+  // Composer hints live in tui.tsx; the /help rows + the /terminal-setup listing moved to
+  // tui/slash.ts with the P3-02 decomposition — the pin covers both.
+  const src =
+    readFileSync(new URL('../src/tui.tsx', import.meta.url), 'utf8') +
+    readFileSync(new URL('../src/tui/slash.ts', import.meta.url), 'utf8');
   // The placeholder and both hint rows claimed Shift+Enter on terminals that cannot send it.
   assert.doesNotMatch(src, /Shift\+Enter newline/, 'stop promising what the default terminal cannot do');
   assert.match(src, /Option\+Enter newline/, 'advertise what actually works today');
@@ -74,7 +78,7 @@ test('the hint text no longer advertises a binding that does not work', () => {
 });
 
 test('/terminal-setup exists and covers the terminals that need it', () => {
-  const src = readFileSync(new URL('../src/tui.tsx', import.meta.url), 'utf8');
+  const src = readFileSync(new URL('../src/tui/slash.ts', import.meta.url), 'utf8'); // P3-02: command table + handler live in slash.ts
   assert.match(src, /\{ name: '\/terminal-setup'/, 'the command is listed');
   const body = src.slice(src.indexOf("case '/terminal-setup'"), src.indexOf("case '/vim'"));
   assert.match(body, /iTerm/, 'iTerm2 instructions');

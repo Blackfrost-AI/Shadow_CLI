@@ -5,7 +5,7 @@
  * (a local gemma is "Local", not "Google"). Cloud models group by company. An explicit
  * `group` on the entry always wins.
  */
-import type { ModelEntry } from '../config.js';
+import type { ModelEntry, ShadowConfig } from '../config.js';
 import { isLocalBaseUrl } from '../safety/offline.js';
 
 export function modelGroup(e: ModelEntry): string {
@@ -64,4 +64,29 @@ export function stepSelectableRow(rows: PickerRow[], from: number, dir: 1 | -1):
     if (rows[i]!.kind === 'model') return i;
   }
   return from;
+}
+
+/**
+ * The selectable model list for the `/model` picker: the configured `models`, or a
+ * single synthesized entry from the active config so the picker is never empty.
+ */
+export function modelEntries(cfg: ShadowConfig): ModelEntry[] {
+  const entries =
+    cfg.models && cfg.models.length > 0
+      ? cfg.models.filter((m) => !m.disabled)
+      : [
+          {
+            label: cfg.model,
+            provider: cfg.provider,
+            model: cfg.model,
+            baseUrl: cfg.baseUrl,
+            selfHosted: cfg.selfHosted,
+          },
+        ];
+  return entries;
+}
+
+/** Grouped picker rows for a config: a category header per company/"Local", then its models. */
+export function modelRows(cfg: ShadowConfig): PickerRow[] {
+  return groupedModelRows(modelEntries(cfg));
 }

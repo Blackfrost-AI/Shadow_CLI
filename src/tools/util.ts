@@ -29,12 +29,13 @@ export function looksBinary(buf: Buffer): boolean {
  * on the same filesystem, so a reader never observes a half-written file. The
  * caller is responsible for having sandbox-checked `absPath` first.
  */
-export function atomicWrite(absPath: string, content: string): void {
+export function atomicWrite(absPath: string, content: string, mode?: number): void {
   const dir = dirname(absPath);
   mkdirSync(dir, { recursive: true });
   const tmp = join(dir, `.${basename(absPath)}.${process.pid}.${Date.now()}.tmp`);
   try {
-    writeFileSync(tmp, content, 'utf8');
+    if (mode !== undefined) writeFileSync(tmp, content, { encoding: 'utf8', mode });
+    else writeFileSync(tmp, content, 'utf8');
     renameSync(tmp, absPath);
   } catch (e) {
     try {

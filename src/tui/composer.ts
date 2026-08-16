@@ -1,6 +1,6 @@
 // Pure composer-input helpers, split out of tui.tsx so they can be unit-tested without booting Ink.
 import { existsSync } from 'node:fs';
-import { displayWidth, nextCluster } from './width.js';
+import { displayWidth, nextCluster } from '../util/width.js';
 
 // Re-exported: the composer was the first caller of displayWidth and every existing import points
 // here. The implementation now lives in width.ts so the transcript flattener measures identically —
@@ -42,6 +42,36 @@ export function expandPastes(text: string, pastes: ReadonlyArray<{ id: number; c
     const p = pastes.find((x) => x.id === Number(idStr));
     return p ? p.content : m;
   });
+}
+
+/** Cap on the session paste registry (F02-06). Chip contents park here until submit, and entries
+ *  whose chip was DELETED from the draft used to linger for the rest of the session — a slow
+ *  memory leak in long sessions. Pruning drops only UNREFERENCED entries, and only above the cap. */
+export const PASTE_CAP = 64;
+
+/** True when any of `texts` still carries the chip for paste entry `id` (`[Pasted text #N …]`). */
+export function pasteChipReferenced(id: number, ...texts: string[]): boolean {
+  const needle = `[Pasted text #${id} `;
+  return texts.some((t) => t.includes(needle));
+}
+
+/** F02-06: above `cap`, drop paste entries no draft/queue text references. Referenced entries are
+ *  ALWAYS kept (their content is owed at submit), so the cap is soft by exactly the number of live
+ *  chips — the leak was the unreferenced tail, and that is what this removes. */
+export function prunePastes<T extends { id: number }>(
+  pastes: T[],
+  texts: ReadonlyArray<string>,
+  cap: number = PASTE_CAP,
+): T[] {
+  if (pastes.length <= cap) return pastes;
+  return pastes.filter((p) => pasteChipReferenced(p.id, ...texts));
+}
+
+/** F02-06: after a task was spliced via expandPastes, drop the entries the SUBMITTED text carried —
+ *  they are consumed; keeping them would re-leak exactly what submit just spent. */
+export function dropConsumedPastes<T extends { id: number }>(pastes: T[], submitted: string): T[] {
+  if (!submitted.includes('[Pasted text #')) return pastes;
+  return pastes.filter((p) => !pasteChipReferenced(p.id, submitted));
 }
 
 // ── Multi-row layout / caret ─────────────────────────────────────────────────
@@ -251,6 +281,66 @@ export function hasSgrMouse(raw: string): boolean {
 /** Strip every SGR mouse report out of a chunk, so a report glued to typed text can't insert garbage. */
 export function stripSgrMouse(raw: string): string {
   return raw.replace(/\x1b?\[<\d+;\d+;\d+[Mm]/g, '');
+}
+
+/**
+ * End index (exclusive) of the ESC-led sequence at the START of `s` (s[0] === ESC), or -1 when
+ * the sequence is incomplete/garbage. CSI runs params (0x20–0x3f) to a final byte (0x40–0x7e);
+ * OSC runs to BEL or ESC\; SS3 (ESC O letter) is three bytes; anything else is ESC + one byte.
+ */
+function keySeqEnd(s: string): number {
+  if (s.length === 1) return 1; // bare ESC
+  const second = s.charCodeAt(1);
+  if (second === 0x1b) return 1; // ESC ESC — a bare ESC; the next sequence starts at the second one
+  if (second === 0x5b /* [ — CSI */) {
+    for (let i = 2; i < s.length; i++) {
+      const c = s.charCodeAt(i);
+      if (c >= 0x40 && c <= 0x7e) return i + 1; // final byte closes the sequence
+      if (c >= 0x20 && c <= 0x3f) continue; // parameter / intermediate byte
+      return -1; // a byte that belongs to no CSI sequence — treat the rest as garbage
+    }
+    return -1; // incomplete CSI
+  }
+  if (second === 0x5d /* ] — OSC */) {
+    const bel = s.indexOf('\x07', 2);
+    const st = s.indexOf('\x1b\\', 2);
+    if (bel >= 0 && (st < 0 || bel < st)) return bel + 1;
+    if (st >= 0) return st + 2;
+    return -1; // incomplete OSC
+  }
+  if (second === 0x4f || second === 0x4e /* O/N — SS3 */) return Math.min(3, s.length); // ESC O <letter>
+  if (second >= 0x20 && second <= 0x2f) {
+    // ESC <intermediate bytes> <final byte> — e.g. the charset designator ESC ( B.
+    let i = 2;
+    while (i < s.length && s.charCodeAt(i) >= 0x20 && s.charCodeAt(i) <= 0x2f) i++;
+    if (i < s.length && s.charCodeAt(i) >= 0x30 && s.charCodeAt(i) <= 0x7e) return i + 1;
+    return -1; // incomplete designator
+  }
+  return Math.min(2, s.length); // two-byte sequence (ESC =, ESC \x7f, …)
+}
+
+/**
+ * F03-05 — the raw keypress tap sees WHOLE stdin chunks, and terminals batch keypresses into one
+ * read (a held arrow repeats as '\x1b[D\x1b[D\x1b[D'; Home lands in the same read as the key
+ * pressed right after it). Ink's parser dispatches the FIRST keypress of a merged chunk and drops
+ * the rest, while the composer's raw-sequence tests (HOME_KEYS, END_KEYS, FORWARD_DELETE,
+ * SHIFT_ENTER, DSR_REPLY_EXACT) are ^…$ anchored and only match a chunk holding EXACTLY one
+ * sequence — so any batch silently killed those keys. Split the chunk on ESC boundaries and
+ * return the LAST complete ESC-led sequence (trimmed of trailing plain text belonging to the
+ * next, already-dropped keypress), or the chunk itself when it carries no ESC, so the most
+ * recent key is the one the disambiguation tests see. Pure and total — never throws.
+ */
+export function lastKeySequence(raw: string): string {
+  let last = '';
+  let i = raw.indexOf('\x1b');
+  while (i >= 0) {
+    const seq = raw.slice(i);
+    const end = keySeqEnd(seq);
+    if (end <= 0) return seq; // incomplete tail — keep it as-is (matches nothing, hurts nothing)
+    last = seq.slice(0, end);
+    i = raw.indexOf('\x1b', i + end); // the walk consumes an OSC's ESC-\ terminator whole
+  }
+  return last || raw;
 }
 
 // ── Word / line motion + kills (readline + macOS Option-key semantics) ────────

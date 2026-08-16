@@ -24,6 +24,7 @@ interface SessionEvent {
   result?: { ok?: boolean; summary?: string };
   reason?: string;
   message?: string;
+  attempt?: number;
   from?: string;
   to?: string;
   ts?: string;
@@ -83,6 +84,22 @@ export function sessionToMarkdown(events: unknown[], meta: ExportMeta): string {
       case 'assistant_done':
         if (e.text?.trim()) lines.push('## Assistant', '', e.text.trimEnd(), '');
         break;
+      case 'reasoning_done':
+        // F02-04: reasoning is context, not the answer — export it COLLAPSED so the transcript
+        // stays readable but nothing is lost (the old export dropped it entirely).
+        if (e.text?.trim()) {
+          lines.push(
+            '## Reasoning',
+            '',
+            '<details><summary>Reasoning (collapsed)</summary>',
+            '',
+            e.text.trimEnd(),
+            '',
+            '</details>',
+            '',
+          );
+        }
+        break;
       case 'tool_start':
         if (e.call?.name) pendingTools.set(e.call.name + (e.ts ?? ''), { name: e.call.name, input: e.call.input });
         break;
@@ -115,9 +132,14 @@ export function sessionToMarkdown(events: unknown[], meta: ExportMeta): string {
       case 'error':
         lines.push('## System', '', `Error: ${e.message ?? 'unknown'}`, '');
         break;
-      case 'retry':
-        lines.push('## System', '', `Retry: ${e.message ?? JSON.stringify(e)}`, '');
+      case 'retry': {
+        // Retry events carry {attempt, delayMs, reason} — never `message`. Rendering the whole
+        // event as JSON dumped `{"type":"retry","attempt":1,…}` into every exported transcript;
+        // show the human-readable reason + attempt instead.
+        const which = typeof e.attempt === 'number' && e.attempt > 0 ? ` (attempt ${e.attempt})` : '';
+        lines.push('## System', '', `Retry${which}: ${e.reason ?? e.message ?? 'retrying'}`, '');
         break;
+      }
       case 'stop':
         if (e.reason && e.reason !== 'end_turn') {
           lines.push('## System', '', `Stopped: ${e.reason}`, '');

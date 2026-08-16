@@ -40,6 +40,19 @@ export async function classifyToolCall(
 ): Promise<ClassifyResult> {
   const { call, preview, risk, permissionRules, roots } = req;
 
+  // F07-10: the destructive check runs BEFORE the permission rules. The old order resolved
+  // rules first, so a rule `allow` for run_shell returned `allow` and skipped the destructive
+  // hard-deny entirely. The loop itself was already protected (a classifier `allow` is a no-op
+  // there — it can never lower the autonomy floor), but the VERDICT was still wrong, and any
+  // future consumer of classifyToolCall would have run `rm -rf /` on a rule's say-so. A
+  // convenience rule may vouch for ORDINARY commands, never for these.
+  if (call.name === 'run_shell') {
+    const cmd = shellCommandOf(call.input);
+    if (cmd && DESTRUCTIVE_SHELL_RE.test(cmd)) {
+      return { verdict: 'hard_deny', reason: 'destructive shell command blocked by classifier' };
+    }
+  }
+
   if (permissionRules && permissionRules.length > 0) {
     const rule = resolvePermissionRule(call, preview, permissionRules);
     if (rule === 'deny') return { verdict: 'hard_deny', reason: `permission rule denied: ${call.name}` };
@@ -49,9 +62,6 @@ export async function classifyToolCall(
 
   if (call.name === 'run_shell') {
     const cmd = shellCommandOf(call.input);
-    if (cmd && DESTRUCTIVE_SHELL_RE.test(cmd)) {
-      return { verdict: 'hard_deny', reason: 'destructive shell command blocked by classifier' };
-    }
     // A subshell / command substitution cannot ride a read-only-looking prefix
     // into an auto-allow: isBashReadOnly declines it (see bashReadOnly.ts) so it
     // falls through to the gate, where the denylist still sees the full string.
@@ -98,8 +108,36 @@ Respond with exactly one line: ALLOW or SOFT_DENY or HARD_DENY | short reason (m
   return { verdict: 'soft_deny', reason: 'unknown risk — confirmation required' };
 }
 
-const DESTRUCTIVE_SHELL_RE =
-  /\b(rm\s+-[a-z]*r|rm\s+-[a-z]*f|mkfs|dd\s+if=|>\s*\/dev\/|chmod\s+-R\s+777|curl\s+.*\|\s*(ba)?sh)\b/i;
+/**
+ * F07-10: each alternative carries its OWN boundary rules. The old form wrapped the whole group
+ * in one trailing `\b`, which made the `dd\s+if=` branch DEAD: `dd if=/dev/sda` has no word
+ * boundary between `=` and `/`, so exactly the dangerous raw-device reads never matched (only
+ * `dd if=wordchar…` did). `mkfs`/`chmod` keep their `\b`s; the `>`-redirect and `dd if=` forms
+ * are boundary-free by construction.
+ *
+ * BYPASS + regression review (P2-07), three more fixes:
+ *  - the old rm branch's trailing boundary also missed trailing flag letters and long flags
+ *    (`rm -rfv`, `rm --recursive --force /`); the new form carries no trailing boundary and
+ *    covers the `--recursive` / `--force` spellings;
+ *  - the old redirect branch matched a `>` into ANY /dev path and hard-denied the benign
+ *    `> /dev/null` suppression idiom; it now mirrors the catastrophic denylist and only
+ *    matches BLOCK-DEVICE targets (/dev/null, /dev/zero, /dev/urandom, … stay legal);
+ *  - `find … -delete` is destructive by construction and was in neither this regex nor the
+ *    denylist's reach for non-root paths — the classifier tier now hard-denies it (opt-in
+ *    autoClassifier only; the denylist separately catches the root/home/glob targets always).
+ */
+const DESTRUCTIVE_SHELL_RE = new RegExp(
+  [
+    '\\brm\\s+(?:-[a-z]*[rf]|--recursive\\b|--force\\b)', // rm -r/-f/-rf/-fr/-rfv and long flags
+    '\\bmkfs\\b',
+    '\\bdd\\s+if=', // no trailing \b — `if=/dev/…` must match
+    '>\\s*/dev/(?:disk|sd|nvme|hd|vd|mmcblk)', // block devices only — `> /dev/null` is benign
+    '\\bchmod\\s+-R\\s+777\\b',
+    '\\bcurl\\s+.*\\|\\s*(ba)?sh\\b',
+    '\\bfind\\b[^|;&]*\\s-delete\\b',
+  ].join('|'),
+  'i',
+);
 
 function shellCommandOf(input: unknown): string | null {
   if (!input || typeof input !== 'object') return null;

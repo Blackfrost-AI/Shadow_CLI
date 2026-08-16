@@ -68,10 +68,42 @@ export const SECRET_READ_DENY: readonly string[] = [
   '.azure', // Azure CLI tokens
   '.config/huggingface', // HF tokens
   '.m2/settings.xml', // Maven repository credentials (a file, subpath-of-file denies fine)
+  // F07-06 (P2-07): the password-manager + browser/keychain tier. Browsers keep saved passwords
+  // and session cookies here; the macOS Keychain holds EVERYTHING an app chose to store there.
+  // Whole-directory denies are deliberate: the secret files sit several levels deep and move
+  // between browser versions (Chrome's Login Data / Cookies / Web Data), so per-file rules would
+  // rot silently. The cost — a sandboxed shell can't read browser history/bookmarks either — is
+  // the correct trade: agent tasks never legitimately need those. There is NO per-command waiver
+  // for a single read — the only escapes are deliberate all-or-nothing choices (sandbox: "off" in
+  // config, --no-sandbox / --yolo, or full autonomy), each of which drops the WHOLE sandbox.
+  '.password-store', // `pass` — GPG-encrypted, but gpg-agent may hold an unlocked key
+  '.config/google-chrome', // Linux Chrome
+  '.config/chromium', // Linux Chromium
+  '.config/microsoft-edge', // Linux Edge
+  '.mozilla/firefox', // Linux Firefox (logins.json + key4.db)
+  'Library/Application Support/Google/Chrome', // macOS Chrome
+  'Library/Application Support/Chromium', // macOS Chromium
+  'Library/Application Support/Microsoft Edge', // macOS Edge
+  'Library/Application Support/Firefox', // macOS Firefox
+  'Library/Keychains', // macOS Keychain — the OS credential store itself
+  '.local/share/keyrings', // GNOME keyrings (login.keyring holds saved passwords)
+  // BYPASS review (P2-07): the third-party-store tier the first pass missed. rclone configs hold
+  // PLAINTEXT cloud credentials for every configured remote; the rest are the same class —
+  // tokens, key material, password-manager stores, wallet files.
+  '.config/rclone', // rclone.conf — plaintext cloud credentials for every remote
+  '.vault-token', // HashiCorp Vault token
+  '.oci', // Oracle Cloud config + API-key PEMs
+  '.config/BraveSoftware', // Linux Brave (Chromium-based)
+  'Library/Application Support/BraveSoftware', // macOS Brave
+  'Library/Application Support/1Password', // 1Password app data
+  'Library/Application Support/1Password 8', // separate component name — seatbelt subpath is component-exact
+  'Library/Group Containers/2BUA8C4S2C.com.agilebits', // 1Password browser-extension store
+  '.electrum/wallets', // Electrum wallets
+  '.bitcoin/wallets', // Bitcoin Core wallets
 ].map((rel) => join(homedir(), rel));
 
 /** The macOS seatbelt profile, parameterized by WS (workspace) and SD (~/.shadow). */
-function seatbeltProfile(allowNetwork: boolean, extraWrite: string[]): string {
+function seatbeltProfile(allowNetwork: boolean, extraWrite: string[], socketDeny?: boolean): string {
   return [
     '(version 1)',
     '(allow default)',
@@ -95,10 +127,59 @@ function seatbeltProfile(allowNetwork: boolean, extraWrite: string[]): string {
     // result. Independent of the read-only classifier's path scoping — that stops the AUTO-run,
     // this stops the read even when the user approves a shell command that reaches for them.
     ...SECRET_READ_DENY.map((p) => `(deny file-read* (subpath ${JSON.stringify(p)}))`),
+    // P3-08 (MCP children): `(deny network*)` covers INET sockets only — AF_UNIX connect() is
+    // mediated as file-write*, and /private/tmp + /private/var/folders stay WRITABLE in this
+    // profile. A trojaned stdio server could otherwise reach agent sockets living under tmp
+    // (launchd Listeners, ssh-agent, gpg). Deny the common socket shapes for jailed children.
+    // SBPL note: the `glob` matcher does not exist in this seatbelt dialect (profile fails to
+    // compile: "unbound variable: glob") — `regex` does, and is what we use.
+    ...(socketDeny
+      ? [
+          '(deny file-write* (regex "^/private/tmp/com\\.apple\\.launchd\\."))',
+          '(deny file-write* (regex "^/private/tmp/ssh-"))',
+          '(deny file-write* (regex "^/private/var/folders/[^/]+/[^/]+/T/com\\.apple\\.launchd\\."))',
+          '(deny file-write* (regex "^/private/var/folders/[^/]+/[^/]+/T/ssh-"))',
+          '(deny file-write* (regex "^/private/var/folders/[^/]+/[^/]+/T/gpg-"))',
+        ]
+      : []),
     allowNetwork ? '' : '(deny network*)',
   ]
     .filter(Boolean)
     .join('\n');
+}
+
+/** The macOS seatbelt argv prefix (profile included) shared by run_shell and MCP confinement. */
+function seatbeltPrefix(ws: string, shadowDir: string, allowNetwork: boolean, extraWrite: string[], socketDeny?: boolean): string[] {
+  return ['sandbox-exec', '-D', `WS=${ws}`, '-D', `SD=${shadowDir}`, '-p', seatbeltProfile(allowNetwork, extraWrite, socketDeny)];
+}
+
+/** The bubblewrap flag list shared by run_shell and MCP confinement. */
+function bwrapFlags(ws: string, shadowDir: string, extra: string[], allowNetwork: boolean, privateTmp?: boolean): string[] {
+  const flags = [
+    '--die-with-parent',
+    '--new-session',
+    // New PID namespace (+ the fresh --proc below) so a sandboxed child cannot read the parent
+    // agent's environment via /proc/<agent-pid>/environ and exfiltrate the provider API key.
+    '--unshare-pid',
+    '--ro-bind', '/', '/', // whole fs read-only…
+    '--dev', '/dev',
+    '--proc', '/proc',
+    '--bind', ws, ws, // …workspace writable…
+    // P3-08 (MCP children): `--unshare-net` does NOT cover AF_UNIX — ssh-agent sockets live in
+    // /tmp/ssh-*, so a jailed child given the host /tmp could still reach them. MCP children get
+    // a PRIVATE tmpfs instead; run_shell keeps the host /tmp bind (approved interactive commands
+    // legitimately exchange scratch files there).
+    ...(privateTmp ? ['--tmpfs', '/tmp'] : ['--bind', '/tmp', '/tmp']), // …and /tmp…
+    ...extra.flatMap((d) => ['--bind', d, d]), // …and any granted dirs writable…
+    '--tmpfs', shadowDir, // …and ~/.shadow hidden behind an empty tmpfs (no creds read)
+    // Same treatment for the credential stores outside ~/.shadow. A tmpfs makes them read as
+    // empty rather than erroring, which is the friendlier failure and still leaks nothing.
+    // Only bind paths that EXIST — bwrap aborts on a missing source.
+    ...SECRET_READ_DENY.filter((d) => existsSync(d)).flatMap((d) => ['--tmpfs', d]),
+    '--chdir', ws,
+  ];
+  if (!allowNetwork) flags.push('--unshare-net');
+  return flags;
 }
 
 export function wrapCommand(opts: {
@@ -132,37 +213,59 @@ export function wrapCommand(opts: {
     if (!existsSync('/usr/bin/sandbox-exec')) {
       return passthrough('sandbox-exec not found — run_shell runs unconfined');
     }
-    return {
-      argv: ['sandbox-exec', '-D', `WS=${ws}`, '-D', `SD=${shadowDir}`, '-p', seatbeltProfile(allowNetwork, extra), shell, '-c', command],
-      sandboxed: true,
-    };
+    return { argv: [...seatbeltPrefix(ws, shadowDir, allowNetwork, extra), shell, '-c', command], sandboxed: true };
   }
 
   // Linux
   if (hasBwrap()) {
-    const flags = [
-      '--die-with-parent',
-      '--new-session',
-      // New PID namespace (+ the fresh --proc below) so a run_shell command cannot read the parent
-      // agent's environment via /proc/<agent-pid>/environ and exfiltrate the provider API key.
-      '--unshare-pid',
-      '--ro-bind', '/', '/', // whole fs read-only…
-      '--dev', '/dev',
-      '--proc', '/proc',
-      '--bind', ws, ws, // …workspace writable…
-      '--bind', '/tmp', '/tmp', // …and /tmp…
-      ...extra.flatMap((d) => ['--bind', d, d]), // …and any granted dirs writable…
-      '--tmpfs', shadowDir, // …and ~/.shadow hidden behind an empty tmpfs (no creds read)
-      // Same treatment for the credential stores outside ~/.shadow. A tmpfs makes them read as
-      // empty rather than erroring, which is the friendlier failure and still leaks nothing.
-      // Only bind paths that EXIST — bwrap aborts on a missing source.
-      ...SECRET_READ_DENY.filter((d) => existsSync(d)).flatMap((d) => ['--tmpfs', d]),
-      '--chdir', ws,
-    ];
-    if (!allowNetwork) flags.push('--unshare-net');
-    return { argv: ['bwrap', ...flags, shell, '-c', command], sandboxed: true };
+    return { argv: ['bwrap', ...bwrapFlags(ws, shadowDir, extra, allowNetwork), shell, '-c', command], sandboxed: true };
   }
   return passthrough('bubblewrap (bwrap) not found — run_shell runs unconfined');
+}
+
+/**
+ * P3-08 Phase 3 — OS confinement for MCP STDIO CHILDREN. Same jail tiers as run_shell
+ * (workspace+/tmp writes, credential stores denied, ~/.shadow hidden), but the argv tail is the
+ * server's own argv — no shell in between. Network is OFF unless the caller grants it: a stdio
+ * server speaks over its pipes and needs no sockets by default, so a trojaned/broken server
+ * can't beacon. The grant is the server's `network: true` (global config); `sandbox: false`
+ * skips the jail entirely for that one server (the caller decides both).
+ */
+export function wrapMcpArgv(opts: {
+  command: string;
+  args: string[];
+  workspaceRoot: string;
+  additionalRoots?: string[];
+  allowNetwork: boolean;
+  enabled: boolean;
+}): SandboxResult {
+  const { command, args, workspaceRoot, allowNetwork, enabled } = opts;
+  const ws = real(workspaceRoot);
+  const shadowDir = real(join(homedir(), '.shadow'));
+  const extra = [...new Set((opts.additionalRoots ?? []).map(real))].filter((p) => p !== ws && existsSync(p));
+
+  const passthrough = (note?: string): SandboxResult => ({
+    argv: [command, ...args],
+    sandboxed: false,
+    note,
+  });
+
+  if (!enabled) return passthrough();
+  if (IS_WIN) return passthrough('no OS sandbox on Windows — MCP server runs unconfined');
+
+  if (IS_MAC) {
+    if (!existsSync('/usr/bin/sandbox-exec')) {
+      return passthrough('sandbox-exec not found — MCP server runs unconfined');
+    }
+    // socketDeny: AF_UNIX agent sockets under tmp are denied for jailed children (see seatbeltProfile).
+    return { argv: [...seatbeltPrefix(ws, shadowDir, allowNetwork, extra, true), command, ...args], sandboxed: true };
+  }
+
+  if (hasBwrap()) {
+    // privateTmp: fresh tmpfs over /tmp so the child can't reach host agent sockets (ssh-agent).
+    return { argv: ['bwrap', ...bwrapFlags(ws, shadowDir, extra, allowNetwork, true), command, ...args], sandboxed: true };
+  }
+  return passthrough('bubblewrap (bwrap) not found — MCP server runs unconfined');
 }
 
 /**

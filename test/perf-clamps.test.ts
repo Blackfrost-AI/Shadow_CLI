@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { readFile } from '../src/tools/readFile.js';
-import { displayWidth, takeByWidth, chunksByWidth } from '../src/tui/width.js';
+import { displayWidth, takeByWidth, chunksByWidth } from '../src/util/width.js';
 import { toOpenAIMessages } from '../src/provider/openai.js';
 import type { CompletionRequest, Message } from '../src/provider/provider.js';
 import { Semaphore } from '../src/util/semaphore.js';
