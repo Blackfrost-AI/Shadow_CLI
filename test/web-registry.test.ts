@@ -6,11 +6,13 @@ import type { AgentSession } from '../src/agent/bootstrap.js';
 import {
   createSessionRegistry,
   CLI_SESSION_ID,
+  TRANSPORT_GONE_MS,
   type AgentBuilder,
   type TurnRunner,
   type WebSession,
   type McpHandle,
   type JailCapability,
+  type PendingApproval,
 } from '../src/web/registry.js';
 
 /**
@@ -242,4 +244,59 @@ test('interrupt aborts a web session in flight and returns false for one that is
   assert.equal(registry.interrupt(s.id), true, 'a running turn is interruptible');
   await until(() => registry.get(s.id)!.status === 'idle');
   assert.ok(seen, 'runTurn saw the abort signal');
+});
+
+/* --------------------------------------------------------- transport-gone -- */
+
+/** Parks a spy ask the way WebApprovalGate does, so the tests observe the settle. */
+function parkApproval(s: WebSession, id: string, log: Array<[string, string | undefined]>) {
+  s.pendingApprovals.set(id, {
+    receivedAt: Date.now(),
+    settle: (d, label) => log.push([String(d), label]),
+  } as PendingApproval);
+}
+
+test('a parked approval survives a grace window, then settles cancelled once the last browser is gone', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { registry } = makeRegistry();
+  const s = registry.create({ projectRoot: '/tmp/ws' });
+  const settled: Array<[string, string | undefined]> = [];
+  parkApproval(s, 'ap1', settled);
+
+  const detach = s.stream.attach(fakeRes());
+  detach(); // the last browser leaves with the ask still open
+  t.mock.timers.tick(TRANSPORT_GONE_MS - 1000);
+  assert.equal(s.pendingApprovals.size, 1, 'still parked inside the grace window (refresh/switch)');
+
+  t.mock.timers.tick(1000 + 10);
+  assert.equal(s.pendingApprovals.size, 0, 'settled once the window lapses');
+  assert.deepEqual(settled, [['deny', 'cancelled']], 'the turn resolves denied/cancelled, freeing the run lock');
+});
+
+test('a browser returning within the window stands the timer down', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { registry } = makeRegistry();
+  const s = registry.create({ projectRoot: '/tmp/ws' });
+  const settled: Array<[string, string | undefined]> = [];
+  parkApproval(s, 'ap2', settled);
+
+  const d1 = s.stream.attach(fakeRes());
+  d1(); // arms the grace timer
+  const d2 = s.stream.attach(fakeRes()); // a tab comes back — stands it down
+  t.mock.timers.tick(TRANSPORT_GONE_MS * 2);
+  assert.equal(s.pendingApprovals.size, 1, 'the ask lives on while a client is attached');
+  assert.equal(settled.length, 0);
+  d2();
+});
+
+test('no ask pending → the last detach arms nothing', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const { registry } = makeRegistry();
+  const s = registry.create({ projectRoot: '/tmp/ws' });
+  const detach = s.stream.attach(fakeRes());
+  detach();
+  t.mock.timers.tick(TRANSPORT_GONE_MS * 2);
+  parkApproval(s, 'ap3', []);
+  t.mock.timers.tick(TRANSPORT_GONE_MS * 2);
+  assert.equal(s.pendingApprovals.size, 1, 'a later ask with no detach event is never auto-cancelled');
 });

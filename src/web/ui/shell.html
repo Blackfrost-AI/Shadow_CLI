@@ -4,9 +4,29 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Shadow</title>
+  <link rel="stylesheet" href="/assets/tokens.css" />
   <link rel="stylesheet" href="/assets/styles.css" />
 </head>
 <body>
+  <!-- Pre-paint theme boot: runs before any stylesheet-driven paint of the app (sync inline,
+       allowed by the CSP). The token sheets key every semantic alias off body[data-theme], so
+       setting the attribute here means the first paint is already the right theme — no flash.
+       Theme order: saved choice → OS preference. app.js keeps localStorage + this attribute in
+       sync on toggle; color-scheme on <html> makes form controls + scrollbars match. -->
+  <script>
+    (function () {
+      try {
+        var saved = localStorage.getItem('shadow.theme'); // 'light' | 'dark' | 'auto'
+        var dark =
+          saved === 'dark' ||
+          (saved !== 'light' && window.matchMedia('(prefers-color-scheme: dark)').matches);
+        if (dark) document.body.setAttribute('data-theme', 'dark');
+        document.documentElement.style.colorScheme = dark ? 'dark' : 'light';
+      } catch (e) {
+        /* no localStorage (private mode) — light default */
+      }
+    })();
+  </script>
   <div id="app">Loading...</div>
   <!-- Inline error reporter: if the module graph fails to load or boot() throws, surface the
        actual error on the page instead of leaving a blank screen. This inline script is allowed

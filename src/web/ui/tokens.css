@@ -1,0 +1,374 @@
+/* ============================================================================
+   Shadow web console — design tokens.
+
+   The design language is adopted from the DeepSeek Harness (dsh) web UI (MIT),
+   re-tokened for Shadow: same palette, type scale, radii, motion and geometry,
+   everything Shadow-branded under a --sw- prefix. Structure:
+
+     :root              static palette (theme-independent raw values), fonts, motion
+     body[data-theme]   semantic aliases — light default, dark opt-in
+     components         consume aliases only; never a raw palette value
+
+   Theming: `body[data-theme="dark"]` plus `color-scheme` on <html>. The boot
+   script in shell.html sets both before first paint; the theme toggle swaps the
+   attribute and the alias layer restyles the whole app (same mechanism as dsh's
+   data-ds-dark-theme).
+   ========================================================================== */
+
+:root {
+  /* --- fonts -------------------------------------------------------------------- */
+  --sw-font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  /* No bare `monospace` tail — Windows CJK would fall back to SimSun (dsh learned this). */
+  --sw-font-mono: 'SF Mono', 'JetBrains Mono', 'Fira Code', Consolas, 'Liberation Mono', Menlo, Courier,
+    'PingFang SC', 'Microsoft YaHei';
+
+  /* --- motion ------------------------------------------------------------------- */
+  --sw-ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+  --sw-dur-fast: 0.1s;
+  --sw-dur: 0.2s;
+  --sw-dur-slow: 0.3s;
+
+  /* --- static palette: neutral-bluish (the primary neutral ramp) ------------------ */
+  --sw-nb-0: #ffffff;
+  --sw-nb-50: #f9fafb;
+  --sw-nb-60: #f5f6f7;
+  --sw-nb-75: #f1f3f5;
+  --sw-nb-100: #ebeef2;
+  --sw-nb-150: #e9ecf2;
+  --sw-nb-200: #e1e5ee;
+  --sw-nb-300: #cfd3d6;
+  --sw-nb-400: #adb2b8;
+  --sw-nb-500: #979da6;
+  --sw-nb-600: #81858c;
+  --sw-nb-700: #61666b;
+  --sw-nb-750: #43454a;
+  --sw-nb-800: #353638;
+  --sw-nb-850: #2c2c2e;
+  --sw-nb-875: #232324;
+  --sw-nb-900: #1b1b1c;
+  --sw-nb-950: #151517;
+  --sw-nb-1000: #0f1115;
+
+  /* --- static palette: accent blue (links, focus, ongoing state — NOT the button) - */
+  --sw-blue-50: #edf3fe;
+  --sw-blue-100: #e4edfd;
+  --sw-blue-200: #d3e2ff;
+  --sw-blue-300: #b7c8fe;
+  --sw-blue-400: #679efe;
+  --sw-blue-450: #5686fe;
+  --sw-blue-500: #4176e6;
+  --sw-blue-600: #4868b2;
+  --sw-blue-800: #34415b;
+  --sw-blue-900: #283142;
+
+  /* --- static palette: status ----------------------------------------------------- */
+  --sw-red-50: #fef2f2;
+  --sw-red-100: #fee2e2;
+  --sw-red-400: #f25a5a;
+  --sw-red-500: #ef4444;
+  --sw-red-600: #ec1313;
+  --sw-red-900: #570c0c;
+  --sw-green-100: #e6faed;
+  --sw-green-400: #4ed17e;
+  --sw-green-500: #22c55e;
+  --sw-green-900: #233c2c;
+  --sw-amber-100: #fef5e7;
+  --sw-amber-400: #f7ad31;
+  --sw-amber-500: #f59e0b;
+  --sw-amber-600: #dd8629;
+  --sw-amber-900: #27241f;
+
+  /* --- shadows -------------------------------------------------------------------- */
+  --sw-shadow-1: 0 2px 4px 0 rgba(0, 0, 0, 0.05);
+  --sw-shadow-1-blur: 0 4px 12px 0 rgba(0, 0, 0, 0.02);
+  --sw-shadow-2: 0 4px 12px 0 rgba(0, 0, 0, 0.02), 0 2px 8px 0 rgba(0, 0, 0, 0.04);
+  --sw-shadow-3: 0 0 1px 0 rgba(0, 0, 0, 0.2), 0 0 4px 0 rgba(0, 0, 0, 0.02),
+    0 12px 32px 0 rgba(0, 0, 0, 0.08);
+
+  /* --- type scale (UI) — "strong" is 500, not 600 ---------------------------------- */
+  --sw-f-xl: 600 24px/32px var(--sw-font-sans);
+  --sw-f-l: 500 20px/28px var(--sw-font-sans);
+  --sw-f-m: 500 16px/28px var(--sw-font-sans);
+  --sw-f-base: 400 16px/24px var(--sw-font-sans);
+  --sw-f-base-strong: 500 16px/24px var(--sw-font-sans);
+  --sw-f-s: 400 14px/22px var(--sw-font-sans);
+  --sw-f-s-strong: 500 14px/22px var(--sw-font-sans);
+  --sw-f-xs: 400 13px/20px var(--sw-font-sans);
+  --sw-f-xs-strong: 500 13px/20px var(--sw-font-sans);
+  --sw-f-xxs: 400 12px/18px var(--sw-font-sans);
+  --sw-f-xxs-strong: 500 12px/18px var(--sw-font-sans);
+  --sw-f-xxxs: 400 11px/14px var(--sw-font-sans);
+  --sw-f-xxxs-strong: 500 11px/14px var(--sw-font-sans);
+
+  /* --- markdown scale --------------------------------------------------------------- */
+  --sw-f-md-h1: 700 24px/34px var(--sw-font-sans);
+  --sw-f-md-h2: 700 22px/32px var(--sw-font-sans);
+  --sw-f-md-h3: 700 20px/30px var(--sw-font-sans);
+  --sw-f-md-h4: 600 16px/28px var(--sw-font-sans);
+  --sw-f-md-body: 400 16px/28px var(--sw-font-sans);
+  --sw-f-md-small: 400 14px/24px var(--sw-font-sans);
+  --sw-f-md-table: 400 15px/25px var(--sw-font-sans);
+  --sw-f-md-table-head: 500 15px/25px var(--sw-font-sans);
+  --sw-f-md-code: 400 13px/22px var(--sw-font-mono);
+  --sw-f-md-code-sm: 400 12px/18px var(--sw-font-mono);
+
+  /* --- z ladder ---------------------------------------------------------------------- */
+  --sw-z-drag: 2;
+  --sw-z-banner: 6;
+  --sw-z-overlay: 20;
+  --sw-z-menu: 100;
+  --sw-z-modal: 1000;
+  --sw-z-portal-menu: 1100;
+  --sw-z-toast: 1100;
+}
+
+/* ============================================================================
+   Semantic aliases — LIGHT (default)
+   ========================================================================== */
+body {
+  /* backgrounds */
+  --sw-bg-base: var(--sw-nb-0); /* app background */
+  --sw-bg-layer-1: var(--sw-nb-0); /* cards, panels */
+  --sw-bg-layer-2: var(--sw-nb-0); /* dialogs, pills */
+  --sw-bg-layer-3: var(--sw-nb-0); /* menus */
+  --sw-bg-overlay: var(--sw-nb-150);
+  --sw-bg-skeleton: rgba(0, 0, 0, 0.04);
+  --sw-bg-mask-1: rgba(0, 0, 0, 0.24); /* dialog mask */
+  --sw-bg-mask-2: rgba(0, 0, 0, 0.12);
+  --sw-bg-module: var(--sw-nb-60); /* multi-select / selector fields */
+
+  --sw-sidebar-fill: var(--sw-nb-50);
+  --sw-sidebar-item-hover: var(--sw-nb-75);
+  --sw-sidebar-item-active: var(--sw-nb-100);
+  --sw-sidebar-item-active-accent: var(--sw-blue-100);
+
+  --sw-input-major: var(--sw-nb-0);
+  --sw-selector: var(--sw-nb-60);
+  --sw-tip: var(--sw-nb-60);
+  --sw-bubble: var(--sw-blue-50); /* chat user bubble */
+  --sw-bubble-highlight: var(--sw-blue-200);
+  --sw-toast-bg: var(--sw-nb-800);
+  --sw-tooltip-bg: var(--sw-nb-850);
+
+  /* interactive hover fills — translucent washes, not darker solids */
+  --sw-hover: rgba(38, 49, 72, 0.06);
+  --sw-active: rgba(38, 49, 72, 0.1);
+  --sw-hover-accent: rgba(38, 49, 72, 0.14);
+  --sw-hover-danger: rgba(236, 19, 19, 0.05);
+  --sw-hover-solid: var(--sw-nb-75);
+
+  /* text */
+  --sw-t-primary: var(--sw-nb-1000);
+  --sw-t-secondary: var(--sw-nb-700);
+  --sw-t-tertiary: var(--sw-nb-600);
+  --sw-t-caption: var(--sw-nb-400);
+  --sw-t-dimmed: var(--sw-nb-200); /* placeholder */
+  --sw-t-on-primary: var(--sw-nb-0); /* on the monochrome primary fill */
+  --sw-t-inverted: var(--sw-nb-0); /* on contrast/toast fill */
+  --sw-t-bluish: #0e3074;
+
+  /* borders (hairlines) */
+  --sw-border-1: rgba(0, 0, 0, 0.04);
+  --sw-border-2: rgba(0, 0, 0, 0.1);
+  --sw-border-3: rgba(0, 0, 0, 0.12);
+  --sw-border-4: rgba(0, 0, 0, 0.16);
+  --sw-border-inv: rgba(0, 0, 0, 0); /* menu/dialog edge */
+
+  /* accent / brand — the primary BUTTON is monochrome; blue is links/focus/ongoing */
+  --sw-brand-primary: var(--sw-nb-1000);
+  --sw-accent: var(--sw-blue-500);
+  --sw-accent-hover: var(--sw-blue-400);
+  --sw-ongoing: var(--sw-blue-450); /* running-state blue, pinned in both themes */
+
+  /* status */
+  --sw-error: var(--sw-red-600);
+  --sw-error-2: var(--sw-red-400);
+  --sw-success: var(--sw-green-500);
+  --sw-success-2: var(--sw-green-400);
+  --sw-success-bg: var(--sw-green-100);
+  --sw-warn: var(--sw-amber-500);
+  --sw-warn-2: var(--sw-amber-400);
+  --sw-warn-bg: var(--sw-amber-100);
+  --sw-warn-label: var(--sw-amber-600);
+  --sw-accent-bg: var(--sw-blue-100);
+
+  /* buttons */
+  --sw-btn-primary-fill: var(--sw-brand-primary);
+  --sw-btn-primary-hover: var(--sw-nb-750);
+  --sw-btn-primary-dimmed: var(--sw-nb-100);
+  --sw-btn-elevated: var(--sw-nb-0);
+  --sw-btn-floating: var(--sw-nb-0);
+  --sw-btn-floating-hover: var(--sw-nb-75);
+  --sw-btn-contrast: var(--sw-nb-700); /* toast plate */
+  --sw-ghost-active-fill: var(--sw-nb-100);
+  --sw-ghost-active-border: var(--sw-nb-500);
+  --sw-ghost-active-hover: var(--sw-nb-150);
+
+  /* markdown / code surfaces */
+  --sw-code-block: var(--sw-nb-50);
+  --sw-code-banner: var(--sw-nb-50);
+  --sw-code-inline: var(--sw-nb-100);
+  --sw-code-citation: var(--sw-nb-100);
+  --sw-tag: var(--sw-nb-75);
+
+  /* scrollbars (standard-color path; webkit below) */
+  --sw-scroll-thumb: #e5e5e5;
+  --sw-scroll-thumb-hover: #d4d4d4;
+
+  /* syntax */
+  --sw-syn-constant: #1c7ed6;
+  --sw-syn-string: #2f9e44;
+  --sw-syn-comment: #868e96;
+  --sw-syn-keyword: #d6336c;
+  --sw-syn-parameter: #e8590c;
+  --sw-syn-function: #6741d9;
+  --sw-syn-punctuation: #495057;
+  --sw-syn-link: #1971c2;
+
+  /* json tree */
+  --sw-json-property: #881391;
+  --sw-json-string: #c41a16;
+  --sw-json-number: #1c00cf;
+  --sw-json-punct: #202124;
+  --sw-json-icon: #5f6368;
+
+  /* geometry of the shell (component-local but tokenized for the drag logic to read) */
+  --sw-sidebar-w: 280px;
+  --sw-details-w: 360px;
+}
+
+/* ============================================================================
+   Semantic aliases — DARK
+   ========================================================================== */
+body[data-theme='dark'] {
+  --sw-bg-base: var(--sw-nb-950);
+  --sw-bg-layer-1: var(--sw-nb-875);
+  --sw-bg-layer-2: var(--sw-nb-850);
+  --sw-bg-layer-3: var(--sw-nb-800);
+  --sw-bg-overlay: var(--sw-nb-700);
+  --sw-bg-skeleton: rgba(255, 255, 255, 0.08);
+  --sw-bg-mask-1: rgba(0, 0, 0, 0.5);
+  --sw-bg-mask-2: rgba(0, 0, 0, 0.2);
+  --sw-bg-module: var(--sw-nb-800);
+
+  --sw-sidebar-fill: var(--sw-nb-900);
+  --sw-sidebar-item-hover: var(--sw-nb-850);
+  --sw-sidebar-item-active: var(--sw-nb-750);
+  --sw-sidebar-item-active-accent: var(--sw-nb-800);
+
+  --sw-input-major: var(--sw-nb-850);
+  --sw-selector: var(--sw-nb-800);
+  --sw-tip: var(--sw-nb-800);
+  --sw-bubble: var(--sw-nb-850);
+  --sw-bubble-highlight: var(--sw-nb-750);
+  --sw-toast-bg: var(--sw-nb-750);
+  --sw-tooltip-bg: var(--sw-nb-750);
+
+  --sw-hover: rgba(255, 255, 255, 0.08);
+  --sw-active: rgba(255, 255, 255, 0.14);
+  --sw-hover-accent: rgba(255, 255, 255, 0.24);
+  --sw-hover-danger: rgba(242, 90, 90, 0.15);
+  --sw-hover-solid: var(--sw-nb-800);
+
+  --sw-t-primary: var(--sw-nb-50);
+  --sw-t-secondary: var(--sw-nb-300);
+  --sw-t-tertiary: var(--sw-nb-500);
+  --sw-t-caption: var(--sw-nb-600);
+  --sw-t-dimmed: var(--sw-nb-750);
+  --sw-t-on-primary: var(--sw-nb-1000);
+  --sw-t-inverted: var(--sw-nb-800);
+  --sw-t-bluish: var(--sw-nb-50);
+
+  --sw-border-1: rgba(255, 255, 255, 0.06);
+  --sw-border-2: rgba(255, 255, 255, 0.12);
+  --sw-border-3: rgba(255, 255, 255, 0.16);
+  --sw-border-4: rgba(255, 255, 255, 0.2);
+  --sw-border-inv: rgba(255, 255, 255, 0.06);
+
+  --sw-brand-primary: var(--sw-nb-50);
+  --sw-accent: var(--sw-blue-400);
+  --sw-accent-hover: var(--sw-blue-500);
+
+  --sw-error: var(--sw-red-400);
+  --sw-success-bg: var(--sw-green-900);
+  --sw-warn-bg: var(--sw-amber-900);
+  --sw-accent-bg: var(--sw-blue-800);
+
+  --sw-btn-primary-fill: var(--sw-brand-primary);
+  --sw-btn-primary-hover: var(--sw-nb-200);
+  --sw-btn-primary-dimmed: var(--sw-nb-750);
+  --sw-btn-elevated: var(--sw-nb-750);
+  --sw-btn-floating: var(--sw-nb-850);
+  --sw-btn-floating-hover: var(--sw-nb-800);
+  --sw-btn-contrast: var(--sw-nb-50);
+  --sw-ghost-active-fill: var(--sw-nb-750);
+  --sw-ghost-active-border: var(--sw-nb-600);
+  --sw-ghost-active-hover: var(--sw-nb-700);
+
+  --sw-code-block: var(--sw-nb-900);
+  --sw-code-banner: var(--sw-nb-850);
+  --sw-code-inline: var(--sw-nb-850);
+  --sw-code-citation: var(--sw-nb-800);
+  --sw-tag: var(--sw-nb-850);
+
+  --sw-scroll-thumb: #3c3c3d;
+  --sw-scroll-thumb-hover: #545557;
+
+  --sw-syn-constant: #4dabf7;
+  --sw-syn-string: #69db7c;
+  --sw-syn-comment: #adb5bd;
+  --sw-syn-keyword: #faa2c1;
+  --sw-syn-parameter: #ffa94d;
+  --sw-syn-function: #b197fc;
+  --sw-syn-punctuation: #ced4da;
+  --sw-syn-link: #74c0fc;
+
+  --sw-json-property: #5db0d7;
+  --sw-json-string: #f28b82;
+  --sw-json-number: #99c8ff;
+  --sw-json-punct: #e8eaed;
+  --sw-json-icon: #9aa0a6;
+}
+
+/* ============================================================================
+   Scrollbars — the documented two-path system (Firefox standard props inside
+   @supports NOT webkit; webkit pseudo-elements otherwise). Pointer-gated
+   visibility is applied per-scroll-container via .scroll (styles.css).
+   ========================================================================== */
+@supports not selector(::-webkit-scrollbar) {
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--sw-scroll-thumb) transparent;
+  }
+}
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--sw-scroll-thumb);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--sw-scroll-thumb-hover);
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* ============================================================================
+   Reduced motion — every animation honors it.
+   ========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

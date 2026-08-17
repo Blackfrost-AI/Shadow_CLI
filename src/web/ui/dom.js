@@ -30,7 +30,12 @@ export function el(tag, attrs = {}, children = []) {
     // Absent/false attributes are omitted so callers can spread conditionals inline.
     if (v === undefined || v === null || v === false) continue;
     if (k === 'class') node.className = v;
-    else if (k.startsWith('on') && typeof v === 'function') node[k] = v;
+    // Handlers as PROPERTIES (never attributes — see the comment above), normalized to the
+    // lowercase DOM property name: `onClick` and `onclick` both land on node.onclick. The
+    // camelCase form assigned a dead node.onClick property instead (browsers fire only the
+    // lowercase one), which silently killed every handler written that way.
+    else if ((k.startsWith('on') || k.startsWith('On')) && typeof v === 'function')
+      node[k.toLowerCase()] = v;
     else if ((k === 'href' || k === 'src') && !SAFE_URL.test(String(v).trim())) continue;
     else node.setAttribute(k, v);
   }

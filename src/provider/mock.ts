@@ -106,6 +106,42 @@ export function dialectMock(): MockProvider {
           { type: 'done', stopReason: 'tool_use' },
         ];
       }
+      // Browser-console verification of the question dock: a structured ask_user_question
+      // call parks on the approval channel exactly like a real model's would.
+      if (task.includes('ask_user')) {
+        return [
+          {
+            type: 'tool_call',
+            call: {
+              id: 'dialect-ask',
+              name: 'ask_user_question',
+              input: {
+                questions: [
+                  {
+                    question: 'Which database should the migration target?',
+                    header: 'Database',
+                    options: [
+                      { label: 'SQLite (Recommended)', description: 'zero-config, ships in-process' },
+                      { label: 'Postgres', description: 'separate server, richer types' },
+                    ],
+                  },
+                  {
+                    question: 'Which features must ship in v1?',
+                    multiSelect: true,
+                    options: [
+                      { label: 'Auth' },
+                      { label: 'Export' },
+                      { label: 'Audit log', description: 'adds storage requirements' },
+                    ],
+                  },
+                ],
+              },
+            },
+          },
+          { type: 'usage', inputTokens: 10, outputTokens: 5 },
+          { type: 'done', stopReason: 'tool_use' },
+        ];
+      }
       return doneTurn();
     },
   ]);

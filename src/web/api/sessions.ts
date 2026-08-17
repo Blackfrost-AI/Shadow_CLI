@@ -1,5 +1,8 @@
 import { readJsonBody, type ApiContext, type RouteFn } from '../router.js';
 import { resolveJail } from '../projects.js';
+import { AUTONOMY_LEVELS } from '../../safety/permissions.js';
+import type { AutonomyLevel } from '../../safety/permissions.js';
+import type { ApprovalDecision, UserAnswer } from '../../agent/approval.js';
 
 /**
  * Session management surface.
@@ -70,4 +73,62 @@ export function registerSessionsRoutes(route: RouteFn, ctx: ApiContext): void {
     status: 200,
     body: { removed: await ctx.registry.remove(m[1]!) },
   }));
+
+  // --- the browser's approval decision channel -----------------------------------------------
+  //
+  // The ask itself arrives as an `approval_request` LoopEvent on the session's SSE (and is parked
+  // on the session by the WebApprovalGate); this route is the answer half. Body:
+  //   { decision: 'approve' | 'deny' | 'session' }            — permission asks
+  //   { decision: { answers: [{ question, selected: [] }] } } — user_question asks
+  // 'session' maps to approveForSession (the session's SessionApprovals holds the grant).
+  // 409 not-pending on a late/duplicate/unknown id — never an error that hides the real state.
+  route('POST', /^\/api\/sessions\/([^/]+)\/approvals\/([^/]+)$/, async (req, _res, m) => {
+    const body = (await readJsonBody(req)) as { decision?: unknown } | null;
+    const decision = parseApprovalDecision(body?.decision);
+    if (!decision) {
+      return { status: 400, body: { error: "decision must be 'approve' | 'deny' | 'session' | { answers }" } };
+    }
+    const accepted = ctx.registry.decide(m[1]!, m[2]!, decision);
+    return accepted
+      ? { status: 200, body: { accepted: true } }
+      : { status: 409, body: { accepted: false, reason: 'not-pending' } };
+  });
+
+  // Access pill: change this session's autonomy for LATER turns (the running turn keeps its own
+  // level — autonomy is read once per loop run). Widening here only changes what the NEXT
+  // approval gate consults; the jail, denylist and deny-gauntlet are unaffected.
+  route('POST', /^\/api\/sessions\/([^/]+)\/autonomy$/, async (req, _res, m) => {
+    const body = (await readJsonBody(req)) as { level?: unknown } | null;
+    if (typeof body?.level !== 'string' || !AUTONOMY_LEVELS.includes(body.level as AutonomyLevel)) {
+      return { status: 400, body: { error: `level must be one of ${AUTONOMY_LEVELS.join(' | ')}` } };
+    }
+    const ok = ctx.registry.setAutonomy(m[1]!, body.level as AutonomyLevel);
+    return ok ? { status: 200, body: { level: body.level } } : { status: 409, body: { error: 'session autonomy is read-only' } };
+  });
+}
+
+/** Validate the decision payload off the wire — never trust the shape straight to the gate. */
+function parseApprovalDecision(raw: unknown): ApprovalDecision | null {
+  if (raw === 'approve' || raw === 'deny' || raw === 'session') {
+    return raw === 'session' ? { approveForSession: true } : raw;
+  }
+  if (raw && typeof raw === 'object' && Array.isArray((raw as { answers?: unknown }).answers)) {
+    const answers: UserAnswer[] = [];
+    for (const a of (raw as { answers: unknown[] }).answers) {
+      if (
+        a &&
+        typeof a === 'object' &&
+        typeof (a as { question?: unknown }).question === 'string' &&
+        Array.isArray((a as { selected?: unknown }).selected) &&
+        (a as { selected: unknown[] }).selected.every((s) => typeof s === 'string')
+      ) {
+        answers.push({
+          question: (a as { question: string }).question,
+          selected: (a as { selected: string[] }).selected,
+        });
+      }
+    }
+    if (answers.length) return { answers };
+  }
+  return null;
 }

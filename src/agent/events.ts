@@ -3,6 +3,7 @@ import type { ToolResult, ToolRisk } from '../tools/types.js';
 import type { AutonomyLevel } from '../safety/permissions.js';
 import type { TodoItem } from './todo.js';
 import type { PlanSnapshot } from './planMode.js';
+import type { ApprovalKind, UserQuestion } from './approval.js';
 
 /**
  * Typed events the loop emits. The UI (Ink) and the plain REPL both subscribe;
@@ -23,7 +24,24 @@ export type LoopEvent =
   | { type: 'tool_start'; call: ToolCall; risk: ToolRisk; subagent?: string }
   | { type: 'tool_end'; call: ToolCall; result: ToolResult; subagent?: string }
   | { type: 'tool_denied'; call: ToolCall; reason: string; subagent?: string }
-  | { type: 'usage'; inputTokens: number; outputTokens: number; costUSD: number; contextPct: number }
+  // inputTokens/outputTokens/costUSD are TURN-CUMULATIVE (Budget.snapshot) — the HUD contract.
+  // The optional fields are THIS provider request's numbers, added for the web console's
+  // per-turn metrics footer + trajectory: cacheRead/Write split, time-to-first-token, and the
+  // raw per-request counts (iterInput includes cache reads/writes where the provider reports
+  // them — mirror the `recordActualTokens` sum in loop.ts). All optional so older emitters and
+  // tests that only assert the four legacy fields stay valid.
+  | {
+      type: 'usage';
+      inputTokens: number;
+      outputTokens: number;
+      costUSD: number;
+      contextPct: number;
+      cacheReadTokens?: number;
+      cacheWriteTokens?: number;
+      ttftMs?: number;
+      iterInputTokens?: number;
+      iterOutputTokens?: number;
+    }
   | { type: 'latency'; ms: number }
   | { type: 'compaction'; trigger: 'auto' | 'manual'; degraded?: boolean } // earlier turns summarized to reclaim context (surfaced for TUI + eval verification); degraded: the summarizer FAILED and context was reclaimed by local truncation only (F04-11)
   | { type: 'autonomy'; level: AutonomyLevel }
@@ -59,6 +77,30 @@ export type LoopEvent =
   // taskId is '*'. Emitted on the parent bus; the bg `agent` tool run listens for its own taskId and
   // aborts its sub-loop. Completes the F10-02 story: bg agents were visible but uncancellable.
   | { type: 'cancel_subagent'; taskId: string }
+  // --- approvals over HTTP (the web console's decision channel) -----------------------
+  // A gated action announces itself as `approval_request` and is PARKED on the session
+  // (registry.pendingApprovals) until the browser answers via
+  // POST /api/sessions/:id/approvals/:approvalId — or the turn's abort settles it as cancelled.
+  // The wire copy is DISPLAY-SAFE by construction: `argHint` is a short redacted digest of the
+  // call's input (command/path/query/url), never the raw `call.input`; the executor still sees
+  // the full input. `preview` (the gate's own diff/preview text) and `questions` (user_question)
+  // round out what the UI needs to render the strip. Mirrors dsh's approval/requested frame.
+  | {
+      type: 'approval_request';
+      id: string;
+      kind: ApprovalKind;
+      tool: string;
+      risk: ToolRisk;
+      reason: string;
+      preview: string;
+      argHint?: string;
+      acknowledgeOnly?: boolean;
+      questions?: UserQuestion[];
+    }
+  // Terminal state for every request above, emitted to ALL subscribers (every open tab) so a
+  // strip answered in one tab closes in the others. `cancelled` = the turn was interrupted or the
+  // session closed while the ask was pending.
+  | { type: 'approval_resolved'; id: string; outcome: 'approved' | 'session' | 'denied' | 'cancelled' | 'answered' }
 
 export type StopReasonExt =
   | StopReason

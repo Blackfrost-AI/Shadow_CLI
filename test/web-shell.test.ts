@@ -64,7 +64,7 @@ test('serves an app asset as text/javascript with correct MIME', async () => {
     const r = await raw(h.port, 'GET', '/assets/app.js', authHeaders(h));
     assert.equal(r.status, 200);
     assert.match(headerText(r.headers['content-type']), /text\/javascript/);
-    assert.match(r.body, /startRouter/);
+    assert.match(r.body, /createFrame/); // the dsh-style shell boots the frame, not a router
   });
 });
 
@@ -73,7 +73,7 @@ test('serves the stylesheet as text/css', async () => {
     const r = await raw(h.port, 'GET', '/assets/styles.css', authHeaders(h));
     assert.equal(r.status, 200);
     assert.match(headerText(r.headers['content-type']), /text\/css/);
-    assert.match(r.body, /--accent/);
+    assert.match(r.body, /--sw-/); // consumes the dsh token system (tokens.css)
   });
 });
 
@@ -222,7 +222,9 @@ test('the ENTIRE module graph loads the way a browser fetches it (no Authorizati
     // Sanity: this must have actually traversed, not fetched one file and stopped.
     assert.ok(fetched >= 6, `expected to walk the module graph, only fetched ${fetched}`);
     assert.ok(seen.has('api.js'), 'transitive import api.js was reached');
-    assert.ok(seen.has('router.js'), 'transitive import router.js was reached');
+    assert.ok(seen.has('dom.js'), 'transitive import dom.js was reached');
+    assert.ok(seen.has('chat.js'), 'transitive import chat.js was reached');
+    assert.ok(seen.has('sessionModel.js'), 'the session model is part of the served graph');
   });
 });
 

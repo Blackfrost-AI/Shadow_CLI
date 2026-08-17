@@ -60,6 +60,12 @@ export interface SessionStreamOptions {
   bus: EventBus;
   /** Server-wide, so a client id is unique in logs across sessions. */
   allocClientId: () => number;
+  /**
+   * Fires after every attach and every client removal (detach, backpressure drop, write
+   * failure, close) with the new client count. The registry uses it to implement the
+   * approval gate's transport-gone path: an ask parked with nobody left to answer it.
+   */
+  onClientsChange?: (count: number) => void;
 }
 
 export interface SessionStream {
@@ -111,6 +117,7 @@ export function createSessionStream(opts: SessionStreamOptions): SessionStream {
       // terminal stop frame is discarded. Closing is recoverable: EventSource reconnects with its
       // last id and the replay ring supplies every missed frame, including stop.
       clients.delete(c.id);
+      opts.onClientsChange?.(clients.size);
       try { c.res.destroy(); } catch { /* already closed */ }
       return;
     }
@@ -121,6 +128,7 @@ export function createSessionStream(opts: SessionStreamOptions): SessionStream {
       });
     } catch {
       clients.delete(c.id);
+      opts.onClientsChange?.(clients.size);
       try { c.res.destroy(); } catch { /* already closed */ }
     }
   };
@@ -191,11 +199,13 @@ export function createSessionStream(opts: SessionStreamOptions): SessionStream {
 
       const id = opts.allocClientId();
       clients.set(id, { id, res, queued: 0 });
+      opts.onClientsChange?.(clients.size);
       let detached = false;
       return () => {
         if (detached) return;
         detached = true;
         clients.delete(id);
+        opts.onClientsChange?.(clients.size);
       };
     },
 
@@ -224,6 +234,7 @@ export function createSessionStream(opts: SessionStreamOptions): SessionStream {
       if (flushTimer) clearTimeout(flushTimer);
       for (const c of clients.values()) c.res.end();
       clients.clear();
+      opts.onClientsChange?.(0);
     },
   };
 }

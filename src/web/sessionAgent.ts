@@ -79,6 +79,25 @@ export function makeAgentBuilder(deps: { bootConfig: ShadowConfig; installDir: s
     // the servers are the boot set — never whatever a later POST /api/mcp wrote.
     const mcp = await agent.connectMcp();
 
+    // Live task list on the wire (index.ts:todoList.onUpdate parity for the TUI). Without this
+    // the browser todo dock never fills: the tool runs, "List updated" lands, but no `todo` event
+    // ever reaches /events. No explicit detach needed — the todoList dies with the agent and the
+    // bus dies with the session, so the listener's references drop with them on close().
+    agent.todoList.onUpdate((items) => session.bus.emit({ type: 'todo', items }));
+
+    // Durable web transcript: the same bus→recordEvent contract the TUI/REPL wire at boot
+    // (index.ts, tui.tsx). recordEvent drops per-token deltas (SKIP_EVENT_TYPES) and chains
+    // snapshots, so the log stays compact; the in-memory SSE ring remains the browser's replay
+    // source — this is the on-disk record, wired once per built session. Detached on close()
+    // (registry) so a closed session writes nothing more.
+    session.detachLog = session.bus.on((e) => {
+      try {
+        agent.sessionLog.recordEvent(e);
+      } catch {
+        /* a logging failure must never break the bus */
+      }
+    });
+
     return { agent, mcp, jail };
   };
 }

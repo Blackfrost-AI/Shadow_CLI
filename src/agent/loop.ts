@@ -1081,16 +1081,25 @@ export class AgentLoop {
     let namelessCall = false;
     const badCalls: string[] = [];
     let providerError: { code: string; message: string } | undefined;
+    // Web-console metrics: time to the first visible token (text OR thinking — whichever the
+    // model leads with), and the raw per-request usage so the `usage` event can carry this
+    // iteration's numbers alongside the turn-cumulative Budget snapshot.
+    let ttftMs: number | undefined;
+    let iterUsage:
+      | { inputTokens: number; outputTokens: number; cacheReadTokens?: number; cacheWriteTokens?: number }
+      | undefined;
 
     try {
       for await (const ev of provider.send(req)) {
         if (req.signal?.aborted) break; // hard interrupt or user steering — stop consuming now
         switch (ev.type) {
           case 'text':
+            if (ttftMs === undefined) ttftMs = this.now() - t0;
             text += ev.delta;
             this.deps.bus.emit({ type: 'text', delta: ev.delta });
             break;
           case 'thinking':
+            if (ttftMs === undefined) ttftMs = this.now() - t0;
             thinkingText += ev.delta;
             this.deps.bus.emit({ type: 'thinking', delta: ev.delta });
             break;
@@ -1117,6 +1126,12 @@ export class AgentLoop {
             this.deps.context.recordActualTokens(
               ev.inputTokens + (ev.cacheReadTokens ?? 0) + (ev.cacheWriteTokens ?? 0),
             );
+            iterUsage = {
+              inputTokens: ev.inputTokens,
+              outputTokens: ev.outputTokens,
+              cacheReadTokens: ev.cacheReadTokens,
+              cacheWriteTokens: ev.cacheWriteTokens,
+            };
             const snap = this.deps.budget.snapshot(this.now());
             const pct =
               this.deps.context.estimateTokens(provider) / Math.max(1, this.deps.context.budget());
@@ -1126,6 +1141,13 @@ export class AgentLoop {
               outputTokens: snap.outputTokens,
               costUSD: snap.costUSD,
               contextPct: Math.min(1, pct),
+              // This request's detail (see events.ts): undefined fields simply haven't been
+              // measured yet at this point in the stream (e.g. an input-only early usage frame).
+              cacheReadTokens: iterUsage.cacheReadTokens,
+              cacheWriteTokens: iterUsage.cacheWriteTokens,
+              ttftMs,
+              iterInputTokens: iterUsage.inputTokens,
+              iterOutputTokens: iterUsage.outputTokens,
             });
             break;
           }

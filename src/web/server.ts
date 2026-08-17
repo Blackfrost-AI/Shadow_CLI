@@ -7,9 +7,10 @@ import { registerSecret } from '../util/redact.js';
 import { authorizeRequest, isPublicPath, SEC_HEADERS } from './security.js';
 import { createApiRouter } from './router.js';
 import { readAsset, shellPage, contentTypeFor } from './assets.js';
-import { createSessionRegistry, CLI_SESSION_ID } from './registry.js';
+import { createSessionRegistry, CLI_SESSION_ID, type SessionRegistry } from './registry.js';
 import { makeAgentBuilder } from './sessionAgent.js';
 import { makeTurnRunner } from './runTurn.js';
+import { WebApprovalGate } from './approvalGate.js';
 import { INSTALL_DIR } from '../installDir.js';
 import { loadConfig } from '../config.js';
 
@@ -32,6 +33,8 @@ export interface WebServerHandle {
   close: () => Promise<void>;
   /** Live subscriber count — used by tests and by the approval gate's disconnect path. */
   clients: () => number;
+  /** The server's session registry — in-process consumers (tests) park/answer approvals on it. */
+  registry: SessionRegistry;
 }
 
 export interface WebServerOptions {
@@ -79,7 +82,10 @@ export function startWebServer(opts: WebServerOptions): Promise<WebServerHandle>
   // builder/runTurn until C7 (POST /chat).
   const registry = createSessionRegistry({
     builder: makeAgentBuilder({ bootConfig, installDir: INSTALL_DIR }),
-    runTurn: makeTurnRunner(),
+    // The browser's approval channel: gated asks become approval_request events the console
+    // answers over POST /api/sessions/:id/approvals/:id (fail-closed on abort/close). The ACP
+    // adapter injects its own editor-mediated gate the same way (src/acp/cli.ts).
+    runTurn: makeTurnRunner(undefined, (s) => new WebApprovalGate(s)),
   });
   registry.attachReserved({
     bus: opts.bus,
@@ -246,6 +252,7 @@ export function startWebServer(opts: WebServerOptions): Promise<WebServerHandle>
         url: `http://127.0.0.1:${port}/#t=${token}`,
         port,
         token,
+        registry,
         clients: () => registry.totalClients(),
         close: () =>
           new Promise<void>((done) => {

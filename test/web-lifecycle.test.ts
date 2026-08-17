@@ -48,9 +48,10 @@ test('E2: web sessions are capped', () => {
 });
 
 test('E2: the UI can actually close a session', () => {
-  const src = read('../src/web/ui/views/sessions.js');
-  assert.match(src, /del\(`\/api\/sessions\/\$\{s\.id\}`\)/, 'the row has a close control');
+  const src = read('../src/web/ui/sidebar.js');
+  assert.match(src, /del\(`\/api\/sessions\/\$\{s\.id\}`\)/, 'the session row has a close control');
   assert.match(src, /e\.stopPropagation\(\)/, 'which must not also open the console');
+  assert.match(src, /confirmDialog/, 'and closing is confirmed, not a mis-click away');
   // The embedded copy is what the compiled binary serves — a stale map ships a UI without it.
   const bundled = read('../src/web/bundledAssets.ts');
   assert.match(bundled, /api\\\/sessions\\\/\$\{s\.id\}|api\/sessions\/\$\{s\.id\}/, 'and it is embedded');
