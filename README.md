@@ -6,7 +6,7 @@
 
 > **A true gift of freedom and privacy.**
 > Zero-telemetry · provider-neutral · phone home to no one.
-> Current build: **`v8.0.0`** — the web console, rebuilt as a full harness UI: three-pane workspace (sessions · chat · inspector), live approvals and queued prompts, per-request telemetry, and a trajectory timeline — same token-in-fragment security, same project jail, no CDN.
+> Current build: **`v8.0.2`** — paste-safe input: a pasted line sits in the composer as text (never auto-submits; only a typed Enter submits), and fast-typing that coalesces text + Enter into one read submits exactly as if they'd arrived separately — plus the v8.0.0 web console: three-pane harness workspace (sessions · chat · inspector), live approvals, queued prompts, per-request telemetry, trajectory timeline — same token-in-fragment security, same project jail, no CDN.
 
 **Shadow is a zero-telemetry, provider-neutral coding agent that runs on your terms.** Point it at any model — Anthropic, any OpenAI-compatible endpoint, Gemini, or a local model on your own box — and it works as a coding / sysadmin agent over your workspace. **No Shadow account, no signup, no phone-home:** the only outbound traffic is the provider *you* chose and the web tools the agent explicitly invokes. Your config stays local and readable (`~/.shadow/config.json`), your keys never leave your machine, and you can switch models mid-session **without losing context**.
 

@@ -4,6 +4,10 @@ import React from 'react';
 import { render } from 'ink-testing-library';
 import { TuiApp, type TuiOpts } from '../src/tui.js';
 import { EventBus } from '../src/agent/events.js';
+import { Context } from '../src/agent/context.js';
+import { ToolRegistry } from '../src/tools/registry.js';
+import { createProvider } from '../src/provider/index.js';
+import { loadConfig } from '../src/config.js';
 
 /**
  * End-to-end composer editing: drives the REAL <TuiApp> with the exact byte sequences macOS
@@ -17,7 +21,8 @@ function makeOpts(over: Partial<TuiOpts> = {}): TuiOpts {
     provider: {} as TuiOpts['provider'],
     registry: {} as TuiOpts['registry'],
     bus: new EventBus(),
-    context: {} as TuiOpts['context'],
+    // startTurn's first message calls pinTask; most tests never submit, so a no-op stub suffices.
+    context: { pinTask() {}, append() {} } as unknown as TuiOpts['context'],
     sessionLog: { record() {} } as unknown as TuiOpts['sessionLog'],
     system: '',
     workspaceRoot: '/tmp/ws',
@@ -32,8 +37,12 @@ function makeOpts(over: Partial<TuiOpts> = {}): TuiOpts {
 /** Ink throttles frame writes (~32ms leading+trailing), so every read waits past one full window. */
 const FLUSH_MS = 90;
 
-async function mount(t: { after: (fn: () => void) => void }, cfg: Record<string, unknown> = {}) {
-  const opts = makeOpts();
+async function mount(
+  t: { after: (fn: () => void) => void },
+  cfg: Record<string, unknown> = {},
+  over: Partial<TuiOpts> = {},
+) {
+  const opts = makeOpts(over);
   Object.assign(opts.cfg as unknown as Record<string, unknown>, cfg);
   const { lastFrame, stdin, unmount } = render(React.createElement(TuiApp, { opts }));
   // Let the mount settle (the welcome card commits to <Static> on a startup effect) before typing —
@@ -224,6 +233,74 @@ test('batched chunks: a typed byte right after Home in one read must not defeat 
   send('\x1b[Hq'); // Home + 'q' in ONE read: Ink dispatches Home and drops the q itself
   send('Y');
   assert.equal(await draft(), 'Yworld', 'the sequence was trimmed of trailing text before matching');
+});
+
+test('batchedTextReturn: only <printable text><one trailing BARE \r> matches', async () => {
+  const { batchedTextReturn } = await import('../src/tui/keys/common.js');
+  assert.equal(batchedTextReturn('hello\r'), 'hello', 'a typed Enter coalesced with its text');
+  assert.equal(batchedTextReturn('héllo …\r'), 'héllo …', 'non-ASCII text is printable');
+  assert.equal(batchedTextReturn('hello\n'), null, 'trailing LF is an unbracketed-paste signature — literal text, never a submit');
+  assert.equal(batchedTextReturn('hello\r\n'), null, 'trailing CRLF is an unbracketed-paste signature — literal text, never a submit');
+  assert.equal(batchedTextReturn('hello'), null, 'no terminator — plain text takes the legacy path');
+  assert.equal(batchedTextReturn('hel\rlo\r'), null, 'embedded terminator (multi-line) never matches');
+  assert.equal(batchedTextReturn('a\x1b[H\r'), null, 'ESC-led sequence in the chunk');
+  assert.equal(batchedTextReturn('\x1b[200~x\r'), null, 'bracketed-paste marker body');
+  assert.equal(batchedTextReturn('\r'), null, 'a lone Enter is a real keypress, not a batch');
+  assert.equal(batchedTextReturn('a\x7f\r'), null, 'DEL is not printable');
+});
+
+test('batched chunks: text + Enter in ONE read submits instead of swallowing the Enter', async (t) => {
+  // A plain message actually starts a turn, so this one needs the real mock-provider machinery
+  // (the integration-test setup) rather than the bare {} stubs the editing tests run on.
+  const cfg = loadConfig(process.cwd(), { provider: 'mock', model: 'm' });
+  const { send, draft, lastFrame } = await mount(t, cfg as unknown as Record<string, unknown>, {
+    provider: createProvider({ provider: 'mock', model: 'm' }),
+    registry: new ToolRegistry(),
+    context: new Context({
+      contextBudget: cfg.contextBudget,
+      triggerRatio: cfg.summarizeTriggerRatio,
+      keepLastTurns: cfg.keepLastTurns,
+    }),
+  });
+  send('hello\r'); // one stdin read carries the text AND its Enter
+  await new Promise((r) => setTimeout(r, FLUSH_MS));
+  assert.equal(await draft(), '', 'the coalesced Enter submitted — no phantom trailing newline left behind');
+  assert.match(lastFrame() ?? '', /hello/, 'the message landed in the transcript');
+});
+
+test('batched chunks: /goal + Enter in ONE read runs the command (founder report)', async (t) => {
+  const { send, draft, lastFrame } = await mount(t);
+  send('/goal ship the thing\r');
+  await new Promise((r) => setTimeout(r, FLUSH_MS));
+  assert.equal(await draft(), '', 'nothing stranded in the composer');
+  assert.match(lastFrame() ?? '', /Goal set: ship the thing/, 'the slash command actually ran');
+});
+
+test('batched chunks: text + LF/CRLF (unbracketed paste signatures) insert as text, do NOT submit', async (t) => {
+  // A turn WOULD start if the paste wrongly submitted, so this needs the real mock machinery.
+  const cfg = loadConfig(process.cwd(), { provider: 'mock', model: 'm' });
+  const { send, draft, lastFrame } = await mount(t, cfg as unknown as Record<string, unknown>, {
+    provider: createProvider({ provider: 'mock', model: 'm' }),
+    registry: new ToolRegistry(),
+    context: new Context({
+      contextBudget: cfg.contextBudget,
+      triggerRatio: cfg.summarizeTriggerRatio,
+      keepLastTurns: cfg.keepLastTurns,
+    }),
+  });
+  send('pasted line\n'); // what a terminal without bracketed paste sends for a copied line
+  await new Promise((r) => setTimeout(r, FLUSH_MS));
+  // The pasted newline makes the draft multi-row; draft() reads the first composer row.
+  assert.equal(await draft(), 'pasted line', 'the text sits in the composer like a bracketed paste would');
+  assert.doesNotMatch(lastFrame() ?? '', /Shadow \(mock\)/, 'no turn started from the pasted LF');
+  send('second\r\n'); // CRLF variant — same paste signature
+  await new Promise((r) => setTimeout(r, FLUSH_MS));
+  assert.equal(await draft(), 'pasted line', 'CRLF paste also stays in the composer');
+  assert.doesNotMatch(lastFrame() ?? '', /Shadow \(mock\)/, 'no turn started from the pasted CRLF either');
+  send('\r'); // the user presses Enter themselves — NOW it submits
+  await new Promise((r) => setTimeout(r, 450));
+  assert.equal(await draft(), '', 'a real Enter submits the pasted multi-line draft');
+  assert.match(lastFrame() ?? '', /Shadow \(mock\)/, 'the turn ran');
 });
 
 test('Ctrl+D on an EMPTY composer warns first (two-stage arm) and any other key disarms it', async (t) => {

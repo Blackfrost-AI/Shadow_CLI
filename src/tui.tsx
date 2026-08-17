@@ -75,6 +75,7 @@ import { redactString } from './util/redact.js';
 import { useKeybindings } from './tui/keybindings/useKeybinding.js';
 
 import { dispatchKey } from './tui/keys/router.js';
+import { batchedTextReturn } from './tui/keys/common.js';
 import type { KeyEnv } from './tui/keys/types.js';
 import { claimMode, releaseMode, restoreTerminal, installRestoreHandlers } from './tui/terminalState.js';
 import { sanitizeTerminalEscapes, scrubForDisplay } from './util/scrub.js';
@@ -776,6 +777,10 @@ const PAGE_MARGIN = 4;
 /** Terminal answer to a DSR cursor-position query (CSI 6n). Ink strips a chunk-leading ESC. */
 const DSR_REPLY = /\x1b?\[(\d+);(\d+)R/;
 // DSR_REPLY_EXACT / HOME_KEYS / END_KEYS / FORWARD_DELETE / SHIFT_ENTER moved to the
+// The key object a real '\r' carries (parse-keypress: name 'return', use-input: the `return`
+// flag) — the synthetic Enter dispatched after a batched-text replay in onKey.
+const SYNTH_RETURN_KEY = { return: true, name: 'return', sequence: '\r' } as unknown as import('ink').Key;
+
 // focus-owner router (src/tui/keys/reserved.ts + composerOwner.ts, P3-01). DSR_REPLY stays —
 // the raw click tap still parses the cursor-position report itself.
 /** Collaboration Mode: the baton is always this warm orange (Shadow's brand ⏺ color) — never a seat color. */
@@ -3896,6 +3901,27 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         modelRows,
         sanitizeAssistantText,
       };
+      // F03-05 follow-up — text coalesced with its Enter in ONE stdin read. Ink hands the whole
+      // chunk to a single keypress event (input = keypress.sequence), so `ch` arrives as
+      // `hello\r` with NO key.return; the composer used to insert `hello\n` (a phantom newline)
+      // and the submit was silently swallowed — worst on slash commands typed across a busy
+      // frame or a batching transport (tmux/SSH). Sanitize and replay: the text, then a
+      // synthetic Enter — exactly the two events the terminal would have delivered separately.
+      // batchedTextReturn's printable-only match excludes ESC-led transports and multi-line
+      // text, and only a BARE \r (a typed Enter) matches — trailing \n / \r\n are paste
+      // signatures and insert as literal text; the pastingRef gate keeps bracketed-paste
+      // bodies literal (see keys/common.ts).
+      const rawChunk = rawChunkRef.current;
+      const batchedText = rawChunk && !pastingRef.current ? batchedTextReturn(rawChunk) : null;
+      if (
+        batchedText !== null &&
+        !key.return && !key.ctrl && !key.meta &&
+        (ch === batchedText || ch === rawChunk)
+      ) {
+        dispatchKey(env, batchedText, key);
+        dispatchKey(env, '\r', SYNTH_RETURN_KEY);
+        return;
+      }
       dispatchKey(env, ch, key);
     },
     [exit, pushLine, runSlash, selectModel, setAutonomy, setComposer, setLine, setQuestionIndex, opts, startTurn, setQueued, kbConsume, insertPastable, setStreamNow, setThinkNow, applyEdit, moveCaret, pushUndo, handleMouse, openExternalEditor, applySearch, chooseAtQuestion, confirmQuestion, setCursor, setMenuIndex, setPickerOpen, setPickerIndex, setVimMode, setQuestionCursor, setAutoAnswerSecs, ensureFileList],
