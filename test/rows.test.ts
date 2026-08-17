@@ -226,3 +226,17 @@ test('renderReasoning duration: 59.7s rounds into the minute branch, never "60s"
   assert.ok(at(60_100).includes('1m 0s'), '60.1s → 1m 0s');
   assert.ok(!at(59_700).includes('60s'), 'the impossible "thought for 60s" never renders');
 });
+
+// Column-truncation pins (the polish batch): preview text is measured in DISPLAY COLUMNS —
+// .length miscounted CJK/emoji (double-width) and could split surrogate pairs mid-cluster.
+import { displayToolArg } from '../src/tui/toolDisplay.js';
+import { displayWidth } from '../src/util/width.js';
+
+test('displayToolArg: middle-truncates by COLUMNS (CJK path halves, no surrogate split)', () => {
+  const long = `src/${'你好世界'.repeat(10)}/tail.ts`;
+  const out = displayToolArg(long, 24); // head 15 + … + tail 8 ≥ len('tail.ts')
+  assert.ok(displayWidth(out) <= 24, `preview must fit 24 columns, got ${displayWidth(out)}`);
+  assert.ok(out.includes('…'), 'middle ellipsis present');
+  assert.ok(out.endsWith('tail.ts'), 'the tail (a path\'s identity) survives');
+  assert.ok(!/\uD83D[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/.test(out), 'no lone surrogate');
+});

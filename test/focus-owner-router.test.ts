@@ -55,7 +55,7 @@ function fakeEnv(over: Partial<Record<string, unknown>> = {}): KeyEnv {
     searchRef: ref(null),
     vimEnabledRef: ref(false), vimModeRef: ref('insert'), vimPendingRef: ref(''),
     vimCountRef: ref(0), vimFindRef: ref(null), vimRegRef: ref(''),
-    inputRef: ref(''), cursorRef: ref(0), historyRef: ref([]), histIdxRef: ref(-1),
+    inputRef: ref(''), cursorRef: ref(0), goalColRef: ref(null), historyRef: ref([]), histIdxRef: ref(-1),
     draftRef: ref(''), menuIndexRef: ref(0), killRingRef: ref(''), undoRef: ref([]),
     pastesRef: ref([]), attachmentsRef: ref([]), autonomyRef: ref('suggest'),
     argCtxRef: ref(null), customCommandsRef: ref([]), tableRef: ref(null), handleTableInputRef: ref(null),

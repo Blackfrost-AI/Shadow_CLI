@@ -24,7 +24,7 @@ import { parseMarkdown, renderTableLines, wrapSpans, type MdSpan } from './util/
 import { CHART_LANGS, parseChartSpec, renderChart } from './util/chart.js';
 import { fuzzyRank } from './util/fuzzy.js';
 import { providerErrorHint } from './util/errorHints.js';
-import { isBigPaste, expandPastes, prunePastes, dropConsumedPastes, PASTE_CAP, isPathLikeSlashToken, pathExistsSafe, layoutComposer, visibleComposerWindow, clickToCursor, parseSgrMouse, lastKeySequence, historySearchPrompt, type HistorySearchState, COMPOSER_MAX_VISIBLE_ROWS, COMPOSER_GUTTER } from './tui/composer.js';
+import { isBigPaste, expandPastes, prunePastes, dropConsumedPastes, PASTE_CAP, isPathLikeSlashToken, pathExistsSafe, visibleComposerWindow, clickToCursor, parseSgrMouse, lastKeySequence, historySearchPrompt, type HistorySearchState, COMPOSER_MAX_VISIBLE_ROWS, COMPOSER_GUTTER, caretNeedsOwnRow, composerPaintRows } from './tui/composer.js';
 import { withSynchronizedOutput } from './tui/syncOutput.js';
 import type { BrandInfo, ToolInfo } from './tui/rows.js';
 import { recommendedIndex, defaultQuestionSelection, buildQuestionAnswers, buildAutoAnswers, type QuestionSelection } from './tui/questions.js';
@@ -82,7 +82,7 @@ import { stripTextualToolIntent } from './provider/textToolCalls.js';
 import { splitStreamToolIntentCapped } from './tui/streamIntent.js';
 import { extractPatchBlock } from './provider/applyPatch.js';
 import { scrubbedEnv } from './util/safeEnv.js';
-import { displayWidth, takeByWidth } from './util/width.js';
+import { displayWidth, takeByWidth, nextCluster } from './util/width.js';
 import { stripCtl, formatUsage, shellCommandOf, agentAttr, oneLine, formatDiffStats, shortPath } from './tui/format.js';
 import { THEMES, THEME_NAMES, THEME_DESCRIPTIONS, C, normalizeThemeName, applyTheme, paletteSnapshot, backgroundSequence, themeBackground, type ThemeName, type Palette } from './tui/theme.js';
 import { SLASH_COMMANDS, SLASH_NAME_WIDTH, findSlashCommand, runSlashCommand, slashDispatchName, type SlashCommand, type SlashCtx } from './tui/slash.js';
@@ -1146,7 +1146,16 @@ export function Composer({
   // caret math uses, so the draft now wraps at the rule's right end instead of 8 columns short.
   const boxW = Math.max(12, cols - PAGE_MARGIN * 2);
   const inner = Math.max(8, boxW - COMPOSER_GUTTER);
-  const win = visibleComposerWindow(input, caret, inner, Math.max(1, maxRows));
+  const maxV = Math.max(1, maxRows);
+  let win = visibleComposerWindow(input, caret, inner, maxV);
+  // A caret at the end of a row that exactly fills the width cannot paint inline (wrap="truncate"
+  // would eat the CARET cell, not the text) — it gets its own row below. When the window is AT the
+  // cap it yields one row to host the caret (height stays ≤ maxRows, matching composerPaintRows);
+  // below the cap the extra row simply fits.
+  const needCaretRow = caretNeedsOwnRow(win.lines[win.caretRow] ?? '', win.caretCol, inner);
+  if (needCaretRow && win.lines.length === maxV && maxV > 1) {
+    win = visibleComposerWindow(input, caret, inner, maxV - 1);
+  }
 
   return (
     <Box flexDirection="column" flexShrink={0} width={cols} paddingLeft={PAGE_MARGIN}>
@@ -1162,16 +1171,22 @@ export function Composer({
         width={boxW}
       >
         {empty ? (
-          <Text>
+          <Text wrap="truncate">
             <Text color={C.dim}>{'❯ '}</Text>
             <Text inverse> </Text>
-            <Text color={C.dim}>{placeholder}</Text>
+            {/* The full placeholder is 58 cols + gutter + caret = 61; below ~69 terminal cols it
+                wrapped to a SECOND row — an idle composer 4 rows tall where every height budget
+                assumes 3. Ladder to the short form when it can't fit one row; truncate is the
+                final guard for the narrowest terminals. */}
+            <Text color={C.dim}>
+              {boxW < displayWidth(placeholder) + 3 ? 'Send a message…' : placeholder}
+            </Text>
           </Text>
         ) : (
           win.lines.map((line, ri) => {
             const gutter = ri === 0 && win.offset === 0 ? '❯ ' : '  ';
             const onCaretRow = ri === win.caretRow;
-            if (!onCaretRow) {
+            if (!onCaretRow || needCaretRow) {
               return (
                 <Text key={ri} wrap="truncate">
                   <Text color={C.dim}>{gutter}</Text>
@@ -1179,10 +1194,18 @@ export function Composer({
                 </Text>
               );
             }
+            // Caret cell = the WHOLE grapheme cluster under the caret (slice(col, col+1) painted
+            // half an emoji as mojibake). At the row end it is a plain space.
             const col = Math.min(win.caretCol, line.length);
-            const before = line.slice(0, col);
-            const at = line.slice(col, col + 1) || ' ';
-            const after = line.slice(col + 1);
+            let before = line;
+            let at = ' ';
+            let after = '';
+            if (col < line.length) {
+              const cluster = nextCluster(line, col);
+              before = line.slice(0, col);
+              at = cluster;
+              after = line.slice(col + cluster.length);
+            }
             return (
               <Text key={ri} wrap="truncate">
                 <Text color={C.dim}>{gutter}</Text>
@@ -1193,6 +1216,13 @@ export function Composer({
             );
           })
         )}
+        {needCaretRow && !empty ? (
+          // The borrowed caret row: continuation indent + the inverse cell alone.
+          <Text wrap="truncate">
+            <Text color={C.dim}>{'  '}</Text>
+            <Text inverse> </Text>
+          </Text>
+        ) : null}
       </Box>
       {showHint ? (
         <Text wrap="truncate" color={C.dim}>
@@ -1299,6 +1329,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // <Static> as they finish (see the 'text' event), leaving only this in-progress block
   // in `stream` so the live region — and the composer below it — never grows with the answer.
   const streamBufRef = useRef('');
+  // Completed-but-uncommitted answer blocks (perf): pushLine() per streamed unit re-rendered the
+  // app once per line while a fast model landed dozens per second, defeating the 30ms delta
+  // throttle below. Units queue here and drain (a) on the flush tick and (b) at the TOP of every
+  // pushLine — so a tool row, a repetition marker, or turn-end can never land ABOVE a queued
+  // answer block. absorb/dedup still runs synchronously per unit at ENQUEUE time (marker order
+  // unchanged); only the state update is deferred ≤30ms.
+  const pendingUnitsRef = useRef<{ text: string; tight: boolean }[]>([]);
   // Has the current answer already committed at least one block? Drives `tight` so the
   // 2nd…Nth blocks of one reply hug, and gates the e.text fallback on assistant_done.
   const answerOpenRef = useRef(false);
@@ -1320,6 +1357,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     if (flushTimerRef.current) return;
     flushTimerRef.current = setTimeout(() => {
       flushTimerRef.current = null;
+      drainUnitsRef.current?.(); // queued answer blocks land in the SAME render as the live tail
       if (pendingStreamRef.current !== null) {
         setStream(pendingStreamRef.current);
         pendingStreamRef.current = null;
@@ -1342,6 +1380,37 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   }, []);
   useEffect(() => () => void (flushTimerRef.current && clearTimeout(flushTimerRef.current)), []);
   const [toolLine, setToolLine] = useState<string | null>(null);
+  // Perf: chatty shell commands emit hundreds of chunks/sec; one setState per chunk re-rendered
+  // the live region PER CHUNK. Chunks now accumulate raw into shellRawRef and state updates at
+  // most every SHELL_FLUSH_MS — the first chunk of a burst paints immediately (no perceived
+  // latency), the rest coalesce. The flush sanitizes the FULL accumulated text (not per chunk),
+  // so an escape sequence split across chunk boundaries reassembles instead of degrading to
+  // literal bytes — strictly better than the old per-chunk merge.
+  const SHELL_FLUSH_MS = 50;
+  const shellRawRef = useRef('');
+  const shellDirtyRef = useRef(false);
+  const shellTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const shellFlush = useCallback(() => {
+    const merged = sanitizeTerminalEscapes(shellRawRef.current, true).slice(-2000);
+    const last = merged.split('\n').reverse().find((l) => l.trim() !== '');
+    setToolLine(last ? `  ⚙ ${last.trim().slice(0, 160)}` : null);
+  }, []);
+  const shellClear = useCallback(() => {
+    shellRawRef.current = '';
+    shellDirtyRef.current = false;
+    if (shellTimerRef.current) {
+      clearTimeout(shellTimerRef.current);
+      shellTimerRef.current = null;
+    }
+  }, []);
+  // Every "the preview is over" path goes through this (new tool, tool_end, blocked, retry, stop,
+  // /clear via the slash bridge) — clearing state without draining the refs would let a still-
+  // armed flush timer resurrect the stale preview ~50ms later.
+  const clearToolLine = useCallback(() => {
+    shellClear();
+    setToolLine(null);
+  }, [shellClear]);
+  useEffect(() => () => void (shellTimerRef.current && clearTimeout(shellTimerRef.current)), []);
   // The tool currently executing — rendered as a persistent live ⏺ Name(args) row that appears the
   // instant the call starts and resolves in place (into the committed green/red ⏺ row) on tool_end.
   const [activeTool, setActiveTool] = useState<{ name: string; arg: string; agent?: { subagentType?: string; description?: string } } | null>(null);
@@ -1550,6 +1619,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
 
   /** Forward reference to pushLine, which is defined below this hook. */
   const pushLineRef = useRef<((l: Omit<TranscriptItem, 'id' | 'kind'> & { kind?: TranscriptItem['kind'] }) => void) | null>(null);
+  // Drain of pendingUnitsRef — a ref (assigned after pushLine exists) so pushLine can empty the
+  // queue above itself without a circular definition.
+  const drainUnitsRef = useRef<(() => void) | null>(null);
   const absorbAssistant = useCallback((text: string): boolean => {
     const r = repeatStep(answerRunRef.current, repeatPosRef.current, dupKey(text));
     answerRunRef.current = r.run;
@@ -1606,6 +1678,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const draftRef = useRef('');
   const menuIndexRef = useRef(0);
   const cursorRef = useRef(0);
+  // Goal-column memory for a run of ↑/↓ keys (readline): the column the run started from, cleared
+  // by any other key (composerOwner §6) or caret move (moveCaret — click, motion, edit).
+  const goalColRef = useRef<number | null>(null);
   // Rows rendered BELOW the composer input's last line (bottom rule + hint + custom-status),
   // refreshed each render so the click-to-caret handler can map a screen Y to a draft row without
   // guessing. -1 means "a menu/overlay is open below the composer" → don't place a caret from a click.
@@ -1827,6 +1902,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const moveCaret = useCallback((next: number) => {
     const c = Math.max(0, Math.min(inputRef.current.length, next));
     cursorRef.current = c;
+    goalColRef.current = null; // caret moved outside vertical motion — a stale goal must not re-fire
     setCursor(c);
   }, []);
 
@@ -2044,6 +2120,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // (scan → pushImage → pushLine). Assigned below where enqueueMdImages is defined.
   const enqueueMdImagesRef = useRef<(text: string) => void>(() => {});
   const pushLine = useCallback((l: Omit<TranscriptItem, 'id' | 'kind'> & { kind?: TranscriptItem['kind'] }) => {
+    drainUnitsRef.current?.(); // ordering: a queued answer block must never land below this row
     const kind = l.kind ?? 'system';
     // Collaboration Mode: while a seat holds the baton, tag its assistant turns with the active
     // speaker so the flattener draws the colored attribution header. Explicit speaker on the call wins.
@@ -2059,8 +2136,23 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     if (kind === 'assistant' && typeof l.text === 'string') enqueueMdImagesRef.current(l.text);
   }, []);
   pushLineRef.current = pushLine;
+  const drainUnits = useCallback(() => {
+    if (pendingUnitsRef.current.length === 0) return;
+    const queued = pendingUnitsRef.current;
+    pendingUnitsRef.current = [];
+    for (const u of queued) {
+      pushLine({ kind: 'assistant', text: u.text, color: C.fg, meta: 'assistant', tight: u.tight });
+    }
+  }, [pushLine]);
+  drainUnitsRef.current = drainUnits;
+  // /clear mid-stream: the turn being erased must take its QUEUED blocks with it (drain would
+  // re-commit them on top of the wipe).
+  const dropStreamedUnits = useCallback(() => {
+    pendingUnitsRef.current = [];
+  }, []);
 
   const repaintFromContext = useCallback(() => {
+    drainUnitsRef.current?.(); // flush queued stream blocks INTO the list the next line wipes
     setCommitted([]);
     committedRef.current = [];
     setStaticEpoch((n) => n + 1); // remount <Static> so it forgets the previous conversation
@@ -2470,7 +2562,12 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // through the ref while `runSlash` itself keeps a stable identity (onKey depends on it).
   const slashCtxRef = useRef<SlashCtx | null>(null);
   slashCtxRef.current = {
-    setLine, setMenuIndex, setStreamNow, setThinkNow, setToolLine, setCommitted,
+    setLine, setMenuIndex, setStreamNow, setThinkNow,
+    // clearToolLine (shell refs drained + state nulled) — /clear only ever nulls, and a raw
+    // setToolLine here would leave an armed flush timer able to resurrect the wiped preview.
+    clearToolLine,
+    dropStreamedUnits,
+    setCommitted,
     setShowAllExpanded, setStaticEpoch, setTodoItems, setAttachCount, setStatus,
     setPlanMode, setGoal, setPickerIndex, setPickerOpen, setAutonomy, setEffort,
     setStyle, setVimEnabled, setVimMode, setThemeTick, setCustomStatus, setComposer,
@@ -2798,7 +2895,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
               // Turn-scoped: suppress a verbatim re-emission of the answer (even a multi-block one),
               // but never legitimate new content and never an identical short answer in a later turn.
               if (absorbAssistant(display)) continue;
-              pushLine({ kind: 'assistant', text: stripTrailingNewlines(display), color: C.fg, meta: 'assistant', tight: answerOpenRef.current && !u.pad });
+              pendingUnitsRef.current.push({ text: stripTrailingNewlines(display), tight: answerOpenRef.current && !u.pad });
               answerOpenRef.current = true;
             }
             padCarryRef.current = trailingBlank;
@@ -2812,7 +2909,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             if (clamped.commit !== null) {
               const display = sanitizeAssistantText(clamped.commit);
               if (display.trim() && !absorbAssistant(display)) {
-                pushLine({ kind: 'assistant', text: stripTrailingNewlines(display), color: C.fg, meta: 'assistant', tight: answerOpenRef.current });
+                pendingUnitsRef.current.push({ text: stripTrailingNewlines(display), tight: answerOpenRef.current });
                 answerOpenRef.current = true;
               }
               liveRest = clamped.rest;
@@ -2917,7 +3014,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
               setLiveRecon(null);
             }
           }
-          setToolLine(null);
+          clearToolLine();
           break;
         case 'tool_end': {
           if (e.subagent) {
@@ -2935,7 +3032,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             });
             break;
           }
-          setToolLine(null);
+          clearToolLine();
           setActiveTool(null);
           setShellPid(null);
           setShellWarn(null);
@@ -3049,7 +3146,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             });
             break;
           }
-          setToolLine(null);
+          clearToolLine();
           setActiveTool(null);
           pushLine({ kind: 'blocked', text: `  blocked ${friendlyDeniedReason(e.reason)}`, color: C.yellow, meta: e.call.name });
           break;
@@ -3178,23 +3275,21 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         case 'shell_output':
           // Live shell preview = the LAST non-empty output line only, capped — the raw chunks used to
           // accumulate unbounded into this state, ballooning the live region (and the composer with it)
-          // during chatty commands. Full output still lands in the transcript via tool_end.
-          setToolLine((prev) => {
-            // Strip our own display prefix before merging so a chunk that CONTINUES the same output
-            // line glues onto the raw text, not onto the decorated line (no "⚙ ⚙" compounding).
-            // Sanitize the MERGED text (not just the raw chunk): keepSgr appends a per-line `\x1b[0m`
-            // reset at end-of-input, so per-chunk sanitizing would plant a reset at every chunk
-            // boundary and split a color run mid-line when two chunks glue onto the same output line;
-            // re-sanitizing the merged text moves the reset to the line's true end. Re-sanitizing
-            // already-clean text is otherwise a no-op (keepSgr keeps legit colors, drops everything
-            // else), and it keeps the stored value fully clean even after the `.slice(-2000)` cap.
-            // NOTE: a sequence split ACROSS two chunks is NOT reassembled — the earlier pass already
-            // dropped the incomplete head, so the continuation degrades to harmless literal parameter
-            // bytes (e.g. `1m`), never an interpreted escape (fail-closed) — F05-04.
-            const merged = sanitizeTerminalEscapes(`${(prev ?? '').replace(/^ {2}⚙ /, '')}${e.chunk}`, true).slice(-2000);
-            const last = merged.split('\n').reverse().find((l) => l.trim() !== '');
-            return last ? `  ⚙ ${last.trim().slice(0, 160)}` : prev;
-          });
+          // during chatty commands. Full output still lands in the transcript via tool_end. Merge
+          // + flush semantics live in the shellRawRef block above (throttled, full-text sanitize).
+          shellRawRef.current += e.chunk;
+          if (shellTimerRef.current == null) {
+            shellFlush();
+            shellTimerRef.current = setTimeout(() => {
+              shellTimerRef.current = null;
+              if (shellDirtyRef.current) {
+                shellDirtyRef.current = false;
+                shellFlush();
+              }
+            }, SHELL_FLUSH_MS);
+          } else {
+            shellDirtyRef.current = true;
+          }
           break;
         case 'shell_pid':
           setShellPid(e.pid);
@@ -3243,7 +3338,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           pendingThinkRef.current = null;
           setStreamNow('');
           setThinkNow('');
-          setToolLine(null);
+          clearToolLine();
           setActiveTool(null);
           setLiveRecon(null);
           setShellPid(null);
@@ -3436,7 +3531,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         pendingThinkRef.current = null;
         setStreamNow('');
         setThinkNow('');
-        setToolLine(null);
+        clearToolLine();
         setActiveTool(null);
         setLiveRecon(null);
         runningRef.current = false;
@@ -3730,6 +3825,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         vimRegRef,
         inputRef,
         cursorRef,
+        goalColRef,
         historyRef,
         histIdxRef,
         draftRef,
@@ -3993,15 +4089,20 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // rules. The old `rows - 3` ignored the pinned task list and the status strip, so a tall draft
   // overflowed even when the task list had already shrunk itself to zero items.
   const composerInnerW = Math.max(8, terminalSize.cols - COMPOSER_GUTTER - PAGE_MARGIN * 2);
-  const composerLineCount = layoutComposer(input, composerInnerW).lines.length;
+  // Charge the 5-row pinned-block chrome only when the block is actually EXPANDED (Ctrl-T): the
+  // default-collapsed state renders the 1-line summary, which fitHud accounts separately —
+  // charging it anyway shrank the composer window at the 15-16 row floor for a block that
+  // wasn't on screen.
   const maxComposerRows = composerMaxRows(
     terminalSize.rows,
-    showTodo,
+    !todoCollapsed && !!(showPlan || showTodo),
     !!goal,
     !!(showPlan && planMode.path),
     !!customStatus,
   );
-  const composerInputRows = Math.min(maxComposerRows, Math.max(1, composerLineCount));
+  // What will actually paint (window + a borrowed caret-only row when the caret ends a full row),
+  // so the frame budget and the Composer component can never disagree about the box height.
+  const composerInputRows = composerPaintRows(input, cursor, composerInnerW, maxComposerRows);
   const hudFit = fitHud(terminalSize.rows, {
     liveWant,
     liveBlank: !running, // idle slot = blank reserve; the hint outranks it on short terminals
@@ -4090,8 +4191,12 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // newline' is not repeated here — it already lives in the empty-composer placeholder.
   const HINT_TAIL = ' · Shift+Tab mode · / commands';
   const idleFixed = displayWidth(attachTag + vimTag) + safetyPrefixCols;
-  const idleStrip = formatStatusStrip(stripInput, Math.max(16, layout.cols - idleFixed - 1));
-  const idleTail = layout.cols - idleFixed - displayWidth(idleStrip) - 1 >= displayWidth(HINT_TAIL) ? HINT_TAIL : '';
+  // The hint row renders inside paddingLeft={PAGE_MARGIN} under wrap="truncate", so its usable
+  // width is cols − PAGE_MARGIN, not cols — budget the strip (and the tail fits-check) against
+  // that or its ctx/cost tail gets clipped mid-token within 4 columns of the edge.
+  const idleStrip = formatStatusStrip(stripInput, Math.max(16, layout.cols - PAGE_MARGIN - idleFixed - 1));
+  const idleTail =
+    layout.cols - PAGE_MARGIN - idleFixed - displayWidth(idleStrip) - 1 >= displayWidth(HINT_TAIL) ? HINT_TAIL : '';
   // The RUNNING branch carries the safety tags too: while a mid-turn approval/question overlay is up
   // the HUD status row is suppressed and this hint is the only chrome left — OFFLINE/sandbox:off must
   // not vanish exactly then.
@@ -4110,7 +4215,14 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     (menu.length > 0
       ? `↑/↓ select · Tab complete · Enter ${running ? 'queues' : 'runs'} · Esc cancel`
       : running
-        ? 'Type to steer · Enter steers · Option+Enter newline · Esc interrupts · Ctrl-C ×2 quits'
+        ? // Width ladder (same law as the composer placeholder): the full steering hint is ~86
+          // columns and used to clip mid-token on narrow terminals. Each step keeps the two
+          // things a running turn must tell you — you can steer, and Esc interrupts.
+          layout.cols - PAGE_MARGIN - idleFixed >= 86
+          ? 'Type to steer · Enter steers · Option+Enter newline · Esc interrupts · Ctrl-C ×2 quits'
+          : layout.cols - PAGE_MARGIN - idleFixed >= 45
+            ? 'Type to steer · Enter steers · Esc interrupts'
+            : 'steer · Esc interrupts'
         : table
           ? tableLegend
           : `${idleStrip}${idleTail}`);
@@ -4404,7 +4516,14 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
                   const i = menuStart + j;
                   const cur = i === selIndex;
                   const bg = cur ? C.menuSelBg : C.menuBg;
-                  const namePart = c.name.padEnd(SLASH_NAME_WIDTH);
+                  // Only @-mention rows clip to SLASH_NAME_WIDTH: a path can run arbitrarily long
+                  // and would overflow the shaded bar (descRoom ≤ 0, rectangle lost). Slash names —
+                  // including argument rows like `/config get temperature` — are the thing the user
+                  // is choosing and stay COMPLETE; pad-only, so descriptions align at the column.
+                  const clippedName = c.mention && displayWidth(c.name) > SLASH_NAME_WIDTH
+                    ? takeByWidth(c.name, Math.max(1, SLASH_NAME_WIDTH - 1)).head + '…'
+                    : c.name;
+                  const namePart = clippedName + ' '.repeat(Math.max(0, SLASH_NAME_WIDTH - displayWidth(clippedName)));
                   const descRoom = Math.max(0, BAR_W - 2 - displayWidth(namePart) - 1);
                   const clippedDesc = takeByWidth(c.desc, descRoom).head;
                   const desc = displayWidth(c.desc) > descRoom && descRoom > 0

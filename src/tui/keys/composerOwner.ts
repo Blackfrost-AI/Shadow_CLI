@@ -9,6 +9,7 @@
 import {
   cursorOnFirstRow,
   cursorOnLastRow,
+  cursorToRowCol,
   deleteCharRight,
   deleteWordLeft,
   deleteWordRight,
@@ -56,6 +57,10 @@ const SHIFT_ENTER = /^\x1b\[(?:13;(\d+)u|27;(\d+);13~)$/;
 const SLASH_WHILE_RUNNING = new Set(['/help', '/cost', '/usage', '/context', '/connections', '/fast', '/effort', '/version', '/copy']);
 
 function handleComposer(env: KeyEnv, ch: string, key: InkKey): boolean {
+  // Goal-column memory: a RUN of ↑/↓ keeps aiming at the column the run started from; any other
+  // key ends the run — the caret moved for a different reason, so the old goal is stale.
+  if (!key.upArrow && !key.downArrow) env.goalColRef.current = null;
+
   // §3 — Esc, the interrupt key. While a turn runs, Esc stops it (and pending input then
   // flushes, so a steering message runs next). When idle, Esc cancels pending input,
   // else clears the composer. Session always survives — only Ctrl-C quits.
@@ -346,7 +351,9 @@ function handleComposer(env: KeyEnv, ch: string, key: InkKey): boolean {
   if (key.upArrow) {
     const text = env.inputRef.current;
     if (!cursorOnFirstRow(text, env.cursorRef.current, editInner)) {
-      const next = moveCursorVertical(text, env.cursorRef.current, -1, editInner);
+      const goal = env.goalColRef.current ?? cursorToRowCol(text, env.cursorRef.current, editInner).col;
+      env.goalColRef.current = goal;
+      const next = moveCursorVertical(text, env.cursorRef.current, -1, editInner, goal);
       env.cursorRef.current = next;
       env.setCursor(next);
       return true;
@@ -359,12 +366,15 @@ function handleComposer(env: KeyEnv, ch: string, key: InkKey): boolean {
       env.histIdxRef.current -= 1;
       env.setLine(env.historyRef.current[env.histIdxRef.current] ?? '');
     }
+    env.goalColRef.current = null; // a history step replaces the text — the goal is meaningless
     return true;
   }
   if (key.downArrow) {
     const text = env.inputRef.current;
     if (!cursorOnLastRow(text, env.cursorRef.current, editInner)) {
-      const next = moveCursorVertical(text, env.cursorRef.current, 1, editInner);
+      const goal = env.goalColRef.current ?? cursorToRowCol(text, env.cursorRef.current, editInner).col;
+      env.goalColRef.current = goal;
+      const next = moveCursorVertical(text, env.cursorRef.current, 1, editInner, goal);
       env.cursorRef.current = next;
       env.setCursor(next);
       return true;
@@ -378,6 +388,7 @@ function handleComposer(env: KeyEnv, ch: string, key: InkKey): boolean {
           : (env.historyRef.current[env.histIdxRef.current] ?? ''),
       );
     }
+    env.goalColRef.current = null; // a history step replaces the text — the goal is meaningless
     return true;
   }
 

@@ -320,7 +320,11 @@ export interface SlashCtx {
   setMenuIndex: Dispatch<SetStateAction<number>>;
   setStreamNow: (v: string) => void;
   setThinkNow: (v: string) => void;
-  setToolLine: Dispatch<SetStateAction<string | null>>;
+  /** Nulls the live shell-preview line AND drains its throttle refs (an armed flush
+   *  timer must never resurrect a wiped preview). */
+  clearToolLine: () => void;
+  /** Erase queued-but-uncommitted streamed blocks (/clear mid-stream — drain would re-commit). */
+  dropStreamedUnits: () => void;
   setCommitted: Dispatch<SetStateAction<TranscriptBase[]>>;
   setShowAllExpanded: Dispatch<SetStateAction<boolean>>;
   setStaticEpoch: Dispatch<SetStateAction<number>>;
@@ -409,7 +413,7 @@ export interface SlashCtx {
  */
 export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: string): void {
   const {
-    setLine, setMenuIndex, setStreamNow, setThinkNow, setToolLine, setCommitted,
+    setLine, setMenuIndex, setStreamNow, setThinkNow, clearToolLine, dropStreamedUnits, setCommitted,
     setShowAllExpanded, setStaticEpoch, setTodoItems, setAttachCount, setStatus,
     setPlanMode, setGoal, setPickerIndex, setPickerOpen, setAutonomy, setEffort,
     setStyle, setVimEnabled, setVimMode, setThemeTick, setCustomStatus, setComposer,
@@ -494,7 +498,8 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
       answerOpenRef.current = false;
       setStreamNow('');
       setThinkNow('');
-      setToolLine(null);
+      clearToolLine();
+      dropStreamedUnits(); // queued stream blocks die with the transcript being wiped
       setCommitted([]);
       committedRef.current = [];
       setShowAllExpanded(false);

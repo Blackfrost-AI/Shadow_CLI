@@ -19,7 +19,7 @@ import { inlineImageEsc, formatBytes, supportsInlineImages } from '../util/termI
 import { renderBrand, renderToolResult, renderToolChild, renderReasoning, renderToolStack } from './rows.js';
 import type { BrandInfo, ToolInfo, ToolRun } from './rows.js';
 import { collapseKind, isCollapsibleTool, type CollapseKind } from './toolDisplay.js';
-import { displayWidth, takeByWidth, nextCluster } from '../util/width.js';
+import { displayWidth, takeByWidth, nextCluster, stripInvisible } from '../util/width.js';
 
 export { TABLE_COLLAPSE_THRESHOLD };
 
@@ -218,9 +218,9 @@ export function wrapSpans(spans: StyledSpan[], cols: number): StyledSpan[][] {
             flush();
             continue;
           }
-          const cluster = nextCluster(text, 0) || text.slice(0, 1);
+          const cluster = nextCluster(stripInvisible(text), 0) || text.slice(0, 1);
           cur.push({ ...sp, text: cluster });
-          text = text.slice(cluster.length);
+          text = text.slice(cluster.length + (text.length - stripInvisible(text).length));
           flush();
           continue;
         }
@@ -242,6 +242,30 @@ export function wrapSpans(spans: StyledSpan[], cols: number): StyledSpan[][] {
  * hard-splits (URLs/code tokens can exceed any measure). Newlines start new rows. Styles are
  * preserved per token.
  */
+/** Count of OSC 8-style escapes in `s` — an ODD count means a link was opened but not closed, so
+ *  the naive whitespace split cut INSIDE a hyperlink; the halves must be re-merged before a row
+ *  boundary can land there (a committed row with an unterminated link escape styles everything
+ *  after it as the link's URL). */
+function oscCount(s: string): number {
+  return (s.match(/\x1b\]/g) ?? []).length;
+}
+
+/**
+ * Whitespace tokenizer that never splits between the two halves of a hyperlink: split on runs
+ * (keeping the separators, like split(/(\s+)/)), then re-glue tokens while their OSC count is odd.
+ */
+function splitOscAware(text: string): string[] {
+  const naive = text.split(/(\s+)/);
+  const out: string[] = [];
+  for (let i = 0; i < naive.length; i++) {
+    let tok = naive[i]!;
+    if (tok === '') continue;
+    while (oscCount(tok) % 2 === 1 && i + 1 < naive.length) tok += naive[++i]!;
+    out.push(tok);
+  }
+  return out;
+}
+
 export function wrapSpansWord(spans: StyledSpan[], cols: number): StyledSpan[][] {
   const w = Math.max(1, cols);
   const rows: StyledSpan[][] = [];
@@ -269,9 +293,9 @@ export function wrapSpansWord(spans: StyledSpan[], cols: number): StyledSpan[][]
           flush(); // retry on a full-width row
           continue;
         }
-        const cluster = nextCluster(rest, 0) || rest.slice(0, 1); // wider than `cols` itself
+        const cluster = nextCluster(stripInvisible(rest), 0) || rest.slice(0, 1); // wider than `cols` itself
         cur.push({ ...sp, text: cluster });
-        rest = rest.slice(cluster.length);
+        rest = rest.slice(cluster.length + (rest.length - stripInvisible(rest).length));
         flush();
         continue;
       }
@@ -293,8 +317,9 @@ export function wrapSpansWord(spans: StyledSpan[], cols: number): StyledSpan[][]
         flush();
         atLineStart = true; // an explicit newline starts a new logical line
       }
-      // Tokenize into word / whitespace runs, styling each with the span's format.
-      for (const tok of parts[p]!.split(/(\s+)/)) {
+      // Tokenize into word / whitespace runs, styling each with the span's format. OSC-aware so a
+      // multi-word link label stays ONE token (the escape pair brackets it).
+      for (const tok of splitOscAware(parts[p]!)) {
         if (tok === '') continue;
         const isSpace = /^\s+$/.test(tok);
         const tw = displayWidth(tok);
@@ -485,6 +510,14 @@ function tableLineSpans(line: string, theme: ViewportTheme, isHeader: boolean): 
   });
 }
 
+/** CommonMark soft-break reflow: a single newline inside paragraph/quote prose is a SPACE, not a
+ *  row break — a model that hard-wraps its prose at ~72 columns used to render as a ragged
+ *  72-column block on a wide terminal, half the width unused. Matches the live preview's rule
+ *  (markdown.ts wrapSpans collapses whitespace runs to one space). Structure blocks (headings,
+ *  list items, code) keep their lines — a code line must never reflow. */
+const reflowSoftBreaks = (spans: StyledSpan[]): StyledSpan[] =>
+  spans.map((s) => (s.text.includes('\n') ? { ...s, text: s.text.replace(/\n/g, ' ') } : s));
+
 function blockToLines(
   block: MdBlock,
   cols: number,
@@ -505,14 +538,16 @@ function blockToLines(
       if (block.level <= 1) {
         const titleW = Math.min(
           cols,
-          Math.max(3, block.spans.reduce((n, s) => n + s.text.length, 0)),
+          // displayWidth, not .length — a CJK/emoji title underlined 1-per-char was shorter than
+          // its text (2-col glyphs), longer for combining marks.
+          Math.max(3, block.spans.reduce((n, s) => n + displayWidth(s.text), 0)),
         );
         out.push({ key: `${keyPrefix}hu`, spans: [{ text: '─'.repeat(titleW), color: theme.dim }] });
       }
       break;
     }
     case 'paragraph': {
-      const spans = block.spans.map(s => mdSpanToStyled(s, theme));
+      const spans = reflowSoftBreaks(block.spans.map(s => mdSpanToStyled(s, theme)));
       out.push(...wrapLine(`${keyPrefix}p`, spans, cols));
       break;
     }
@@ -550,7 +585,7 @@ function blockToLines(
           `${keyPrefix}q`,
           [{ text: '│ ', color: theme.yellow }],
           [{ text: '│ ', color: theme.yellow }],
-          block.spans.map(s => ({ text: s.text, color: theme.dim, italic: s.italic })),
+          reflowSoftBreaks(block.spans.map(s => ({ text: s.text, color: theme.dim, italic: s.italic }))),
           cols,
         ),
       );
@@ -773,7 +808,12 @@ export function flattenItem(
   if (item.kind === 'finding') {
     const sev = item.severity ?? 'info';
     const bColor = sev === 'error' ? theme.red : sev === 'warn' ? theme.yellow : theme.cyan;
-    out.push({ key: `${kp}ft`, spans: [{ text: `╭─ ${item.title ?? 'Finding'} ─`, color: bColor }] });
+    // truncateSpans: a long finding title used to paint past `cols` and terminal-hard-wrap,
+    // splitting the card's top border across two rows.
+    out.push({
+      key: `${kp}ft`,
+      spans: truncateSpans([{ text: `╭─ ${item.title ?? 'Finding'} ─`, color: bColor }], cols),
+    });
     // Index the loop (F4): every source line reused the key `${kp}fb`, and wrapLine restarts its
     // own counter at 0 per call — so a 3-line finding that wrapped produced 6 rows carrying only
     // 4 distinct keys. React then reconciles two different rows onto one key, which silently

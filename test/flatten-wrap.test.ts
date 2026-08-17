@@ -74,7 +74,8 @@ test('assistant ⏺ turn bullet: on the first block, indent-only on continuation
   const DOT = process.platform === 'darwin' ? '⏺' : '●';
   const nonBlank = (rows: { spans: { text: string; color?: string }[] }[]) => rows.filter((r) => r.spans.some((s) => s.text.trim() !== ''));
 
-  const first = nonBlank(flattenItem({ id: 1, kind: 'assistant', text: 'first line\nsecond line' }, 60, false, T));
+  // Wraps via WIDTH (a soft \n in the source now reflows to a space — see transcript-wrap-polish).
+  const first = nonBlank(flattenItem({ id: 1, kind: 'assistant', text: 'first line second line' }, 20, false, T));
   assert.equal(first[0]!.spans[0]!.text, `${DOT} `, 'first block: ⏺ on the first content line');
   assert.equal(first[0]!.spans[0]!.color, '#d97757', 'the dot is Claude orange');
   assert.equal(first[1]!.spans[0]!.text, '  ', 'wrapped line of the first block aligns under the dot (indent)');

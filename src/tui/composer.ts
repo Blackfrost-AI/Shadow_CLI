@@ -100,6 +100,14 @@ export interface ComposerLayout {
  * characters = 2× that many columns, overran the box, and got truncated by Ink while the caret
  * drifted. `starts` remains a list of SOURCE indices, so every caller that maps a cursor through
  * this layout is unaffected.
+ *
+ * Word-aware (the "world-class entry bar" pass): when a cluster overflows mid-word, the row backs
+ * off to just past the last space that fits, so prose breaks at spaces exactly like the transcript
+ * (flatten's wrapSpansWord) instead of splitting `multimedia` into `multim/edia`. The break space
+ * stays at the end of the earlier row (invisible when painted) so `starts` stay plain source
+ * indices and cursor mapping is unchanged. No space behind → hard-split as before; a row that is
+ * entirely indentation also hard-splits (a wrap point must not eat the indent); a single cluster
+ * wider than the whole row is still emitted alone.
  */
 export function layoutComposer(text: string, innerWidth: number): ComposerLayout {
   const w = Math.max(1, innerWidth | 0);
@@ -113,14 +121,30 @@ export function layoutComposer(text: string, innerWidth: number): ComposerLayout
     starts.push(i);
     let width = 0;
     let j = i;
+    let lastBreak = -1; // absolute index just past the last space run that FITS — a legal wrap point
     while (j < n && text[j] !== '\n') {
       // Advance a whole grapheme cluster at a time — a wrap must never land inside one.
       const cluster = nextCluster(text, j);
       const cw = displayWidth(cluster);
-      if (width + cw > w && j > i) break; // the cluster would overflow: wrap before it
+      if (width + cw > w && j > i) {
+        // The cluster would overflow. Break after the last space instead of inside the word —
+        // unless everything before it is whitespace (that "space" is indentation, not a wrap point).
+        if (lastBreak > i && !/^\s+$/.test(text.slice(i, lastBreak))) j = lastBreak;
+        break;
+      }
       width += cw;
       j += cluster.length;
-      if (width >= w) break; // exactly full
+      if (/\s/.test(cluster)) lastBreak = j;
+      if (width >= w) {
+        // Exactly full. If the row CONTINUES with a word char, this break lands mid-word — the
+        // cluster after the margin belongs to the word we just finished. Back off to the last
+        // space (same guard as the overflow branch: an all-space prefix is indent, not a point).
+        const nx = j < n ? text[j] : '';
+        if (nx && nx !== '\n' && !/\s/.test(nx) && lastBreak > i && !/^\s+$/.test(text.slice(i, lastBreak))) {
+          j = lastBreak;
+        }
+        break;
+      }
     }
     if (j < n && text[j] === '\n') {
       lines.push(text.slice(i, j));
@@ -161,18 +185,22 @@ export function rowColToCursor(text: string, row: number, col: number, innerWidt
   return starts[r]! + c;
 }
 
-/** Move the caret up/down one visual row, preserving column when possible. */
+/** Move the caret up/down one visual row, preserving column when possible. `goalCol` (optional,
+ *  source-unit column) overrides the caret's own column — the goal-column memory behind a run of
+ *  ↑/↓ keys: passing over a SHORT row clamps the caret, and without the memory the next move
+ *  would aim from the clamp instead of the column the run started from (readline semantics). */
 export function moveCursorVertical(
   text: string,
   cursor: number,
   dir: -1 | 1,
   innerWidth: number,
+  goalCol?: number,
 ): number {
   const { row, col } = cursorToRowCol(text, cursor, innerWidth);
   const { lines } = layoutComposer(text, innerWidth);
   const next = row + dir;
   if (next < 0 || next >= lines.length) return cursor; // no move (caller may do history)
-  return rowColToCursor(text, next, col, innerWidth);
+  return rowColToCursor(text, next, goalCol ?? col, innerWidth);
 }
 
 /** True when the caret is on the first visual row (↑ may fall through to history). */
@@ -185,6 +213,38 @@ export function cursorOnLastRow(text: string, cursor: number, innerWidth: number
   const { row } = cursorToRowCol(text, cursor, innerWidth);
   const { lines } = layoutComposer(text, innerWidth);
   return row >= lines.length - 1;
+}
+
+/** True when the inverse caret cell cannot paint INLINE at the caret position: the caret row
+ *  exactly fills the width, so the cell would sit one column past the box's last column — and
+ *  Ink's `wrap="truncate"` cuts from the RIGHT, meaning the cell it deletes is the caret itself.
+ *  That was "type a full row and the caret vanishes". Instead the row paints plain and the caret
+ *  gets its own row below (see composerPaintRows, which yields the window row for it). */
+export function caretNeedsOwnRow(line: string, caretCol: number, innerWidth: number): boolean {
+  return caretCol >= line.length && displayWidth(line) >= innerWidth;
+}
+
+/** Rows of composer input that will actually PAINT for this draft — the shared number behind both
+ *  the Composer component and the caller's frame budget (fitHud's composerInputRows), so what the
+ *  layout counts is what lands on screen. Normally the visible window (min(maxRows, total rows)).
+ *  When the caret needs its own row: below the cap the caret row rides on top (window + 1, still
+ *  ≤ maxRows); AT the cap the window yields one row to host it, so the height never exceeds
+ *  maxRows. The Composer component's shrink condition (window at cap) mirrors this exactly. */
+export function composerPaintRows(
+  text: string,
+  cursor: number,
+  innerWidth: number,
+  maxRows: number,
+): number {
+  const { lines } = layoutComposer(text, innerWidth);
+  const total = Math.max(1, lines.length);
+  const cap = Math.max(1, maxRows);
+  const win = Math.min(cap, total);
+  const { row, col } = cursorToRowCol(text, cursor, innerWidth);
+  const line = lines[Math.min(row, total - 1)] ?? '';
+  if (!caretNeedsOwnRow(line, col, innerWidth)) return win;
+  if (win === cap && win > 1) return win; // window yields one row for the caret → net unchanged
+  return win + 1; // floor (win 1) or uncapped (total < maxRows): caret row painted on top
 }
 
 /**

@@ -4,6 +4,7 @@
 // speaks the reference-client vocabulary (`Read`, `Update`, `Bash`) and collapses the
 // noise (reads/searches) while leaving the signal (edits/writes/shell) as one-row
 // markers. Pure helpers — no Ink, no side effects.
+import { displayWidth, takeByWidth, tailByWidth } from '../util/width.js';
 
 /** Tools whose results are pure reconnaissance — safe to fold into a group. */
 const COLLAPSIBLE = new Set([
@@ -119,7 +120,11 @@ export function displayToolArg(arg: string | undefined, max = 56): string {
   let a = arg.replace(/^\$\s+/, '').replace(/\s+/g, ' ').trim();
   // Protocol strip for URLs (same as rows.shortArg).
   a = a.replace(/^https?:\/\//, '');
-  if (a.length > max) a = `${a.slice(0, Math.ceil(max * 0.62))}…${a.slice(a.length - Math.floor(max * 0.34))}`;
+  // Middle-truncate by COLUMNS, not .length — a CJK path counted double meant the cut removed
+  // half the promised budget and could split a surrogate pair mid-emoji.
+  if (displayWidth(a) > max) {
+    a = `${takeByWidth(a, Math.ceil(max * 0.62)).head}…${tailByWidth(a, Math.floor(max * 0.34))}`;
+  }
   return a;
 }
 

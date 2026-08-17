@@ -6,7 +6,7 @@
 
 > **A true gift of freedom and privacy.**
 > Zero-telemetry · provider-neutral · phone home to no one.
-> Current build: **`v7.0.0`** — the completed Frontier line, global: hardened agent security (jail-smuggling closed, 35-entry credential denylist, egress quarantine, jailed MCP children), sub-agent budgets, `/fork` + profiles + `/rewind`, the `shadow acp` editor bridge, a focus-router TUI that never swallows keys, and a THREAT_MODEL re-verified claim-by-claim against the shipped code.
+> Current build: **`v7.1.0`** — the TUI feel release: word-wrapped composer with a caret that never vanishes, column-correct transcript wrapping (CJK/emoji/links/reflow), and atomic flicker-free frames — plus a red test can no longer wedge the suite.
 
 **Shadow is a zero-telemetry, provider-neutral coding agent that runs on your terms.** Point it at any model — Anthropic, any OpenAI-compatible endpoint, Gemini, or a local model on your own box — and it works as a coding / sysadmin agent over your workspace. **No Shadow account, no signup, no phone-home:** the only outbound traffic is the provider *you* chose and the web tools the agent explicitly invokes. Your config stays local and readable (`~/.shadow/config.json`), your keys never leave your machine, and you can switch models mid-session **without losing context**.
 

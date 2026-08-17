@@ -185,6 +185,12 @@ export function initKeybindingsWatcher(cb: (next: LoadedBindings) => void): () =
       }
     }
   }, 1500);
+  // unref'd: the TUI process stays alive through its real I/O (stdin raw mode / ink), not through
+  // this poller. Without unref, a test that renders the app and fails an assertion BEFORE unmount()
+  // leaks the interval and the node:test runner waits on a dead worker forever — a red test wedged
+  // the whole suite instead of failing it. Hot-reload is unaffected: the interval still fires for
+  // as long as the process lives.
+  timer.unref();
   return () => clearInterval(timer);
 }
 

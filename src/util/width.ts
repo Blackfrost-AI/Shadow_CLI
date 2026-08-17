@@ -109,6 +109,18 @@ export function nextCluster(text: string, i: number): string {
  */
 const SGR_RE = /\x1b\[[\x20-\x3f]*m/g;
 
+/** OSC sequences (hyperlinks `ESC ] 8 ; ; URL ST`, window titles, …) also occupy no columns — but
+ *  unlike SGR they carry a PAYLOAD (the URL) inside the escape, so before this, a hyperlink span
+ *  measured as label + whole URL (a 14-column link measured 112) and hard-splits cut mid-escape,
+ *  printing raw unterminated URL fragments into committed rows. Stripping here means split rows
+ *  degrade to the plain label text — the right failure. */
+const OSC_RE = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
+
+/** One strip for every width path: both zero-width escape classes, SGR first so an OSC body can't
+ *  be mistaken for one (an OSC terminator `ESC\` is not an SGR final byte). Exported for the
+ *  flattener's cluster fallbacks, which must degrade escape-led text the same way. */
+export const stripInvisible = (s: string): string => s.replace(OSC_RE, '').replace(SGR_RE, '');
+
 /**
  * Terminal columns a string occupies. A grapheme CLUSTER is measured by its widest code point, so
  * an emoji built from a ZWJ sequence (👨‍👩‍👧) counts once, not once per component. SGR escapes are
@@ -116,7 +128,7 @@ const SGR_RE = /\x1b\[[\x20-\x3f]*m/g;
  * measure "too wide" and get needlessly split.
  */
 export function displayWidth(s: string): number {
-  const clean = s.replace(SGR_RE, '');
+  const clean = stripInvisible(s);
   if (isPlainAscii(clean)) return clean.length; // F06-06: fast path — no segmentation
   let w = 0;
   for (const g of graphemes(clean)) w += clusterWidth(g);
@@ -133,11 +145,14 @@ function isPlainAscii(s: string): boolean {
   return true;
 }
 
-/** Width of one grapheme cluster: its widest code point. */
+/** Width of one grapheme cluster: its widest code point. A text-default symbol + VS16 (FE0F)
+ *  requests EMOJI presentation — terminals render the cluster 2 columns wide even though the
+ *  base measures 1 and the selector measures 0 (U+2764+FE0F ❤️, U+26A0+FE0F ⚠️), so the max
+ *  alone under-measured by one column and wrap="truncate" silently deleted the overrun. */
 function clusterWidth(cluster: string): number {
   let gw = 0;
   for (const ch of cluster) gw = Math.max(gw, charWidth(ch.codePointAt(0) ?? 0));
-  return gw;
+  return cluster.includes('\uFE0F') ? Math.max(gw, 2) : gw;
 }
 
 /**
@@ -157,7 +172,7 @@ function clusterWidth(cluster: string): number {
  */
 export function takeByWidth(s: string, cols: number): { head: string; rest: string; width: number } {
   if (cols <= 0) return { head: '', rest: s, width: 0 };
-  const clean = s.replace(SGR_RE, '');
+  const clean = stripInvisible(s);
   if (isPlainAscii(clean)) {
     return { head: clean.slice(0, cols), rest: clean.slice(cols), width: Math.min(clean.length, cols) };
   }
@@ -188,6 +203,24 @@ export function takeByWidth(s: string, cols: number): { head: string; rest: stri
   return { head: clean.slice(0, i), rest: clean.slice(i), width: w };
 }
 
+/** Trailing `cols` columns of `s` — the cluster-safe mirror of takeByWidth's head (used for
+ *  middle-truncation, where the TAIL must survive intact: a path's filename is its identity). */
+export function tailByWidth(s: string, cols: number): string {
+  const clean = stripInvisible(s);
+  if (cols <= 0) return '';
+  if (isPlainAscii(clean)) return clean.slice(Math.max(0, clean.length - cols));
+  const gs = graphemes(clean);
+  let out = '';
+  let w = 0;
+  for (let i = gs.length - 1; i >= 0; i--) {
+    const cw = clusterWidth(gs[i]!);
+    if (w + cw > cols) break;
+    out = gs[i]! + out;
+    w += cw;
+  }
+  return out;
+}
+
 /**
  * Hard-split into chunks of at most `cols` columns each. Always returns ≥ 1 chunk.
  *
@@ -197,7 +230,7 @@ export function takeByWidth(s: string, cols: number): { head: string; rest: stri
  */
 export function chunksByWidth(s: string, cols: number): string[] {
   const budget = Math.max(1, cols);
-  const clean = s.replace(SGR_RE, '');
+  const clean = stripInvisible(s);
   if (clean === '') return [''];
   if (isPlainAscii(clean)) {
     const out: string[] = [];

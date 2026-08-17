@@ -10,6 +10,7 @@
 // which the ADA pass banned as unreadable.
 
 import type { StyledSpan, ViewportTheme } from './flatten.js';
+import { displayWidth } from '../util/width.js';
 import {
   displayToolArg,
   displayToolName,
@@ -44,9 +45,11 @@ export interface BrandInfo {
  */
 export function renderBrand(b: BrandInfo, theme: ViewportTheme, cols: number): StyledSpan[][] {
   const rows: StyledSpan[][] = [];
-  const width = (spans: StyledSpan[]): number => spans.reduce((n, s) => n + s.text.length, 0);
+  // Measure in DISPLAY COLUMNS (.length miscounts CJK/emoji meta — a wide model name made the
+  // right-aligned meta block overflow the terminal edge).
+  const width = (spans: StyledSpan[]): number => spans.reduce((n, s) => n + displayWidth(s.text), 0);
   const art = b.art ?? [];
-  const artW = art.length ? Math.max(...art.map((l) => l.length)) : 0;
+  const artW = art.length ? Math.max(...art.map((l) => displayWidth(l))) : 0;
 
   // The meta block: version, model, workspace, hints, and (when active) the YOLO warning.
   const meta: StyledSpan[][] = [

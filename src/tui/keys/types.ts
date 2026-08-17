@@ -118,6 +118,10 @@ export interface KeyEnv {
   // ── composer owner state ───────────────────────────────────────────────────
   inputRef: Ref<string>;
   cursorRef: Ref<number>;
+  /** Goal-column memory for a run of ↑/↓ keys (readline): the column the run started from, so
+   *  passing over a short row doesn't re-anchor vertical motion at the clamp. Any non-vertical
+   *  key or other caret move (click, edit, history step) clears it. */
+  goalColRef: Ref<number | null>;
   historyRef: Ref<string[]>;
   histIdxRef: Ref<number>;
   draftRef: Ref<string>;
