@@ -69,7 +69,13 @@ import { lc } from './util/lc.js';
 import { createInterface } from 'node:readline/promises';
 import { AutoApproveGate, AutoDenyGate, type ApprovalGate } from './agent/approval.js';
 import { ReplGate } from './replGate.js';
-import { loadGlobalConfig, saveGlobalConfig, ensureShadowLayout } from './state/globalStore.js';
+import { loadGlobalConfig, saveGlobalConfig, ensureShadowLayout, configPath, GLOBAL_DIR } from './state/globalStore.js';
+import {
+  configInit,
+  formatConfigInit,
+  globalConfigLooksEmpty,
+  FIRST_RUN_HINT,
+} from './config/configInit.js';
 import { listResumableSessions } from './state/resume.js';
 import { isDumbTerm, queryTerminalBackground, themeForBackground } from './util/themeDetect.js';
 import { normalizeThemeName } from './tui/theme.js';
@@ -141,6 +147,7 @@ function helpText(): string {
     '  mcp <list|enable|disable>  manage MCP servers (e.g. `mcp enable browser`)',
     '  plugin <add|list|enable|disable|remove|search>  local-first plugin manager (data-only markdown bundles)',
     '  local <add|list|test|use|remove>  manage local models — .gguf or MLX (no Ollama/LM Studio needed)',
+    '  config init          seed a documented config template + safe defaults (never overwrites existing config)',
     '  doctor               diagnose Node, ripgrep, credentials, provider, guardrails',
     '  doctor --privacy     prove this config\'s privacy posture: egress, keys-at-rest, offline (no network)',
     '  doctor model [name]  capability test: can this model code agentically? (active model or a preset)',
@@ -270,6 +277,16 @@ async function runUpdate(): Promise<void> {
     process.exit(1);
   }
   stdout.write(`\n✓ Shadow updated v${before} → v${readVersion()}. Run \`shadow\` to use it.\n`);
+}
+
+/** `shadow config init` — documented template + safe defaults, strictly additive. */
+function runConfigCommand(args: string[]): void {
+  if (args[0] !== 'init') {
+    process.stderr.write('Usage: shadow config init\n');
+    process.exit(1);
+  }
+  const res = configInit(GLOBAL_DIR, configPath(), { loadGlobalConfig, saveGlobalConfig });
+  process.stdout.write(formatConfigInit(res, configPath()) + '\n');
 }
 
 
@@ -919,6 +936,10 @@ async function main(): Promise<void> {
     await runLocal(argv.slice(1));
     return;
   }
+  if (argv[0] === 'config') {
+    runConfigCommand(argv.slice(1));
+    return;
+  }
   if (argv[0] === 'doctor') {
     if (argv[1] === 'model') {
       await runDoctorModel(argv[2], process.cwd());
@@ -1043,6 +1064,10 @@ async function main(): Promise<void> {
 
   // First run with no provider configured → guide the user through setup.
   if (needsOnboarding(cfg)) {
+    // T2 Phase 2 — first-run hint: an empty config.json means no one knows which knobs exist
+    // (that's the Windows "blank config" report). One line on stderr; disappears once
+    // `shadow config init` seeds defaults.
+    if (globalConfigLooksEmpty(configPath())) process.stderr.write(FIRST_RUN_HINT + '\n');
     if (flags.task || !process.stdin.isTTY || !process.stdout.isTTY) {
       process.stderr.write('No model provider configured. Run `shadow onboard` to set one up.\n');
       process.exit(1);

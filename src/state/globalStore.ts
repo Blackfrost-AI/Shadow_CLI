@@ -13,6 +13,11 @@ export const GLOBAL_DIR = join(homedir(), '.shadow');
 const CONFIG_PATH = join(GLOBAL_DIR, 'config.json');
 const CREDS_PATH = join(GLOBAL_DIR, 'credentials.json');
 
+/** The live global config path — exported so `shadow config init` / doctor layout can aim at it. */
+export function configPath(): string {
+  return CONFIG_PATH;
+}
+
 const LAYOUT_DIRS = ['agents', 'commands', 'rules', 'workflows', 'projects', 'tasks', 'checkpoints', 'memories', 'plugins'] as const; // deeper ~/.shadow for Claude parity + recovery; plugins = P3-07 install root
 
 /** Ensure the extended `~/.shadow` layout exists (idempotent). */

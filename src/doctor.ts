@@ -8,6 +8,7 @@ import { GLOBAL_DIR } from './state/globalStore.js';
 import { sandboxConfinement } from './safety/sandbox.js';
 import { SessionLog } from './state/session.js';
 import { planRetention, formatBytes, ARCHIVE_DIRNAME } from './state/retention.js';
+import { buildLayoutPanel, formatLayoutPanel, type LayoutRow } from './config/configInit.js';
 
 export type DoctorSeverity = 'error' | 'warn' | 'info';
 
@@ -21,6 +22,8 @@ export interface DoctorCheck {
 export interface DoctorReport {
   ok: boolean;
   checks: DoctorCheck[];
+  /** ~/.shadow layout panel (present since the blank-config report). */
+  layout?: LayoutRow[];
 }
 
 /** Run environment diagnostics (Claude `/doctor` parity baseline). */
@@ -224,12 +227,12 @@ export function runDoctor(cwd: string): DoctorReport {
     checks.push({ id: 'retention', ok: true, severity: 'info', detail });
   }
 
-  return finalize(checks);
+  return finalize(checks, buildLayoutPanel(GLOBAL_DIR));
 }
 
-function finalize(checks: DoctorCheck[]): DoctorReport {
+function finalize(checks: DoctorCheck[], layout?: LayoutRow[]): DoctorReport {
   const ok = checks.filter((c) => c.severity === 'error').every((c) => c.ok);
-  return { ok, checks };
+  return { ok, checks, layout };
 }
 
 export function formatDoctorReport(report: DoctorReport, version: string): string {
@@ -241,5 +244,9 @@ export function formatDoctorReport(report: DoctorReport, version: string): strin
   }
   lines.push('');
   lines.push(report.ok ? 'All critical checks passed.' : 'One or more critical checks failed.');
+  if (report.layout && report.layout.length > 0) {
+    lines.push('');
+    lines.push(formatLayoutPanel(GLOBAL_DIR, report.layout));
+  }
   return lines.join('\n');
 }

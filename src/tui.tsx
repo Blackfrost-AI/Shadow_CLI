@@ -12,6 +12,7 @@ import { supportsInlineImages, saveAndOpen, canOpenViewer } from './util/termIma
 import { extractCommittableUnits, clampTail, clampLiveRest, stripTrailingNewlines, dupKey, repeatStep, leadsWithBlock } from './tui/streamCommit.js';
 import { computeLayout, formatStatusStrip, pinnedMaxItems, composerMaxRows, fitHud, type HudFit } from './tui/layout.js';
 import { clampToastText, toastColor, TOAST_TTL_MS, type ToastKind } from './tui/toast.js';
+import { decideInstructionAutopilot, seedInstructionFile, autopilotToastText } from './tui/instructionAutopilot.js';
 import { IS_DARWIN, NEWLINE_HINT } from './tui/platform.js';
 import { PendingOverlay, ModelPickerOverlay } from './tui/overlays.js';
 import { buildSeats, resolveTableEntries, parseTableInput, seatTag, MIN_SEATS, MAX_SEATS, type Seat, type SpeakerTag } from './tui/roundTable.js';
@@ -2506,6 +2507,22 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       setToast(null);
     }, TOAST_TTL_MS);
   }, [pushLine]);
+
+  // T2 Phase 3 — instruction-file autopilot (Claude Code / Codex parity): at LAUNCH, seed
+  // SHADOW.md when no instruction file exists here, or acknowledge AGENTS.md/CLAUDE.md when
+  // they do. Strictly additive (an existing file is NEVER touched), toast-only and silent
+  // otherwise. The guard makes it run exactly once even if the host remounts; seed is
+  // idempotent anyway (a second call reports alreadyPresent and stays silent).
+  const autopilotRanRef = useRef(false);
+  useEffect(() => {
+    if (autopilotRanRef.current) return;
+    autopilotRanRef.current = true;
+    const decision = decideInstructionAutopilot(opts.workspaceRoot);
+    if (decision.action === 'none') return;
+    const seed = decision.action === 'seed' ? seedInstructionFile(opts.workspaceRoot) : undefined;
+    const text = autopilotToastText(decision, seed);
+    if (text) showToast(text, 'ok');
+  }, [opts.workspaceRoot, showToast]);
 
   // Copy the last assistant answer — or just its last fenced code block — to the OS
   // clipboard. Shared by `/copy [code]` and the Alt+C keybinding. Secrets are redacted
