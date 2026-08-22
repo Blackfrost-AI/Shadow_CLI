@@ -58,6 +58,8 @@ import type { LoadedBindings } from './keybindings/types.js';
 import type { SubAgentView } from './subagentPanel.js';
 import { updateReset } from './terminalState.js';
 import { C, THEMES, THEME_DESCRIPTIONS, THEME_NAMES, applyTheme, backgroundSequence, normalizeThemeName, type CanonicalThemeName } from './theme.js';
+import type { ToastKind } from './toast.js';
+import { NEWLINE_HINT } from './platform.js';
 import type { VimFind, VimMode } from './vim.js';
 import type { BannerLine, TranscriptBase, TuiOpts } from '../tui.js';
 
@@ -278,7 +280,7 @@ function helpLines(topic: HelpTopic): BannerLine[] {
     return [
       { text: 'Keyboard shortcuts', color: C.cyan, bold: true },
       { text: 'Compose', color: C.purple, bold: true },
-      { text: '  Enter send  ·  Option+Enter newline  ·  Ctrl+V paste  ·  Ctrl+R search history', dimColor: true },
+      { text: `  Enter send  ·  ${NEWLINE_HINT} newline  ·  Ctrl+V paste  ·  Ctrl+R search history`, dimColor: true },
       { text: '  ↑/↓ move through a multi-line draft; at its edges they browse history.', dimColor: true },
       { text: 'Navigate', color: C.purple, bold: true },
       { text: '  / opens commands  ·  ↑/↓ select  ·  Tab completes  ·  Esc closes', dimColor: true },
@@ -302,7 +304,7 @@ function helpLines(topic: HelpTopic): BannerLine[] {
     { text: '  Model      /model  /local  /provider  /effort', dimColor: true },
     { text: '  Agent      /goal  /autonomy  /permissions  /tasks', dimColor: true },
     { text: '  Workspace  /diff  /files  /branch  /review', dimColor: true },
-    { text: 'Keys: Enter send · Option+Enter newline · Shift+Tab mode · Esc interrupt · Ctrl+C twice to quit', dimColor: true },
+    { text: `Keys: Enter send · ${NEWLINE_HINT} newline · Shift+Tab mode · Esc interrupt · Ctrl+C twice to quit`, dimColor: true },
     { text: 'Approvals: y once · n deny · s session · f shell prefix · a raise autonomy', dimColor: true },
     { text: 'More: /help keys for shortcuts · /help all for every command · type / to search', dimColor: true },
   ];
@@ -345,6 +347,9 @@ export interface SlashCtx {
   setComposer: (nextInput: string, nextCursor: number) => void;
   // ── callbacks (defined in tui.tsx, stable across renders) ─────────────────
   pushLine: (l: Omit<TranscriptBase, 'id' | 'kind'> & { kind?: TranscriptBase['kind'] }) => void;
+  /** T1: transient one-line ack (never reaches the transcript). Falls back to a dim pushLine
+   *  internally when the HUD has no room for a toast row — callers just fire and forget. */
+  showToast: (text: string, kind?: ToastKind) => void;
   showBanner: () => void;
   exit: () => void;
   refreshStatusLine: () => void;
@@ -418,6 +423,7 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
     setPlanMode, setGoal, setPickerIndex, setPickerOpen, setAutonomy, setEffort,
     setStyle, setVimEnabled, setVimMode, setThemeTick, setCustomStatus, setComposer,
     pushLine, showBanner, exit, refreshStatusLine, copyLast, refreshRewindTurns,
+    showToast,
     showResumeRecap, pushImage, loadCustomCommands,
     startTurnRef, kbLoadedRef, firstRef, answerOpenRef, committedRef, attachmentsRef,
     pastesRef, lastUsageRef, sessionCostRef, prevTurnCostRef, sessionInTokRef,
@@ -686,7 +692,7 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
               prov = createProvider({
                 // F10-01: probe the entry with its real wire contract (idle knobs +
                 // capability block) so /model test exercises what a session would use.
-                ...entryStreamContract(entry),
+                ...entryStreamContract(entry, opts.cfg.stream),
                 provider: p,
                 model: entry.model,
                 apiKey,
@@ -893,7 +899,7 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
       setStyle(next);
       opts.styleState?.setStyle(next);
       void saveGlobalConfig({ lastStyle: next });
-      pushLine({ text: `Style → ${next}`, color: C.purple });
+      showToast(`Style → ${next}`, 'ok');
       break;
     }
     case '/autonomy': {
@@ -906,7 +912,7 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
       const next = req ? (req as AutonomyLevel) : cycleAutonomy(autonomyRef.current);
       setAutonomy(next);
       loopRef.current?.setAutonomy(next);
-      pushLine({ text: `Autonomy → ${next}`, color: C.purple });
+      showToast(`Autonomy → ${next}`, 'ok');
       break;
     }
     case '/fast': {
@@ -920,10 +926,7 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
       const next = want === 'on' ? true : want === 'off' ? false : !opts.cfg.fastMode;
       opts.cfg.fastMode = next;
       void saveGlobalConfig({ fastMode: next });
-      pushLine({
-        text: `Fast mode → ${next ? 'on' : 'off'} (applies on the next model turn)`,
-        color: C.cyan,
-      });
+      showToast(`Fast mode → ${next ? 'on' : 'off'} (applies on the next model turn)`, 'ok');
       break;
     }
     case '/effort': {
@@ -937,10 +940,7 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
       }
       const next = parsed ?? cycleEffort(effortRef.current);
       setEffort(next);
-      pushLine({
-        text: `Effort → ${next} ${effortSymbol(next)} — ${effortDescription(next)} (applies next turn)`,
-        color: C.cyan,
-      });
+      showToast(`Effort → ${next} ${effortSymbol(next)} — ${effortDescription(next)} (applies next turn)`, 'ok');
       break;
     }
     case '/compact': {
@@ -2026,12 +2026,14 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
       opts.cfg.lastTheme = next; // keep the in-memory cfg in sync for the next cycle
       saveGlobalConfig({ lastTheme: next });
       setThemeTick((t) => t + 1); // repaint with the new palette
-      pushLine({
-        text: THEMES[next].bg
+      // T1: theme apply is a fire-and-forget ack — toast it (falls back to the transcript
+      // internally when the HUD can't fit a row) so it doesn't clutter /rewindable history.
+      showToast(
+        THEMES[next].bg
           ? `Theme: ${next} — the terminal background is now ${THEMES[next].bg} (restored on exit; SHADOW_NO_BG=1 opts out).`
           : `Theme: ${next}`,
-        color: C.cyan,
-      });
+        'ok',
+      );
       break;
     }
     case '/add-dir': {
@@ -2166,7 +2168,7 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
         lines.push({ text: 'Bind Shift+Enter to send the escape sequence:  ESC [ 1 3 ; 2 u', dimColor: true });
       }
       lines.push({ text: '' });
-      lines.push({ text: 'Working today with no setup: Option+Enter, Ctrl+J, or a trailing \\ then Enter.', dimColor: true });
+      lines.push({ text: `Working today with no setup: ${NEWLINE_HINT}, Ctrl+J, or a trailing \\ then Enter.`, dimColor: true });
       pushLine({ kind: 'system', text: 'terminal-setup', lines });
       break;
     }
@@ -2184,12 +2186,12 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
         vimCountRef.current = 0;
         vimRegRef.current = '';
       }
-      pushLine({
-        text: next
+      showToast(
+        next
           ? 'Vim mode ON — Esc for NORMAL, i/a to insert. Motions: h l 0 $ w b e j k f F t T ; , · edits: x s d c y D C p o O r J · counts work (3w, d2w, 2dd).'
           : 'Vim mode OFF — standard composer editing restored.',
-        dimColor: true,
-      });
+        'info',
+      );
       break;
     }
     case '/exit':

@@ -66,14 +66,28 @@ test("xterm's modifyOtherKeys encoding works too", async (t) => {
 });
 
 test('the hint text no longer advertises a binding that does not work', () => {
-  // Composer hints live in tui.tsx; the /help rows + the /terminal-setup listing moved to
-  // tui/slash.ts with the P3-02 decomposition — the pin covers both.
-  const src =
-    readFileSync(new URL('../src/tui.tsx', import.meta.url), 'utf8') +
-    readFileSync(new URL('../src/tui/slash.ts', import.meta.url), 'utf8');
-  // The placeholder and both hint rows claimed Shift+Enter on terminals that cannot send it.
+  // Composer hints live in tui.tsx; the /help rows + the /terminal-setup listing live in
+  // tui/slash.ts (P3-02 decomposition); the key combo itself is platform-aware via tui/platform.ts.
+  const tuiSrc = readFileSync(new URL('../src/tui.tsx', import.meta.url), 'utf8');
+  const slashSrc = readFileSync(new URL('../src/tui/slash.ts', import.meta.url), 'utf8');
+  const platformSrc = readFileSync(new URL('../src/tui/platform.ts', import.meta.url), 'utf8');
+  const src = tuiSrc + slashSrc + platformSrc;
+
+  // Never promise Shift+Enter to terminals that cannot send it — that was the whole 3.x bug.
   assert.doesNotMatch(src, /Shift\+Enter newline/, 'stop promising what the default terminal cannot do');
-  assert.match(src, /Option\+Enter newline/, 'advertise what actually works today');
+
+  // T1: the placeholder and hint rows are now assembled from the platform-aware NEWLINE_HINT
+  // rather than a hardcoded combo, so the advertised key matches the OS actually in use.
+  assert.match(tuiSrc, /NEWLINE_HINT/, 'the placeholder uses the platform-aware hint');
+  assert.match(slashSrc, /NEWLINE_HINT/, 'the /help rows use the platform-aware hint');
+
+  // platform.ts advertises what works today on each OS: Option+Enter on darwin (the composer's
+  // meta-return branch), Alt+Enter elsewhere — and never claims Shift+Enter as the default.
+  assert.match(platformSrc, /Option\+Enter/, 'darwin advertises Option+Enter');
+  assert.match(platformSrc, /Alt\+Enter/, 'non-darwin advertises Alt+Enter');
+  assert.doesNotMatch(platformSrc, /NEWLINE_HINT\s*=\s*[^;]*Shift\+Enter/, 'Shift+Enter is never the default newline');
+
+  // And point at the command that enables Shift+Enter for terminals that support CSI-u.
   assert.match(src, /terminal-setup/, 'and point at the command that enables Shift+Enter');
 });
 

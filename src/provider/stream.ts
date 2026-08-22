@@ -21,6 +21,21 @@ const MAX_ATTEMPTS = 5; // ~24s of ride-out across the ladder — see backoff()
 const MAX_TOKEN_SHRINKS = 5;
 /** Abort a request that produces no bytes for this long (initial wait or mid-stream stall). */
 const IDLE_MS = 120_000;
+/** T2: self-hosted endpoints (local/LAN or the explicit marker) that set no knob of their own
+ *  get a looser default — long prefill on big contexts keeps SSE silent far past 120s, and a
+ *  blank config.json used to strand exactly the tight public-API budget on them. */
+export const SELF_HOSTED_DEFAULT_IDLE_MS = 300_000;
+
+/**
+ * T2 — pure resolver for the steady-state idle budget of one attempt. Exported so the
+ * precedence (explicit knob → self-hosted-aware default) is unit-testable without waiting out
+ * a real watchdog. `SHADOW_IDLE_MS` env override is resolved one layer up (the provider
+ * adapter stamps it onto `idleTimeoutMs` before the attempt is built), so env still wins.
+ */
+export function resolveIdleBudget(idleTimeoutMs: number | undefined, url: string, selfHosted?: boolean): number {
+  const selfHostedEff = selfHosted === true || isLocalBaseUrl(url);
+  return idleTimeoutMs ?? (selfHostedEff ? SELF_HOSTED_DEFAULT_IDLE_MS : IDLE_MS);
+}
 /** The non-stream rescue gets its own bound — it used to inherit no timeout at all. */
 const NON_STREAM_TIMEOUT_MS = 180_000;
 
@@ -254,16 +269,17 @@ export function stripParamFromBody(body: unknown, param: string): boolean {
  *   - idle timeout                → recoverable error (no retry; already waited)
  */
 export async function* streamWithRetry(a: StreamAttempt): AsyncIterable<ProviderEvent> {
-  // Per-endpoint resolve (P1A-04): config-knob → SHADOW_IDLE_MS env → IDLE_MS default. The env
-  // override MUST beat config for the operator escape hatch; the watchdog frame must KNOW what
-  // frame the user picked, so resolve once per stream (not per attempt) and reuse for the error.
-  const idleBudget = a.idleTimeoutMs ?? IDLE_MS; // ms since last event before the watchdog trips
+  // Per-endpoint resolve (P1A-04 + T2): env → entry knob → top-level stream knob →
+  // self-hosted-aware default. The env override MUST beat config for the operator escape hatch;
+  // the watchdog frame must KNOW what frame the user picked, so resolve once per stream (not per
+  // attempt) and reuse for the error. T2 emergency fix: a SELF-HOSTED endpoint that sends no
+  // config knob gets 300s (was 120s) — local/LAN serves and remote self-hosted proxies routinely
+  // sit silent through long prefill on big contexts, and a blank config.json used to leave
+  // exactly the tight public-API budget in force (the founder's Windows-box timeouts).
+  const selfHosted = a.selfHosted === true || isLocalBaseUrl(a.url);
+  const idleBudget = resolveIdleBudget(a.idleTimeoutMs, a.url, selfHosted); // ms since last event before the watchdog trips
   const frameMs = Math.max(0, idleBudget); // never negative; 0 = disable (kick immediately trips)
   const maxRetries = a.streamRetries ?? MAX_ATTEMPTS;
-  // selfHosted is an explicit marker — vLLM/SGLang flush headers before prefill completes, so a
-  // headers-then-silence server looks like a mid-stream stall at emitted===0. The C4 no-re-POST
-  // protection must survive that shape too: a busy LOCAL serve already has the prompt.
-  const selfHosted = a.selfHosted === true || isLocalBaseUrl(a.url);
   let shrinks = 0;
   let imagesStripped = false;
   let toolChoiceStripped = false;
@@ -523,7 +539,7 @@ function idleError(frameMs = IDLE_MS): ProviderEvent {
     recoverable: true,
     code: 'idle_timeout',
     message: `no response within ${Math.round(frameMs / 1000)}s — the model may be overloaded or the connection stalled` +
-      (frameMs !== IDLE_MS ? ` (configured stream idle timeout; raise \`idleTimeoutMs\` or ${'$'}SHADOW_IDLE_MS for a slow local serve)` : ''),
+      (frameMs !== IDLE_MS ? ` (configured stream idle timeout; raise \`stream.idleTimeoutMs\` or \`idleTimeoutMs\` in ~/.shadow/config.json, or ${'$'}SHADOW_IDLE_MS)` : ''),
   };
 }
 

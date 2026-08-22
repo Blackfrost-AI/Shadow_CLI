@@ -37,18 +37,34 @@ export interface ProviderOptions {
  * ignored fail-closed) and the P1A-06 declarative capability block. Bootstrap AND every
  * interactive rebuild (TUI /model switch, in-TUI fallback, /model test) spread this into their
  * createProvider call, so a live switch can never silently shed the entry's wire contract.
+ *
+ * T2: `defaults` carries the session-wide `stream` block from config.json — the fallback for
+ * setups that configure provider/model/baseUrl DIRECTLY (no `models[]` preset), which
+ * previously had no config knob at all. Precedence: SHADOW_IDLE_MS env > per-model entry >
+ * top-level stream block > self-hosted-aware default (300s local/LAN, 120s public) >
+ * built-in default. Capabilities stay entry-specific and never fall through to the top
+ * level. The global `~/.shadow/config.json` stream block reaches here through loadConfig's
+ * deep merge into `cfg.stream` — resolved at the call site, NOT inside this module (this
+ * file must stay globalStore-free so provider-only imports never pin GLOBAL_DIR early).
  */
+export interface StreamDefaults {
+  idleTimeoutMs?: number;
+  firstByteTimeoutMs?: number;
+  retries?: number;
+}
+
 export function entryStreamContract(
   entry?: Pick<ModelEntry, 'idleTimeoutMs' | 'firstByteTimeoutMs' | 'streamRetries' | 'capabilities'>,
+  defaults?: StreamDefaults,
 ): Pick<ProviderOptions, 'idleTimeoutMs' | 'firstByteTimeoutMs' | 'streamRetries' | 'capabilities'> {
   const raw = process.env.SHADOW_IDLE_MS;
   const trimmed = raw?.trim();
   const envIdleMs =
     trimmed != null && /^\d+$/.test(trimmed) && Number(trimmed) > 0 ? Number(trimmed) : undefined;
   return {
-    idleTimeoutMs: envIdleMs ?? entry?.idleTimeoutMs,
-    firstByteTimeoutMs: entry?.firstByteTimeoutMs,
-    streamRetries: entry?.streamRetries,
+    idleTimeoutMs: envIdleMs ?? entry?.idleTimeoutMs ?? defaults?.idleTimeoutMs,
+    firstByteTimeoutMs: entry?.firstByteTimeoutMs ?? defaults?.firstByteTimeoutMs,
+    streamRetries: entry?.streamRetries ?? defaults?.retries,
     capabilities: entry?.capabilities,
   };
 }

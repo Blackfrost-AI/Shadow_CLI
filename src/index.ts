@@ -773,7 +773,7 @@ async function runDoctorModel(name: string | undefined, cwd: string): Promise<vo
   try {
     probeProvider = createProvider({
       // F10-01: probe with the entry's real wire contract (idle knobs + capability block).
-      ...entryStreamContract(entry ?? undefined),
+      ...entryStreamContract(entry ?? undefined, cfg.stream),
       provider: startProvider,
       model,
       apiKey,

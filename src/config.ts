@@ -130,7 +130,9 @@ export function normalizeBaseUrl(raw: string | undefined): string | undefined {
 /** One selectable model in the `/model` picker. */
 export const ModelEntrySchema = z.object({
   label: z.string(),
-  provider: z.enum(['anthropic', 'openai', 'mock']),
+  /** Onboarding writes `openai-compat` for self-hosted/compat endpoints; the current wire enum
+   *  is `openai`. Coerce so installs onboarded through that path keep parsing. */
+  provider: z.enum(['anthropic', 'openai', 'openai-compat', 'mock']).transform((v) => (v === 'openai-compat' ? 'openai' : v)),
   model: z.string(),
   baseUrl: z
     .string()
@@ -252,7 +254,8 @@ const ProfileSchema = z.object({
 });
 
 const ConfigSchema = z.object({
-  provider: z.enum(['anthropic', 'openai', 'mock']).default('anthropic'),
+  /** Same legacy coercion as ModelEntrySchema — onboarding writes `openai-compat`. */
+  provider: z.enum(['anthropic', 'openai', 'openai-compat', 'mock']).default('anthropic').transform((v) => (v === 'openai-compat' ? 'openai' : v)),
   model: z.string().default('claude-opus-4-8'),
   baseUrl: z
     .string()
@@ -380,6 +383,24 @@ const ConfigSchema = z.object({
   // at once (provider connections + context windows + GPU contention on local rigs). Raise it
   // on powerful machines; 1 serializes sub-agents entirely.
   subagentConcurrency: z.number().int().min(1).max(16).default(4),
+
+  // T2 — session-wide stream-resilience defaults. The per-model `idleTimeoutMs` /
+  // `firstByteTimeoutMs` / `streamRetries` knobs on `models[]` entries cover preset users; this
+  // block covers the DIRECT provider/model/baseUrl path (no preset) that previously had no
+  // config knob at all and died on the built-in 120s idle watchdog. Resolution order at request
+  // time: SHADOW_IDLE_MS env > per-model entry > this block > built-in default
+  // (see entryStreamContract). Slow local/self-hosted serves (vLLM/SGLang/llama.cpp long
+  // prefill) routinely exceed 120s between SSE frames — raise idleTimeoutMs here or per-entry.
+  stream: z
+    .object({
+      /** Mid-stream silence tolerated before the watchdog aborts the attempt (ms). */
+      idleTimeoutMs: z.number().int().positive().optional(),
+      /** Max wait for the FIRST byte of any response attempt (ms). */
+      firstByteTimeoutMs: z.number().int().positive().optional(),
+      /** SSE retry ceiling for transient 5xx / connection resets. */
+      retries: z.number().int().min(0).optional(),
+    })
+    .optional(),
 
   // P2-11 (F09-08) — named profiles (Codex `[profiles.NAME]` parity). A profile bundles a model
   // with its matching effort/autonomy/sandbox/context knobs; activate with `--profile <name>`

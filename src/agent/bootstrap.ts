@@ -424,7 +424,7 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   const provider = createProvider({
     // P1A-04 knobs + P1A-06 capability block, SHADOW_IDLE_MS env override included (F10-01:
     // one shared helper with the TUI rebuild sites so the contract can't drift between them).
-    ...entryStreamContract(activeModelEntry ?? undefined),
+    ...entryStreamContract(activeModelEntry ?? undefined, cfg.stream),
     provider: startProvider as 'anthropic' | 'openai' | 'mock',
     model: cfg.model,
     apiKey: startApiKey,
@@ -600,7 +600,7 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     cfg.keepLastTurns = policy.keepLastTurns;
     const next = createProvider({
       // P1A-04 knobs + P1A-06 capability block (F10-01 shared helper — see entryStreamContract).
-      ...entryStreamContract(entry),
+      ...entryStreamContract(entry, cfg.stream),
       provider: nextProvider,
       model: entry.model,
       apiKey,

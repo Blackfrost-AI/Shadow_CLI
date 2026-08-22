@@ -2,6 +2,18 @@ import type { ProviderName } from '../provider/index.js';
 import type { ModelEntry } from '../config.js';
 import type { PresetEntryExtras } from './catalog.js';
 import { loadGlobalConfig, saveGlobalConfig } from '../state/globalStore.js';
+import { isLocalBaseUrl } from '../safety/offline.js';
+import { SELF_HOSTED_DEFAULT_IDLE_MS } from '../provider/stream.js';
+
+/** T2 onboarding resilience: self-hosted/local entries default to a loose idle budget (long
+ *  prefill keeps SSE silent well past the 120s public-API default), a generous first-byte
+ *  budget (vLLM/SGLang flush headers before prefill completes), and a high retry ceiling
+ *  (busy serves 5xx during queue storms). A catalog preset's own declared knob wins verbatim. */
+export const ONBOARD_SELF_HOSTED_DEFAULTS = {
+  idleTimeoutMs: SELF_HOSTED_DEFAULT_IDLE_MS,
+  firstByteTimeoutMs: 600_000,
+  streamRetries: 8,
+} as const;
 
 export interface OnboardTargetInput {
   provider: ProviderName;
@@ -38,20 +50,38 @@ export function onboardTargetPatch(input: OnboardTargetInput): Record<string, un
   };
 }
 
+/** True when the onboarding target is a self-hosted-class endpoint: the user said yes, or the
+ *  URL is local/LAN. These get the T2 resilience knobs stamped onto their carrier entry. */
+export function isSelfHostedTarget(input: Pick<OnboardTargetInput, 'selfHosted' | 'baseUrl'>): boolean {
+  return input.selfHosted === true || isLocalBaseUrl(input.baseUrl);
+}
+
 /** Upsert (by case-insensitive label) the ModelEntry that carries a preset's contract extras. */
 export function presetEntryUpsert(
   models: ModelEntry[],
   input: { provider: ProviderName; model: string; baseUrl?: string; entryExtras: PresetEntryExtras & { label: string } },
 ): ModelEntry[] {
   const { label, selfHosted, idleTimeoutMs, capabilities } = input.entryExtras;
+  const selfHostedEntry = selfHosted === true || isLocalBaseUrl(input.baseUrl);
   const entry: ModelEntry = {
     label,
     provider: input.provider as ModelEntry['provider'],
     model: input.model,
     ...(input.baseUrl ? { baseUrl: input.baseUrl } : {}),
     ...(selfHosted === true ? { selfHosted: true } : {}),
-    ...(idleTimeoutMs != null ? { idleTimeoutMs } : {}),
     ...(capabilities ? { capabilities } : {}),
+    // T2 resilience knobs: the preset's declared idle budget wins verbatim; otherwise a
+    // self-hosted-class entry gets the loose default set. undefined fields are dropped by
+    // JSON serialization, so public presets keep the strict built-in budgets unchanged.
+    ...(selfHostedEntry
+      ? {
+          idleTimeoutMs: idleTimeoutMs ?? ONBOARD_SELF_HOSTED_DEFAULTS.idleTimeoutMs,
+          firstByteTimeoutMs: ONBOARD_SELF_HOSTED_DEFAULTS.firstByteTimeoutMs,
+          streamRetries: ONBOARD_SELF_HOSTED_DEFAULTS.streamRetries,
+        }
+      : idleTimeoutMs != null
+        ? { idleTimeoutMs }
+        : {}),
   };
   const idx = models.findIndex((m) => m.label.trim().toLowerCase() === label.trim().toLowerCase());
   // Re-onboarding refreshes the contract fields but keeps anything the user added to the entry
@@ -61,13 +91,26 @@ export function presetEntryUpsert(
 
 export function persistOnboardTarget(input: OnboardTargetInput): void {
   const patch = onboardTargetPatch(input);
+  const models = (loadGlobalConfig().models as ModelEntry[] | undefined) ?? [];
   if (input.entryExtras && input.model) {
-    const models = (loadGlobalConfig().models as ModelEntry[] | undefined) ?? [];
     patch.models = presetEntryUpsert(models, {
       provider: input.provider,
       model: input.model,
       baseUrl: input.baseUrl,
       entryExtras: input.entryExtras,
+    });
+  } else if (input.model && isSelfHostedTarget(input)) {
+    // T2: a custom/local self-hosted target onboarded WITHOUT catalog contract extras still
+    // gets a carrier entry — the top-level patch cannot hold per-entry fields, and without a
+    // carrier the resilience knobs never reach the wire (the blank-config 120s timeouts).
+    patch.models = presetEntryUpsert(models, {
+      provider: input.provider,
+      model: input.model,
+      baseUrl: input.baseUrl,
+      entryExtras: {
+        label: input.model,
+        ...(input.selfHosted === true ? { selfHosted: true } : {}),
+      },
     });
   }
   saveGlobalConfig(patch);

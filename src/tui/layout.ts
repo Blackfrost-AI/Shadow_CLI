@@ -1,5 +1,7 @@
 /** Pure terminal layout math for the Shadow TUI — no React/Ink imports. */
 
+import { formatContextGauge } from './gauge.js';
+
 export interface ChromeConfig {
   statusRows?: number;
   composerRows?: number;
@@ -139,12 +141,35 @@ export interface StatusStripInput {
   sandboxStatus?: string; // e.g. ' · sandbox:off' under --yolo, else '' (core already shows '(yolo)')
   effortStatus?: string; // e.g. ' · ◑ high' — reasoning-depth indicator (drops on narrow)
   status: string;
+  /** Context usage percent (0-100) — when present the ctx segment gains a block gauge. */
+  contextPct?: number;
+  /** summarizeTriggerRatio (0-1) — marks the cliff cell on the gauge when known. */
+  triggerRatio?: number;
+}
+
+/** 24-bit SGR for a #rrggbb hex color. Pure (no deps) so layout stays standalone. */
+function sgrFg24(hex: string): string {
+  const m = /^#?([0-9a-f]{6})$/i.exec(hex);
+  if (!m) return '';
+  const n = parseInt(m[1]!, 16);
+  return `\u001b[38;2;${(n >> 16) & 255};${(n >> 8) & 255};${n & 255}m`;
 }
 
 /** Build the 1-line status strip (priority fields first; drops plan/todo on narrow). */
-export function formatStatusStrip(input: StatusStripInput, cols: number): string {
+export function formatStatusStrip(
+  input: StatusStripInput,
+  cols: number,
+  palette?: { warn?: string; hot?: string },
+): string {
   const core = `${input.provider}/${input.model} · mode: ${input.autonomy}${input.bypass ? ' (yolo)' : ''}`;
-  const ctx = input.status;
+  // Context gauge rides at the head of the ctx segment — same drop priority as the usage
+  // text (drops LAST, before it the mode label). Plain text for the width ladder; the
+  // SGR color is injected into the WINNING tier only, so `.length` math stays exact.
+  const gauge = Number.isFinite(input.contextPct) && (input.contextPct as number) >= 0
+    ? formatContextGauge(input.contextPct as number, input.triggerRatio)
+    : null;
+  const gaugeText = gauge ? `${gauge.bar}${gauge.label} · ` : '';
+  const ctx = `${gaugeText}${input.status}`;
   const extras = `${input.effortStatus ?? ''}${input.planStatus ?? ''}${input.todoStatus ?? ''}${input.sandboxStatus ?? ''}`;
   const full = `${core}${extras} · ${ctx}`;
   const narrow = `${core} · ${ctx}`;
@@ -152,9 +177,18 @@ export function formatStatusStrip(input: StatusStripInput, cols: number): string
   // early warning of context exhaustion, so it drops LAST — before it, lose extras, then mode.
   const slim = `${input.model} · ${ctx}`;
   const min = `${input.model} · ${input.autonomy}`;
-  if (full.length <= cols) return full;
-  if (narrow.length <= cols) return narrow;
-  if (slim.length <= cols && ctx) return slim;
+  // Colorize the gauge in the winning tier (the gauge is present only when ctx is).
+  const paintGauge = (tier: string): string => {
+    if (!gauge || !palette) return tier;
+    const hex = gauge.level === 'hot' ? palette.hot : gauge.level === 'warn' ? palette.warn : null;
+    if (!hex) return tier;
+    const sgr = sgrFg24(hex);
+    if (!sgr) return tier;
+    return tier.replace(gaugeText, `${sgr}${gaugeText}\u001b[39m`);
+  };
+  if (full.length <= cols) return paintGauge(full);
+  if (narrow.length <= cols) return paintGauge(narrow);
+  if (slim.length <= cols && ctx) return paintGauge(slim);
   if (min.length <= cols) return min;
   return min.slice(0, Math.max(8, cols - 1)) + '…';
 }
@@ -167,6 +201,7 @@ export interface HudFit {
   queued: boolean;    // the type-ahead queue line
   custom: boolean;    // the customStatus (/statusline) strip
   hint: boolean;      // the composer's keybinding hint row
+  toast: boolean;     // the transient toast row (clipboard/theme/style acks — never Static)
   marginTop: boolean; // the blank spacer above the composer group
   strip: boolean;     // the main status strip
   height: number;     // total live-frame height this produces (always < rows for rows >= 4)
@@ -176,10 +211,10 @@ export interface HudFit {
  * Bound the LIVE (non-<Static>) frame so its height stays STRICTLY below `rows`. Ink wipes the whole
  * screen + scrollback and re-dumps the entire transcript on EVERY render when `outputHeight >= rows`
  * (node_modules/ink/build/ink.js:121) — the flicker/duplication you get on a short or split-pane
- * terminal. The composer's input + its two borders (3 rows) are mandatory; every other row is added
+ * terminal). The composer's input + its two borders (3 rows) are mandatory; every other row is added
  * only while it still fits under `rows - 1`, in priority order, so as the terminal shrinks the least
- * important rows drop first (custom status → queued → pinned → margin → live preview → status line →
- * strip → hint) and the frame never reaches the terminal height. Pure; the invariant is unit-tested.
+ * important rows drop first (custom status → toast → queued → pinned → margin → live preview →
+ * status line → strip → hint) and the frame never reaches the terminal height. Pure; the invariant is unit-tested.
  */
 export function fitHud(
   rows: number,
@@ -188,6 +223,8 @@ export function fitHud(
     pinned: boolean;
     queued: boolean;
     custom: boolean;
+    /** The transient toast row is currently UP (a recent ack is showing). 1 row when it fits. */
+    toast?: boolean;
     /** The live slot is currently BLANK (idle reserve): rank it below the hint so short terminals keep real content over empty rows. */
     liveBlank?: boolean;
     /** Separate status strip row. Default true; Phase B merges strip into hint/status so callers pass false. */
@@ -207,7 +244,7 @@ export function fitHud(
   const inputRows = Math.max(1, Math.min(want.composerInputRows ?? 1, Math.max(1, rows - 3)));
   const f: HudFit = {
     liveRows: 0, status: false, pinned: false, queued: false, custom: false,
-    hint: false, marginTop: false, strip: false,
+    hint: false, toast: false, marginTop: false, strip: false,
     // Composer chrome: top rule + N (clamped) input rows + bottom rule.
     height: 2 + inputRows,
   };
@@ -227,6 +264,7 @@ export function fitHud(
   if (want.liveBlank) { addHint(); addLive(); } else { addLive(); addHint(); }
   if (want.pinned) add(1, () => (f.pinned = true));  // goal / task summary
   if (want.queued) add(1, () => (f.queued = true));
+  if (want.toast) add(1, () => (f.toast = true));    // transient ack — outranks /statusline, not the queue
   if (want.custom) add(1, () => (f.custom = true));
   add(1, () => (f.marginTop = true)); // cosmetic blank above the composer — first to go
   return f;

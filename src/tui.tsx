@@ -10,7 +10,9 @@ import { resolveEditor, openEditorFile } from './tui/externalEditor.js';
 import { atMentionToken, walkWorkspaceFiles, rankFileCandidates, expandFileMentions } from './tui/fileMentions.js';
 import { supportsInlineImages, saveAndOpen, canOpenViewer } from './util/termImage.js';
 import { extractCommittableUnits, clampTail, clampLiveRest, stripTrailingNewlines, dupKey, repeatStep, leadsWithBlock } from './tui/streamCommit.js';
-import { computeLayout, formatStatusStrip, pinnedMaxItems, composerMaxRows, fitHud } from './tui/layout.js';
+import { computeLayout, formatStatusStrip, pinnedMaxItems, composerMaxRows, fitHud, type HudFit } from './tui/layout.js';
+import { clampToastText, toastColor, TOAST_TTL_MS, type ToastKind } from './tui/toast.js';
+import { IS_DARWIN, NEWLINE_HINT } from './tui/platform.js';
 import { PendingOverlay, ModelPickerOverlay } from './tui/overlays.js';
 import { buildSeats, resolveTableEntries, parseTableInput, seatTag, MIN_SEATS, MAX_SEATS, type Seat, type SpeakerTag } from './tui/roundTable.js';
 import { spawn, spawnSync } from 'node:child_process';
@@ -177,7 +179,7 @@ export function runStatusLine(cmd: string, ctx: StatusLineCtx, cb: (line: string
 // The Shadow spinner: a circle spinning between LIGHT and DARK — the half-disc rotates through
 // four phases (founder pick, 2026-07-11; replaced the sparkle pulse). Reads as an eclipse: on
 // brand for a client named Shadow, and it's the ◐ "working" glyph the redesign spec already used.
-const IS_DARWIN = process.platform === 'darwin';
+// IS_DARWIN moved to ./tui/platform.js (shared with slash help lines) — imported below.
 const SPINNER = ['◐', '◓', '◑', '◒']; // light/dark halves chase around the circle
 // The signature left-gutter dot on assistant turns; color (not shape) carries tool state.
 const BLACK_CIRCLE = IS_DARWIN ? '⏺' : '●';
@@ -1113,7 +1115,10 @@ function isChatter(kind: string | undefined): boolean {
 }
 
 /** Empty-composer placeholder — a dim prompt, not an example that could be mistaken for real input. */
-const COMPOSER_PLACEHOLDER = 'Send a message…  ( / for commands · Option+Enter newline )';
+// T1: platform-aware — macOS sends Option+Enter as ESC-prefixed; Linux terminals send Alt+Enter.
+// The composer's newline branch keys on key.meta+return, so the hint names that path (Shift+Enter
+// is deliberately NOT advertised — without CSI-u it sends the message instead of breaking the line).
+const COMPOSER_PLACEHOLDER = `Send a message…  ( / for commands · ${NEWLINE_HINT} newline )`;
 
 /**
  * Multi-row composer: soft-wraps long lines, keeps a real caret on any row, scrolls a window when
@@ -1416,6 +1421,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     setToolLine(null);
   }, [shellClear]);
   useEffect(() => () => void (shellTimerRef.current && clearTimeout(shellTimerRef.current)), []);
+  useEffect(() => () => void (toastTimerRef.current && clearTimeout(toastTimerRef.current)), []);
   // The tool currently executing — rendered as a persistent live ⏺ Name(args) row that appears the
   // instant the call starts and resolves in place (into the committed green/red ⏺ row) on tool_end.
   const [activeTool, setActiveTool] = useState<{ name: string; arg: string; agent?: { subagentType?: string; description?: string } } | null>(null);
@@ -1425,6 +1431,27 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // Rendered as a distinct "Running N agents" panel so a sub-agent never hijacks the parent's own
   // activeTool row. Map stays immutable (every update returns a fresh Map) so Ink re-renders.
   const [subAgents, setSubAgents] = useState<Map<string, SubAgentView>>(new Map());
+  // Fresh snapshot of the sub-agent map for one-shot bus handlers (the bus effect registers ONCE,
+  // so it must not read the captured `subAgents` state — that would be stale forever).
+  const subAgentsRef = useRef(subAgents);
+  subAgentsRef.current = subAgents;
+  // T1: transient toast (copy/paste/theme/style/autonomy acks) — a single row that NEVER reaches
+  // the committed transcript. Replaces itself and expires after TOAST_TTL_MS. Ref-mirrored so
+  // async callbacks (the clipboard read resolves later) and key handlers can fire it.
+  const [toast, setToast] = useState<{ text: string; kind: ToastKind } | null>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Ref mirror of the toast so showToast can tell whether fitHud ALREADY budgeted a toast row
+  // (if one is on screen, replacing it costs zero extra rows — otherwise we'd add 1 and
+  // double-count, wrongly falling back to pushLine inside the 3.2s replace window).
+  const toastRef = useRef<{ text: string; kind: ToastKind } | null>(null);
+  toastRef.current = toast;
+  // The last fitHud result — showToast uses it to decide PRECISELY whether the HUD's priority
+  // ladder would accept one more row (the toast is 1 row; the ladder grants it iff headroom
+  // remains). Updated during render below.
+  const lastHudFitRef = useRef<HudFit | null>(null);
+  // Ref mirror of the terminal size for the same async-safe reason (showToast fires from async
+  // clipboard reads, long after the render that produced the size).
+  const terminalSizeRef = useRef(terminalSize);
   // F06-09: MCP servers connect in the background so first paint is never gated on them. This
   // flag drives the transient "mcp: connecting…" chip; it clears the moment the settle promise
   // resolves (success OR failure — per-server failures already warn on stderr).
@@ -2454,6 +2481,32 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     if (!running) refreshStatusLine();
   }, [running, current.model, current.provider, autonomy, refreshStatusLine]);
 
+  /**
+   * T1 toast: a transient one-line ack that never reaches the committed transcript. TTL ~3.2s;
+   * a newer toast replaces the older one (the timer resets). Fallback: when the HUD's priority
+   * ladder cannot spare a row (judged precisely against the last fitHud headroom), a dim
+   * transcript line is pushed instead — the ack is NEVER silently swallowed.
+   */
+  const showToast = useCallback((text: string, kind: ToastKind = 'info') => {
+    const fit = lastHudFitRef.current;
+    const size = terminalSizeRef.current;
+    // If a toast is ALREADY on screen, fitHud has already budgeted that row into fit.height —
+    // replacing it costs zero extra rows. Otherwise it would cost exactly 1. Mirror fitHud's
+    // grant rule precisely so showToast's fallback decision can never disagree with the HUD.
+    const extraRows = toastRef.current ? 0 : 1;
+    if (!fit || fit.height + extraRows > size.rows - 1) {
+      pushLine({ text, color: kind === 'error' ? C.red : undefined, dimColor: kind !== 'error' });
+      return;
+    }
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    const view = { text: clampToastText(text, size.cols), kind };
+    setToast(view);
+    toastTimerRef.current = setTimeout(() => {
+      toastTimerRef.current = null;
+      setToast(null);
+    }, TOAST_TTL_MS);
+  }, [pushLine]);
+
   // Copy the last assistant answer — or just its last fenced code block — to the OS
   // clipboard. Shared by `/copy [code]` and the Alt+C keybinding. Secrets are redacted
   // first: the clipboard is a broader sink than the screen (macOS Universal Clipboard /
@@ -2485,13 +2538,14 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     const redacted = safe !== raw;
     void (async () => {
       const ok = await copyToClipboard(safe);
-      pushLine(
+      showToast(
         ok
-          ? { text: `Copied last ${label} — ${safe.length} chars${redacted ? ' (secrets redacted)' : ''}.`, color: C.cyan }
-          : { text: 'Clipboard copy failed.', color: C.red },
+          ? `Copied last ${label} — ${safe.length} chars${redacted ? ' (secrets redacted)' : ''}`
+          : 'Clipboard copy failed.',
+        ok ? 'ok' : 'error',
       );
     })();
-  }, [pushLine]);
+  }, [pushLine, showToast]);
 
   // Alt/Option+C — copy the last answer without reaching for /copy.
   useEffect(() => kbRegister('transcript:copyLastAnswer', () => copyLast('answer')), [kbRegister, copyLast]);
@@ -2504,13 +2558,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     void (async () => {
       const text = await readClipboard();
       if (text === null) {
-        pushLine({ text: 'Paste failed — no clipboard helper (pbpaste / wl-paste / xclip) or read error.', dimColor: true });
+        showToast('Paste failed — no clipboard helper (pbpaste / wl-paste / xclip) or read error.', 'warn');
         return;
       }
       if (!text) return; // empty clipboard — nothing to do
       insertPastable(text.replace(/\r\n?/g, '\n'));
     })();
-  }, [insertPastable, pushLine]);
+  }, [insertPastable, pushLine, showToast]);
   useEffect(() => kbRegister('chat:pasteClipboard', pasteFromClipboard), [kbRegister, pasteFromClipboard]);
 
   // ── Approval (Confirmation) + question-dialog (QuestionDialog) actions ──────────
@@ -2576,7 +2630,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     setShowAllExpanded, setStaticEpoch, setTodoItems, setAttachCount, setStatus,
     setPlanMode, setGoal, setPickerIndex, setPickerOpen, setAutonomy, setEffort,
     setStyle, setVimEnabled, setVimMode, setThemeTick, setCustomStatus, setComposer,
-    pushLine, showBanner, exit, refreshStatusLine, copyLast, refreshRewindTurns,
+    pushLine, showToast, showBanner, exit, refreshStatusLine, copyLast, refreshRewindTurns,
     showResumeRecap, pushImage, loadCustomCommands,
     startTurnRef, kbLoadedRef, firstRef, answerOpenRef, committedRef, attachmentsRef,
     pastesRef, lastUsageRef, sessionCostRef, prevTurnCostRef, sessionInTokRef,
@@ -2682,7 +2736,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         // F10-01: a live /model switch or in-TUI fallback must carry the entry's P1A-04 stream
         // knobs + P1A-06 capability block exactly like bootstrap does — omitting them silently
         // reverted the idle watchdog to 120s and dropped the self-hosted contract mid-session.
-        ...entryStreamContract(entry),
+        ...entryStreamContract(entry, opts.cfg.stream),
         provider,
         model: entry.model,
         apiKey,
@@ -3242,6 +3296,15 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           // panel row is removed. A BACKGROUND agent has no such transcript row yet (its result
           // arrives later as a task-notification), so mark it done and LINGER — F10-02: it must stay
           // visible through completion, and clears on the next user turn (see startTurn).
+          // T1: a BACKGROUND sub-agent finishing has no transcript cue (its panel row just flips
+          // to done) — ping over the same channel as long turns, so a user who tabbed away while
+          // a delegated job ran is called back. Sync agents commit their result inline; no ping.
+          {
+            const bg = subAgentsRef.current.get(e.taskId);
+            if (bg?.background) {
+              emitNotification(opts.cfg.notify ?? 'auto', 'Shadow', `Sub-agent ${bg.subagentType} ${e.ok ? 'finished' : 'failed'}`, { isTTY: !!process.stdout.isTTY });
+            }
+          }
           setSubAgents((prev) => {
             const cur = prev.get(e.taskId);
             if (!cur) return prev;
@@ -3581,6 +3644,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         for (const [id, a] of prev) if (!a.done) m.set(id, a);
         return m;
       });
+      // T1: drop any stale transient toast — a "Theme → …" from the previous turn should not
+      // linger while a new turn streams. (The expiry timer is a backstop; this is the guarantee.)
+      if (toastTimerRef.current) {
+        clearTimeout(toastTimerRef.current);
+        toastTimerRef.current = null;
+      }
+      setToast(null);
       // Commit the finished turn's cost into the session total baseline, then reset
       // the per-turn cursors so the next turn's usage deltas accumulate from 0 (P1B-03).
       prevTurnCostRef.current = 0;
@@ -4021,6 +4091,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     todoStatus,
     effortStatus: ` · ${effortSymbol(effort)} ${effort}`,
     status,
+    // T1: context pressure rides on the same merged row as the usage text — the gauge appears
+    // exactly when the first usage event lands (there is nothing to measure before then).
+    contextPct: lastUsageRef.current ? Math.round(lastUsageRef.current.contextPct * 100) : undefined,
+    triggerRatio: opts.cfg.summarizeTriggerRatio,
   };
   // Refresh what the dynamic argument menus see, before the menu is built below.
   argCtxRef.current = {
@@ -4135,9 +4209,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     pinned: wantPinnedLine,
     queued: queued.length > 0 && !menuOpen,
     custom: !!customStatus,
+    toast: !!toast,
     strip: false, // Phase B: strip merged into composer hint (idle) / status line (running)
     composerInputRows,
   });
+  // T1: snapshot the fit + size so showToast can judge ladder headroom precisely (see its defn).
+  lastHudFitRef.current = hudFit;
+  terminalSizeRef.current = terminalSize;
   // Rows below the composer input for click-to-caret: bottom rule (1) + hint (if shown) + custom
   // status (if shown). When the slash menu is open below the composer, mark -1 so a click isn't
   // misread as caret placement. Read live by the mouse handler via belowComposerRef.
@@ -4188,6 +4266,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           16,
           layout.cols - PAGE_MARGIN * 2 - displayWidth(statusVerb) - displayWidth(statusPrefix) - statusSafetyPrefixCols - 6,
         ),
+        { warn: C.yellow, hot: C.red },
       )
     : '';
   const pickerRows = modelRows(opts.cfg);
@@ -4220,7 +4299,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // The hint row renders inside paddingLeft={PAGE_MARGIN} under wrap="truncate", so its usable
   // width is cols − PAGE_MARGIN, not cols — budget the strip (and the tail fits-check) against
   // that or its ctx/cost tail gets clipped mid-token within 4 columns of the edge.
-  const idleStrip = formatStatusStrip(stripInput, Math.max(16, layout.cols - PAGE_MARGIN - idleFixed - 1));
+  const idleStrip = formatStatusStrip(stripInput, Math.max(16, layout.cols - PAGE_MARGIN - idleFixed - 1), { warn: C.yellow, hot: C.red });
   const idleTail =
     layout.cols - PAGE_MARGIN - idleFixed - displayWidth(idleStrip) - 1 >= displayWidth(HINT_TAIL) ? HINT_TAIL : '';
   // The RUNNING branch carries the safety tags too: while a mid-turn approval/question overlay is up
@@ -4245,7 +4324,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           // columns and used to clip mid-token on narrow terminals. Each step keeps the two
           // things a running turn must tell you — you can steer, and Esc interrupts.
           layout.cols - PAGE_MARGIN - idleFixed >= 86
-          ? 'Type to steer · Enter steers · Option+Enter newline · Esc interrupts · Ctrl-C ×2 quits'
+          ? `Type to steer · Enter steers · ${NEWLINE_HINT} newline · Esc interrupts · Ctrl-C ×2 quits`
           : layout.cols - PAGE_MARGIN - idleFixed >= 45
             ? 'Type to steer · Enter steers · Esc interrupts'
             : 'steer · Esc interrupts'
@@ -4490,6 +4569,14 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       ) : null}
 
       <Box flexDirection="column" flexShrink={0} marginTop={hudFit.marginTop ? 1 : 0}>
+        {hudFit.toast && toast ? (
+          // T1 toast: transient ack (copy/paste/theme/style/autonomy) — a single tinted row at
+          // the top of the chrome group that replaces itself and expires in ~3.2s. NEVER commits
+          // to Static; fitHud budgets the row and drops it first-class on short terminals.
+          <Text wrap="truncate" color={toastColor(toast.kind, C)}>
+            {MARGIN_PAD + toast.text}
+          </Text>
+        ) : null}
         {/* Pending input — human messages steer at a safe boundary; commands/wakeups remain FIFO
             deferred. Visible so the user knows the input was accepted. */}
         {hudFit.queued ? (
