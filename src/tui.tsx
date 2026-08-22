@@ -12,7 +12,7 @@ import { supportsInlineImages, saveAndOpen, canOpenViewer } from './util/termIma
 import { extractCommittableUnits, clampTail, clampLiveRest, stripTrailingNewlines, dupKey, repeatStep, leadsWithBlock } from './tui/streamCommit.js';
 import { computeLayout, formatStatusStrip, pinnedMaxItems, composerMaxRows, fitHud, type HudFit } from './tui/layout.js';
 import { clampToastText, toastColor, TOAST_TTL_MS, type ToastKind } from './tui/toast.js';
-import { decideInstructionAutopilot, seedInstructionFile, autopilotToastText } from './tui/instructionAutopilot.js';
+import { decideInstructionAutopilot, seedInstructionFile, autopilotToastText, autopilotEnabledForBoot } from './tui/instructionAutopilot.js';
 import { IS_DARWIN, NEWLINE_HINT } from './tui/platform.js';
 import { PendingOverlay, ModelPickerOverlay } from './tui/overlays.js';
 import { buildSeats, resolveTableEntries, parseTableInput, seatTag, MIN_SEATS, MAX_SEATS, type Seat, type SpeakerTag } from './tui/roundTable.js';
@@ -2517,6 +2517,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   useEffect(() => {
     if (autopilotRanRef.current) return;
     autopilotRanRef.current = true;
+    if (!autopilotEnabledForBoot()) return; // node:test render tests must not seed the workspace
     const decision = decideInstructionAutopilot(opts.workspaceRoot);
     if (decision.action === 'none') return;
     const seed = decision.action === 'seed' ? seedInstructionFile(opts.workspaceRoot) : undefined;

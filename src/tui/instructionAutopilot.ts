@@ -90,6 +90,17 @@ export function seedInstructionFile(workspaceRoot: string): SeedResult {
   }
 }
 
+/**
+ * Whether the LAUNCH autopilot should run at all. The boot effect in the TUI checks
+ * this — it is skipped under node:test workers (NODE_TEST_CONTEXT is set by the test
+ * runner itself, never in production), so render tests that mount the full App can't
+ * seed SHADOW.md into the real workspace. The pure decide/seed functions are NOT
+ * guarded — unit tests exercise them directly against temp dirs.
+ */
+export function autopilotEnabledForBoot(): boolean {
+  return process.env.NODE_TEST_CONTEXT === undefined;
+}
+
 /** Render the T1 toast text for a decision (+ optional seed outcome). */
 export function autopilotToastText(decision: AutopilotDecision, seed?: SeedResult): string | null {
   switch (decision.action) {

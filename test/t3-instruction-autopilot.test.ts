@@ -10,6 +10,7 @@ import {
   decideInstructionAutopilot,
   seedInstructionFile,
   autopilotToastText,
+  autopilotEnabledForBoot,
 } from '../src/tui/instructionAutopilot.js';
 
 function tmp(): string {
@@ -116,4 +117,17 @@ test('toast: read → names the files being ingested', () => {
 
 test('toast: none → null (stay silent when SHADOW.md already rules)', () => {
   assert.equal(autopilotToastText({ action: 'none' }), null);
+});
+
+test('autopilotEnabledForBoot: false under node:test workers, true otherwise', () => {
+  // The boot effect in tui.tsx gates on this so render tests can never seed the
+  // real workspace. NODE_TEST_CONTEXT is what node --test itself injects.
+  assert.equal(autopilotEnabledForBoot(), false, 'inside a node:test worker');
+  const saved = process.env.NODE_TEST_CONTEXT;
+  delete process.env.NODE_TEST_CONTEXT;
+  try {
+    assert.equal(autopilotEnabledForBoot(), true, 'production boot (env unset)');
+  } finally {
+    process.env.NODE_TEST_CONTEXT = saved;
+  }
 });
