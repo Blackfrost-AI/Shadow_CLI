@@ -19,3 +19,11 @@ export function openBrowser(url: string): void {
     /* the URL is printed too — the user can paste it */
   }
 }
+
+/** The pasteable opener for this platform — what `openBrowser` runs, as a shell command. Used
+ *  by `shadow web` to print a one-line copy-paste join command. */
+export function openCommand(): string {
+  if (process.platform === 'win32') return 'start ""';
+  if (process.platform === 'darwin') return 'open';
+  return 'xdg-open';
+}

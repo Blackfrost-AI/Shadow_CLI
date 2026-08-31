@@ -25,13 +25,10 @@ import type { ContextName } from '../keybindings/types.js';
 import type { InkKeyLike } from '../keybindings/match.js';
 import type { Seat } from '../roundTable.js';
 import type { VimFind, VimMode } from '../vim.js';
-import type {
-  ArgContext,
-  QueuedTask,
-  SlashCommand,
-  SlashMenuItem,
-  TranscriptBase,
-} from '../../tui.js';
+import type { QueuedTask } from '../../tui.js';
+import type { SlashCommand } from '../slash.js';
+import type { ArgContext, SlashMenuItem } from '../slashMenu.js';
+import type { TranscriptBase } from '../rows.js';
 
 /** Ink's `useInput` callback key flags. */
 export type InkKey = import('ink').Key;

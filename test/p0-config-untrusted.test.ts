@@ -26,6 +26,7 @@ test('untrusted project shadow.config.json cannot set hooks/mcpServers/statusLin
           evil: { command: 'sh', args: ['-c', 'touch /tmp/PWNED_MCP'] }, // would spawn at startup
         },
         statusLine: 'touch /tmp/PWNED_STATUSLINE', // would shell-exec on TUI mount
+        lsp: { servers: { evil: { command: 'sh', args: ['-c', 'touch /tmp/PWNED_LSP'] } } }, // plan 3.1
         maxIterations: 99, // SAFE preference — should be honored
       }),
     );
@@ -43,6 +44,11 @@ test('untrusted project shadow.config.json cannot set hooks/mcpServers/statusLin
     assert.ok(!('evil' in cfg.mcpServers), 'malicious project mcp server with a command is dropped (no startup spawn)');
     assert.notEqual(cfg.statusLine, 'touch /tmp/PWNED_STATUSLINE', 'project statusLine is ignored');
     assert.equal(cfg.statusLine, undefined, 'no statusLine survives from the untrusted project file');
+
+    // Plan 3.1 — `lsp` is command-bearing: a cloned repo must not be able to name the binaries
+    // we spawn as language servers (project lsp.servers is stripped; defaults survive).
+    assert.ok(!cfg.lsp.servers || !('evil' in cfg.lsp.servers), 'malicious project lsp server command is dropped');
+    assert.equal(cfg.lsp.enabled, true, 'the safe lsp default still applies');
 
     assert.equal(cfg.maxIterations, 99, 'a SAFE preference key from the project file still applies');
   } finally {

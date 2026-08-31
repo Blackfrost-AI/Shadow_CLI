@@ -15,6 +15,7 @@ import { BgRegistry } from '../tools/bgShell.js';
 import {
   makeAskUserQuestionTool,
   makeEnterPlanModeTool,
+  makeMissionUpdateTool,
   makeExitPlanModeTool,
   makePlanWriteTool,
   makeSkillTool,
@@ -46,6 +47,7 @@ import { applyRetention } from '../state/retention.js';
 import { makeMemoryTool } from '../tools/memory.js';
 import { TodoList } from './todo.js';
 import { PlanModeState } from './planMode.js';
+import { MissionState, readMissionSnapshot } from './mission.js';
 import { buildStyledSystem } from './system.js';
 import { setCustomStyles } from './styles.js';
 import { discoverCustomStyles } from './outputStyles.js';
@@ -122,6 +124,8 @@ export interface AgentSession {
   memory: ProjectMemory;
   todoList: TodoList;
   planMode: PlanModeState;
+  /** Session /goal mission (lead loop only — sub-agents never receive it). */
+  mission: MissionState;
   wakeup: WakeupScheduler;
   skills: SkillEntry[];
   facts: string;
@@ -475,6 +479,11 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   registry.register(makePlanWriteTool(planMode));
   registry.register(makeExitPlanModeTool(planMode));
   registry.register(makeEnterPlanModeTool(planMode));
+  // /goal mission state (Sprint 3 item 3.2): the lead agent's orchestrator view. The
+  // loop pins mission.block() into the system prompt; mission_update is the only writer.
+  // Registry-shared into sub-agent loops, but the ctx.nestedAgent guard makes it inert there.
+  const mission = new MissionState();
+  registry.register(makeMissionUpdateTool(mission));
   registry.register(makeAskUserQuestionTool());
   if (skills.length) registry.register(makeSkillTool(skills));
   registry.register(makeToolSearch(registry));
@@ -522,6 +531,18 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   let context: Context;
   if (opts.resumeSessionPath) {
     ({ context } = resumeSession(opts.resumeSessionPath, contextOpts));
+    // /goal mission survives resume: the last mission event in the OLD session log is
+    // authoritative (a trailing `clear` rehydrates nothing). Best-effort — a missing or
+    // unreadable log resumes mission-less, never blocks startup.
+    try {
+      const restored = readMissionSnapshot(opts.resumeSessionPath);
+      if (restored) {
+        mission.restore(restored);
+        write(`Mission resumed: ${restored.mission} (${restored.phase}${restored.tasks.length ? `, ${restored.tasks.length} task(s)` : ''}).\n`);
+      }
+    } catch {
+      /* best-effort */
+    }
     write(`Resumed session ${opts.resumeSessionPath} (${context.messages().length} messages in context).\n`);
     // Background sub-agent recovery note (tasks captured via extended snapshot)
     const recoveredTasks = (context as any)._subAgentTasks || [];
@@ -621,6 +642,7 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     memory,
     todoList,
     planMode,
+    mission,
     wakeup,
     skills,
     facts,

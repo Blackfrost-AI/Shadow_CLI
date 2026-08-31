@@ -21,6 +21,8 @@ import { cycleEffort, effortDescription, effortSymbol, normalizeEffort } from '.
 import type { EventBus } from '../agent/events.js';
 import type { AgentLoop } from '../agent/loop.js';
 import type { PlanSnapshot } from '../agent/planMode.js';
+import type { MissionSnapshot } from '../agent/mission.js';
+import { missionStatusLines } from './missionHud.js';
 import type { TodoItem } from '../agent/todo.js';
 import { buildCodexAuthUrl, clearSubAuth, getSubAuth, importOfficialCredential, type SubProvider } from '../auth/index.js';
 import { vaultExists } from '../auth/vault.js';
@@ -61,7 +63,8 @@ import { C, THEMES, THEME_DESCRIPTIONS, THEME_NAMES, applyTheme, backgroundSeque
 import type { ToastKind } from './toast.js';
 import { NEWLINE_HINT } from './platform.js';
 import type { VimFind, VimMode } from './vim.js';
-import type { BannerLine, TranscriptBase, TuiOpts } from '../tui.js';
+import type { BannerLine, TranscriptBase } from './rows.js';
+import type { TuiOpts } from '../tui.js';
 
 export interface SlashCommand {
   name: string;
@@ -80,7 +83,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/keybindings', desc: 'Show / customize keybindings (/keybindings init writes a starter config)' },
   { name: '/clear', desc: 'Clear the screen and reset the conversation' },
   { name: '/new', desc: 'Start a fresh conversation (alias for /clear)' },
-  { name: '/goal', desc: 'Set a standing goal the model works toward (/goal clear to remove)' },
+  { name: '/goal', desc: 'Start a mission: plan → tasks → verify (/goal = status, /goal clear = end)' },
   { name: '/model', desc: 'Switch, list, add, remove, enable, disable, or test (capability check) model presets' },
   { name: '/table', desc: 'Collaboration Mode (experimental): /table <model> <model> — a live round-table; @handle to route, /table done to end' },
   { name: '/provider', desc: 'Show active provider, endpoint, auth status, and model presets' },
@@ -89,6 +92,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/style', desc: 'Cycle output style' },
   { name: '/output-style', desc: 'Cycle output style (alias for /style)', dispatch: '/style' },
   { name: '/autonomy', desc: 'Cycle autonomy: manual → auto-read → auto-edit → full' },
+  { name: '/plan', desc: 'Toggle plan mode (reads free, writes held): /plan [on|off|status]' },
   { name: '/compact', desc: 'Summarize earlier turns to free up context' },
   { name: '/summary', desc: 'Summarize earlier turns to free up context (alias for /compact)', dispatch: '/compact' },
   { name: '/fast', desc: 'Toggle Anthropic fast mode (lower latency, no extended thinking)' },
@@ -98,7 +102,7 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/stats', desc: 'Show session token usage and cost (alias for /cost)', dispatch: '/cost' },
   { name: '/context', desc: 'Show context-window usage' },
   { name: '/connections', desc: 'Show the egress receipt: every host Shadow reached this session, why, allowed/denied' },
-  { name: '/export', desc: 'Export session to markdown (optional path)' },
+  { name: '/export', desc: 'Export session to markdown or HTML ("html" first arg, optional path)' },
   { name: '/copy', desc: 'Copy the last answer to the clipboard (/copy code → last code block); Alt+C' },
   { name: '/session', desc: 'Show current session id, log path, and message count' },
   { name: '/sessions', desc: 'List resumable sessions in this workspace (/resume <id> to load one)' },
@@ -284,7 +288,8 @@ function helpLines(topic: HelpTopic): BannerLine[] {
       { text: '  ↑/↓ move through a multi-line draft; at its edges they browse history.', dimColor: true },
       { text: 'Navigate', color: C.purple, bold: true },
       { text: '  / opens commands  ·  ↑/↓ select  ·  Tab completes  ·  Esc closes', dimColor: true },
-      { text: '  Shift+Tab changes mode  ·  Ctrl+O folds details  ·  Ctrl+T expands tasks', dimColor: true },
+      { text: '  Shift+Tab toggles plan mode  ·  Ctrl+X M model picker  ·  Tab cycles mode', dimColor: true },
+      { text: '  Ctrl+O folds details  ·  Ctrl+T expands tasks  ·  Alt+C copies last answer', dimColor: true },
       { text: 'While Shadow works', color: C.purple, bold: true },
       { text: '  Keep typing and press Enter to steer the active turn  ·  Esc interrupts', dimColor: true },
       { text: '  State-changing slash commands wait until the current turn ends.', dimColor: true },
@@ -304,7 +309,7 @@ function helpLines(topic: HelpTopic): BannerLine[] {
     { text: '  Model      /model  /local  /provider  /effort', dimColor: true },
     { text: '  Agent      /goal  /autonomy  /permissions  /tasks', dimColor: true },
     { text: '  Workspace  /diff  /files  /branch  /review', dimColor: true },
-    { text: `Keys: Enter send · ${NEWLINE_HINT} newline · Shift+Tab mode · Esc interrupt · Ctrl+C twice to quit`, dimColor: true },
+    { text: `Keys: Enter send · ${NEWLINE_HINT} newline · Shift+Tab plan mode · Ctrl+X M model · Esc interrupt · Ctrl+C twice to quit`, dimColor: true },
     { text: 'Approvals: y once · n deny · s session · f shell prefix · a raise autonomy', dimColor: true },
     { text: 'More: /help keys for shortcuts · /help all for every command · type / to search', dimColor: true },
   ];
@@ -334,7 +339,6 @@ export interface SlashCtx {
   setAttachCount: Dispatch<SetStateAction<number>>;
   setStatus: Dispatch<SetStateAction<string>>;
   setPlanMode: Dispatch<SetStateAction<PlanSnapshot>>;
-  setGoal: Dispatch<SetStateAction<string | null>>;
   setPickerIndex: Dispatch<SetStateAction<number>>;
   setPickerOpen: Dispatch<SetStateAction<boolean>>;
   setAutonomy: (l: AutonomyLevel) => void;
@@ -376,7 +380,9 @@ export interface SlashCtx {
   sessionTurnsRef: { current: number };
   costWarnedRef: { current: boolean };
   fileListLoadedRef: { current: boolean };
-  goalRef: { current: string | null };
+  missionRef: { current: MissionSnapshot | null };
+  /** Queue a deferred turn while one runs (the /goal begin-while-running path). */
+  queueDeferred: (text: string) => void;
   startTableRef: { current: ((arg: string) => void) | null };
   currentRef: { current: { provider: string; model: string } };
   selectModelRef: { current: ((entry: ModelEntry) => Promise<void>) | null };
@@ -420,7 +426,7 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
   const {
     setLine, setMenuIndex, setStreamNow, setThinkNow, clearToolLine, dropStreamedUnits, setCommitted,
     setShowAllExpanded, setStaticEpoch, setTodoItems, setAttachCount, setStatus,
-    setPlanMode, setGoal, setPickerIndex, setPickerOpen, setAutonomy, setEffort,
+    setPlanMode, setPickerIndex, setPickerOpen, setAutonomy, setEffort,
     setStyle, setVimEnabled, setVimMode, setThemeTick, setCustomStatus, setComposer,
     pushLine, showBanner, exit, refreshStatusLine, copyLast, refreshRewindTurns,
     showToast,
@@ -428,12 +434,12 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
     startTurnRef, kbLoadedRef, firstRef, answerOpenRef, committedRef, attachmentsRef,
     pastesRef, lastUsageRef, sessionCostRef, prevTurnCostRef, sessionInTokRef,
     sessionOutTokRef, prevTurnInTokRef, prevTurnOutTokRef, sessionTurnsRef,
-    costWarnedRef, fileListLoadedRef, goalRef, startTableRef, currentRef,
+    costWarnedRef, fileListLoadedRef, missionRef, startTableRef, currentRef,
     selectModelRef, asyncCommandRef, providerRef, activeTargetRef, styleRef,
     autonomyRef, loopRef, effortRef, runningRef, compactingRef, compactAbortRef,
     sessionLogRef, sessionApprovalsRef, rewindableTurnsRef, additionalRootsRef,
     statusLineRef, vimEnabledRef, vimPendingRef, vimFindRef, vimCountRef, vimRegRef,
-    flushQueueRef, runOneRef, repaintFromContextRef,
+    flushQueueRef, runOneRef, repaintFromContextRef, queueDeferred,
     context, opts, bus, subAgents, todoItems,
   } = ctx;
   setLine('');
@@ -540,17 +546,44 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
       opts.planMode?.exit();
       setPlanMode({ mode: 'implement' }); // drop any stale plan title
       showBanner();
-      pushLine({ text: 'Cleared — conversation reset. (goal kept — use /goal clear to drop it)', dimColor: true });
+      pushLine({ text: 'Cleared — conversation reset. (mission kept — use /goal clear to drop it)', dimColor: true });
       break;
     case '/goal': {
+      // Mission mode (8.4): /goal <text> starts a REAL mission — plan mode engages, a
+      // kickoff turn runs, and the harness pins the mission + tasks in front of the model
+      // every turn until done/failed or /goal clear. No arg = status, 'clear' = end.
       if (!arg) {
-        pushLine({ text: goalRef.current ? `Goal: ${goalRef.current}` : 'No goal set. Use /goal <text> to set one, /goal clear to remove.', dimColor: true });
+        for (const line of missionStatusLines(missionRef.current)) {
+          pushLine({ text: line, dimColor: !missionRef.current?.active });
+        }
       } else if (arg.toLowerCase() === 'clear') {
-        setGoal(null);
-        pushLine({ text: 'Goal cleared.', dimColor: true });
+        if (!opts.mission) {
+          pushLine({ text: 'Mission state unavailable in this session.', color: C.red });
+          break;
+        }
+        const had = missionRef.current?.active === true;
+        opts.mission.clear();
+        if (had) pushLine({ text: 'Mission cleared.', dimColor: true });
+        else pushLine({ text: 'No mission active.', dimColor: true });
       } else {
-        setGoal(arg);
-        pushLine({ text: `Goal set: ${arg}`, color: C.purple });
+        if (!opts.mission) {
+          pushLine({ text: 'Mission state unavailable in this session.', color: C.red });
+          break;
+        }
+        opts.mission.begin(arg);
+        // Enter plan mode with it: missions start with an approved plan (the plan's tasks
+        // become the mission list on approval). Drive the state object — the bus event
+        // updates the HUD, so UI and truth cannot disagree (the /plan lesson).
+        opts.planMode?.enter();
+        pushLine({ text: `Mission started: ${arg}`, color: C.purple });
+        pushLine({ text: 'Plan mode on — write the plan (plan_write, include tasks), then exit_plan_mode for approval.', dimColor: true });
+        const kickoff = `[mission] ${arg}\nBegin the planning phase: explore as needed, write the plan with plan_write (include a tasks array), then call exit_plan_mode for approval.`;
+        if (runningRef.current) {
+          queueDeferred(kickoff);
+          pushLine({ text: '  ⏳ mission kickoff queued — runs when this turn ends', dimColor: true });
+        } else {
+          runOneRef.current?.(kickoff);
+        }
       }
       break;
     }
@@ -913,6 +946,46 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
       setAutonomy(next);
       loopRef.current?.setAutonomy(next);
       showToast(`Autonomy → ${next}`, 'ok');
+      break;
+    }
+    case '/plan': {
+      // Runtime plan-mode toggle (1.2) — Shift+Tab is the key form; this is the explicit form
+      // with idempotent on/off/status. Driving PlanModeState (not just React state) keeps the
+      // badge, the system-prompt block, and the write gate in agreement (/clear's D2 rule).
+      const pm = opts.planMode;
+      if (!pm) {
+        pushLine({ text: 'Plan mode is not available in this session.', dimColor: true });
+        break;
+      }
+      const req = arg.trim().toLowerCase();
+      if (req && req !== 'on' && req !== 'off' && req !== 'status') {
+        pushLine({ text: 'Usage: /plan [on|off|status] — no argument toggles.', dimColor: true });
+        break;
+      }
+      if (req === 'status') {
+        const snap = pm.snapshot();
+        pushLine({
+          text: snap.mode === 'planning'
+            ? `Plan mode ON${snap.title ? ` — ${snap.title}` : ''} · reads free, writes held · /plan off to resume`
+            : 'Plan mode off · writes allowed · /plan on to start planning',
+          dimColor: true,
+        });
+        break;
+      }
+      const want = req === 'on' ? true : req === 'off' ? false : !pm.active;
+      if (want === pm.active) {
+        pushLine({ text: want ? 'Plan mode is already on.' : 'Plan mode is already off.', dimColor: true });
+        break;
+      }
+      if (want) {
+        pm.enter();
+        showToast('Plan mode on — reads free, writes held (/plan off to resume)', 'ok');
+      } else {
+        pm.exit();
+        setAutonomy('manual'); // leaving plan restarts at the cautious end of the ring
+        loopRef.current?.setAutonomy('manual');
+        showToast('Plan mode off — writes allowed, autonomy → manual', 'ok');
+      }
       break;
     }
     case '/fast': {
@@ -1532,12 +1605,16 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
       break;
     }
     case '/export': {
-      const outArg = arg;
+      // `/export [path]` → markdown (existing); `/export html [path]` → standalone HTML.
+      const [first, ...rest] = arg.split(/\s+/);
+      const html = first?.toLowerCase() === 'html';
+      const outArg = html ? rest.join(' ') : arg;
       try {
         const { path, bytes } = exportSession({
           sessionPath: sessionLogRef.current.path,
           workspaceRoot: opts.workspaceRoot,
           outPath: outArg || undefined,
+          format: html ? 'html' : 'markdown',
           meta: {
             version: opts.version,
             workspaceRoot: opts.workspaceRoot,
@@ -1600,7 +1677,7 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
           { text: `id: ${id}`, color: C.cyan },
           { text: `messages: ${messages.toLocaleString()} · style ${styleRef.current} · autonomy ${autonomyRef.current}`, dimColor: true },
           { text: `log: ${sessionLogRef.current.path ? shortPath(sessionLogRef.current.path) : 'not available'}`, dimColor: true },
-          { text: 'Use /export to save a markdown transcript, /resume to load an earlier session.', dimColor: true },
+          { text: 'Use /export to save a markdown or HTML transcript, /resume to load an earlier session.', dimColor: true },
         ],
       });
       break;
@@ -1669,7 +1746,9 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
                 color: C.yellow,
               }
             : { text: `sandbox ${sandboxConfinement(opts.cfg.sandbox)}`, dimColor: true },
-          ...(goalRef.current ? [{ text: `goal: ${goalRef.current}`, color: C.purple }] : []),
+          ...(missionRef.current?.active
+            ? [{ text: `mission: ${missionRef.current.mission} (${missionRef.current.phase})`, color: C.purple }]
+            : []),
         ],
       });
       break;

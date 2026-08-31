@@ -10,6 +10,7 @@ import { clampToastText, toastColor, TOAST_TTL_MS, TOAST_INDENT } from '../src/t
 import { displayWidth as displayWidthOf } from '../src/util/width.js';
 import { formatContextGauge, gaugeLevel, GAUGE_FILLED, GAUGE_EMPTY, GAUGE_TRIGGER } from '../src/tui/gauge.js';
 import { fitHud, formatStatusStrip, type StatusStripInput } from '../src/tui/layout.js';
+import { PAGE_MARGIN, MARGIN_PAD } from '../src/tui/chrome.js';
 
 // ── toast.clampToastText ────────────────────────────────────────────────────
 
@@ -61,12 +62,13 @@ test('TOAST_TTL_MS is the documented ~3.2s window', () => {
 test('TOAST_INDENT equals the page margin the render side actually indents with', () => {
   // The chrome group prefixes PAGE_MARGIN spaces to the toast text. If this drifts, the
   // clamped row becomes 1+ cols too wide and Ink's truncate clips the ellipsis.
-  const src = readFileSync(new URL('../src/tui.tsx', import.meta.url), 'utf8');
-  const pm = src.match(/const PAGE_MARGIN = (\d+)/);
-  assert.ok(pm, 'PAGE_MARGIN definition found');
-  assert.equal(TOAST_INDENT, Number(pm?.[1]), 'clamp indent must match the render indent');
+  // PAGE_MARGIN moved to tui/chrome.tsx in plan 2.4 — importing it ties this assertion to the
+  // live constant instead of a source grep that goes stale on the next extraction.
+  assert.equal(TOAST_INDENT, PAGE_MARGIN, 'clamp indent must match the render indent');
+  assert.equal(MARGIN_PAD, ' '.repeat(PAGE_MARGIN), 'the render indent is the page margin as spaces');
   // And the render site must indent the toast by the page margin (guard against a future
-  // rewrite dropping the indent; MARGIN_PAD is ' '.repeat(PAGE_MARGIN) in tui.tsx).
+  // rewrite dropping the indent).
+  const src = readFileSync(new URL('../src/tui.tsx', import.meta.url), 'utf8');
   assert.match(src, /MARGIN_PAD \+ toast\.text/, 'toast row is still indented by the page margin');
 });
 

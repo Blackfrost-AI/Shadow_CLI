@@ -625,8 +625,8 @@ test('hint-only guard: "/goal " ⏎ submits the bare command — never auto-runs
   stdin.write('\r'); // no partial typed, no navigation — the menu is only a hint here
   await tick();
   const out = strip(frames.join('\n'));
-  assert.match(out, /No goal set/, 'bare /goal ran (status readout)');
-  assert.doesNotMatch(out, /Goal cleared/, '"clear" did NOT fire itself');
+  assert.match(out, /No mission active/, 'bare /goal ran (status readout)');
+  assert.doesNotMatch(out, /Mission cleared/, '"clear" did NOT fire itself');
   unmount();
 });
 

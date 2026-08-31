@@ -6,6 +6,7 @@ import { resolveWithin } from '../safety/workspaceJail.js';
 import { applyStringEdit, nearestMatch, atomicWrite } from './util.js';
 import { diffLines } from '../util/diff.js';
 import { saveCheckpoint } from '../state/checkpoints.js';
+import { formatAfterWrite } from '../agent/formatter.js';
 
 const inputSchema = z.object({
   path: z
@@ -140,6 +141,11 @@ export const editFile: Tool<EditFileInput, EditFileData> = {
       return fail('edit_file', 'write', Date.now() - start, 'write_failed', `write failed: ${(e as Error).message}`);
     }
 
+    // Auto-format after write (plan 2.1, v1). Before the readTracker marks (so the recorded
+    // mtime includes the formatter's rewrite); never fails the edit — errors ride back as a
+    // one-line note on the summary.
+    const formatNote = await formatAfterWrite(abs, ctx);
+
     ctx.readTracker?.markRead(abs);
     ctx.readTracker?.markSeen(abs); // edited by us → still known for subsequent edits
 
@@ -147,7 +153,7 @@ export const editFile: Tool<EditFileInput, EditFileData> = {
       'edit_file',
       'write',
       Date.now() - start,
-      `Edited "${input.path}" — replaced ${result.count} occurrence(s)${via}.`,
+      `Edited "${input.path}" — replaced ${result.count} occurrence(s)${via}.${formatNote ? `\n${formatNote}` : ''}`,
       { path: abs, replacements: result.count },
     );
     const diff = diffLines(text, result.updated); // UI-only; rides on meta, not the model result

@@ -22,6 +22,9 @@ const RAW_DEFAULTS: Record<ContextName, Record<string, string>> = {
   Chat: {
     enter: 'chat:submit',
     'shift+tab': 'chat:cycleMode',
+    // One-key model switch (1.3): an opencode-style leader chord opens the fuzzy model picker —
+    // /model stays the explicit path. The registered handler mirrors /model's idle behavior.
+    'ctrl+x m': 'chat:openModelPicker',
     up: 'chat:historyPrevious',
     down: 'chat:historyNext',
     escape: 'chat:cancel',
@@ -119,7 +122,8 @@ export const KNOWN_ACTION_IDS: ReadonlySet<string> = new Set([...KEYBINDING_ACTI
  */
 export const UNMIGRATED_ACTIONS: ReadonlySet<string> = new Set([
   'chat:submit',
-  'chat:cycleMode',
+  // 'chat:cycleMode' migrated (1.2): Shift+Tab toggles plan mode via its registered handler,
+  // with a raw-byte fallback in the composer owner for terminals that drop Ink's shift flag.
   'chat:historyPrevious',
   'chat:historyNext',
   'chat:cancel',

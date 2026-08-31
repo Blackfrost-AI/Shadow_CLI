@@ -271,6 +271,18 @@ const ConfigSchema = z.object({
   // additionalDirectories on the wire — that was a total allowlist bypass (every deny rule is
   // written against `path`; resolveWithin treats every root as equally authoritative).
   projects: z.array(ProjectEntrySchema).default([]),
+  // Loopback web console (`shadow web` and the `--web` mirror). GLOBAL-only — `web` is in
+  // PROJECT_UNTRUSTED_KEYS, so a cloned repo cannot pin the console's bearer token (a known
+  // token would let any process on this machine drive your allowlisted projects).
+  web: z
+    .object({
+      // Stable bearer token. When set, every `shadow web` boot uses it, so a saved URL keeps
+      // working across restarts (no rotation dance); when unset, a fresh random token is minted
+      // per boot. Validated at server start (min 16 chars, no whitespace/control chars — see
+      // resolveWebToken in src/web/server.ts); an invalid value fails the boot, not the parse.
+      token: z.string().optional(),
+    })
+    .default({}),
   models: z.array(ModelEntrySchema).default([]), // selectable presets for the `/model` picker
   fallbackModel: z.string().optional(), // global fallback when primary model fails
   lastModel: z.string().optional(), // label of the last model chosen via the picker
@@ -322,6 +334,46 @@ const ConfigSchema = z.object({
   /** Rule-based permission classifier stub (NOT LLM). Extends auto-read with finer gating. */
   autoClassifier: z.boolean().default(false),
   dryRun: z.boolean().default(false),
+
+  // Auto-format after writes (plan 2.1): after a successful write/edit by the agent's file
+  // tools, run the project's detected formatter (prettier/biome/ruff/gofmt/rustfmt/shfmt) on
+  // that file. A formatter failure never fails the write — at most a one-line note is appended
+  // to the tool result. Kill switch: SHADOW_NO_FORMAT=1. See src/agent/formatter.ts.
+  formatters: z
+    .object({
+      enabled: z.boolean().default(true),
+      // Extension-like key (".ts" or "ts") → formatter to run for that extension, or "off"
+      // to skip formatting those files entirely. Overrides project detection.
+      overrides: z
+        .record(z.string(), z.enum(['prettier', 'biome', 'ruff', 'gofmt', 'rustfmt', 'shfmt', 'off']))
+        .default({}),
+    })
+    .default({}),
+  // LSP diagnostics after writes (plan 3.1): after a successful write/edit by the agent's file
+  // tools, diagnostics from the project's own language servers (the local node_modules tsserver,
+  // or pyright/gopls/rust-analyzer already on PATH — detected, NEVER installed) are appended to
+  // the tool result as a deduped, budget-capped note. An LSP problem never fails the write and
+  // never wedges the turn. Kill switch: SHADOW_NO_LSP=1. See src/agent/lsp/.
+  lsp: z
+    .object({
+      enabled: z.boolean().default(true), // no-op until a server is detected
+      timeoutMs: z.number().int().min(100).max(30_000).default(3_000),
+      // Server id → command override. GLOBAL CONFIG ONLY (`lsp` is in PROJECT_UNTRUSTED_KEYS):
+      // a cloned repo must not be able to name commands we spawn.
+      servers: z.record(z.object({ command: z.string(), args: z.array(z.string()).default([]) })).default({}),
+      // Spawn servers found in the PROJECT'S OWN node_modules (its typescript/tsserver.js)?
+      // Default false: that file is repo content — executing it must be the user's call, made
+      // here in trusted global config, never in a cloned repo. PATH-detected servers (and
+      // `servers` overrides above) never need this.
+      trustNodeModules: z.boolean().default(false),
+      notes: z
+        .object({
+          maxTurnChars: z.number().int().min(0).default(8_000),
+          maxSessionChars: z.number().int().min(0).default(60_000),
+        })
+        .default({}),
+    })
+    .default({}),
   // OPT-IN update discovery. OFF by default (zero-telemetry stance): when true, at most once a day on
   // launch Shadow does a plain payload-free GET of the PUBLIC version and prints one line if a newer
   // release exists. Never sends anything about the user. See src/update/checkUpdate.ts.
@@ -457,6 +509,15 @@ const ConfigSchema = z.object({
       maxTotalTokens: z.number().int().positive().optional(),
       maxCostUSD: z.number().positive().optional(),
       maxWallClockSec: z.number().positive().optional(),
+      // Spend guardrails (soft): warn once at warnRatio, then pause and ask via the
+      // approval seam; approve grants exactly one more allowance window (same limits
+      // again), deny ends the run gracefully. Distinct from the hard ceilings above:
+      // maxCostUSD stops unconditionally and is never negotiable. NOTE the deliberate
+      // case split — `maxCostUSD` (hard) vs `maxCostUsd` (soft): flagged for a naming
+      // review, but kept as specced for now. Absent = no guardrails.
+      maxSteps: z.number().int().positive().optional(),
+      maxCostUsd: z.number().positive().optional(),
+      warnRatio: z.number().positive().max(1).default(0.8),
     })
     .default({}),
 
@@ -533,7 +594,10 @@ const CONFIG_FILE = 'shadow.config.json';
 // could still sweep every log into .archive the moment a session starts in it — history a
 // user may want must not be movable by an untrusted file, so the keys come only from
 // ~/.shadow (global), env, or CLI flags.
-const PROJECT_UNTRUSTED_KEYS = ['baseUrl', 'selfHosted', 'shellEnvAllowlist', 'autonomy', 'denylistExtra', 'systemPromptPath', 'sandbox', 'sandboxNetwork', 'sandboxFailurePolicy', 'egress', 'additionalDirectories', 'projects', 'offline', 'hooks', 'statusLine', 'vision', 'permissionRules', 'diagnostics', 'pluginIndexUrl', 'pluginIndexKey', 'profiles', 'sessionRetentionDays', 'sessionRetentionKeep'];
+// `web` carries the console's bearer token (`web.token`) — a repo-pinned token is known to
+// whoever wrote the repo, and the token is the last factor after Host/Origin, so it is
+// global-only alongside `projects` (the filesystem allowlist).
+const PROJECT_UNTRUSTED_KEYS = ['baseUrl', 'selfHosted', 'shellEnvAllowlist', 'autonomy', 'denylistExtra', 'systemPromptPath', 'sandbox', 'sandboxNetwork', 'sandboxFailurePolicy', 'egress', 'additionalDirectories', 'projects', 'web', 'offline', 'hooks', 'statusLine', 'vision', 'permissionRules', 'diagnostics', 'lsp', 'pluginIndexUrl', 'pluginIndexKey', 'profiles', 'sessionRetentionDays', 'sessionRetentionKeep'];
 
 /**
  * Layered precedence: CLI flags > env > active profile > project config file (de-fanged) >

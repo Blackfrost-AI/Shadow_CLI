@@ -8,6 +8,7 @@ import type { Budget } from './budget.js';
 import type { Context } from './context.js';
 import type { TodoList } from './todo.js';
 import type { PlanModeState } from './planMode.js';
+import type { MissionState } from './mission.js';
 import type { SessionLog as SessionLogType } from '../state/session.js';
 import { resolveParallelTools } from '../config/familyProfiles.js';
 import { sandboxToolAvailable } from '../safety/sandbox.js';
@@ -39,6 +40,8 @@ export interface LoopDepsInput {
   forceConfirm?: (call: ToolCall, risk: string) => string | null;
   todoList?: TodoList;
   planMode?: PlanModeState;
+  /** Lead-loop only — the sub-agent factory deliberately omits it (delegates don't see the mission). */
+  mission?: MissionState;
   /** TUI streams shell output; headless and sub-agents do not. */
   streamShell: boolean;
   sessionLog?: SessionLogType;
@@ -75,6 +78,7 @@ export function buildLoopDeps(input: LoopDepsInput): LoopDeps {
     forceConfirm: input.forceConfirm,
     todoList: input.todoList,
     planMode: input.planMode,
+    mission: input.mission,
     streamShell: input.streamShell,
     sessionLog: input.sessionLog,
     approvals: input.approvals,
@@ -95,6 +99,16 @@ export function buildLoopDeps(input: LoopDepsInput): LoopDeps {
     autoClassifier: cfg.autoClassifier,
     hooks: cfg.hooks,
     diagnostics: cfg.diagnostics,
+    // Auto-format after writes (plan 2.1): config block threaded to the file tools. Sub-agents
+    // inherit it via agentTool's `...base` spread.
+    formatters: cfg.formatters,
+    // LSP diagnostics after writes (plan 3.1): config block for the loop-level fold-in. The
+    // servers themselves are cached per workspace root (src/agent/lsp/index.ts), so this block
+    // seeds the service once and every later call reuses the warmed children.
+    lsp: cfg.lsp,
+    // Spend guardrails (plan 2.3): the soft step/cost budget, when configured. Derived here so
+    // headless, TUI, and sub-agent call sites all get it identically.
+    spendGuard: cfg.budget,
     // P2-12 — confinement-aware approval escalation. `sandbox: 'off'` is set by index.ts for
     // --no-sandbox/--yolo/unrestricted/full-autonomy (an EXPLICIT waiver → undefined, no
     // escalation). Otherwise the truth is whether this host has the tool to confine with.

@@ -113,3 +113,24 @@ if [ -f package.json ]; then
   esac
   echo "release-gate OK: test script globs all TS + TSX tests (quoted for node, not sh) with a timeout."
 fi
+
+# --- docs must name the shipping version (1.6) --------------------------------------------
+# The README advertised v8.0.2 while package.json shipped 8.3.1 — three releases of rot that
+# undercut every quality claim. The README "Current build" line is what users and the mirror
+# sync meet first; at release time it must name the version being published.
+if [ -f package.json ] && [ -f README.md ]; then
+  PKG_VER="$(node -p "require('./package.json').version" 2>/dev/null || echo "")"
+  # FIRST vX.Y.Z token on the line is authoritative: the line may recount prior versions later
+  # (a greedy match would extract the last one and pass a stale build). Keep the current
+  # version first: `Current build: vX.Y.Z — …`.
+  README_VER="$(grep -m1 'Current build:' README.md | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 | cut -c2-)"
+  if [ -z "$PKG_VER" ] || [ -z "$README_VER" ] || [ "$PKG_VER" != "$README_VER" ]; then
+    echo "RELEASE BLOCKED (1.6): README 'Current build' does not match package.json." >&2
+    echo "  package.json: ${PKG_VER:-<unreadable>}" >&2
+    echo "  README.md:    ${README_VER:-<no 'Current build:' version found>}" >&2
+    echo "Fix: update README.md's 'Current build' line and HANDOFF.md §0 to v$PKG_VER," >&2
+    echo "  then rerun. Docs that name a stale build undercut every other quality gate." >&2
+    exit 1
+  fi
+  echo "release-gate OK: README 'Current build' matches package.json (v$PKG_VER)."
+fi

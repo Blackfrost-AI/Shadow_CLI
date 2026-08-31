@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
 import { render, Box, Text, Static, useApp, useInput, useStdin, useStdout } from 'ink';
-import { flattenItemCached, itemIsCollapsible, computeToolRunsAppendable, type ToolRunsCache } from './tui/flatten.js';
-import type { ToolRun } from './tui/rows.js';
+import { itemIsCollapsible, computeToolRunsAppendable, type ToolRunsCache } from './tui/flatten.js';
+import { type BannerLine, type TranscriptItem } from './tui/rows.js';
 import { collapseKind, displayToolArg, displayToolName, formatReconSummary, isCollapsibleTool, isWriteTool, reconCount, type CollapseKind } from './tui/toolDisplay.js';
 import { renderSubAgentPanel, type SubAgentView } from './tui/subagentPanel.js';
 import { emitNotification, NOTIFY_MIN_TURN_MS, NOTIFY_APPROVAL_WAIT_MS } from './util/notify.js';
@@ -23,23 +23,21 @@ import type { ToolRegistry } from './tools/registry.js';
 import { EventBus, type StopReasonExt } from './agent/events.js';
 import { Budget } from './agent/budget.js';
 import { maybeNotifyUpdate } from './update/checkUpdate.js';
-import { parseMarkdown, renderTableLines, wrapSpans, type MdSpan } from './util/markdown.js';
-import { CHART_LANGS, parseChartSpec, renderChart } from './util/chart.js';
-import { fuzzyRank } from './util/fuzzy.js';
 import { providerErrorHint } from './util/errorHints.js';
-import { isBigPaste, expandPastes, prunePastes, dropConsumedPastes, PASTE_CAP, isPathLikeSlashToken, pathExistsSafe, visibleComposerWindow, clickToCursor, parseSgrMouse, lastKeySequence, historySearchPrompt, type HistorySearchState, COMPOSER_MAX_VISIBLE_ROWS, COMPOSER_GUTTER, caretNeedsOwnRow, composerPaintRows } from './tui/composer.js';
+import { isBigPaste, expandPastes, prunePastes, dropConsumedPastes, PASTE_CAP, visibleComposerWindow, clickToCursor, parseSgrMouse, lastKeySequence, historySearchPrompt, type HistorySearchState, COMPOSER_MAX_VISIBLE_ROWS, COMPOSER_GUTTER, composerPaintRows } from './tui/composer.js';
 import { withSynchronizedOutput } from './tui/syncOutput.js';
-import type { BrandInfo, ToolInfo } from './tui/rows.js';
 import { recommendedIndex, defaultQuestionSelection, buildQuestionAnswers, buildAutoAnswers, type QuestionSelection } from './tui/questions.js';
 import { fetchRemoteImage, imageMediaType, MAX_IMAGE_BYTES } from './util/image.js';
-import { highlight, type CodeRole } from './util/highlight.js';
 import { Context } from './agent/context.js';
 import type { TodoItem, TodoList } from './agent/todo.js';
 import type { PlanModeState, PlanSnapshot } from './agent/planMode.js';
+import type { MissionSnapshot, MissionState } from './agent/mission.js';
+import { missionHudLine, missionPinnedRow } from './tui/missionHud.js';
+import { drainTurnInput } from './tui/turnInput.js';
 import { AgentLoop } from './agent/loop.js';
 import { buildLoopDeps } from './agent/loopDeps.js';
 import { runLock, CLI_HOLDER } from './web/runLock.js';
-import { type ApprovalDecision, type ApprovalGate, type ApprovalRequest, AutoApproveGate, SessionApprovals } from './agent/approval.js';
+import { type ApprovalGate, type ApprovalRequest, AutoApproveGate, SessionApprovals } from './agent/approval.js';
 import { raiseAutonomy, type AutonomyLevel } from './safety/permissions.js';
 
 import { isLocalBaseUrl, isLocalModelTarget } from './safety/offline.js';
@@ -53,8 +51,6 @@ import { configuredContextWindow, detectServerContextWindow, ensureLocalServer, 
 
 import { resolveBaseUrl, resolveEntryCredential, type ShadowConfig, type ModelEntry } from './config.js';
 import { vaultExists } from './auth/vault.js';
-
-import { listLocalModels } from './local/garage.js';
 
 import { type OutputStyle } from './styles.js';
 import { firstSelectableRow, modelRows } from './util/modelGroups.js';
@@ -71,7 +67,7 @@ import { friendlyDeniedReason } from './util/deniedReason.js';
 import type { VimFind, VimMode } from './tui/vim.js';
 import { runHookPhase } from './hooks/runner.js';
 
-import { effortDescription, effortOrDefault, effortSymbol } from './agent/effort.js';
+import { effortOrDefault, effortSymbol } from './agent/effort.js';
 
 import { copyToClipboard, hasClipboard, readClipboard } from './util/clipboard.js';
 import { redactString } from './util/redact.js';
@@ -82,16 +78,33 @@ import { batchedTextReturn } from './tui/keys/common.js';
 import type { KeyEnv } from './tui/keys/types.js';
 import { claimMode, releaseMode, restoreTerminal, installRestoreHandlers } from './tui/terminalState.js';
 import { sanitizeTerminalEscapes, scrubForDisplay } from './util/scrub.js';
-import { stripTextualToolIntent } from './provider/textToolCalls.js';
 import { splitStreamToolIntentCapped } from './tui/streamIntent.js';
-import { extractPatchBlock } from './provider/applyPatch.js';
 import { scrubbedEnv } from './util/safeEnv.js';
-import { displayWidth, takeByWidth, nextCluster } from './util/width.js';
-import { stripCtl, formatUsage, shellCommandOf, agentAttr, oneLine, formatDiffStats, shortPath } from './tui/format.js';
-import { THEMES, THEME_NAMES, THEME_DESCRIPTIONS, C, normalizeThemeName, applyTheme, paletteSnapshot, backgroundSequence, themeBackground, type ThemeName, type Palette } from './tui/theme.js';
+import { displayWidth, takeByWidth } from './util/width.js';
+import { stripCtl, formatUsage, shellCommandOf, agentAttr, oneLine, formatDiffStats } from './tui/format.js';
+import { THEMES, THEME_NAMES, C, normalizeThemeName, applyTheme, paletteSnapshot, backgroundSequence, themeBackground, type ThemeName, type Palette } from './tui/theme.js';
 import { SLASH_COMMANDS, SLASH_NAME_WIDTH, findSlashCommand, runSlashCommand, slashDispatchName, type SlashCommand, type SlashCtx } from './tui/slash.js';
+import { slashMatches, classifySlash, type SlashMenuItem, type ArgContext } from './tui/slashMenu.js';
+import { sanitizeAssistantText } from './tui/sanitize.js';
+import { InteractiveGate } from './tui/gate.js';
+import {
+  PAGE_MARGIN,
+  MARGIN_PAD,
+  PinnedState,
+  StatusStrip,
+  ChromeMarkers,
+  isChatter,
+  Composer,
+  FlatItem,
+  type ChromeMarker,
+} from './tui/chrome.js';
+import { previewOf } from './tui/headless.js';
 export { parseSafeConfig } from './tui/slash.js';
 export type { SlashCommand } from './tui/slash.js';
+// Moved to modules (plan 2.4 structural budget) — re-exported so existing importers keep working.
+export { attachRenderer } from './tui/headless.js';
+export { Markdown } from './tui/markdown.js';
+export { Composer };
 
 interface TuiStyleState {
   style: OutputStyle;
@@ -194,289 +207,6 @@ const CLAUDE_ORANGE = '#d97757'; // fallback only — prefer C.accent at render 
 const DEFAULT_STATUS_VERB = 'Shadowing';
 // Bracketed-paste markers moved to src/tui/keys/reserved.ts (P3-01 focus-owner router).
 
-// ── Slash commands (the `/` dropdown) ────────────────────────────────────────
-/** A dropdown row: a command, or (when `base` is set) a completed first ARGUMENT of one —
- *  `name` then holds the full submission text ("/theme colorblind") and `base` the command. */
-export interface SlashMenuItem extends SlashCommand {
-  base?: string;
-  /** An informational row ("no prior sessions yet") — shown, but never completed or run. */
-  hint?: boolean;
-}
-
-// Enumerable FIRST arguments per command (keyed by dispatch name). Typing `/cmd ` opens a
-// second-level menu of these — users pick values instead of memorizing them. Only verified
-// vocabularies belong here (a completion that the command then rejects is worse than none).
-const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
-
-/** One selectable argument row. */
-export interface ArgCompletion {
-  value: string;
-  desc: string;
-}
-
-/**
- * What a DYNAMIC completion may look at. The commands that most need a picker are exactly the
- * ones whose vocabulary only exists at runtime — which session to resume, which turn to rewind
- * to, which rule to remove — so a completion may be a function of the live session instead of a
- * constant. Keep this surface small and cheap: it is called on every keystroke while the menu
- * is open.
- */
-export interface ArgContext {
-  cfg: ShadowConfig;
-  workspaceRoot: string;
-  /** Prior sessions, newest first (for /resume). */
-  sessions: { id: string; label: string }[];
-  /**
-   * The rewindable SNAPSHOT turns this session has (for /rewind), newest first, each carrying
-   * the prompt that produced its turn (F08-07 — the picker names turns by what the user asked,
-   * not just an index, and a rewind prefills that prompt back into the composer).
-   *
-   * NOT the composer-history length. `rewindToTurn` addresses context snapshots written by the
-   * loop — the submission count counts slash commands that never ran a turn and misses injected
-   * (wakeup) turns, so the two drift apart within minutes of normal use, and "Turn 3" in the
-   * menu would revert WORKSPACE FILES to a different point than the label named.
-   */
-  turns: RewindableTurn[];
-  /** Extra directories granted this session (for /add-dir remove). */
-  extraRoots: string[];
-}
-
-type ArgProvider = ArgCompletion[] | ((ctx: ArgContext) => ArgCompletion[]);
-
-const SLASH_ARG_COMPLETIONS: Record<string, ArgProvider> = {
-  '/help': [
-    { value: 'overview', desc: 'Quick start, everyday commands, and essential keys' },
-    { value: 'keys', desc: 'Keyboard shortcuts and approval controls' },
-    { value: 'all', desc: 'Complete slash-command catalog' },
-  ],
-  '/theme': [
-    ...THEME_NAMES.map((n) => ({ value: n, desc: THEME_DESCRIPTIONS[n] })),
-    { value: 'preview', desc: 'Try a theme without saving it (/theme preview <name>)' },
-    { value: 'list', desc: 'List every theme with its description' },
-  ],
-  '/effort': EFFORT_LEVELS.map((l) => ({ value: l, desc: effortDescription(l) })),
-  '/autonomy': [
-    { value: 'manual', desc: 'Approve every tool call' },
-    { value: 'auto-read', desc: 'Reads are automatic; writes and commands ask' },
-    { value: 'auto-edit', desc: 'Reads and edits are automatic; commands ask' },
-    { value: 'full', desc: 'Routine tools run without asking; this session keeps its current filesystem boundary' },
-  ],
-  '/style': [
-    { value: 'proactive', desc: 'Lead with the result; act, then report' },
-    { value: 'explanatory', desc: 'Explain the reasoning alongside the work' },
-    { value: 'learning', desc: 'Teach while working — more context, more why' },
-    { value: 'procedural', desc: 'Terse step-by-step execution' },
-  ],
-  '/copy': [{ value: 'code', desc: 'Copy only the last fenced code block' }],
-  '/plugins': [
-    { value: 'enable', desc: 'Enable an installed plugin: /plugins enable <name>' },
-    { value: 'disable', desc: 'Disable a plugin: /plugins disable <name>' },
-  ],
-  '/config': [
-    { value: 'show', desc: 'Show safe runtime settings (secrets hidden)' },
-    { value: 'get temperature', desc: 'Show self-hosted sampling temperature' },
-    { value: 'set temperature', desc: 'Append a value from 0..2 (default 1.0)' },
-    { value: 'get fastMode', desc: 'Show Anthropic fast mode' },
-    { value: 'set fastMode', desc: 'Append on/off' },
-    { value: 'get effort', desc: 'Show reasoning effort' },
-    { value: 'set effort', desc: 'Append low | medium | high | xhigh | max' },
-    { value: 'get cacheTtl', desc: 'Show prompt-cache TTL' },
-    { value: 'set cacheTtl', desc: 'Append 5m or 1h' },
-    { value: 'get maxIterations', desc: 'Show the agent loop cap' },
-    { value: 'set maxIterations', desc: 'Append a non-negative integer' },
-    { value: 'get maxOutputTokens', desc: 'Show the per-call output cap' },
-    { value: 'set maxOutputTokens', desc: 'Append an integer ≥ 256' },
-    { value: 'get autoClassifier', desc: 'Show automatic safety classification' },
-    { value: 'set autoClassifier', desc: 'Append on/off' },
-    { value: 'get parallelTools', desc: 'Show parallel tool execution' },
-    { value: 'set parallelTools', desc: 'Append on/off' },
-    { value: 'get costWarnUSD', desc: 'Show the session cost warning threshold' },
-    { value: 'set costWarnUSD', desc: 'Append a positive USD amount' },
-  ],
-  '/mcp': [
-    { value: 'list', desc: 'List configured MCP servers' },
-    { value: 'get', desc: 'Inspect one server: /mcp get <name>' },
-    { value: 'enable browser', desc: 'Add isolated Chrome tools (requires Node/npm+npx)' },
-    { value: 'enable context-cooler', desc: 'Add token-efficient ctx_* retrieval tools' },
-    { value: 'disable', desc: 'Disable a server: /mcp disable <name>' },
-  ],
-  '/tasks': [{ value: 'clear', desc: 'Clear the live task list' }],
-  '/image': [{ value: 'clear', desc: 'Drop queued image attachments' }],
-  '/goal': [{ value: 'clear', desc: 'Remove the standing goal' }],
-  '/keybindings': [{ value: 'init', desc: 'Write a starter ~/.shadow/keybindings.json' }],
-  '/table': [{ value: 'done', desc: 'End the round-table and return to single-model chat' }],
-  '/statusline': [{ value: 'none', desc: 'Clear the custom footer line' }],
-
-  // ── on/off toggles ─────────────────────────────────────────────────────────
-  // Bare `/vim` flips the switch, so the menu's job is to let you set it EXPLICITLY (and to show
-  // which way it currently points via the "✓ current" row).
-  '/vim': [
-    { value: 'on', desc: 'Modal editing — Esc for NORMAL, i/a to insert' },
-    { value: 'off', desc: 'Standard composer editing' },
-  ],
-  '/fast': [
-    { value: 'on', desc: 'Lower latency, no extended thinking (Anthropic)' },
-    { value: 'off', desc: 'Normal latency with extended thinking' },
-  ],
-
-  // ── verbs whose vocabulary is fixed ────────────────────────────────────────
-  '/permissions': [
-    { value: 'list', desc: 'Show every rule in match order' },
-    { value: 'add', desc: 'Add a rule: /permissions add <allow|ask|deny> <tool> [pattern]' },
-    { value: 'remove', desc: 'Remove a rule by index: /permissions remove <n>' },
-    { value: 'set', desc: 'Replace a rule: /permissions set <n> <allow|ask|deny>' },
-    { value: 'clear', desc: 'Remove every rule (back to the autonomy defaults)' },
-  ],
-  '/doctor': [{ value: 'model', desc: 'Probe the active model: tools, vision, context window' }],
-  '/login': [{ value: 'codex', desc: 'Sign in with ChatGPT/Codex' }],
-
-  // ── dynamic: the vocabulary only exists at runtime ─────────────────────────
-  // These are the reason ArgProvider accepts a function. A constant table cannot list YOUR
-  // sessions or YOUR turn count, which is exactly where "type the id from memory" hurt most.
-  '/resume': (ctx) =>
-    ctx.sessions.length
-      ? ctx.sessions.map((s) => ({ value: s.id, desc: s.label }))
-      : [{ value: '', desc: 'No prior sessions in this workspace yet' }],
-  // Turn indexes are 0-based (`0` = the first assistant turn — see the /rewind handler), and the
-  // newest is listed first because that is overwhelmingly the one you want.
-  // Rows are newest-first and name each turn by the prompt that produced it (F08-07) — "Turn 2"
-  // alone forced the user to remember their own history by index.
-  '/rewind': (ctx) =>
-    ctx.turns.length
-      ? ctx.turns.map((t, i) => ({
-          value: String(t.turn),
-          desc: t.label
-            ? `Turn ${t.turn} — ${t.label}`
-            : i === 0
-              ? `Turn ${t.turn} — the most recent`
-              : t.turn === 0
-                ? 'Turn 0 — the first turn'
-                : `Turn ${t.turn}`,
-        }))
-      : [{ value: '', desc: 'Nothing to rewind to yet — no turns this session' }],
-  '/add-dir': (ctx) =>
-    ctx.extraRoots.length
-      ? ctx.extraRoots.map((d) => ({ value: d, desc: 'Already granted this session' }))
-      : [{ value: '', desc: 'Type a path to grant it to the file tools' }],
-  '/model': (ctx) => [
-    { value: 'list', desc: 'Show configured model presets' },
-    { value: 'add', desc: 'Add a preset: /model add <name> …' },
-    { value: 'remove', desc: 'Remove a preset by name' },
-    { value: 'enable', desc: 'Enable a disabled preset' },
-    { value: 'disable', desc: 'Disable a preset (kept in config)' },
-    { value: 'test', desc: 'Capability-check a preset (tools, vision, context)' },
-    // Bare `/model` opens the grouped picker; naming a preset switches straight to it.
-    ...(ctx.cfg.models ?? [])
-      .filter((m) => !m.disabled)
-      .map((m) => ({ value: m.label, desc: `Switch to ${m.provider}/${m.model}` })),
-  ],
-  '/local': (ctx) => [
-    { value: 'list', desc: 'Show local model presets (.gguf / MLX / vLLM)' },
-    { value: 'add', desc: 'Register one: /local add <path.gguf | mlx-folder | org/repo>' },
-    { value: 'use', desc: 'Switch to a registered local model' },
-    { value: 'test', desc: 'Launch it and check it answers' },
-    { value: 'remove', desc: 'Unregister a local model' },
-    // The registered locals by name, so `/local use <tab-completed>` never needs the name typed
-    // from memory — the failure mode that made a hash-named preset unreachable in the first place.
-    ...listLocalModels(ctx.cfg.models ?? []).map((m) => ({
-      value: `use ${m.label}`,
-      desc: `Switch to ${m.label} (${m.gguf ? 'gguf' : m.mlx ? 'MLX' : 'vLLM'})`,
-    })),
-  ],
-};
-
-/**
- * Build the dropdown for the current composer text.
- *  - `/wor` → commands, FUZZY-ranked (`/thm` finds /theme; falls back to description search)
- *  - bare `/` → the curated browse list, with pure-alias rows folded out (they still match typed)
- *  - `/cmd part` → the command's known first arguments, fuzzy-filtered; `current` (dispatch →
- *    active value) marks the live setting so pickers double as status readouts
- */
-function slashMatches(
-  input: string,
-  current?: Record<string, string | undefined>,
-  ctx?: ArgContext,
-  extra: SlashCommand[] = [],
-): SlashMenuItem[] {
-  if (!input.startsWith('/')) return [];
-  if (isPathLikeSlashToken(input)) return []; // a path (/Users/…, /x.y) is not a command — no menu
-  const all = extra.length ? [...SLASH_COMMANDS, ...extra] : SLASH_COMMANDS;
-  const sp = input.indexOf(' ');
-  if (sp < 0) {
-    const q = input.slice(1);
-    if (!q) return all.filter((c) => !/\balias\b/i.test(c.desc));
-    // NAME-only fuzzy — deliberately no description search: Enter runs the selected row, and
-    // a desc match on a mistyped name ("/modle") would execute an unrelated command instead
-    // of falling through to the did-you-mean suggestion.
-    return fuzzyRank(all, q, (c) => c.name.slice(1)).map((r) => r.item);
-  }
-  const cmd = findSlashCommand(input.slice(0, sp), extra);
-  if (!cmd) return [];
-  const provider = SLASH_ARG_COMPLETIONS[slashDispatchName(cmd)];
-  if (!provider) return [];
-  // A dynamic provider needs the live session; without a context (headless/unit callers) it
-  // simply contributes nothing rather than throwing.
-  const completions = typeof provider === 'function' ? (ctx ? provider(ctx) : []) : provider;
-  // An empty `value` is a HINT row ("no sessions yet") — informational, never completable, so it
-  // can't put a bare `/resume ` on the composer and run the wrong thing on Enter.
-  if (!completions.length) return [];
-  const partial = input.slice(sp + 1);
-  if (/\s/.test(partial)) return []; // only the FIRST argument completes
-  const active = current?.[slashDispatchName(cmd)];
-  const items: SlashMenuItem[] = completions.map((a) => ({
-    name: a.value ? `${cmd.name} ${a.value}` : cmd.name,
-    desc: a.value === active ? `✓ current · ${a.desc}` : a.desc,
-    dispatch: cmd.dispatch,
-    base: cmd.name,
-    ...(a.value ? {} : { hint: true }),
-  }));
-  if (!partial) return items;
-  return fuzzyRank(items, partial, (i) => i.name.slice(cmd.name.length + 1)).map((r) => r.item);
-}
-
-/** Levenshtein distance, early-exiting when it must exceed `max` — for did-you-mean on typos.
- *  Fuzzy subsequence matching can't see TRANSPOSITIONS (/modle ⊄ /model), so this fills that gap. */
-function editDistance(a: string, b: string, max: number): number {
-  if (Math.abs(a.length - b.length) > max) return max + 1;
-  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
-  for (let i = 1; i <= a.length; i++) {
-    const cur = [i, ...new Array<number>(b.length).fill(0)];
-    let rowMin = i;
-    for (let j = 1; j <= b.length; j++) {
-      cur[j] = Math.min(prev[j]! + 1, cur[j - 1]! + 1, prev[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1));
-      rowMin = Math.min(rowMin, cur[j]!);
-    }
-    if (rowMin > max) return max + 1;
-    prev = cur;
-  }
-  return prev[b.length]!;
-}
-
-/** Best "did you mean" candidate for a mistyped command name, or undefined when nothing is close.
- *  Fuzzy first (catches abbreviations: /thm), then edit-distance ≤ 2 (catches transpositions: /modle). */
-function suggestSlash(first: string): string | undefined {
-  const q = first.slice(1);
-  if (!q) return undefined;
-  const fuzzy = fuzzyRank(SLASH_COMMANDS, q, (c) => c.name.slice(1))[0];
-  if (fuzzy) return fuzzy.item.name;
-  let best: { name: string; d: number } | undefined;
-  for (const c of SLASH_COMMANDS) {
-    const d = editDistance(q.toLowerCase(), c.name.slice(1), 2);
-    if (d <= 2 && (!best || d < best.d)) best = { name: c.name, d };
-  }
-  return best?.name;
-}
-
-/** Classify a `/`-leading submission: a KNOWN command, a likely TYPO (/modl), or a PATH/message the
- *  user pasted or typed (/Users/…, /tmp). This is what stops a directory being rejected as a command.
- *  Typos carry a `suggestion` when a command is plausibly close. */
-function classifySlash(task: string, extra: SlashCommand[] = []): { cmd?: SlashCommand; kind: 'command' | 'typo' | 'message'; suggestion?: string } {
-  const first = task.split(/\s+/)[0] ?? '';
-  const cmd = findSlashCommand(first, extra);
-  if (cmd) return { cmd, kind: 'command' };
-  if (isPathLikeSlashToken(first) || pathExistsSafe(first)) return { kind: 'message' };
-  return { kind: 'typo', suggestion: suggestSlash(first) };
-}
 
 export type QueuedTask = {
   text: string;
@@ -485,17 +215,6 @@ export type QueuedTask = {
 };
 // queuedTaskKind moved to src/tui/keys/common.ts (P3-01 — the key router owns submit-classification).
 
-/** Display-safe assistant text. Textual/native-looking calls are execution intent, never prose. */
-function sanitizeAssistantText(text: string): string {
-  let visible = stripTextualToolIntent(text);
-  const patch = extractPatchBlock(visible);
-  if (patch) visible = patch.cleaned;
-  else {
-    const partialPatch = visible.indexOf('*** Begin Patch');
-    if (partialPatch >= 0) visible = visible.slice(0, partialPatch);
-  }
-  return scrubForDisplay(visible);
-}
 
 /** Informational slash commands safe to run mid-turn without interrupting the agent. */
 // SLASH_WHILE_RUNNING moved to src/tui/keys/composerOwner.ts (P3-01 focus-owner router).
@@ -547,42 +266,6 @@ function formatDuration(totalSec: number): string {
   return h > 0 ? `${h}h ${m}m ${s}s` : `${m}m ${s}s`;
 }
 
-// ── Structured transcript items (printed once, never re-rendered) ─────────────
-export interface BannerLine {
-  text: string;
-  color?: string;
-  dimColor?: boolean;
-  bold?: boolean;
-}
-export interface TranscriptBase {
-  id: number;
-  kind: 'user' | 'assistant' | 'tool' | 'system' | 'blocked' | 'error' | 'banner' | 'reasoning' | 'finding' | 'image';
-  text: string;
-  color?: string;
-  dimColor?: boolean;
-  bold?: boolean;
-  meta?: string;
-  /** Continuation block of a multi-block streamed answer — hug the previous block (gap 0). */
-  tight?: boolean;
-  /** Finding card title (kind === 'finding'). */
-  title?: string;
-  /** Finding card severity (kind === 'finding'). */
-  severity?: 'info' | 'warn' | 'error';
-  /** Grouped multi-line content rendered inside ONE box (welcome banner, /model, /help). */
-  lines?: BannerLine[];
-  /** v2 structured payloads consumed by flattenItem. `text`/`lines` remain the plain
-   *  fallback the stock Ink components read, so both paths stay in sync. */
-  brand?: BrandInfo;
-  tool?: ToolInfo;
-  /** Inline image (/image echo, view_image result, fetched markdown ![](url)). Rendered as a
-   *  durable placeholder + terminal-native pixels when supported (see flatten.ts). */
-  image?: { bytes: string; mediaType: string; alt?: string; source?: string };
-  /** Reasoning wall-clock (ms) when known — fold header shows `thought for Ns`. */
-  durationMs?: number;
-  /** Collaboration Mode: which seat produced this assistant turn (attribution header). */
-  speaker?: SpeakerTag;
-}
-type TranscriptItem = TranscriptBase;
 
 // Idle-countdown config: when the model asks a question and the user is away, auto-pick the
 // recommended answer after this many seconds — like every other TUI's "(default in Ns)" prompt.
@@ -597,56 +280,6 @@ const AUTO_ANSWER_ENABLED = process.env.SHADOW_NO_AUTO_ANSWER !== '1';
 
 // dialogArmMs moved to src/tui/keys/reserved.ts (P3-01 focus-owner router).
 
-// ── Interactive approval gate ────────────────────────────────────────────────
-/**
- * Bridges the headless loop's `ApprovalGate` contract to the React UI: `request`
- * surfaces the pending call to the component (via `show`) and parks a Promise;
- * the key handler calls `respond` to resolve it. One stable instance is shared
- * by the loop and the key handler (kept in a ref) so respond() always targets
- * the Promise the running loop is awaiting.
- */
-class InteractiveGate implements ApprovalGate {
-  /**
-   * Pending requests, oldest first. A single `resolver` field could only ever hold ONE — a second
-   * concurrent request overwrote it and the first promise was orphaned, so the loop awaited a
-   * decision that could no longer arrive and the turn hung until Esc. Reachable whenever two gated
-   * calls land in one turn (parallel tools, or the `ask_user_question` tool racing a permission
-   * gate), which `mayNeedPermissionPrompt` no longer under-reports either.
-   */
-  private queue: Array<{ req: ApprovalRequest; resolve: (d: ApprovalDecision) => void }> = [];
-  /** Wired by the component to set/clear the pending-approval state. */
-  show: (req: ApprovalRequest | null) => void = () => {};
-
-  request(req: ApprovalRequest): Promise<ApprovalDecision> {
-    return new Promise<ApprovalDecision>((resolve) => {
-      const entry = { req, resolve };
-      this.queue.push(entry);
-      // An aborted request (Esc/Ctrl-C) is settled by settleWithAbort, not by us — but its queue
-      // slot must go, or it would surface as a dialog for a call that is already dead.
-      req.signal?.addEventListener('abort', () => this.drop(entry), { once: true });
-      if (this.queue.length === 1) this.show(req); // nothing ahead of it: show now
-    });
-  }
-
-  respond(d: ApprovalDecision): void {
-    const head = this.queue.shift();
-    if (!head) return;
-    this.show(this.queue[0]?.req ?? null); // surface the next one, or clear the dialog
-    head.resolve(d);
-  }
-
-  private drop(entry: { req: ApprovalRequest }): void {
-    const i = this.queue.findIndex((e) => e === entry);
-    if (i < 0) return;
-    const wasHead = i === 0;
-    this.queue.splice(i, 1);
-    if (wasHead) this.show(this.queue[0]?.req ?? null);
-  }
-
-  get awaiting(): boolean {
-    return this.queue.length > 0;
-  }
-}
 
 export interface TuiOpts {
   provider: Provider;
@@ -681,11 +314,16 @@ export interface TuiOpts {
   styleState?: TuiStyleState;
   todoList?: TodoList;
   planMode?: PlanModeState;
+  /** Session /goal mission — drives the pinned HUD row and the /goal slash trio. */
+  mission?: MissionState;
+  /** bg sub-agent results drained into the NEXT user turn (index.ts attachBgAgentDelivery). */
+  pendingNotifications?: { drain(): string[]; size(): number };
   wakeupHandler?: { fire: (task: string, reason: string) => void };
   /** Extra granted roots (--add-dir / additionalDirectories) — widens jail + shell sandbox. */
   additionalRoots?: string[];
   /**
-   * Called whenever autonomy changes (Shift+Tab ring, `/autonomy`, an approval-dialog `a`).
+   * Called whenever autonomy changes (Tab ring, `/autonomy`, an approval-dialog `a`; a
+   * Shift+Tab or /plan exit from plan mode lands here at `manual`).
    * Without it the process-level binding stayed at its STARTUP value, so a sub-agent spawned
    * after the user dropped to `manual` was still constructed at the startup level — directly
    * contradicting AgentToolDeps' own claim that a sub-agent "inherits it, never escalates".
@@ -740,43 +378,6 @@ function useTerminalSize(): { cols: number; rows: number } {
  * card carried is gone, so a tool/denial row folds its tool name (meta) inline.
  */
 /** Inline run: bold / italic / inline-code spans rendered within one line. */
-function Inline({ spans, color, dim, bold }: { spans: MdSpan[]; color?: string; dim?: boolean; bold?: boolean }) {
-  return (
-    <Text color={dim ? C.dim : color} bold={bold}>
-      {spans.map((s, i) => (
-        <Text key={i} color={s.code ? C.cyan : dim ? C.dim : color} bold={bold || s.bold} italic={s.italic}>
-          {s.text}
-        </Text>
-      ))}
-    </Text>
-  );
-}
-
-/** Map a highlighter token role to a canvas color (comments are dimmed separately). */
-function codeRoleColor(role: CodeRole): string | undefined {
-  switch (role) {
-    case 'keyword':
-      return C.purple;
-    case 'string':
-      return C.green;
-    case 'number':
-      return C.yellow;
-    case 'comment':
-      return C.dim; // ADA-readable gray (was Ink dimColor faint, which blended into the bg)
-    case 'plain':
-    default:
-      return undefined; // default foreground (white)
-  }
-}
-
-/** Cap assistant prose to a readable measure so lines don't run edge-to-edge on wide terminals,
- *  and cap it IDENTICALLY for the streaming and committed renders so a finished turn never reflows.
- *  The `width` prop now constrains the whole block (previously it only reached table layout, so prose
- *  wrapped at the full pane width). */
-const PROSE_MAX_COLS = 100;
-/** Left/right page margin for transcript content — floats content off the terminal edges
- *  like the reference client instead of running flush to column 1. */
-const PAGE_MARGIN = 4;
 /** Terminal answer to a DSR cursor-position query (CSI 6n). Ink strips a chunk-leading ESC. */
 const DSR_REPLY = /\x1b?\[(\d+);(\d+)R/;
 // DSR_REPLY_EXACT / HOME_KEYS / END_KEYS / FORWARD_DELETE / SHIFT_ENTER moved to the
@@ -788,193 +389,7 @@ const SYNTH_RETURN_KEY = { return: true, name: 'return', sequence: '\r' } as unk
 // the raw click tap still parses the cursor-position report itself.
 /** Collaboration Mode: the baton is always this warm orange (Shadow's brand ⏺ color) — never a seat color. */
 const BATON_ORANGE = '#d97757';
-const MARGIN_PAD = ' '.repeat(PAGE_MARGIN);
 
-/** The single palette handed to flattenItem (the FlatItem stock renderer). `dim` is the
- *  EXPLICIT ADA gray — v2 rows use it for all de-emphasis instead of the banned faint attribute. */
-// LIVE theme view for the flattener. Getters (not a snapshot!) so `/theme` re-themes the
-// transcript: the old `{ fg: '#c9d2da', dim: C.dim, … }` literal froze the palette at module
-// load — switching to `light` left transcript prose painted in dark-theme gray, unreadable on
-// a white terminal. Every property now reads the mutable `C` singleton at render time.
-const PIN_THEME = {
-  get fg() { return C.body; },
-  get bright() { return C.bright; },
-  get dim() { return C.dim; },
-  get green() { return C.green; },
-  get cyan() { return C.cyan; },
-  get yellow() { return C.yellow; },
-  get red() { return C.red; },
-  get purple() { return C.purple; },
-  get user() { return C.user; },
-  get accent() { return C.accent; },
-  get codeBg() { return C.codeBg; },
-};
-
-export function Markdown({ source, color = C.fg, width = PROSE_MAX_COLS }: { source: string; color?: string; width?: number }) {
-  const blocks = parseMarkdown(source);
-  return (
-    <Box flexDirection="column" width={width}>
-      {blocks.map((b, i) => {
-        switch (b.type) {
-          case 'heading':
-            return (
-              <Box key={i} marginTop={i === 0 ? 0 : 1}>
-                <Inline spans={b.spans} color={C.purple} bold />
-              </Box>
-            );
-          case 'paragraph':
-            return (
-              <Box key={i} flexDirection="column" marginTop={i === 0 ? 0 : 1}>
-                {wrapSpans(b.spans, width).map((ln, k) => (
-                  <Inline key={k} spans={ln} color={color} />
-                ))}
-              </Box>
-            );
-          case 'list': {
-            // Mirror flatten.ts's list rendering so the LIVE preview matches the committed block: a
-            // dedicated ordinal advances only for top-level ordered items (a nested bullet must not
-            // inflate the next number), and depth drives the bullet glyph + indent.
-            const bullets = ['•', '◦', '▪', '‣'];
-            let ordinal = b.start ?? 1;
-            return (
-              <Box key={i} flexDirection="column" marginTop={i === 0 ? 0 : 1}>
-                {b.items.map((it, j) => {
-                  const depth = b.depths?.[j] ?? 0;
-                  const indent = '  '.repeat(depth);
-                  const marker =
-                    b.ordered && depth === 0
-                      ? `${ordinal++}. `
-                      : `${bullets[Math.min(depth, bullets.length - 1)]} `;
-                  const lead = indent + marker;
-                  const wrapped = wrapSpans(it, Math.max(1, width - lead.length));
-                  return (
-                    <Box key={j} flexDirection="column">
-                      {wrapped.map((ln, k) => (
-                        <Box key={k}>
-                          <Text color={color}>{k === 0 ? lead : ' '.repeat(lead.length)}</Text>
-                          <Inline spans={ln} color={color} />
-                        </Box>
-                      ))}
-                    </Box>
-                  );
-                })}
-              </Box>
-            );
-          }
-          case 'quote':
-            return (
-              <Box key={i} flexDirection="column" marginTop={i === 0 ? 0 : 1}>
-                {wrapSpans(b.spans, Math.max(1, width - 2)).map((ln, k) => (
-                  <Box key={k}>
-                    <Text color={C.yellow}>│ </Text>
-                    <Inline spans={ln} color={color} dim />
-                  </Box>
-                ))}
-              </Box>
-            );
-          case 'code': {
-            // Closed ```chart|graph|spark fences preview as the real chart (same renderer as
-            // the committed path); an open fence or unparseable spec stays a code block.
-            if (b.closed && CHART_LANGS.has((b.lang || '').toLowerCase())) {
-              const spec = parseChartSpec(b.code);
-              if (spec) {
-                const chartRows = renderChart(spec, Math.min(width, 72));
-                return (
-                  <Box key={i} flexDirection="column" marginTop={i === 0 ? 0 : 1}>
-                    {chartRows.map((spans, j) => (
-                      <Text key={j} wrap="truncate">
-                        {spans.map((s, k) => (
-                          <Text
-                            key={k}
-                            color={s.role === 'title' ? C.bright : s.role === 'label' ? C.fg : s.role === 'bar' ? C.cyan : C.dim}
-                            bold={s.role === 'title'}
-                          >
-                            {s.text}
-                          </Text>
-                        ))}
-                      </Text>
-                    ))}
-                  </Box>
-                );
-              }
-            }
-            // Quiet code — mirrors flatten.ts: dim lang label + │ gutter, NO Ink round border
-            // (design law: one border in the app = the composer). Live preview ≡ committed.
-            // Line-by-line so multi-line fences wrap correctly (role colors stay per token).
-            const sourceLines = (b.code || ' ').split('\n');
-            return (
-              <Box key={i} flexDirection="column" marginTop={i === 0 ? 0 : 1}>
-                {b.lang ? <Text color={C.dim} italic>{b.lang}</Text> : null}
-                {sourceLines.map((line, j) => {
-                  const lineSpans = highlight(line || ' ', b.lang);
-                  return (
-                    <Box key={j}>
-                      <Text color={C.dim}>{'│ '}</Text>
-                      <Text>
-                        {lineSpans.map((s, k) => (
-                          <Text key={k} color={codeRoleColor(s.role)}>
-                            {s.text}
-                          </Text>
-                        ))}
-                      </Text>
-                    </Box>
-                  );
-                })}
-              </Box>
-            );
-          }
-          case 'rule':
-            return (
-              <Box key={i} marginTop={i === 0 ? 0 : 1}>
-                <Text color={C.dim}>{'─'.repeat(Math.max(1, width))}</Text>
-              </Box>
-            );
-          case 'table': {
-            // Live preview: full grid with dim chrome (same as committed flatten path). Large-table
-            // folding is a committed-transcript concern (Ctrl-O); the live slot is already ≤2 rows.
-            const lines = renderTableLines(b, width);
-            const isGrid = /^[╭┌]/.test(lines[0] ?? '');
-            const sepIdx = isGrid ? lines.findIndex((l) => l.startsWith('├')) : -1;
-            return (
-              <Box key={i} flexDirection="column" marginTop={i === 0 ? 0 : 1}>
-                {lines.map((l, j) => {
-                  const isHeader = isGrid && j > 0 && (sepIdx < 0 || j < sepIdx);
-                  if (l.startsWith('—') || /^[╭┌├╰└]/.test(l)) {
-                    return <Text key={j} color={C.dim}>{l}</Text>;
-                  }
-                  if (!l.includes('│')) {
-                    return <Text key={j} color={color} bold={isHeader}>{l}</Text>;
-                  }
-                  // Dim │ pipes; bold+bright header cells, body in answer color.
-                  const parts: React.ReactNode[] = [];
-                  let k = 0;
-                  let pi = 0;
-                  while (k < l.length) {
-                    if (l[k] === '│') {
-                      parts.push(<Text key={pi++} color={C.dim}>│</Text>);
-                      k++;
-                    } else {
-                      let e = k;
-                      while (e < l.length && l[e] !== '│') e++;
-                      const cell = l.slice(k, e);
-                      parts.push(
-                        <Text key={pi++} color={isHeader ? C.fg : color} bold={isHeader}>
-                          {cell}
-                        </Text>,
-                      );
-                      k = e;
-                    }
-                  }
-                  return <Text key={j}>{parts}</Text>;
-                })}
-              </Box>
-            );
-          }
-        }
-      })}
-    </Box>
-  );
-}
 
 /** Large tool/diff output and reasoning are collapsible; everything else renders full.
  *  Collapsible items START collapsed; Ctrl-O expands ALL. Threshold lives in flatten.ts so the
@@ -995,320 +410,6 @@ function capTranscriptBody(rawLines: string[]): string[] {
   return [`… ${omitted} earlier lines omitted …`, ...rawLines.slice(-MAX_TRANSCRIPT_BODY_LINES)];
 }
 
-/** Pinned agent state — a light, full-width block above the composer: a dim top
- *  rule, a one-line header (plan mode/title + task count), the todo items marked
- *  ✔/▶/·, then a closing rule. No borders, so it reads as part of the flow rather
- *  than a crowding card, and (unlike the old side panel) never sits beside <Static>. */
-function PinnedState({
-  goal,
-  plan,
-  todos,
-  showPlan,
-  showTodo,
-  collapsed,
-  cols,
-  maxItems,
-}: {
-  goal: string | null;
-  plan: PlanSnapshot;
-  todos: TodoItem[];
-  showPlan: boolean;
-  showTodo: boolean;
-  collapsed: boolean;
-  cols: number;
-  /** Terminal-height-aware cap on visible todo rows (block chrome ≈ 6 rows worst case), so the
-   *  idle pinned block can never push the live frame to terminal height on short terminals. */
-  maxItems?: number;
-}) {
-  const planActive = plan.mode === 'planning';
-  const done = todos.filter((t) => t.status === 'completed').length;
-  const planLabel = showPlan
-    ? `${planActive ? 'Plan mode' : 'Implement mode'}${plan.title ? ` — ${plan.title}` : ''}`
-    : '';
-  const todoLabel = showTodo
-    ? `${collapsed ? '▸' : '▾'} Task list ${done}/${todos.length}${collapsed ? ' · Ctrl-T' : ''}`
-    : '';
-  // todoLabel FIRST: the row truncates right, and the task count must survive a verbose plan title.
-  const header = [todoLabel, planLabel].filter(Boolean).join('   ·   ');
-  // The block is inset by PAGE_MARGIN on both sides (see the Box below), so its rules measure the
-  // same span as the composer's — not the full terminal width.
-  const rule = '─'.repeat(Math.max(8, cols - PAGE_MARGIN * 2));
-  const MAX = maxItems ?? 8;
-  const shown = todos.slice(0, MAX);
-  const mark = (s: TodoItem['status']) => (s === 'completed' ? '✔' : s === 'in_progress' ? '▶' : '·');
-  const itemColor = (s: TodoItem['status']) =>
-    s === 'in_progress' ? C.yellow : s === 'completed' ? 'gray' : undefined;
-  return (
-    // Every row below is wrap="truncate": this block sits in the LIVE frame, whose height budget
-    // counts physical rows. A model-written 70-char todo subject (or long goal / plan path)
-    // wrapping to 2+ rows on a narrow terminal blew the budget and re-armed Ink's scrollback-
-    // wiping clearTerminal fallback — maxItems bounds item COUNT, truncation bounds each row.
-    // paddingLeft=PAGE_MARGIN: expanded (Ctrl-T) and collapsed forms must share the transcript's
-    // left edge. Without it the same task list jumped 4 columns left when you expanded it, and its
-    // two rules ran the full terminal width — the loudest lines on screen.
-    <Box flexDirection="column" flexShrink={0} marginTop={1} width={cols} paddingLeft={PAGE_MARGIN}>
-      <Text color={C.dim}>{rule}</Text>
-      {goal ? <Text wrap="truncate" bold color={C.purple}>{`🎯 Goal: ${goal}`}</Text> : null}
-      {header ? (
-        <Text wrap="truncate" bold color={planActive ? C.yellow : C.green}>
-          {header}
-        </Text>
-      ) : null}
-      {showPlan && plan.path ? <Text wrap="truncate" color={C.dim}>{shortPath(plan.path)}</Text> : null}
-      {showTodo && !collapsed
-        ? shown.map((item) => (
-            <Text key={item.id} wrap="truncate" color={item.status === 'completed' ? C.dim : itemColor(item.status)}>
-              {` ${mark(item.status)} ${item.subject}`}
-            </Text>
-          ))
-        : null}
-      {showTodo && !collapsed && todos.length > MAX ? (
-        <Text italic color={C.dim}>{`   … +${todos.length - MAX} more`}</Text>
-      ) : null}
-      <Text color={C.dim}>{rule}</Text>
-    </Box>
-  );
-}
-
-function StatusStrip({ text, marker }: { text: string; marker?: { text: string; color: string } }) {
-  return (
-    // wrap="truncate": the strip is budgeted at exactly ONE row. A verbose /statusline command
-    // (customStatus renders through this too) used to wrap to several rows on narrow terminals,
-    // silently blowing the frame budget and re-triggering Ink's scrollback-wiping fallback.
-    // No paddingX here: the call site already insets by PAGE_MARGIN, and the two composed to a
-    // 5-column indent — one off from every other chrome row, which reads as a rendering glitch.
-    <Box>
-      <Text wrap="truncate" color={C.dim}>
-        {marker ? (
-          <Text color={marker.color} bold>
-            {marker.text + ' · '}
-          </Text>
-        ) : null}
-        {text}
-      </Text>
-    </Box>
-  );
-}
-
-interface ChromeMarker {
-  text: string;
-  color: string;
-  bold?: boolean;
-}
-
-/** High-priority state badges used in the composer/status chrome (privacy and guardrail state). */
-function ChromeMarkers({ markers, trailing }: { markers: ChromeMarker[]; trailing?: boolean }) {
-  return (
-    <>
-      {markers.map((marker, i) => (
-        <React.Fragment key={`${marker.text}-${i}`}>
-          <Text color={marker.color} bold={marker.bold}>{marker.text}</Text>
-          {i < markers.length - 1 || trailing ? <Text color={C.dim}>{' · '}</Text> : null}
-        </React.Fragment>
-      ))}
-    </>
-  );
-}
-
-/** Small chrome rows (confirmations, errors, denials) — one block when they arrive back to back. */
-function isChatter(kind: string | undefined): boolean {
-  return kind === 'system' || kind === 'error' || kind === 'blocked';
-}
-
-/** Empty-composer placeholder — a dim prompt, not an example that could be mistaken for real input. */
-// T1: platform-aware — macOS sends Option+Enter as ESC-prefixed; Linux terminals send Alt+Enter.
-// The composer's newline branch keys on key.meta+return, so the hint names that path (Shift+Enter
-// is deliberately NOT advertised — without CSI-u it sends the message instead of breaking the line).
-const COMPOSER_PLACEHOLDER = `Send a message…  ( / for commands · ${NEWLINE_HINT} newline )`;
-
-/**
- * Multi-row composer: soft-wraps long lines, keeps a real caret on any row, scrolls a window when
- * the draft is taller than COMPOSER_MAX_VISIBLE_ROWS. Open-sided rules (no L/R border).
- */
-export function Composer({
-  input,
-  cursor,
-  hint,
-  markers = [],
-  cols,
-  maxRows = COMPOSER_MAX_VISIBLE_ROWS,
-  showHint = true,
-  borderColor = C.dim,
-  placeholder = COMPOSER_PLACEHOLDER,
-}: {
-  input: string;
-  cursor: number;
-  hint: string;
-  /** Priority badges painted before the quiet hint so warnings survive right-edge truncation. */
-  markers?: ChromeMarker[];
-  /** Terminal width — drives soft-wrap for caret math + paint. */
-  cols: number;
-  /** Max visible input rows — clamped by the caller to what the terminal height allows. */
-  maxRows?: number;
-  showHint?: boolean;
-  borderColor?: string;
-  placeholder?: string;
-}) {
-  const caret = Math.min(cursor, input.length);
-  const empty = input.length === 0;
-  // The composer sits on the SAME left edge as the transcript (PAGE_MARGIN) and stops the same
-  // distance from the right — anything else reads as a misaligned column. `inner` is what's left
-  // for text after the `❯ ` gutter (also the continuation indent), and it is exactly the width the
-  // caret math uses, so the draft now wraps at the rule's right end instead of 8 columns short.
-  const boxW = Math.max(12, cols - PAGE_MARGIN * 2);
-  const inner = Math.max(8, boxW - COMPOSER_GUTTER);
-  const maxV = Math.max(1, maxRows);
-  let win = visibleComposerWindow(input, caret, inner, maxV);
-  // A caret at the end of a row that exactly fills the width cannot paint inline (wrap="truncate"
-  // would eat the CARET cell, not the text) — it gets its own row below. When the window is AT the
-  // cap it yields one row to host the caret (height stays ≤ maxRows, matching composerPaintRows);
-  // below the cap the extra row simply fits.
-  const needCaretRow = caretNeedsOwnRow(win.lines[win.caretRow] ?? '', win.caretCol, inner);
-  if (needCaretRow && win.lines.length === maxV && maxV > 1) {
-    win = visibleComposerWindow(input, caret, inner, maxV - 1);
-  }
-
-  return (
-    <Box flexDirection="column" flexShrink={0} width={cols} paddingLeft={PAGE_MARGIN}>
-      {/* Open-sided input: top + bottom rule only. Multi-line drafts grow up to
-          COMPOSER_MAX_VISIBLE_ROWS, then scroll around the caret. */}
-      <Box
-        flexDirection="column"
-        borderStyle="single"
-        borderColor={borderColor}
-        borderLeft={false}
-        borderRight={false}
-        paddingX={0}
-        width={boxW}
-      >
-        {empty ? (
-          <Text wrap="truncate">
-            <Text color={C.dim}>{'❯ '}</Text>
-            <Text inverse> </Text>
-            {/* The full placeholder is 58 cols + gutter + caret = 61; below ~69 terminal cols it
-                wrapped to a SECOND row — an idle composer 4 rows tall where every height budget
-                assumes 3. Ladder to the short form when it can't fit one row; truncate is the
-                final guard for the narrowest terminals. */}
-            <Text color={C.dim}>
-              {boxW < displayWidth(placeholder) + 3 ? 'Send a message…' : placeholder}
-            </Text>
-          </Text>
-        ) : (
-          win.lines.map((line, ri) => {
-            const gutter = ri === 0 && win.offset === 0 ? '❯ ' : '  ';
-            const onCaretRow = ri === win.caretRow;
-            if (!onCaretRow || needCaretRow) {
-              return (
-                <Text key={ri} wrap="truncate">
-                  <Text color={C.dim}>{gutter}</Text>
-                  {line || ' '}
-                </Text>
-              );
-            }
-            // Caret cell = the WHOLE grapheme cluster under the caret (slice(col, col+1) painted
-            // half an emoji as mojibake). At the row end it is a plain space.
-            const col = Math.min(win.caretCol, line.length);
-            let before = line;
-            let at = ' ';
-            let after = '';
-            if (col < line.length) {
-              const cluster = nextCluster(line, col);
-              before = line.slice(0, col);
-              at = cluster;
-              after = line.slice(col + cluster.length);
-            }
-            return (
-              <Text key={ri} wrap="truncate">
-                <Text color={C.dim}>{gutter}</Text>
-                {before}
-                <Text inverse>{at}</Text>
-                {after}
-              </Text>
-            );
-          })
-        )}
-        {needCaretRow && !empty ? (
-          // The borrowed caret row: continuation indent + the inverse cell alone.
-          <Text wrap="truncate">
-            <Text color={C.dim}>{'  '}</Text>
-            <Text inverse> </Text>
-          </Text>
-        ) : null}
-      </Box>
-      {showHint ? (
-        <Text wrap="truncate" color={C.dim}>
-          <ChromeMarkers markers={markers} trailing={markers.length > 0 && hint.length > 0} />
-          {hint}
-        </Text>
-      ) : null}
-    </Box>
-  );
-}
-
-/**
- * Render a committed transcript item using the v2 flatten output (the SAME styling the pinned
- * renderer produces: ✦ brand, one-row tool results, ADA markdown), but as plain Ink <Text> rows
- * inside <Static>. This is the reference-client architecture — Ink owns the cursor and native scrollback, so the
- * whole scroll-region/absolute-paint bug class is structurally impossible — with the v2 look intact.
- * A left page margin (PAGE_MARGIN) insets content off the terminal edge.
- */
-function FlatItem({
-  item,
-  cols,
-  collapsed,
-  continuation = false,
-  foldLargeTables = true,
-  toolRun,
-}: {
-  item: TranscriptItem;
-  cols: number;
-  collapsed: boolean;
-  continuation?: boolean;
-  /** When true (default), GFM tables with many body rows fold to `⌄ table N×M · ^O`. */
-  foldLargeTables?: boolean;
-  /** Tool-call stacking descriptor (set only for items in a run of ≥2 consecutive tools). */
-  toolRun?: ToolRun;
-}) {
-  const inner = Math.max(20, cols - PAGE_MARGIN * 2);
-  const w = item.kind === 'banner' ? inner : Math.min(inner, PROSE_MAX_COLS);
-  // P3-03: epoch-independent memo — a <Static key={staticEpoch}> remount recreates every FlatItem
-  // (in-component useMemo would die with it), so the cache lives in flatten.ts, a WeakMap keyed on
-  // the ITEM OBJECT (ids restart at 0 per TuiApp mount and would collide across instances) with the
-  // layout inputs as the variant key. Ctrl-O at unchanged width reuses the wrap work; only items
-  // whose fold/layout actually changed re-flatten.
-  const lines = flattenItemCached(
-    item as Parameters<typeof flattenItemCached>[0],
-    w,
-    collapsed,
-    PIN_THEME,
-    continuation,
-    foldLargeTables,
-    toolRun,
-  );
-  return (
-    <Box flexDirection="column" paddingLeft={PAGE_MARGIN}>
-      {lines.map((ln) => {
-        const empty = ln.spans.every((s) => s.text === '');
-        if (empty) return <Text key={ln.key}> </Text>; // preserve block-gap blank lines
-        return (
-          <Text key={ln.key} wrap="truncate">
-            {ln.spans.map((s, i) => (
-              <Text
-                key={i}
-                color={s.color ?? (s.dim ? C.dim : undefined)}
-                backgroundColor={s.bg}
-                bold={s.bold}
-                italic={s.italic}
-              >
-                {s.text}
-              </Text>
-            ))}
-          </Text>
-        );
-      })}
-    </Box>
-  );
-}
 
 // DiffPanel removed — diffs now render as a single collapsible transcript item
 // (see the tool_end handler); no separate always-expanded live panel to flood the view.
@@ -1495,7 +596,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const todoItemsRef = useRef<TodoItem[]>([]);
   todoItemsRef.current = todoItems;
   const [planMode, setPlanMode] = useState<PlanSnapshot>(opts.planMode?.snapshot() ?? { mode: 'implement' });
-  const [goal, setGoal] = useState<string | null>(null); // standing objective (/goal); injected into system each turn
+  // /goal mission state: the session-scoped MissionState is the truth; this snapshot
+  // mirrors its bus events for render. `goal` stays as the one-line HUD text (missionHudLine)
+  // so the layout's hasGoal accounting keeps meaning exactly one pinned row.
+  const [missionSnap, setMissionSnap] = useState<MissionSnapshot | null>(opts.mission?.snapshot() ?? null);
   const [tick, setTick] = useState(0);
   const runStartRef = useRef(0); // wall-clock start of the current turn, for the elapsed timer
   const [menuIndex, setMenuIndex] = useState(0); // selected row in the slash-command menu
@@ -1799,7 +903,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     customCommandsLoadedRef.current = true;
     loadCustomCommands();
   }
-  const goalRef = useRef<string | null>(null);
+  const missionRef = useRef<MissionSnapshot | null>(null); // live mission snapshot for slash/turn seams
   // Extra granted roots, mutable at runtime via /add-dir (seeded from startup config/--add-dir).
   // The loop deps re-read this ref each turn, so a grant takes effect on the next turn.
   const additionalRootsRef = useRef<string[]>([...(opts.additionalRoots ?? [])]);
@@ -1850,7 +954,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   pickerOpenRef.current = pickerOpen;
   pickerIndexRef.current = pickerIndex;
   styleRef.current = style;
-  goalRef.current = goal;
+  missionRef.current = missionSnap;
+  const goal = missionHudLine(missionSnap); // ONE pinned row, same slot the standing goal used
 
   // Set the composer text and move the caret to the end (history nav, autocomplete, clear).
   const setLine = useCallback((v: string) => {
@@ -2508,6 +1613,55 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     }, TOAST_TTL_MS);
   }, [pushLine]);
 
+  // Shift+Tab: plan-mode fast lane (1.2). `chat:cycleMode` is a default Chat binding, but until
+  // this registration nothing handled it — the key fell through to the bare-Tab ring. Tab keeps
+  // the full autonomy ring; this one key jumps straight in and out of plan mode. Terminals that
+  // deliver Shift+Tab WITHOUT Ink's shift flag never match the binding — the composer owner's
+  // raw-byte fallback catches those. Safe mid-turn: PlanModeState is shared with the running
+  // loop, so the write gate engages on the next turn.
+  useEffect(() => kbRegister('chat:cycleMode', () => {
+    const pm = opts.planMode;
+    if (!pm) return;
+    if (pm.active) {
+      pm.exit();
+      setAutonomy('manual'); // leaving plan restarts at the cautious end of the ring
+      loopRef.current?.setAutonomy('manual');
+    } else {
+      pm.enter();
+    }
+  }), [kbRegister, opts.planMode, setAutonomy]);
+
+  // Ctrl+X M (leader chord): open the model picker — the one-key switch (1.3). Mirrors the
+  // idle path of /model exactly (same guard, same active-row focus) so key and command can't
+  // drift. Blocked mid-turn ON PURPOSE: while the picker has focus it captures EVERY key, so
+  // an open picker would swallow the Esc that interrupts the running turn.
+  useEffect(() => kbRegister('chat:openModelPicker', () => {
+    if (runningRef.current) {
+      pushLine({ text: 'Finish the current turn before switching models — Esc stops it.', dimColor: true });
+      return;
+    }
+    const rows = modelRows(opts.cfg);
+    if (rows.filter((r) => r.kind === 'model').length <= 1) {
+      pushLine({
+        kind: 'system',
+        text: 'model',
+        lines: [
+          { text: `${currentRef.current.provider} / ${currentRef.current.model}`, color: C.cyan },
+          { text: 'Use /model add <label> <provider> <model> [baseUrl] [--self-hosted] to add a preset.', dimColor: true },
+        ],
+      });
+      return;
+    }
+    const active = rows.findIndex(
+      (r) =>
+        r.kind === 'model' &&
+        r.entry.provider === currentRef.current.provider &&
+        r.entry.model === currentRef.current.model,
+    );
+    setPickerIndex(active >= 0 ? active : firstSelectableRow(rows));
+    setPickerOpen(true);
+  }), [kbRegister, opts.cfg, pushLine]);
+
   // T2 Phase 3 — instruction-file autopilot (Claude Code / Codex parity): at LAUNCH, seed
   // SHADOW.md when no instruction file exists here, or acknowledge AGENTS.md/CLAUDE.md when
   // they do. Strictly additive (an existing file is NEVER touched), toast-only and silent
@@ -2646,19 +1800,24 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     dropStreamedUnits,
     setCommitted,
     setShowAllExpanded, setStaticEpoch, setTodoItems, setAttachCount, setStatus,
-    setPlanMode, setGoal, setPickerIndex, setPickerOpen, setAutonomy, setEffort,
+    setPlanMode, setPickerIndex, setPickerOpen, setAutonomy, setEffort,
     setStyle, setVimEnabled, setVimMode, setThemeTick, setCustomStatus, setComposer,
     pushLine, showToast, showBanner, exit, refreshStatusLine, copyLast, refreshRewindTurns,
     showResumeRecap, pushImage, loadCustomCommands,
     startTurnRef, kbLoadedRef, firstRef, answerOpenRef, committedRef, attachmentsRef,
     pastesRef, lastUsageRef, sessionCostRef, prevTurnCostRef, sessionInTokRef,
     sessionOutTokRef, prevTurnInTokRef, prevTurnOutTokRef, sessionTurnsRef,
-    costWarnedRef, fileListLoadedRef, goalRef, startTableRef, currentRef,
+    costWarnedRef, fileListLoadedRef, missionRef, startTableRef, currentRef,
     selectModelRef, asyncCommandRef, providerRef, activeTargetRef, styleRef,
     autonomyRef, loopRef, effortRef, runningRef, compactingRef, compactAbortRef,
     sessionLogRef, sessionApprovalsRef, rewindableTurnsRef, additionalRootsRef,
     statusLineRef, vimEnabledRef, vimPendingRef, vimFindRef, vimCountRef, vimRegRef,
     flushQueueRef, runOneRef, repaintFromContextRef,
+    // /goal begin while a turn runs: queue the kickoff like a wakeup (never a second
+    // concurrent turn on the shared Context).
+    queueDeferred: (text: string) => {
+      setQueued([...queuedTasksRef.current, { text, kind: 'deferred' }]);
+    },
     context, opts, bus, subAgents, todoItems,
   };
   const runSlash = useCallback(
@@ -3358,6 +2517,16 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         case 'plan_mode':
           setPlanMode(e.plan);
           break;
+        case 'mission': {
+          // Phase transitions toast once (a task-status update alone doesn't); the row
+          // itself repaints via missionSnap on every event.
+          const prev = missionRef.current;
+          setMissionSnap(e.mission);
+          if (prev?.active && e.mission.active && prev.phase !== e.mission.phase) {
+            showToast(`mission → ${e.mission.phase}`, 'info');
+          }
+          break;
+        }
         case 'shell_output':
           // Live shell preview = the LAST non-empty output line only, capped — the raw chunks used to
           // accumulate unbounded into this state, ballooning the live region (and the composer with it)
@@ -3506,15 +2675,22 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       setThinkNow('');
       ctrlCArmedRef.current = false;
 
+      // Fold any background sub-agent results into THIS user turn (index.ts parity — the
+      // TUI never drained them, so a bg agent's answer never reached the model in TUI
+      // sessions). Drained ONLY here at the turn-build seam via the named helper —
+      // see src/tui/turnInput.ts for why this is never done anywhere else.
+      const taskText = drainTurnInput(task, opts.pendingNotifications);
       // Prepend any queued /image attachments, then clear the buffer (one-shot per message).
       const imgs = attachmentsRef.current;
-      const content: ContentBlock[] = task ? [{ type: 'text', text: task }] : [];
+      // `taskText` (not `task`): an image-only send can still carry DRAINED background-agent
+      // results — gating on `task` here silently dropped them (drain already emptied the queue).
+      const content: ContentBlock[] = taskText ? [{ type: 'text', text: taskText }] : [];
       content.push(...imgs);
       if (imgs.length) {
         attachmentsRef.current = [];
         setAttachCount(0);
       }
-      const userMsg: Message = { role: 'user', content: content.length ? content : [{ type: 'text', text: task }] };
+      const userMsg: Message = { role: 'user', content: content.length ? content : [{ type: 'text', text: taskText }] };
       if (firstRef.current) {
         context.pinTask(userMsg);
         firstRef.current = false;
@@ -3550,16 +2726,16 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         // LIVE model, resolved per turn — a /model switch changes the family mid-session
         // and parallelTools is derived from whatever is passed here.
         model: currentRef.current.model,
-        system:
-          (opts.styleState?.systemForStyle?.(styleRef.current) ?? opts.system) +
-          (goalRef.current
-            ? `\n\n## Standing goal\nThe user set a standing goal for this session. Keep working toward it until it is met or explicitly cleared; do not consider the task done while it is unmet:\n${goalRef.current}\n`
-            : ''),
+        // The mission block now comes from the LOOP (deps.mission → mission.block() pinned
+        // into the system prompt each turn, plan/todo parity) — the TUI no longer injects a
+        // standing-goal suffix here, so the two could never disagree mid-mission.
+        system: opts.styleState?.systemForStyle?.(styleRef.current) ?? opts.system,
         workspaceRoot: opts.workspaceRoot,
         additionalRoots: additionalRootsRef.current,
         forceConfirm: opts.forceConfirm,
         todoList: opts.todoList,
         planMode: opts.planMode,
+        mission: opts.mission,
         streamShell: true,
         // P2-11 (/fork): read through the ref so a turn that runs AFTER a /fork writes to the
         // forked session log, not the pre-fork one the app was mounted with.
@@ -3569,7 +2745,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         // session" re-prompted one message later.
         approvals: sessionApprovalsRef.current,
         priorStopReason: lastStopReasonRef.current,
-        continuityState: goalRef.current ? `Standing goal:\n${goalRef.current}` : undefined,
+        // mission continuity rides the loop's compaction continuity (deps.mission), not the TUI.
         resolveFallback: async (entry, fallbackSignal) => {
           fallbackSignal?.throwIfAborted();
           const build = buildProviderRef.current;
@@ -4191,7 +3367,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const wantFullBlock = !todoCollapsed && !!(showPlan || showTodo);
   const showFullPinned = wantFullBlock && terminalSize.rows >= 16;
   const hudPinnedLine = [
-    goal ? `🎯 ${goal}` : '',
+    goal, // missionHudLine(missionSnap) — 🎯 mission · phase n/m, one row
     showPlan ? `${planMode.mode === 'planning' ? 'plan' : 'implement'}: ${planMode.title ?? ''}` : '',
     showTodo
       // The glyph mirrors what actually RENDERED: '▾' only when the full block is truly open —
@@ -4569,7 +3745,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           composer is stationary anyway. Cell path keeps the full block (fixed-height viewport). */}
       {menuOpen ? null : showFullPinned ? (
         <PinnedState
-          goal={goal}
+          goal={missionPinnedRow(missionSnap)}
           plan={planMode}
           todos={todoItems}
           showPlan={showPlan}
@@ -4758,121 +3934,6 @@ export function runTui(opts: TuiOpts): Promise<void> {
   return waitUntilExit().finally(cleanup);
 }
 
-// ── Headless renderer (one-shot / piped) — raw ANSI straight to stdout ───────
-//
-// Colour is emitted only for a real terminal that has not asked for plain output. This path is
-// taken by `--task` and `--repl` as well as by piped runs (index.ts: `headless = !!flags.task ||
-// !!flags.repl || !interactive`), so gating on "headless" would wrongly strip colour from an
-// interactive `--task` in a terminal — the gate has to be isTTY + NO_COLOR, like every other CLI.
-// Without it, `shadow --task ... > out.txt` wrote raw SGR into the file.
-const COLOR = !!process.stdout.isTTY && !process.env.NO_COLOR;
-const c = (seq: string): string => (COLOR ? seq : '');
-const A = {
-  reset: c('\x1b[0m'),
-  dim: c('\x1b[2m'),
-  green: c('\x1b[38;2;16;185;129m'),
-  red: c('\x1b[38;2;239;68;68m'),
-  yellow: c('\x1b[38;2;245;158;11m'),
-  cyan: c('\x1b[36m'),
-};
-
-export function attachRenderer(bus: EventBus, _opts?: { animate: boolean }): () => void {
-  // Sub-agent taskId → type, so a delegated tool line can name its agent instead of a bare taskId.
-  const subagentType = new Map<string, string>();
-  return bus.on((e) => {
-    switch (e.type) {
-      case 'text':
-        if (e.delta) process.stdout.write(stripCtl(e.delta));
-        break;
-      case 'subagent_start':
-        subagentType.set(e.taskId, e.subagentType);
-        // F06-10: a queued announcement reads as queued; the admission re-announcement then prints
-        // the normal started line — two honest lines instead of one misleading one.
-        if (e.queued) {
-          process.stdout.write(`\n${A.dim}▸ sub-agent ${e.subagentType}${e.description ? ` · ${stripCtl(e.description)}` : ''} queued — waiting for a concurrency slot${e.background ? ' (background)' : ''}${A.reset}\n`);
-        } else {
-          process.stdout.write(`\n${A.cyan}▸ sub-agent ${e.subagentType}${e.description ? ` · ${stripCtl(e.description)}` : ''} started${e.background ? ' (background)' : ''}${A.reset}\n`);
-        }
-        break;
-      case 'subagent_end':
-        process.stdout.write(`${e.ok ? A.dim : A.yellow}▸ sub-agent ${e.subagentType ?? subagentType.get(e.taskId) ?? 'agent'} ${e.ok ? 'finished' : 'failed'}${A.reset}\n`);
-        break;
-      case 'tool_start': {
-        // A forwarded sub-agent tool is tagged with e.subagent (taskId); attribute it so headless
-        // output distinguishes delegated activity from the parent's own (BUG 3 headless half).
-        const who = e.subagent ? `${A.cyan}[${subagentType.get(e.subagent) ?? 'agent'}]${A.dim} ` : '';
-        process.stdout.write(`\n${A.dim}↳ ${who}${e.call.name} ${stripCtl(previewOf(e.call.input))}${A.reset}\n`);
-        break;
-      }
-      case 'tool_end': {
-        const mark = e.result.ok ? `${A.green}ok${A.reset}` : `${A.red}err${A.reset}`;
-        process.stdout.write(`  ${mark} ${stripCtl(oneLine(e.result.summary))}\n`);
-        break;
-      }
-      case 'tool_denied':
-        process.stdout.write(`  ${A.yellow}blocked${A.reset} ${stripCtl(friendlyDeniedReason(e.reason))}\n`);
-        break;
-      case 'reasoning_done':
-        process.stdout.write(`\n${A.dim}▸ Reasoning${A.reset}\n${A.dim}${stripCtl(e.text)}${A.reset}\n`);
-        break;
-      case 'finding': {
-        const color = e.severity === 'error' ? A.red : e.severity === 'warn' ? A.yellow : A.cyan;
-        process.stdout.write(`\n${color}▣ ${stripCtl(e.title)}${A.reset}\n${stripCtl(e.body)}\n`);
-        break;
-      }
-      case 'shell_output':
-        process.stdout.write(stripCtl(e.chunk));
-        break;
-      case 'shell_pid':
-        if (e.warn) process.stderr.write(`  ${A.yellow}⚠ shell pid ${e.pid}: ${e.warn} — kill manually if needed${A.reset}\n`);
-        break;
-      case 'model_fallback':
-        process.stdout.write(`  ${A.dim}model fallback: ${e.from} → ${e.to}${A.reset}\n`);
-        break;
-      case 'compaction':
-        process.stdout.write(
-          e.degraded
-            ? `  ${A.yellow}⟳ context reclaimed locally — summarizer unavailable${A.reset}\n`
-            : `  ${A.dim}⟳ context compacted — earlier turns summarized${A.reset}\n`,
-        );
-        break;
-      case 'retry':
-        process.stdout.write(`  retry ${e.attempt} in ${e.delayMs}ms (${oneLine(e.reason)})\n`);
-        break;
-      case 'error':
-        process.stdout.write(`  ${A.red}${e.message}${A.reset}\n`);
-        break;
-      case 'stop': {
-        const empty = e.reason === 'max_tokens' && !e.finalAnswer.trim();
-        if (e.reason === 'provider_error' || e.reason === 'fatal_tool_error' || empty) {
-          const msg = empty ? 'max_tokens (no output produced)' : e.reason;
-          process.stderr.write(`  ${A.red}stopped: ${msg}${A.reset}\n`);
-        }
-        break;
-      }
-      default:
-        break;
-    }
-  });
-}
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-function previewOf(input: unknown): string {
-  const o = input as Record<string, unknown> | undefined;
-  if (o && typeof o === 'object') {
-    if (typeof o.command === 'string') {
-      // Collapse a multi-line command (e.g. a python -c heredoc) to one line and cap it, so the live
-      // "↳ run_shell $ …" preview can't fill the window while the command runs.
-      const cmd = o.command.replace(/\s+/g, ' ').trim();
-      return `$ ${cmd.length > 120 ? cmd.slice(0, 119) + '…' : cmd}`;
-    }
-    if (typeof o.path === 'string') return o.path;
-    if (typeof o.url === 'string') return o.url;
-    if (typeof o.pattern === 'string') return o.pattern;
-  }
-  return '';
-}
 
 // Re-exported so existing importers (tests, scripts/demo-tui.ts) keep working after the
 // theme table moved to tui/theme.ts.

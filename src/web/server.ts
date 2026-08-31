@@ -12,7 +12,7 @@ import { makeAgentBuilder } from './sessionAgent.js';
 import { makeTurnRunner } from './runTurn.js';
 import { WebApprovalGate } from './approvalGate.js';
 import { INSTALL_DIR } from '../installDir.js';
-import { loadConfig } from '../config.js';
+import { loadConfig, type ShadowConfig } from '../config.js';
 
 /**
  * Shadow's loopback web server: one process, one port, same origin for assets and the
@@ -62,18 +62,63 @@ export interface WebServerOptions {
   };
 }
 
-export function startWebServer(opts: WebServerOptions): Promise<WebServerHandle> {
-  const token = randomBytes(24).toString('base64url');
-  // The token is a live credential. Register it so redact() scrubs it from anything the
-  // agent might read back — tool output, surfaced errors, the session log.
-  registerSecret(token);
+/** Floor for a user-set web token. The random default is 32 base64url chars; this is the
+ *  minimum we accept from a hand-written one. */
+export const WEB_TOKEN_MIN_LENGTH = 16;
 
+/**
+ * Reject a user-set web token that is not safe to serve as the console's bearer credential.
+ * Whitespace and control characters are refused because the token travels through the printed
+ * `open "...#t=…"` join line, the `?t=` query form, and the Authorization header — a token that
+ * breaks any of those would strand the user exactly like the rotation dance this setting removes.
+ * The message names the key, the file, and the fallback, so it is actionable on first read.
+ */
+export function assertValidWebToken(token: string): void {
+  const fix =
+    'fix the value under "web" in ~/.shadow/config.json, or delete it there to fall back ' +
+    'to a fresh random token on each `shadow web` boot';
+  if (token.length < WEB_TOKEN_MIN_LENGTH) {
+    throw new Error(`web.token must be at least ${WEB_TOKEN_MIN_LENGTH} characters (got ${token.length}) — ${fix}.`);
+  }
+  // \s covers space/tab/newline and unicode space; \u0000-\u001f + \u007f catch the C0 controls.
+  const bad = /[\s\u0000-\u001f\u007f]/.exec(token);
+  if (bad) {
+    throw new Error(
+      `web.token must not contain whitespace or control characters (found at index ${bad.index}) — ${fix}.`,
+    );
+  }
+}
+
+/**
+ * The console's bearer token: the user's own `web.token` from ~/.shadow/config.json when set —
+ * stable across restarts, which is the point — otherwise a fresh random token per boot. An
+ * invalid set token FAILS the boot rather than falling back to random: a silent fallback would
+ * leave the user's saved URL dead with no explanation.
+ */
+export function resolveWebToken(config: Pick<ShadowConfig, 'web'>): string {
+  const configured = config.web?.token;
+  if (configured !== undefined) {
+    assertValidWebToken(configured);
+    return configured;
+  }
+  return randomBytes(24).toString('base64url');
+}
+
+export async function startWebServer(opts: WebServerOptions): Promise<WebServerHandle> {
   const workspaceRoot = opts.workspaceRoot ?? process.cwd();
 
   // Snapshot the config at boot (§8 Q3): the lazy agent builder uses THIS for mcpServers + model
   // presets, never a fresh disk reload, so a POST /api/mcp between boot and a first prompt cannot
   // inject a spawn command into a web build. The allowlist (resolveJail) is still read fresh.
   const bootConfig = loadConfig(workspaceRoot);
+
+  // Token: the user's own web.token when set — stable across restarts, so saved URLs keep
+  // working (no rotation dance) — otherwise a fresh random one per boot. An invalid set token
+  // rejects the startup promise with an actionable error (startWebServer is async on purpose).
+  const token = resolveWebToken(bootConfig);
+  // The token is a live credential whichever way it was minted. Register it so redact() scrubs
+  // it from anything the agent might read back — tool output, surfaced errors, the session log.
+  registerSecret(token);
 
   // The session registry, constructed per server (NOT module-level — two servers in one process
   // must not share it; test/web-server.test.ts:270 guards this). The reserved 'cli' session wraps

@@ -241,3 +241,149 @@ export class Budget {
     return this.costUSD;
   }
 }
+
+// ── Spend guardrail (plan 2.3) ────────────────────────────────────────────────
+/**
+ * A PURE state machine for the configurable step/cost budget with warn-once +
+ * explicit-continue semantics — fully unit-testable, no I/O. Unlike the `Budget`
+ * class above (unconditional hard ceilings), the guardrail WARNS once at
+ * `warnRatio`, then pauses and asks; an approval grants exactly one more
+ * allowance window (same limits again), a denial ends the run gracefully.
+ * Absent limits = no guardrail (always 'ok').
+ */
+export interface BudgetGuardConfig {
+  maxSteps?: number;
+  maxCostUsd?: number;
+  /** Fraction (0,1] of each limit at which the one-time warning fires. Default 0.8. */
+  warnRatio?: number;
+}
+
+export type BudgetGuardStatus = 'ok' | 'warned' | 'exceeded';
+
+export interface BudgetGuardSnapshot {
+  steps: number;
+  costUsd: number;
+  status: BudgetGuardStatus;
+  maxSteps?: number;
+  maxCostUsd?: number;
+  warnRatio: number;
+  /** Warn crossings announced (at most one per window). */
+  warnings: number;
+  /** Allowance windows granted via explicit continue. */
+  continuations: number;
+}
+
+export interface BudgetGuardState {
+  /** Count one model call (one agent step). */
+  recordStep(): void;
+  /** Accrue USD spent (an INCREMENT, not the cumulative session cost). */
+  recordCost(usd: number): void;
+  /** 'exceeded' when EITHER configured limit is hit; 'warned' inside the warn band. */
+  status(): BudgetGuardStatus;
+  snapshot(): BudgetGuardSnapshot;
+  /**
+   * Mark the current warn-band crossing as announced. Returns true only on the
+   * FIRST call after a crossing — this is what makes the warning fire exactly
+   * once per threshold crossing (reset by grantContinuation, so a fresh window
+   * can warn again).
+   */
+  announceWarning(): boolean;
+  /** Explicit continue: reset the window counters; one more allowance, same limits. */
+  grantContinuation(): void;
+  /** True when at least one limit is configured. */
+  readonly active: boolean;
+}
+
+export const DEFAULT_BUDGET_WARN_RATIO = 0.8;
+
+export function createBudgetState(cfg: BudgetGuardConfig): BudgetGuardState {
+  const warnRatio = cfg.warnRatio ?? DEFAULT_BUDGET_WARN_RATIO;
+  const maxSteps = cfg.maxSteps;
+  const maxCostUsd = cfg.maxCostUsd;
+  let steps = 0;
+  let costUsd = 0;
+  let warnAnnounced = false;
+  let warnings = 0;
+  let continuations = 0;
+
+  const rawStatus = (): BudgetGuardStatus => {
+    const exceeded =
+      (maxSteps != null && steps >= maxSteps) ||
+      (maxCostUsd != null && costUsd >= maxCostUsd);
+    if (exceeded) return 'exceeded';
+    const warned =
+      (maxSteps != null && steps >= maxSteps * warnRatio) ||
+      (maxCostUsd != null && costUsd >= maxCostUsd * warnRatio);
+    return warned ? 'warned' : 'ok';
+  };
+
+  return {
+    recordStep() {
+      steps += 1;
+    },
+    recordCost(usd) {
+      if (usd > 0) costUsd += usd;
+    },
+    status: rawStatus,
+    snapshot() {
+      return { steps, costUsd, status: rawStatus(), maxSteps, maxCostUsd, warnRatio, warnings, continuations };
+    },
+    announceWarning() {
+      if (warnAnnounced) return false;
+      warnAnnounced = true;
+      warnings += 1;
+      return true;
+    },
+    grantContinuation() {
+      steps = 0;
+      costUsd = 0;
+      warnAnnounced = false;
+      continuations += 1;
+    },
+    get active() {
+      return maxSteps != null || maxCostUsd != null;
+    },
+  };
+}
+
+/** The decision the agent loop consults before dispatching the next model call. */
+export type BudgetDecision = 'proceed' | 'warn' | 'ask' | 'stop';
+
+/**
+ * Given the guard state, what the loop should do next:
+ * - 'proceed' — under budget (or warning already announced);
+ * - 'warn'    — crossed the warn threshold; announce once, then continue;
+ * - 'ask'     — a limit is hit and a human can be asked (approval gate);
+ * - 'stop'    — a limit is hit with no one to ask: end the run gracefully.
+ */
+export function decideBudgetAction(state: BudgetGuardState, opts: { interactive: boolean }): BudgetDecision {
+  const status = state.status();
+  if (status === 'exceeded') return opts.interactive ? 'ask' : 'stop';
+  if (status === 'warned' && state.announceWarning()) return 'warn';
+  return 'proceed';
+}
+
+function fmtUsd(n: number): string {
+  return `$${n >= 0.01 ? n.toFixed(2) : n.toFixed(4)}`;
+}
+
+/** Warn-band summary, only the configured limits: "Budget 80%: 8/10 steps · $0.80/$1.00". */
+export function budgetProgressMessage(snap: BudgetGuardSnapshot): string {
+  const parts: string[] = [];
+  if (snap.maxSteps != null) parts.push(`${snap.steps}/${snap.maxSteps} steps`);
+  if (snap.maxCostUsd != null) parts.push(`${fmtUsd(snap.costUsd)}/${fmtUsd(snap.maxCostUsd)}`);
+  return `Budget ${Math.round(snap.warnRatio * 100)}%: ${parts.join(' · ')}`;
+}
+
+/** Over-limit detail, only the configured limits: "10/10 steps · $1.20/$1.00". */
+export function budgetExceededDetail(snap: BudgetGuardSnapshot): string {
+  const parts: string[] = [];
+  if (snap.maxSteps != null) parts.push(`${snap.steps}/${snap.maxSteps} steps`);
+  if (snap.maxCostUsd != null) parts.push(`${fmtUsd(snap.costUsd)}/${fmtUsd(snap.maxCostUsd)}`);
+  return parts.join(' · ');
+}
+
+/** Option that ends the run. FIRST so every auto-answer path (yolo, idle countdown) stops safely. */
+export const BUDGET_STOP_LABEL = 'Stop here (Recommended)';
+/** Option that grants exactly one more allowance window (same limits again). */
+export const BUDGET_CONTINUE_LABEL = 'Continue — one more allowance window';

@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { readFileSync, existsSync, unlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { resolve, parse } from 'node:path';
+import { resolve, parse, join } from 'node:path';
+import { homedir } from 'node:os';
 import { stdout } from 'node:process';
 import {
   loadConfig,
@@ -68,6 +69,7 @@ import { Logger } from './util/logger.js';
 import { lc } from './util/lc.js';
 import { createInterface } from 'node:readline/promises';
 import { AutoApproveGate, AutoDenyGate, type ApprovalGate } from './agent/approval.js';
+import { stopLspServices } from './agent/lsp/index.js';
 import { ReplGate } from './replGate.js';
 import { loadGlobalConfig, saveGlobalConfig, ensureShadowLayout, configPath, GLOBAL_DIR } from './state/globalStore.js';
 import {
@@ -77,6 +79,8 @@ import {
   FIRST_RUN_HINT,
 } from './config/configInit.js';
 import { listResumableSessions } from './state/resume.js';
+import { SessionLog } from './state/session.js';
+import { scanClaudeSessions, importClaudeSession } from './state/claudeImport.js';
 import { isDumbTerm, queryTerminalBackground, themeForBackground } from './util/themeDetect.js';
 import { normalizeThemeName } from './tui/theme.js';
 import { buildCodexAuthUrl } from './auth/oauth.js';
@@ -93,6 +97,7 @@ import { readVersion } from './version.js';
 import { runAcp } from './acp/cli.js';
 import { runHookPhase } from './hooks/runner.js';
 import { parseArgs } from './cli/flags.js';
+import { shouldAutoOnboard, NO_PROVIDER_HINT } from './cli/autoOnboard.js';
 
 // INSTALL_DIR (package root) is imported from ./installDir.js at the top — its own module so
 // src/web/* can share it without pulling in this file's top-level main().
@@ -106,10 +111,12 @@ const CLOSED = Symbol('repl-closed');
 async function runExport(args: string[], cwd: string): Promise<void> {
   let sessionPath: string | undefined;
   let outPath: string | undefined;
+  let html = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === '--session') sessionPath = resolve(cwd, args[++i] ?? '');
     else if (a === '--out') outPath = args[++i];
+    else if (a === '--html') html = true;
     else if (!a.startsWith('-') && !outPath) outPath = a;
   }
   const workspaceRoot = resolve(cwd);
@@ -129,7 +136,7 @@ async function runExport(args: string[], cwd: string): Promise<void> {
     model: cfg.model,
     style: cfg.lastStyle,
     autonomy: cfg.autonomy,
-  }, outPath);
+  }, outPath, html ? 'html' : 'markdown');
   stdout.write(`Exported ${bytes} bytes → ${path}\n`);
 }
 
@@ -143,7 +150,7 @@ function helpText(): string {
     '  onboard              guided provider setup — pick a provider, key, model; tested + saved',
     '  onboard --web        secure setup in a local browser form → encrypted vault + master password',
     '  update               self-update: git checkout → pull+rebuild; binary install → re-fetch from host',
-    '  export [path.md]     export session log to markdown (--session, --out)',
+    '  export [path]        export session log to markdown, or standalone HTML with --html (--session, --out)',
     '  mcp <list|enable|disable>  manage MCP servers (e.g. `mcp enable browser`)',
     '  plugin <add|list|enable|disable|remove|search>  local-first plugin manager (data-only markdown bundles)',
     '  local <add|list|test|use|remove>  manage local models — .gguf or MLX (no Ollama/LM Studio needed)',
@@ -152,7 +159,9 @@ function helpText(): string {
     '  doctor --privacy     prove this config\'s privacy posture: egress, keys-at-rest, offline (no network)',
     '  doctor model [name]  capability test: can this model code agentically? (active model or a preset)',
     '  egress               show the outbound-connection receipt (~/.shadow/egress.log) — who Shadow talked to, why, allowed/denied',
-    '  resume [--session]   resume a prior session from its latest context snapshot',
+    '  resume [--session] [--from-claude]  resume a prior session from its latest context snapshot',
+    '                       --from-claude first imports Claude Code sessions (~/.claude/projects)',
+    '                       into the Shadow session store, then resumes as normal',
     '  login codex|grok     OAuth login (codex only; grok uses API key)',
     '  acp                  ACP agent for editors (Zed et al.) — JSON-RPC 2.0 over stdio; --add-project',
     '',
@@ -840,6 +849,53 @@ async function runLogin(args: string[]): Promise<void> {
   process.exit(1);
 }
 
+/**
+ * `resume --from-claude`: scan ~/.claude/projects and import every Claude Code transcript into
+ * the Shadow session store (READ-ONLY on the source tree), printing one status line per file,
+ * then return so the normal resume flow picks a session — imported ones included.
+ */
+function runFromClaudeImport(workspaceRoot: string): void {
+  const baseDir = join(homedir(), '.claude', 'projects');
+  stdout.write(`Scanning ${baseDir} for Claude Code sessions...\n`);
+  const scan = scanClaudeSessions(baseDir);
+  for (const w of scan.warnings) stdout.write(`  warning: ${w}\n`);
+  if (!scan.sessions.length) {
+    stdout.write('No Claude Code sessions found.\n');
+    return;
+  }
+  if (scan.truncated) stdout.write(`  note: listing capped at ${scan.sessions.length} sessions (most recent first)\n`);
+  const targetStore = SessionLog.sessionsDir(workspaceRoot);
+  let imported = 0;
+  let duplicates = 0;
+  let tooLarge = 0;
+  let failed = 0;
+  for (const s of scan.sessions) {
+    const r = importClaudeSession(s.file, targetStore);
+    const label = [s.projectPath, s.title ? `"${s.title}"` : ''].filter(Boolean).join(' — ');
+    switch (r.status) {
+      case 'imported':
+        imported++;
+        stdout.write(`  imported          ${r.sessionId}${label ? ` (${label})` : ''}\n`);
+        break;
+      case 'skipped-duplicate':
+        duplicates++;
+        stdout.write(`  skipped-duplicate ${r.sessionId} (already imported)\n`);
+        break;
+      case 'skipped-too-large':
+        tooLarge++;
+        stdout.write(`  skipped-too-large ${r.sessionId}${label ? ` (${label})` : ''}\n`);
+        break;
+      case 'failed':
+        failed++;
+        stdout.write(`  failed            ${r.sessionId}: ${r.error ?? 'unknown error'}\n`);
+        break;
+    }
+  }
+  stdout.write(
+    `Imported ${imported} session(s), ${duplicates} already imported, ${tooLarge} too large, ${failed} failed.\n`,
+  );
+}
+
 async function main(): Promise<void> {
   ensureShadowLayout();
   // Self-heal local presets whose label is a bare HuggingFace snapshot hash (added before
@@ -873,13 +929,19 @@ async function main(): Promise<void> {
   }
   if (argv[0] === 'resume') {
     const rest: string[] = [];
+    let fromClaude = false;
     for (let i = 1; i < argv.length; i++) {
       const a = argv[i]!;
       if (a === '--session' && argv[i + 1]) {
         resumeSessionPath = resolve(process.cwd(), argv[++i]!);
+      } else if (a === '--from-claude') {
+        fromClaude = true;
       } else {
         rest.push(a);
       }
+    }
+    if (fromClaude) {
+      runFromClaudeImport(resolve(process.cwd()));
     }
     if (!resumeSessionPath) {
       const sessions = listResumableSessions(resolve(process.cwd()));
@@ -1068,12 +1130,25 @@ async function main(): Promise<void> {
     // (that's the Windows "blank config" report). One line on stderr; disappears once
     // `shadow config init` seeds defaults.
     if (globalConfigLooksEmpty(configPath())) process.stderr.write(FIRST_RUN_HINT + '\n');
-    if (flags.task || !process.stdin.isTTY || !process.stdout.isTTY) {
-      process.stderr.write('No model provider configured. Run `shadow onboard` to set one up.\n');
+    // 1.1 — the decision is a pure function (unit-tested): only a GENUINELY interactive first
+    // run gets the wizard; one-shot (--task), --repl, and piped/redirected runs keep the
+    // stderr hint + exit path so scripts see machine-readable output, never a prompt.
+    if (!shouldAutoOnboard({
+      configured: false,
+      stdinIsTTY: !!process.stdin.isTTY,
+      stdoutIsTTY: !!process.stdout.isTTY,
+      taskMode: !!flags.task,
+      replMode: !!flags.repl,
+    })) {
+      process.stderr.write(NO_PROVIDER_HINT + '\n');
       process.exit(1);
     }
     const ok = await runOnboard();
-    if (!ok) return;
+    if (!ok) {
+      // A cancelled wizard used to die silently with exit 0 — indistinguishable from success.
+      process.stderr.write(NO_PROVIDER_HINT + '\n');
+      process.exit(1);
+    }
     cfg = loadConfig(cwd, overrides, flags.profile); // pick up the freshly-saved provider/model/credentials
   }
 
@@ -1175,7 +1250,7 @@ async function main(): Promise<void> {
 
   // Destructured so the rest of main() reads exactly as it did before the extraction.
   cfg = session.cfg;
-  const { provider, registry, bg, memory, todoList, planMode, wakeup, skills, facts, sessionLog, offline, context } =
+  const { provider, registry, bg, memory, todoList, planMode, mission, wakeup, skills, facts, sessionLog, offline, context } =
     session;
   const fullSystemForStyle = session.systemForStyle;
   const fullSystem = session.system;
@@ -1264,6 +1339,10 @@ async function main(): Promise<void> {
   todoList.onUpdate((items) => bus.emit({ type: 'todo', items }));
   planMode.onUpdate((plan) => bus.emit({ type: 'plan_mode', plan }));
   bus.emit({ type: 'plan_mode', plan: planMode.snapshot() });
+  // /goal mission state → `mission` events. The bus→recordEvent subscriber journals each
+  // one, so resume (readMissionSnapshot) and the web/TUI HUDs all read the same stream.
+  mission.onUpdate((m) => bus.emit({ type: 'mission', mission: m }));
+  bus.emit({ type: 'mission', mission: mission.snapshot() });
 
   // --yolo / --nuke / --dangerously-skip-permissions: bypass ALL gating.
   const yolo = flags.yolo ?? false;
@@ -1366,6 +1445,11 @@ async function main(): Promise<void> {
       } catch {
         /* best effort */
       }
+    }
+    try {
+      stopLspServices(); // plan 3.1 — LSP children are unref'd; stop them so none outlive us
+    } catch {
+      /* best effort */
     }
   };
   process.on('exit', () => {
@@ -1553,6 +1637,8 @@ async function main(): Promise<void> {
       forceConfirm,
       todoList,
       planMode,
+      // Lead loop only — the mission orchestrates FROM here; delegates never see it.
+      mission,
       streamShell: !headless,
       sessionLog,
       continuityState: '',
@@ -1750,12 +1836,16 @@ async function main(): Promise<void> {
       styleState,
       todoList,
       planMode,
+      mission,
+      // bg sub-agent results: the TUI drains these into its NEXT user turn (8.4 fix —
+      // they previously accumulated forever in TUI sessions; only headless drained).
+      pendingNotifications,
       wakeupHandler,
       additionalRoots,
       // Safety posture must track LIVE autonomy, not process start. Two things were frozen:
       // sub-agent inheritance (getAutonomy closed over this binding) and the unrestricted
       // filesystem-root grant. Lowering autonomy mid-session now actually re-tightens both;
-      // RAISING it deliberately does NOT re-grant the fs root — `full` reached by Shift+Tab is
+      // RAISING it deliberately does NOT re-grant the fs root — `full` reached by the Tab ring is
       // not the same promise as `--yolo` chosen at launch, and silently widening the jail
       // because someone tabbed one stop too far is exactly the surprise to avoid.
       onAutonomyChange: (level) => {

@@ -6,6 +6,7 @@ import { ok, fail } from './types.js';
 import { resolveWithin } from '../safety/workspaceJail.js';
 import { applyStringEdit, atomicWrite } from './util.js';
 import { diffLines } from '../util/diff.js';
+import { formatAfterWrite } from '../agent/formatter.js';
 
 const editSchema = z.object({
   old_string: z.string().describe('Exact text to find (must match the file after prior edits in this call).'),
@@ -118,6 +119,12 @@ export const multiEdit: Tool<MultiEditInput, MultiEditData> = {
     } catch (e) {
       return fail('multi_edit', 'write', Date.now() - start, 'write_failed', `write failed: ${(e as Error).message}`);
     }
+
+    // Auto-format after write (plan 2.1, v1). Before the readTracker marks (so the recorded
+    // mtime includes the formatter's rewrite); never fails the edit — errors ride back as a
+    // one-line note on the summary.
+    const formatNote = await formatAfterWrite(abs, ctx);
+
     ctx.readTracker?.markRead(abs);
     ctx.readTracker?.markSeen(abs);
 
@@ -125,7 +132,7 @@ export const multiEdit: Tool<MultiEditInput, MultiEditData> = {
       'multi_edit',
       'write',
       Date.now() - start,
-      `Applied ${input.edits.length} edit(s) to "${input.path}" (${replacements} replacement(s)).`,
+      `Applied ${input.edits.length} edit(s) to "${input.path}" (${replacements} replacement(s)).${formatNote ? `\n${formatNote}` : ''}`,
       { path: abs, edits: input.edits.length, replacements },
     );
     const diff = diffLines(original, text);

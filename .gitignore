@@ -28,6 +28,8 @@ research/
 
 # other tools' session scratch
 .zcode/
+# Claude Code worktree/session scratch (agent-isolation worktrees live under .claude/worktrees/)
+.claude/
 
 # Secrets that must never be committed. `.env` alone did NOT cover `.env.local` / `.env.*`,
 # and the mirror sync uses a broad `git add -A`.

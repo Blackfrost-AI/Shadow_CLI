@@ -6,6 +6,7 @@ import { TuiApp, type TuiOpts } from '../src/tui.js';
 import { EventBus } from '../src/agent/events.js';
 import { Context } from '../src/agent/context.js';
 import { ToolRegistry } from '../src/tools/registry.js';
+import { MissionState } from '../src/agent/mission.js';
 import { createProvider } from '../src/provider/index.js';
 import { loadConfig } from '../src/config.js';
 
@@ -269,11 +270,11 @@ test('batched chunks: text + Enter in ONE read submits instead of swallowing the
 });
 
 test('batched chunks: /goal + Enter in ONE read runs the command (founder report)', async (t) => {
-  const { send, draft, lastFrame } = await mount(t);
+  const { send, draft, lastFrame } = await mount(t, { budget: { maxTotalTokens: 50_000 } }, { mission: new MissionState() });
   send('/goal ship the thing\r');
   await new Promise((r) => setTimeout(r, FLUSH_MS));
   assert.equal(await draft(), '', 'nothing stranded in the composer');
-  assert.match(lastFrame() ?? '', /Goal set: ship the thing/, 'the slash command actually ran');
+  assert.match(lastFrame() ?? '', /Mission started: ship the thing/, 'the slash command actually ran');
 });
 
 test('batched chunks: text + LF/CRLF (unbracketed paste signatures) insert as text, do NOT submit', async (t) => {

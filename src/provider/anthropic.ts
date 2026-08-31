@@ -85,9 +85,10 @@ export class AnthropicProvider implements Provider {
     tools?: any[];
     signal?: AbortSignal;
   }): Promise<number> {
-    // Build a minimal count_tokens request body.
+    // Build a minimal count_tokens request body. F10-03: count_tokens hits the same API and
+    // rejects the `[1m]` config alias too — the wire id is always the base model.
     const body: any = {
-      model: args.model || this.model,
+      model: stripContext1mAlias(args.model || this.model),
       messages: (args.messages ?? []).map((m) => ({
         role: m.role,
         content: m.content.map((b) => {
@@ -253,6 +254,17 @@ export function toAnthropicMessages(messages: Message[], model?: string): AntMes
  * models (≤4.5), local, and OpenAI-compat endpoints get no thinking config.
  */
 /**
+ * F10-03: `[1m]` is Shadow's config ALIAS for a model's 1M-context variant (e.g.
+ * `claude-opus-4-8[1m]`). The API accepts only the BASE model id; the 1M window is granted by
+ * the `context-1m-2025-08-07` beta header — see anthropicBetaHeaders, which fires on the alias.
+ * The two must ship together: stripping the alias from the wire id WITHOUT the header would
+ * silently downgrade the context window. Apply this to every model id that goes on the wire.
+ */
+export function stripContext1mAlias(model: string): string {
+  return model.replace(/\[1m\]/gi, '');
+}
+
+/**
  * `anthropic-beta` flags to send for a given model. The 1M context window is beta-
  * gated behind `context-1m-2025-08-07` and only offered on `[1m]` model variants;
  * adaptive thinking + effort are GA on 4.6+ so they need no header.
@@ -289,6 +301,12 @@ export function buildAnthropicBody(
   stream = true,
 ): Record<string, unknown> {
   const model = req.model || fallbackModel;
+  // F10-03: the wire id is the BASE model — the `[1m]` config alias never goes on the wire
+  // (the context-1m beta header carries the 1M opt-in; anthropicBetaHeaders sees the alias).
+  // Everything else below keeps the ALIASED id: adaptive-thinking detection is a prefix match,
+  // and toAnthropicMessages compares thinking-block signature stamps, which the loop writes
+  // with the configured (aliased) model string.
+  const wireModel = stripContext1mAlias(model);
   // Fast mode is a low-latency path; it's mutually exclusive with extended thinking,
   // so fast mode disables adaptive thinking rather than risk a 400.
   const adaptive = supportsAdaptiveThinking(model) && !req.fastMode;
@@ -304,7 +322,7 @@ export function buildAnthropicBody(
     (lastMsg.content[lastMsg.content.length - 1] as Record<string, unknown>).cache_control = cacheControl;
   }
   const body: Record<string, unknown> = {
-    model,
+    model: wireModel,
     max_tokens: adaptive ? Math.max(req.maxOutputTokens, MIN_THINKING_MAX_TOKENS) : req.maxOutputTokens,
     // NOTE: no `temperature`/`top_p`/`top_k` — all return HTTP 400 on adaptive models.
     messages,

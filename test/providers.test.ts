@@ -221,6 +221,42 @@ test('anthropicBetaHeaders adds extended-cache-ttl and fast-mode flags when requ
   ]);
 });
 
+test('F10-03: buildAnthropicBody strips the [1m] alias from the wire model id', async () => {
+  // The `[1m]` suffix is a Shadow config alias for the 1M-context variant; the Anthropic API
+  // accepts only the BASE model id plus the context-1m beta header (anthropicBetaHeaders keeps
+  // firing on the alias — see the test above). Sending the suffixed id verbatim 400s.
+  const base: CompletionRequest = {
+    model: 'claude-opus-4-8[1m]',
+    system: '',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    tools: [],
+    maxOutputTokens: 8192,
+  };
+  const body = buildAnthropicBody(base, 'claude-opus-4-8[1m]');
+  assert.equal(body.model, 'claude-opus-4-8', 'wire id is the base model, no [1m] suffix');
+  // Adaptive-thinking detection must see through the alias too.
+  assert.deepEqual(body.thinking, { type: 'adaptive', display: 'summarized' });
+  // Thinking-block signature matching compares against the ALIASED model (the loop stamps
+  // blocks with the configured model string), so message conversion must keep receiving it.
+  const withThinking: CompletionRequest = {
+    ...base,
+    messages: [
+      { role: 'user', content: [{ type: 'text', text: 'hi' }] },
+      {
+        role: 'assistant',
+        content: [{ type: 'thinking', thinking: 'hm', signature: 'sig', model: 'claude-opus-4-8[1m]' }],
+      },
+      { role: 'user', content: [{ type: 'text', text: 'go on' }] },
+    ],
+  };
+  const body2 = buildAnthropicBody(withThinking, 'claude-opus-4-8[1m]');
+  const msgs = body2.messages as Array<{ content: Array<{ type: string }> }>;
+  assert.ok(
+    msgs.some((m) => m.content.some((b) => b.type === 'thinking')),
+    'signed thinking blocks survive the [1m] alias (signature model match still works)',
+  );
+});
+
 test('buildAnthropicBody: fast mode sets speed and disables thinking; cacheTtl flows to cache_control', async () => {
   const base: CompletionRequest = {
     model: 'claude-opus-4-8',

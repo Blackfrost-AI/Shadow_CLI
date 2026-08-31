@@ -19,8 +19,10 @@ function handlePicker(env: KeyEnv, ch: string, key: InkKey): boolean {
   const rows = env.modelRows(env.cfg);
   let sel = Math.min(env.pickerIndexRef.current, rows.length - 1);
   if (rows[sel]?.kind !== 'model') sel = firstSelectableRow(rows); // never land on a header
-  if (key.upArrow) env.setPickerIndex(stepSelectableRow(rows, sel, -1));
-  else if (key.downArrow) env.setPickerIndex(stepSelectableRow(rows, sel, 1));
+  // Ctrl+P / Ctrl+N are emacs-style aliases for the arrows — omp users live on Ctrl+P model
+  // cycling; the picker honors it without making anyone re-learn the arrows.
+  if (key.upArrow || (key.ctrl && ch === 'p')) env.setPickerIndex(stepSelectableRow(rows, sel, -1));
+  else if (key.downArrow || (key.ctrl && ch === 'n')) env.setPickerIndex(stepSelectableRow(rows, sel, 1));
   else if (key.return) {
     const row = rows[sel];
     if (row?.kind === 'model') env.selectModel(row.entry);

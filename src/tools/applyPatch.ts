@@ -24,6 +24,7 @@ import { resolveWithin } from '../safety/workspaceJail.js';
 import { atomicWrite } from './util.js';
 import { saveCheckpoint, saveCheckpointAbsent } from '../state/checkpoints.js';
 import { diffLines, type DiffLine } from '../util/diff.js';
+import { formatAfterWrite } from '../agent/formatter.js';
 
 // ── grammar markers ──────────────────────────────────────────────────────────
 const BEGIN = '*** Begin Patch';
@@ -393,7 +394,22 @@ export const applyPatch: Tool<ApplyPatchInput, ApplyPatchData> = {
       return F('write_failed', `patch write failed (rolled back): ${(e as Error).message}`);
     }
 
-    const res = ok('apply_patch', 'write', Date.now() - start, `Applied patch: +${added} added, ~${updated} updated, -${deleted} deleted (${touched.join(', ')}).`, {
+    // Auto-format after write (plan 2.1, v1): format every file the patch WROTE (never the
+    // deletes), after the whole patch landed. Never fails the patch — formatter errors ride
+    // back as one-line notes. Re-mark each formatted file so the readTracker mtimes include
+    // the formatter's rewrite (else the next edit trips the stale-on-disk guard).
+    const formatNotes: string[] = [];
+    const formatted = new Set<string>();
+    for (const a of actions) {
+      if (a.kind !== 'write' || formatted.has(a.abs)) continue;
+      formatted.add(a.abs);
+      const note = await formatAfterWrite(a.abs, ctx);
+      if (note) formatNotes.push(note);
+      ctx.readTracker?.markRead(a.abs);
+    }
+    const noteSuffix = formatNotes.length ? `\n${formatNotes.join('\n')}` : '';
+
+    const res = ok('apply_patch', 'write', Date.now() - start, `Applied patch: +${added} added, ~${updated} updated, -${deleted} deleted (${touched.join(', ')}).${noteSuffix}`, {
       added,
       updated,
       deleted,

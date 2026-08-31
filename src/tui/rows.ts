@@ -10,6 +10,7 @@
 // which the ADA pass banned as unreadable.
 
 import type { StyledSpan, ViewportTheme } from './flatten.js';
+import type { SpeakerTag } from './roundTable.js';
 import { displayWidth } from '../util/width.js';
 import {
   displayToolArg,
@@ -298,3 +299,43 @@ export function renderReasoning(
   const n = lineCount === 1 ? '1 line' : `${Math.max(lineCount, 1)} lines`;
   return [header, [{ text: `  ⌄ ${n} · ^O`, color: theme.dim }]];
 }
+
+// ── Structured transcript items ───────────────────────────────────────────────
+// The record type every committed transcript entry carries (printed once, never re-rendered).
+// Lives here — not tui.tsx — so the render modules (chrome.tsx, flatten.ts) can name it without
+// importing the TUI component module.
+export interface BannerLine {
+  text: string;
+  color?: string;
+  dimColor?: boolean;
+  bold?: boolean;
+}
+export interface TranscriptBase {
+  id: number;
+  kind: 'user' | 'assistant' | 'tool' | 'system' | 'blocked' | 'error' | 'banner' | 'reasoning' | 'finding' | 'image';
+  text: string;
+  color?: string;
+  dimColor?: boolean;
+  bold?: boolean;
+  meta?: string;
+  /** Continuation block of a multi-block streamed answer — hug the previous block (gap 0). */
+  tight?: boolean;
+  /** Finding card title (kind === 'finding'). */
+  title?: string;
+  /** Finding card severity (kind === 'finding'). */
+  severity?: 'info' | 'warn' | 'error';
+  /** Grouped multi-line content rendered inside ONE box (welcome banner, /model, /help). */
+  lines?: BannerLine[];
+  /** v2 structured payloads consumed by flattenItem. `text`/`lines` remain the plain
+   *  fallback the stock Ink components read, so both paths stay in sync. */
+  brand?: BrandInfo;
+  tool?: ToolInfo;
+  /** Inline image (/image echo, view_image result, fetched markdown ![](url)). Rendered as a
+   *  durable placeholder + terminal-native pixels when supported (see flatten.ts). */
+  image?: { bytes: string; mediaType: string; alt?: string; source?: string };
+  /** Reasoning wall-clock (ms) when known — fold header shows `thought for Ns`. */
+  durationMs?: number;
+  /** Collaboration Mode: which seat produced this assistant turn (attribution header). */
+  speaker?: SpeakerTag;
+}
+export type TranscriptItem = TranscriptBase;

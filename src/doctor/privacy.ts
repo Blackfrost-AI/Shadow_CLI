@@ -25,6 +25,7 @@ import { mlxOfflineReady, isMlxDir } from '../gguf.js';
 import { vaultExists } from '../auth/vault.js';
 import { legacyCredentialsExist } from '../state/globalStore.js';
 import { available as keychainAvailable } from '../auth/keychain.js';
+import { detectLspServers } from '../agent/lsp/detect.js';
 
 const UPDATE_HOST = 'raw.githubusercontent.com';
 const PROVIDER_DEFAULT_BASE: Record<string, string> = {
@@ -53,6 +54,8 @@ export interface PrivacyReport {
   credentials: { store: 'vault' | 'plaintext' | 'env-only' | 'none'; keychainAvailable: boolean; detail: string };
   offlineEligible: { eligible: boolean; reason: string };
   telemetry: string;
+  /** 8.4: which local LSP servers would auto-spawn after writes (honest, machine-specific). */
+  codeIntel: string;
   /** P3-08: one-line summary of the on-disk egress receipt (+ quarantine policy state). */
   receipt?: string[];
   /** Things that WIDEN exposure — surfaced so the report never reads cleaner than reality. */
@@ -74,6 +77,7 @@ export interface PrivacyConfigView {
   statusLine?: string;
   sandbox?: 'auto' | 'off';
   sandboxFailurePolicy?: 'auto' | 'fail-closed' | 'warn';
+  lsp?: { enabled?: boolean; servers?: Record<string, { command: string }> };
 }
 
 export interface PrivacyEnv {
@@ -319,6 +323,17 @@ export function buildPrivacyReport(cfg: PrivacyConfigView, env: PrivacyEnv): Pri
     egress,
     credentials: credential,
     offlineEligible,
+    // 8.4 — the report says WHICH local language servers would spawn, per machine + directory.
+    // Detection is pure inspection (files + PATH); nothing spawns here.
+    codeIntel:
+      (cfg.lsp?.enabled ?? true) && process.env.SHADOW_NO_LSP !== '1'
+        ? (() => {
+            const ids = detectLspServers(process.cwd(), { overrides: cfg.lsp?.servers }).map((s) => s.id);
+            return ids.length
+              ? `enabled — after agent file writes these local servers spawn (stdio, scrubbed env, never installed by Shadow): ${ids.join(', ')}`
+              : 'enabled, but no servers detected here (local node_modules typescript or pyright/gopls/rust-analyzer on PATH) — dormant';
+          })()
+        : 'disabled (lsp.enabled false or SHADOW_NO_LSP=1) — no language server ever spawns',
     telemetry:
       'none — no analytics, crash-reporting, or phone-home; enforced by a source guard + pinned host snapshot (test/no-telemetry.test.ts). Every outbound request Shadow ITSELF makes flows through a single egress broker and is journaled to a local receipt — `shadow egress` / ~/.shadow/egress.log (child-process sockets are confined by the OS jail where one exists, not by this journal). Contrast: mainstream coding agents routinely transmit usage analytics, crash dumps, and completion telemetry, and can upload your code for indexing — public reporting has even documented an agent shipping user repo contents to vendor servers (README: Zero telemetry).',
     warnings,
@@ -362,6 +377,9 @@ export function formatPrivacyReport(r: PrivacyReport, color = true): string {
   L.push('');
   L.push(`${c.bold}Telemetry${c.reset}  ${c.green}none${c.reset}`);
   L.push(`  ${c.dim}${r.telemetry}${c.reset}`);
+  L.push('');
+  L.push(`${c.bold}Code intelligence${c.reset} ${c.dim}(LSP diagnostics after writes)${c.reset}`);
+  L.push(`  ${c.dim}${r.codeIntel}${c.reset}`);
   if (r.receipt?.length) {
     // P3-08: the zero-telemetry claim gets its runtime proof here — what ACTUALLY left the box.
     L.push('');

@@ -9,6 +9,7 @@ import { z } from 'zod';
 import { TuiApp, type TuiOpts } from '../src/tui.js';
 import { EventBus } from '../src/agent/events.js';
 import { Context } from '../src/agent/context.js';
+import { MissionState } from '../src/agent/mission.js';
 import { ToolRegistry } from '../src/tools/registry.js';
 import { createProvider } from '../src/provider/index.js';
 import { loadConfig } from '../src/config.js';
@@ -566,7 +567,7 @@ test('queued /compact is an asynchronous FIFO barrier before the next message', 
   unmount();
 });
 
-test('type-ahead: a slash command typed while running is queued and runs after the turn', async () => {
+test('type-ahead: /goal typed while running begins live and queues its kickoff turn', async () => {
   const provider = {
     name: 'slashqueue',
     estimateTokens: () => 0,
@@ -577,6 +578,7 @@ test('type-ahead: a slash command typed while running is queued and runs after t
     },
   };
   const cfg = loadConfig(process.cwd(), { provider: 'mock', model: 'm' });
+  const mission = new MissionState();
   const opts: TuiOpts = {
     provider: provider as unknown as TuiOpts['provider'],
     registry: new ToolRegistry(),
@@ -593,6 +595,7 @@ test('type-ahead: a slash command typed while running is queued and runs after t
     autonomy: 'auto-edit',
     bypass: false,
     version: '0.0.0',
+    mission,
   };
 
   const { stdin, frames, unmount } = render(React.createElement(TuiApp, { opts }));
@@ -603,15 +606,19 @@ test('type-ahead: a slash command typed while running is queued and runs after t
   stdin.write('\r');
   await waitFor(() => /Esc interrupt/.test(seen()), 1500);
 
-  // A non-informational slash command typed mid-turn is queued, not run immediately.
+  // /goal is live-safe (SLASH_WHILE_RUNNING): the mission begins immediately, but the
+  // kickoff TURN is deferred to the queue — a second concurrent loop must never start.
   stdin.write('/goal ship it');
   await new Promise((r) => setTimeout(r, 20));
   stdin.write('\r');
-  await waitFor(() => /queued \(1\)/.test(seen()), 1500);
-  assert.doesNotMatch(seen(), /Goal set: ship it/, 'the slash command did not run mid-turn');
+  await waitFor(() => /Mission started: ship it/.test(seen()), 1500);
+  await waitFor(() => /mission kickoff queued/.test(seen()), 1500);
+  // The queued HUD previews the kickoff truncated ("Begin the planning ph…") — only the
+  // real turn renders the full phrase, so this is the mid-turn/no-mid-turn discriminator.
+  assert.doesNotMatch(seen(), /Begin the planning phase:/, 'the kickoff turn did not run mid-turn');
 
-  // After the turn ends it flushes through the SAME dispatch path as a typed slash command.
-  await waitFor(() => /Goal set: ship it/.test(seen()), 1500);
+  // After the turn ends the queue flushes the kickoff through the same dispatch path.
+  await waitFor(() => /Begin the planning phase:/.test(seen()), 1500);
   unmount();
 });
 

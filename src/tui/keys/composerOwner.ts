@@ -31,7 +31,7 @@ import { leadsWithBlock, stripTrailingNewlines } from '../streamCommit.js';
 import { C } from '../theme.js';
 import { cycleAutonomy } from '../../safety/permissions.js';
 import type { ContextName } from '../keybindings/types.js';
-import type { SlashMenuItem } from '../../tui.js';
+import type { SlashMenuItem } from '../slashMenu.js';
 import { queuedTaskKind } from './common.js';
 import type { FocusOwnerHandler, InkKey, KeyEnv } from './types.js';
 
@@ -52,9 +52,18 @@ const FORWARD_DELETE = /^\x1b\[3(;\d+)?~$/;
  * sends `ESC [ 13 ; 2 u`; xterm's modifyOtherKeys sends `ESC [ 27 ; 2 ; 13 ~`.
  */
 const SHIFT_ENTER = /^\x1b\[(?:13;(\d+)u|27;(\d+);13~)$/;
+/**
+ * Shift+Tab — the encodings terminals actually send. Most terminals (Terminal.app, iTerm2,
+ * xterm) send the classic `ESC [ Z`; CSI-u terminals (kitty/foot/WezTerm) send `ESC [ 9 ; 2 u`
+ * and xterm modifyOtherKeys sends `ESC [ 27 ; 2 ; 9 ~`. Ink does not reliably deliver these as
+ * `key.shift`+`key.tab`, so §4 checks the raw bytes BEFORE the bare-Tab ring. This is the fast
+ * lane of the `chat:cycleMode` binding — when the terminal DOES set the shift flag, the
+ * resolver's registered handler already consumed the key; this branch is the fallback.
+ */
+const SHIFT_TAB = /^\x1b(?:\[(?:9;(\d+)u|27;(\d+);9~)|\[Z)$/;
 
 /** Slash commands safe to run LIVE while a turn is executing; everything else queues. */
-const SLASH_WHILE_RUNNING = new Set(['/help', '/cost', '/usage', '/context', '/connections', '/fast', '/effort', '/version', '/copy']);
+const SLASH_WHILE_RUNNING = new Set(['/help', '/cost', '/usage', '/context', '/connections', '/fast', '/effort', '/version', '/copy', '/plan', '/goal']);
 
 function handleComposer(env: KeyEnv, ch: string, key: InkKey): boolean {
   // Goal-column memory: a RUN of ↑/↓ keeps aiming at the column the run started from; any other
@@ -220,6 +229,26 @@ function handleComposer(env: KeyEnv, ch: string, key: InkKey): boolean {
       // fall through: submit the composer text verbatim (§8 below)
     }
     // typing / backspace fall through below to re-filter the menu
+  }
+
+  // §3.5 — Shift+Tab: direct plan-mode toggle (the fast lane; applies live to a running loop —
+  //    PlanModeState is shared with it, so the write gate engages on the NEXT turn). The Tab
+  //    ring below still ends at plan mode; this key jumps straight in and out. The resolver
+  //    already consumed the key on terminals that deliver it with the shift flag (registered
+  //    `chat:cycleMode` handler); this raw-byte branch catches the terminals that don't.
+  if (SHIFT_TAB.test(env.rawKeyRef.current)) {
+    const pm = env.planMode;
+    if (pm) {
+      if (pm.active) {
+        pm.exit(); // leaving plan restarts at the cautious end of the ring
+        env.setAutonomy('manual');
+        env.loopRef.current?.setAutonomy('manual');
+      } else {
+        pm.enter(); // straight into plan mode from anywhere in the ring
+      }
+      return true;
+    }
+    // No plan mode in this session: fall through to the bare-Tab ring.
   }
 
   // §4 — Tab / Shift+Tab: cycle the working mode (applies live to a running loop too).

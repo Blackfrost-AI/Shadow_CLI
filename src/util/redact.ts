@@ -84,7 +84,7 @@ export function redactString(s: string): string {
  * KEY says credential, the value is masked whatever its shape.
  */
 const SECRET_KEY_RE =
-  /^(?:.*[_-])?(?:api_?key|auth_?token|access_?token|refresh_?token|secret|client_?secret|password|passwd|pwd|private_?key|credential|bearer)s?$/i;
+  /^(?:.*[_-])?(?:api_?key|auth_?token|access_?token|refresh_?token|secret|client_?secret|password|passwd|pwd|private_?key|credential|bearer|token)s?$/i;
 
 /** True when a config/JSON key names a credential. */
 export function isSecretKey(key: string): boolean {

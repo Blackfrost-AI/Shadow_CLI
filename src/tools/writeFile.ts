@@ -6,6 +6,7 @@ import { resolveWithin } from '../safety/workspaceJail.js';
 import { atomicWrite } from './util.js';
 import { diffLines } from '../util/diff.js';
 import { saveCheckpoint } from '../state/checkpoints.js';
+import { formatAfterWrite } from '../agent/formatter.js';
 
 const inputSchema = z.object({
   path: z
@@ -88,6 +89,12 @@ export const writeFile: Tool<WriteFileInput, WriteFileData> = {
       return fail('write_file', 'write', Date.now() - start, 'write_failed', `write failed: ${(e as Error).message}`);
     }
 
+    // Auto-format after write (plan 2.1, v1): run the project's formatter on the new file.
+    // Runs BEFORE the readTracker marks so the recorded mtime includes the formatter's
+    // rewrite (else the next edit trips the stale-on-disk guard). Never fails the write —
+    // a formatter error only appends a one-line note to the summary.
+    const formatNote = await formatAfterWrite(abs, ctx);
+
     ctx.readTracker?.markRead(abs);
     ctx.readTracker?.markSeen(abs); // newly created/written by us → can edit without separate read_file
 
@@ -95,7 +102,7 @@ export const writeFile: Tool<WriteFileInput, WriteFileData> = {
       'write_file',
       'write',
       Date.now() - start,
-      `${existed ? 'Overwrote' : 'Created'} "${input.path}" (${bytes} bytes).`,
+      `${existed ? 'Overwrote' : 'Created'} "${input.path}" (${bytes} bytes).${formatNote ? `\n${formatNote}` : ''}`,
       { path: abs, bytesWritten: bytes, changed: true },
     );
     const diff = diffLines(oldText, input.content); // UI-only; rides on meta, not the model result

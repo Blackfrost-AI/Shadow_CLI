@@ -261,3 +261,18 @@ test('plan mode allows read-like memory actions but blocks memory writes', async
     rmSync(workspace, { recursive: true, force: true });
   }
 });
+
+test('plan mode toggle: enter()/exit() preserve recorded plan tasks (a Shift+Tab never orphans work)', () => {
+  const planMode = new PlanModeState(false);
+  planMode.enter();
+  planMode.recordPlan('P', '/w/plan.md', ['write tests', 'implement']);
+  // Toggle out and back in (Shift+Tab twice) — the recorded tasks must survive BOTH flips,
+  // or a /goal begun after a plan_write would seed a taskless mission on approval.
+  const afterExit = planMode.exit();
+  assert.deepEqual(afterExit.tasks, ['write tests', 'implement'], 'exit keeps tasks (the side-door mission seed reads them)');
+  const afterEnter = planMode.enter();
+  assert.deepEqual(afterEnter.tasks, ['write tests', 'implement'], 'enter keeps tasks');
+  const snap = planMode.snapshot();
+  assert.equal(snap.mode, 'planning');
+  assert.deepEqual(snap.tasks, ['write tests', 'implement']);
+});

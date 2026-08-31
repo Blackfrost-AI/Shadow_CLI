@@ -157,7 +157,8 @@ function handleDialog(env: KeyEnv, ch: string, key: InkKey): boolean {
     // raiseAutonomy, NOT cycleAutonomy: the cycle WRAPS full→manual, so pressing "(a)lways"
     // on the one dialog a full-autonomy session ever sees (a denylisted call) both ran the
     // catastrophic call AND flipped the session to ask-about-everything. replGate.ts:33 got
-    // this right; the TUI kept the cycling version. Shift+Tab is still the cycle.
+    // this right; the TUI kept the cycling version. (Shift+Tab is the plan-mode toggle now;
+    // Tab keeps the cycle.)
     const next = raiseAutonomy(env.autonomyRef.current);
     env.setAutonomy(next);
     g.respond({ setAutonomy: next });

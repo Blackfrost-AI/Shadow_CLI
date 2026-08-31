@@ -15,6 +15,15 @@ export interface PlanData {
 const planSchema = z.object({
   title: z.string().min(1),
   body: z.string().optional(),
+  tasks: z
+    .array(z.string().min(1))
+    .max(24)
+    .optional()
+    .describe(
+      'Concrete implementation steps for this plan — on plan approval these become the mission ' +
+        'task list (/goal missions) the lead agent tracks with mission_update. Keep each step a ' +
+        'single verifiable action.',
+    ),
 });
 
 const enterSchema = z.object({
@@ -48,7 +57,7 @@ export function makeEnterPlanModeTool(planMode: PlanModeState): Tool<z.infer<typ
   };
 }
 
-export function makePlanWriteTool(planMode: PlanModeState): Tool<{ title: string; body?: string }, PlanData> {
+export function makePlanWriteTool(planMode: PlanModeState): Tool<{ title: string; body?: string; tasks?: string[] }, PlanData> {
   return {
     name: 'plan_write',
     description: 'Write the current plan to disk and keep exploring until user approval exits plan mode.',
@@ -59,12 +68,22 @@ export function makePlanWriteTool(planMode: PlanModeState): Tool<{ title: string
       const path = ctx.dryRun ? `plans/${slug}.md` : resolve(ctx.workspaceRoot, `plans/${slug}.md`);
       if (!ctx.dryRun) {
         mkdirSync(resolve(ctx.workspaceRoot, 'plans'), { recursive: true });
-        writeFileSync(path, `${input.body ?? ''}\n`);
+        writeFileSync(path, renderPlanFile(input));
       }
-      const snapshot = planMode.recordPlan(input.title, path);
+      const snapshot = planMode.recordPlan(input.title, path, input.tasks);
       return ok('plan_write', 'write', 1, `Plan written: ${input.title}.`, { title: input.title, path, planMode: snapshot });
     },
   };
+}
+
+/** Plan file body: the model's prose, then the task list it committed to (checkboxes). */
+function renderPlanFile(input: { title: string; body?: string; tasks?: string[] }): string {
+  const parts: string[] = [`# ${input.title ?? ''}`.trim()];
+  if (input.body) parts.push(input.body);
+  if (input.tasks && input.tasks.length > 0) {
+    parts.push('## Tasks', ...input.tasks.map((t) => `- [ ] ${t}`));
+  }
+  return `${parts.join('\n\n')}\n`;
 }
 
 export function makeExitPlanModeTool(
@@ -77,7 +96,7 @@ export function makeExitPlanModeTool(
     risk: 'read',
     inputSchema: z.object({}),
     async run(_input, ctx) {
-      const snapshot = ctx?.dryRun ? planMode.snapshot() : planMode.exit();
+      const snapshot = ctx?.dryRun ? planMode.snapshot() : planMode.exit({ approved: true });
       if (!ctx?.dryRun && opts.persist !== false) await saveGlobalConfig({ planMode: false });
       return ok('exit_plan_mode', 'read', 1, 'Plan mode exited. Implementation tools are now available.', snapshot);
     },

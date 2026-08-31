@@ -20,6 +20,7 @@ export {
   type PlanData,
 } from './planModeTools.js';
 export { makeAskUserQuestionTool } from './askUser.js';
+export { makeMissionUpdateTool, type MissionUpdateData } from './missionTools.js';
 export { makeSkillTool } from './skillTool.js';
 export { makeScheduleWakeupTool } from './scheduleWakeup.js';
 export { makeAgentTool, type AgentToolDeps } from './agentTool.js';

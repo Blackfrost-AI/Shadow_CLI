@@ -119,6 +119,23 @@ Resolution order: env > per-model entry > stream block > self-hosted-aware defau
 - \`sessionRetentionDays\` / \`sessionRetentionKeep\` — archive old session logs (never deletes).
 - \`autonomy\` — "ask" | "auto-edit" | "full"; \`--yolo\` still drops the sandbox entirely.
 
+## Code intelligence + guardrails
+
+- \`formatters\` — auto-format after agent writes (prettier/biome/ruff/gofmt/rustfmt/shfmt,
+  detected from the project — never installed): \`{ "enabled": true, "overrides": { "ts": "prettier" } }\`.
+  A formatter failure never fails the write. Kill switch: \`SHADOW_NO_FORMAT=1\`.
+- \`lsp\` — LSP diagnostics after agent writes, from servers already on your machine (pyright/
+  gopls/rust-analyzer on PATH — detected, never installed). Errors/warnings ride the tool result
+  as a deduped, budget-capped note:
+  \`{ "enabled": true, "timeoutMs": 3000, "notes": { "maxTurnChars": 8000, "maxSessionChars": 60000 } }\`.
+  \`lsp.servers\` (command overrides) is GLOBAL-ONLY — a cloned repo cannot name commands we spawn —
+  and the project's own node_modules tsserver only spawns after \`"trustNodeModules": true\`
+  (repo content is never a spawn target on its own). Kill switch: \`SHADOW_NO_LSP=1\`. See
+  \`shadow doctor --privacy\` for which servers would spawn here.
+- \`budget\` — spend ceilings and guardrails: \`maxTotalTokens\`/\`maxCostUSD\`/\`maxWallClockSec\`
+  are hard stops; \`maxCostUsd\` (note the case split — deliberate, under naming review) and
+  \`maxSteps\` are SOFT guardrails that warn, then pause and ask. Absent = none.
+
 See \`shadow doctor\` for the live state of all of this (the layout panel shows every
 file above with its status).
 `;

@@ -3,6 +3,7 @@ import type { ReadTracker } from './readTracker.js';
 import type { DiffLine } from '../util/diff.js';
 import type { ImageBlock } from '../provider/provider.js';
 import type { Budget } from '../agent/budget.js';
+import type { FormatterConfig, FormatterExec } from '../agent/formatter.js';
 
 export type ToolRisk = 'read' | 'write' | 'exec' | 'network';
 
@@ -50,6 +51,12 @@ export interface ToolContext {
   toolCallId?: string;
   /** When set, write tools save a pre-mutation checkpoint for `/rewind`. */
   checkpoint?: { sessionId: string; turn: number };
+  /** Auto-format-after-write settings (config `formatters` block). Absent = defaults (enabled). */
+  formatters?: FormatterConfig;
+  /** Injectable runner for the post-write formatter (tests/fakes); defaults to a real spawn. */
+  formatterExec?: FormatterExec;
+  /** Injectable binary lookup for the post-write formatter; defaults to PATH search. */
+  formatterWhich?: (bin: string) => string | null;
   /** F06-10: true when this tool runs inside a sub-agent loop. A nested `agent` call uses it
    *  to bypass the session admission gate — queuing behind its own parent's permit deadlocks. */
   nestedAgent?: boolean;

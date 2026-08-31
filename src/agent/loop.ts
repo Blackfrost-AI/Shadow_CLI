@@ -8,6 +8,8 @@ import { resolvePermissionRule, type PermissionRule } from '../safety/rules.js';
 import type { ShadowConfig } from '../config.js';
 import { runHooks, runHookPhase, combineHookContexts } from '../hooks/runner.js';
 import { diagnosticsNoteFor } from './diagnostics.js';
+import { getLspService, lspNoteFor } from './lsp/index.js';
+import type { LspServiceConfig } from './lsp/service.js';
 import { isFallbackEligible, resolveFallbackEntry } from '../provider/fallback.js';
 import { looksLikeTokenOverflow } from '../provider/stream.js';
 import type { UserQuestion } from './approval.js';
@@ -16,12 +18,25 @@ import type { ModelEntry } from '../config.js';
 import type { ApprovalGate, ApprovalRequest, ApprovalDecision } from './approval.js';
 import { settleWithAbort, nextApprovalId, SessionApprovals } from './approval.js';
 import type { EventBus, StopReasonExt } from './events.js';
-import type { Budget } from './budget.js';
+import {
+  type Budget,
+  type BudgetGuardConfig,
+  type BudgetGuardSnapshot,
+  type BudgetGuardState,
+  createBudgetState,
+  decideBudgetAction,
+  budgetProgressMessage,
+  budgetExceededDetail,
+  BUDGET_STOP_LABEL,
+  BUDGET_CONTINUE_LABEL,
+} from './budget.js';
 import type { Context } from './context.js';
 import { SessionLog, type SessionLog as SessionLogType } from '../state/session.js';
 import type { TodoList } from './todo.js';
 import type { PlanModeState } from './planMode.js';
+import type { MissionState } from './mission.js';
 import { createReadTracker } from '../tools/readTracker.js';
+import type { FormatterConfig } from './formatter.js';
 import { redactString } from '../util/redact.js';
 import { sniffToolCalls, stripTextualToolIntent } from '../provider/textToolCalls.js';
 import { normalizeForeignTool } from '../tools/foreignAdapter.js';
@@ -79,6 +94,13 @@ export interface LoopDeps {
    */
   todoList?: TodoList;
   planMode?: PlanModeState;
+  /**
+   * Session-scoped /goal mission state. Present only in the LEAD loop — the sub-agent
+   * factory omits it, so delegates never see the mission block or seed/clobber it.
+   * The loop pins mission.block() into the system prompt each turn (summarization-proof,
+   * plan/todo parity) and seeds tasks on approved plan exit.
+   */
+  mission?: MissionState;
   permissionRules?: PermissionRule[];
   autoClassifier?: boolean;
   hooks?: ShadowConfig['hooks']; // full set; only some phases are invoked from the loop today
@@ -108,6 +130,16 @@ export interface LoopDeps {
   priorStopReason?: StopReasonExt;
   /** When set, a context snapshot is written after each assistant turn. */
   sessionLog?: SessionLogType;
+  /** Auto-format-after-write settings (config `formatters` block), threaded to the tool ctx. */
+  formatters?: FormatterConfig;
+  /** LSP diagnostics-after-write settings (config `lsp` block, plan 3.1). See src/agent/lsp/. */
+  lsp?: LspServiceConfig;
+  /**
+   * Spend guardrails (optional): soft step/cost budget for the task — warn once at
+   * warnRatio, then pause and ask via the approval gate (approve = one more
+   * allowance window, deny = graceful stop). Absent / no limits = no guardrails.
+   */
+  spendGuard?: BudgetGuardConfig;
   /**
    * SESSION-scoped "approve for session / for prefix" grants. Optional: a loop without one keeps
    * its grants to itself (tests, one-shot runs). Callers that construct a loop PER USER MESSAGE
@@ -187,6 +219,10 @@ export class AgentLoop {
    * shared instance so a grant outlives the per-message loop that recorded it.
    */
   private readonly approvals: SessionApprovals;
+  /** Soft spend guardrail (plan 2.3); null when unconfigured or limit-less. */
+  private readonly guard: BudgetGuardState | null;
+  /** Last cumulative session cost seen, for feeding the guard WINDOW cost deltas. */
+  private lastGuardCostUsd = 0;
 
   constructor(
     private readonly deps: LoopDeps,
@@ -197,6 +233,8 @@ export class AgentLoop {
     this.approvals = deps.approvals ?? new SessionApprovals();
     this.effort = deps.effort ?? DEFAULT_EFFORT;
     this.now = deps.now ?? Date.now;
+    const g = deps.spendGuard ? createBudgetState(deps.spendGuard) : null;
+    this.guard = g && g.active ? g : null;
     // Continue this SESSION's numbering rather than restarting at 0 for every user message.
     if (deps.sessionLog) {
       try {
@@ -298,6 +336,7 @@ export class AgentLoop {
       continuity: [
         this.deps.continuityState ?? '',
         this.deps.planMode?.block() ?? '',
+        this.deps.mission?.block() ?? '',
         this.deps.todoList?.block() ?? '',
       ].filter((s) => s.trim()).join('\n\n'),
       beforeCompact: () => {
@@ -343,11 +382,24 @@ export class AgentLoop {
     let emptyResponseAttempts = 0;
     let emptyNudgeSent = false;
 
+    // Plan 3.1 — fresh per-turn LSP note budget (session cap persists inside the service).
+    // Resolves/creates the cached service; no server spawns until a relevant file is written.
+    try {
+      if (this.deps.lsp) getLspService(this.deps.workspaceRoot, this.deps.lsp).beginTurn();
+    } catch {
+      /* LSP never blocks a turn */
+    }
+
     for (;;) {
       if (this.deps.signal.aborted || this.steerRequested) return this.stop('interrupted', finalAnswer);
 
       const stop = budget.check(this.now());
       if (stop) return this.stop(stop, finalAnswer);
+
+      // Spend guardrails: consulted before dispatching the next model call. Warns
+      // once per threshold crossing; when exceeded, pauses and asks via the gate.
+      const guardStop = await this.checkSpendGuard(finalAnswer);
+      if (guardStop) return guardStop;
 
       bus.emit({ type: 'mode', mode: 'thinking' });
       // Render the live todo list into the system prompt each turn. The system
@@ -355,6 +407,26 @@ export class AgentLoop {
       // message history, so this is summarization-proof and always current. The
       // block is '' until the model writes its first list, so this is a no-op
       // before the model calls todo_write.
+      //
+      // Mission un-sticking: a mission left in `planning` while plan mode was exited by a
+      // SIDE DOOR — Shift+Tab out instead of an approved exit_plan_mode. The approval-gated
+      // seed in checkPlanMode never fires on that route, so the pinned block would order
+      // "do not implement" forever. Inactivity alone is NOT the signal (a mission begun
+      // while plan mode was never entered legitimately waits in planning): the one-shot
+      // exit latch is. It is consumed every turn regardless, so a stale latch can never
+      // flip a mission begun much later; the seed fires only while the mission still plans.
+      if (!this.deps.planMode?.active) {
+        // Consumed every turn (mission or not) — a stale latch must never flip a mission
+        // begun much later; only a real exit-then-still-planning overlap un-sticks.
+        const sideDoorExit = this.deps.planMode?.consumeUnapprovedExit() ?? null;
+        if (sideDoorExit && this.deps.mission?.snapshot().phase === 'planning') {
+          try {
+            this.deps.mission.onPlanApproved({ title: sideDoorExit.title, path: sideDoorExit.path, tasks: sideDoorExit.tasks });
+          } catch {
+            /* mission continuity is best-effort; the turn proceeds regardless */
+          }
+        }
+      }
       // Rebuild the system prompt each turn: base profile + the live effort directive
       // (model-agnostic — see agent/effort.ts) + plan/todo blocks. Joined with blank
       // lines so sections never glue together; empties are dropped.
@@ -362,6 +434,7 @@ export class AgentLoop {
         this.deps.system,
         effortDirective(this.effort),
         this.deps.planMode?.block() ?? '',
+        this.deps.mission?.block() ?? '',
         this.deps.todoList?.block() ?? '',
       ]
         .filter((s) => s && s.trim())
@@ -409,6 +482,7 @@ export class AgentLoop {
 
       const turn = await this.runProviderTurnWithFallback(this.deps.provider, req);
       budget.tick();
+      this.guard?.recordStep();
 
       // A stream error makes the entire provider turn incomplete. Keep any text that was
       // already shown, but never recover or execute a native/textual tool call from that turn:
@@ -1133,6 +1207,12 @@ export class AgentLoop {
               cacheWriteTokens: ev.cacheWriteTokens,
             };
             const snap = this.deps.budget.snapshot(this.now());
+            // Feed the guardrail its WINDOW cost increment (session cost is cumulative).
+            if (this.guard) {
+              const delta = snap.costUSD - this.lastGuardCostUsd;
+              if (delta > 0) this.guard.recordCost(delta);
+              this.lastGuardCostUsd = snap.costUSD;
+            }
             const pct =
               this.deps.context.estimateTokens(provider) / Math.max(1, this.deps.context.budget());
             this.deps.bus.emit({
@@ -1580,6 +1660,8 @@ export class AgentLoop {
             turn: this.toolTurn,
           }
         : undefined,
+      // Auto-format-after-write (plan 2.1): config block threaded down to the file tools.
+      formatters: this.deps.formatters,
       onShellOutput: (chunk, stream) => {
         bus.emit({ type: 'shell_output', callId: call.id, stream, chunk });
       },
@@ -1633,6 +1715,21 @@ export class AgentLoop {
       diagnostics: this.deps.diagnostics,
     });
     if (diagNote) result.summary += diagNote;
+    // Plan 3.1 — LSP diagnostics fold-in: same seam, richer signal. The servers see the
+    // post-format disk state (this runs after the in-tool formatAfterWrite rewrite), and the
+    // note is deduped/budget-capped inside the service. Like diagNote: advisory only.
+    const lspNote = await lspNoteFor({
+      tool: call.name,
+      ok: result.ok,
+      dryRun: this.deps.dryRun,
+      input: parsed.data,
+      result,
+      workspaceRoot: this.deps.workspaceRoot,
+      lsp: this.deps.lsp,
+      bus,
+      signal: this.deps.signal,
+    });
+    if (lspNote) result.summary += lspNote;
     if (hookNote) result.summary += `\n\nAdditional context (user hook):\n${hookNote}`;
 
     this.emitToolEnd(call, result);
@@ -1715,6 +1812,7 @@ export class AgentLoop {
       if (typeof decision === 'object' && 'setAutonomy' in decision) {
         this.setAutonomy(decision.setAutonomy);
         this.approvedPlanExitIds.add(call.id);
+        this.seedMissionFromPlan();
         return null;
       }
       if (decision === 'deny') {
@@ -1725,6 +1823,7 @@ export class AgentLoop {
         };
       }
       this.approvedPlanExitIds.add(call.id);
+      this.seedMissionFromPlan();
       return null;
     }
 
@@ -1736,6 +1835,17 @@ export class AgentLoop {
       block: this.resultBlock(call.id, false, reason),
       isFatal: false,
     };
+  }
+
+  /** Approved plan exit → seed the mission's tasks (planning → executing). Never blocks the exit. */
+  private seedMissionFromPlan(): void {
+    if (!this.deps.mission) return;
+    try {
+      const plan = this.deps.planMode?.snapshot();
+      if (plan) this.deps.mission.onPlanApproved({ title: plan.title, path: plan.path, tasks: plan.tasks });
+    } catch {
+      // mission seeding is best-effort; a failure here must not taint the approved exit
+    }
   }
 
   private serialize(result: ToolResult): string {
@@ -1958,6 +2068,87 @@ export class AgentLoop {
       });
     }
     return { stopReason: reason, finalAnswer };
+  }
+
+  /**
+   * Spend-guardrail check run before each model call. 'warn' emits a one-time
+   * notice and continues; 'ask' pauses on the approval gate — approve grants one
+   * more allowance window (same limits), deny (or a non-answering gate) ends the
+   * run gracefully with reason 'budget'. Returns a LoopResult to stop, else null.
+   */
+  private async checkSpendGuard(finalAnswer: string): Promise<LoopResult | null> {
+    const guard = this.guard;
+    if (!guard) return null;
+    const action = decideBudgetAction(guard, { interactive: true });
+    if (action === 'proceed') return null;
+    const snap = guard.snapshot();
+    if (action === 'warn') {
+      this.deps.bus.emit({
+        type: 'finding',
+        title: budgetProgressMessage(snap),
+        body: 'Spend guardrail: approaching the configured budget for this task.',
+        severity: 'warn',
+      });
+      return null;
+    }
+    if (action === 'stop') {
+      this.emitBudgetSummary(snap);
+      return this.stop('budget', finalAnswer);
+    }
+    // 'ask' — the gate is the seam: a non-interactive gate (AutoDenyGate on the
+    // headless --task path) denies, which is the clean stop for a run nobody watches.
+    const granted = await this.askBudgetContinue(snap);
+    if (!granted) {
+      this.emitBudgetSummary(snap);
+      return this.stop('budget', finalAnswer);
+    }
+    guard.grantContinuation();
+    this.deps.bus.emit({
+      type: 'finding',
+      title: 'Budget extended — one more allowance window granted',
+      body: 'Spend guardrail: continuing with the same limits again.',
+      severity: 'info',
+    });
+    return null;
+  }
+
+  /** Ask the approval seam whether to grant one more allowance window. Goes through
+   *  requestApproval so the request gets an id + the interruptible settleWithAbort seam —
+   *  ESC/Ctrl-C must break a stuck budget prompt exactly like any other approval. */
+  private async askBudgetContinue(snap: BudgetGuardSnapshot): Promise<boolean> {
+    const question = `Budget reached (${budgetExceededDetail(snap)}). Continue this task?`;
+    const decision = await this.requestApproval({
+      kind: 'user_question',
+      call: { id: `budget_guard_${this.now()}`, name: 'budget_guard', input: {} },
+      risk: 'read',
+      reason: 'Spend guardrail: the task reached its configured step/cost budget.',
+      preview: question,
+      questions: [
+        {
+          question,
+          header: 'Budget reached',
+          options: [
+            { label: BUDGET_STOP_LABEL, description: 'End the run gracefully; everything so far is kept.' },
+            { label: BUDGET_CONTINUE_LABEL, description: 'Grant one more allowance window (same limits) and keep going.' },
+          ],
+        },
+      ],
+    });
+    if (decision === 'approve') return true;
+    if (typeof decision === 'object' && 'answers' in decision) {
+      return decision.answers.some((a) => a.selected.includes(BUDGET_CONTINUE_LABEL));
+    }
+    return false; // deny, skip, or anything not an explicit continue stops the run
+  }
+
+  /** Graceful-stop summary line for a budget that was reached and not extended. */
+  private emitBudgetSummary(snap: BudgetGuardSnapshot): void {
+    this.deps.bus.emit({
+      type: 'finding',
+      title: `Budget exhausted — run stopped (${budgetExceededDetail(snap)})`,
+      body: 'Spend guardrail: the configured budget was reached and no continuation was granted.',
+      severity: 'warn',
+    });
   }
 }
 

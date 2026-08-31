@@ -1,6 +1,6 @@
 import { EventBus } from '../agent/events.js';
-import { startWebServer } from './server.js';
-import { openBrowser } from './browser.js';
+import { startWebServer, type WebServerHandle } from './server.js';
+import { openBrowser, openCommand } from './browser.js';
 import { ensureVaultReady } from '../auth/unlock.js';
 
 export interface RunWebOptions {
@@ -11,6 +11,21 @@ export interface RunWebOptions {
   open?: boolean;
   /** Existing bus to mirror; phase 5 passes the live agent's. */
   bus?: EventBus;
+}
+
+/**
+ * The boot block `shadow web` prints once the server is up. The third line is a one-line
+ * copy-paste join command; the token rides in the URL FRAGMENT (`#t=`), which browsers never
+ * send to the server — the fragment handoff model in security.ts stays untouched.
+ */
+export function formatWebBoot(server: Pick<WebServerHandle, 'port' | 'url'>): string {
+  return (
+    `\nShadow web UI — http://127.0.0.1:${server.port}\n` +
+    `  ${server.url}\n` +
+    `  ${openCommand()} "${server.url}"\n` +
+    'Loopback only. The token in that URL is required; requests from any other\n' +
+    'host or origin are refused. Nothing leaves this machine.\n\n'
+  );
 }
 
 /**
@@ -35,10 +50,7 @@ export async function runWeb(opts: RunWebOptions): Promise<void> {
   const bus = opts.bus ?? new EventBus();
   const server = await startWebServer({ bus, port: opts.port });
 
-  opts.write(`\nShadow web UI — http://127.0.0.1:${server.port}\n`);
-  opts.write(`  ${server.url}\n`);
-  opts.write('Loopback only. The token in that URL is required; requests from any other\n');
-  opts.write('host or origin are refused. Nothing leaves this machine.\n\n');
+  opts.write(formatWebBoot(server));
   opts.write('Ctrl-C to stop.\n');
 
   if (opts.open !== false) openBrowser(server.url);

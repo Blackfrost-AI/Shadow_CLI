@@ -3,6 +3,7 @@ import type { ToolResult, ToolRisk } from '../tools/types.js';
 import type { AutonomyLevel } from '../safety/permissions.js';
 import type { TodoItem } from './todo.js';
 import type { PlanSnapshot } from './planMode.js';
+import type { MissionSnapshot } from './mission.js';
 import type { ApprovalKind, UserQuestion } from './approval.js';
 
 /**
@@ -47,6 +48,7 @@ export type LoopEvent =
   | { type: 'autonomy'; level: AutonomyLevel }
   | { type: 'todo'; items: TodoItem[] }
   | { type: 'plan_mode'; plan: PlanSnapshot }
+  | { type: 'mission'; mission: MissionSnapshot } // /goal mission state (NOT forwarded to sub-agents — the lead agent owns it)
   | { type: 'retry'; attempt: number; delayMs: number; reason: string }
   // Diagnostic channel (F04-06): machine-readable loop internals (e.g. the healer dropping a
   // duplicate tool_result). Renderers ignore it by default; the session log persists it.

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import {
   flattenItem,
   flattenItemCached,
@@ -108,13 +108,30 @@ test('P3-03: the memo is a WeakMap keyed on the item — entries die with the it
   assert.doesNotMatch(tui, /flattenCacheReset/, 'the TUI carries no cache-reset calls either');
 });
 
-test('P3-03: FlatItem consults the epoch-independent cache — no bare flattenItem call survives in tui.tsx', () => {
-  const i = tui.indexOf('function FlatItem(');
-  assert.ok(i > 0, 'FlatItem still exists');
-  const body = tui.slice(i, i + 2000);
+test('P3-03: FlatItem consults the epoch-independent cache — no bare flattenItem call survives in the TUI', () => {
+  // Plan 2.4 moved FlatItem from tui.tsx to tui/chrome.tsx; the invariant travels with it and
+  // now covers the WHOLE extracted surface (tui.tsx + src/tui/**), so a future extraction
+  // cannot smuggle a bare call back in.
+  const chrome = readFileSync(new URL('../src/tui/chrome.tsx', import.meta.url), 'utf8');
+  const i = chrome.indexOf('function FlatItem(');
+  assert.ok(i > 0, 'FlatItem still exists (in tui/chrome.tsx)');
+  const body = chrome.slice(i, i + 2000);
   assert.match(body, /flattenItemCached\(/, 'FlatItem wraps via the memoized flatten');
   // `flattenItemCached(` does not contain `flattenItem(`, so this is a true bare-call check.
-  assert.doesNotMatch(tui, /flattenItem\(/, 'no un-memoized flattenItem call site remains in the TUI');
+  // flatten.ts is exempted: it holds the definition itself, not a call site.
+  const surfaces = [
+    ['src/tui.tsx', tui],
+    ...readdirSync(new URL('../src/tui/', import.meta.url))
+      .filter((f) => /\.(ts|tsx)$/.test(f) && f !== 'flatten.ts')
+      .map((f) => [`src/tui/${f}`, readFileSync(new URL(`../src/tui/${f}`, import.meta.url), 'utf8')]),
+  ] as const;
+  const bareCall = (src: string): boolean =>
+    src
+      .split('\n')
+      .some((line) => /flattenItem\(/.test(line) && !/^\s*(\/\/|\*|\/\*)/.test(line)); // comments don't count
+  for (const [path, src] of surfaces) {
+    assert.ok(!bareCall(src), `no un-memoized flattenItem call site in ${path}`);
+  }
 });
 
 test('P3-03: resize never reflows — rows-only never wipes and resize-during-stream keeps committed history', () => {
