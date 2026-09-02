@@ -99,18 +99,24 @@ export function envelopeSafeSlice(text: string, cap: number): string {
   let cut = text.slice(0, cap);
   const BEGIN = /<<<(=*)UNTRUSTED_CONTENT_BEGIN\1>>>/g; // \1: padding balanced on both sides
   for (;;) {
-    let last: RegExpExecArray | null = null;
+    // Closure is checked PER PAD CLASS, not on the last BEGIN alone: a payload may legitimately
+    // carry a forged pair at a deeper pad than its own envelope, and a forged deeper BEGIN/END
+    // after the real BEGIN used to satisfy the "closes inside the prefix" test while the REAL
+    // envelope stayed open past the cut — exactly the gap a later forged bare END exploits.
+    let earliestOpen: RegExpExecArray | null = null;
+    const lastBeginPerPad = new Map<string, RegExpExecArray>();
     let m: RegExpExecArray | null;
     BEGIN.lastIndex = 0;
-    while ((m = BEGIN.exec(cut)) !== null) last = m;
-    if (!last) return cut;
-    const pad = last[1];
-    if (cut.indexOf(`<<<${pad}UNTRUSTED_CONTENT_END${pad}>>>`, last.index + last[0].length) !== -1) {
-      return cut; // the open envelope closes inside the prefix — containment intact
+    while ((m = BEGIN.exec(cut)) !== null) lastBeginPerPad.set(m[1]!, m);
+    for (const [pad, begin] of lastBeginPerPad) {
+      if (cut.indexOf(`<<<${pad}UNTRUSTED_CONTENT_END${pad}>>>`, begin.index + begin[0].length) === -1) {
+        if (!earliestOpen || begin.index < earliestOpen.index) earliestOpen = begin;
+      }
     }
+    if (!earliestOpen) return cut;
     // Open envelope: strip it wholesale. The header + policy lines sit on the two lines above the
     // BEGIN marker (envelopUntrusted joins them with '\n'), so walk back two line starts.
-    let cutPoint = last.index;
+    let cutPoint = earliestOpen.index;
     for (let i = 0; i < 2; i++) {
       const nl = cut.lastIndexOf('\n', cutPoint - 1);
       if (nl === -1) {

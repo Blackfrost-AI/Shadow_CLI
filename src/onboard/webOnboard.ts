@@ -9,7 +9,8 @@
  * go to config.json.
  *
  * Security model (same as an OAuth loopback flow): bind to 127.0.0.1 ONLY, a one-time token guards
- * /save, the server dies on completion or a 5-minute idle timeout. Keys never leave the machine.
+ * /save, the server dies on completion or a 5-minute idle timeout. The page can only talk to the
+ * loopback server; an explicit Discover action uses the key solely against the selected endpoint.
  */
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -24,9 +25,10 @@ import {
   type VaultData,
 } from '../auth/vault.js';
 import { storeKey, retrieveKey, available as keychainAvailable } from '../auth/keychain.js';
-import { shredLegacyCredentials } from '../state/globalStore.js';
+import { shredLegacyCredentials, loadLegacyCredentials } from '../state/globalStore.js';
 import { persistOnboardTarget } from './persistTarget.js';
 import { PROVIDERS, findPreset } from './catalog.js';
+import { probeModelEndpoint } from './probe.js';
 
 export interface PersistResult {
   /** true = added to an existing vault; false = a new vault was created. */
@@ -71,19 +73,40 @@ export function persistOnboardSecret(input: {
         throw new Error('bad-password');
       }
     }
+    // Merge any legacy plaintext credentials into the vault BEFORE re-sealing. Shredding
+    // credentials.json without this step destroyed the user's OTHER provider keys — the
+    // documented invariant (unlock.ts) is merge → re-seal → verify → shred.
+    const legacy = loadLegacyCredentials();
+    for (const [slot, cred] of Object.entries(legacy ?? {})) {
+      if (!data[slot]) data[slot] = cred; // vault wins on conflict — it is the newer, deliberate store
+    }
     data[input.provider] = entry;
     saveSecrets(data, key);
     const cached = keychainAvailable() ? storeKey(key.toString('base64')) : Boolean(cachedB64);
-    // The key is sealed — drop any plaintext copy. Without this a vault and a live
-    // credentials.json coexist, and the plaintext is still served whenever nothing is unlocked.
-    shredLegacyCredentials();
+    // The key is sealed — drop any plaintext copy, but only after a verified re-open proves the
+    // sealed vault is actually readable. Without this a vault and a live credentials.json coexist,
+    // and the plaintext is still served whenever nothing is unlocked.
+    try {
+      unlockWithKey(key);
+      shredLegacyCredentials();
+    } catch {
+      /* keep the plaintext — the vault failed verification, it is the only copy now */
+    }
     return { merged: true, cached };
   }
   // Fresh vault — the password sets the master password.
   if (!input.password || input.password.length < 8) throw new Error('weak-password');
-  const key = createVault(input.password, { [input.provider]: entry });
+  // Legacy plaintext credentials ride along into the new vault (the new provider wins on conflict),
+  // so creating a vault never orphans the keys the plaintext file already held.
+  const initial: VaultData = { ...loadLegacyCredentials(), [input.provider]: entry };
+  const key = createVault(input.password, initial);
   const cached = keychainAvailable() ? storeKey(key.toString('base64')) : false;
-  shredLegacyCredentials(); // same reason as above
+  try {
+    unlockWithKey(key);
+    shredLegacyCredentials(); // verified readable — now the plaintext copy can go
+  } catch {
+    /* keep the plaintext */
+  }
   return { merged: false, cached };
 }
 
@@ -106,6 +129,8 @@ export function persistWebOnboardTarget(input: {
   selfHosted?: boolean;
   /** Contract extras from the chosen catalog preset (persisted as a ModelEntry — P1A-06 step 4). */
   entryExtras?: import('./persistTarget.js').OnboardTargetInput['entryExtras'];
+  selectedModels?: string[];
+  entryGroup?: string;
 }): void {
   persistOnboardTarget(input);
 }
@@ -131,12 +156,12 @@ function escapeHtml(value: string): string {
 
 /** Keep browser and terminal onboarding on the same provider/model catalog. */
 function providerOptions(): string {
-  return PROVIDERS
-    .filter((preset) => !preset.comingSoon)
+  return PROVIDERS.filter((preset) => !preset.comingSoon)
     .map(
       (preset) =>
         `<option value="${escapeHtml(preset.id)}" data-p="${preset.adapter}" ` +
-        `data-url="${escapeHtml(preset.baseUrl ?? '')}" data-model="${escapeHtml(preset.defaultModel)}">` +
+        `data-url="${escapeHtml(preset.baseUrl ?? '')}" data-model="${escapeHtml(preset.defaultModel)}" ` +
+        `data-models="${escapeHtml(JSON.stringify(preset.recommendedModels ?? (preset.defaultModel ? [preset.defaultModel] : [])))}">` +
         `${escapeHtml(preset.label)}</option>`,
     )
     .join('\n   ');
@@ -168,10 +193,14 @@ export function page(token: string, hasVault = false): string {
  input:focus,select:focus{outline:none;border-color:var(--cyan)}
  button{width:100%;margin-top:22px;padding:12px;background:var(--accent);border:none;border-radius:8px;color:#0d1117;font-weight:700;font-size:15px;cursor:pointer}
  button:disabled{opacity:.5;cursor:default}
+ button.secondary{margin-top:10px;background:transparent;color:var(--cyan);border:1px solid var(--line);font-size:13px;padding:9px}
  .note{margin-top:16px;font-size:12px;color:var(--dim);text-align:center}
  .msg{margin-top:14px;padding:10px;border-radius:8px;font-size:13px;display:none}
  .ok{background:#1a3326;color:#4ade80;display:block}.err{background:#3a1e1e;color:#f87171;display:block}
  .row{display:flex;gap:10px}.row>div{flex:1}
+ .choices{max-height:180px;overflow:auto;border:1px solid var(--line);border-radius:8px;margin-top:8px;padding:4px 10px}
+ .choices label{display:flex;align-items:center;gap:8px;margin:0;padding:7px 0;color:var(--fg);border-bottom:1px solid #21262d}
+ .choices label:last-child{border-bottom:0}.choices input{width:auto}.status{font-size:12px;color:var(--dim);margin-top:7px}
  [hidden]{display:none!important}
 </style></head><body>
 <div class="card">
@@ -193,8 +222,15 @@ export function page(token: string, hasVault = false): string {
     <option value="yes">Yes — my server</option>
    </select>
   </div>
-  <label>Model <span style="color:var(--dim)">(suggested automatically; editable)</span></label>
-  <input id="model" type="text" placeholder="e.g. qwen3.8-max" required>
+  <button id="discover" class="secondary" type="button">Discover models from this endpoint</button>
+  <div id="endpointStatus" class="status">Recommended models are ready; discovery checks what this key can actually access.</div>
+  <label>Models to add <span style="color:var(--dim)">(only checked models appear in Shadow)</span></label>
+  <input id="modelFilter" type="text" placeholder="Filter models…">
+  <div id="modelChoices" class="choices"></div>
+  <label>Exact model ID <span style="color:var(--dim)">(optional, when the API does not list it)</span></label>
+  <input id="manualModel" type="text" placeholder="e.g. glm-5.3">
+  <label>Default model</label>
+  <select id="model" required></select>
   ${
     hasVault
       ? `<label>Master password <span style="color:var(--dim)">(to unlock — leave blank if cached in your keychain)</span></label>
@@ -206,16 +242,24 @@ export function page(token: string, hasVault = false): string {
   }
   <button id="go" type="submit">${hasVault ? 'Unlock &amp; add' : 'Encrypt &amp; save'}</button>
   <div id="msg" class="msg"></div>
-  <p class="note">Nothing is transmitted — this page only talks to Shadow on your own machine.</p>
+  <p class="note">This page only talks to Shadow on your machine. “Discover” checks the selected provider; keys are never sent anywhere else.</p>
  </form>
 </div>
 <script>
  var TOKEN=${JSON.stringify(token)};
  var HASVAULT=${JSON.stringify(hasVault)};
  var sel=document.getElementById('provider'),base=document.getElementById('baseUrl'),model=document.getElementById('model');
+ var choices=document.getElementById('modelChoices'),filter=document.getElementById('modelFilter'),manual=document.getElementById('manualModel');
+ var endpointStatus=document.getElementById('endpointStatus'),detectedProvider='openai';
  var selfHosted=document.getElementById('selfHosted'),selfHostedWrap=document.getElementById('selfHostedWrap');
- function fill(){var o=sel.options[sel.selectedIndex];base.value=o.getAttribute('data-url')||'';model.value=o.getAttribute('data-model')||'';var custom=sel.value==='custom'&&o.getAttribute('data-p')==='openai';selfHostedWrap.hidden=!custom;if(!custom)selfHosted.value='no';}
+ function selectedModels(){return Array.prototype.map.call(choices.querySelectorAll('input:checked'),function(x){return x.value;});}
+ function updateDefault(preferred){var picked=selectedModels();var exact=manual.value.trim();if(exact&&picked.indexOf(exact)<0)picked.push(exact);var old=preferred||model.value;model.textContent='';picked.forEach(function(id){var op=document.createElement('option');op.value=id;op.textContent=id;model.appendChild(op);});if(picked.indexOf(old)>=0)model.value=old;else if(picked.length)model.value=picked[0];}
+ function renderModels(models,checked,preferred){choices.textContent='';var initial=checked||models;models.forEach(function(id){var lab=document.createElement('label');var cb=document.createElement('input');cb.type='checkbox';cb.value=id;cb.checked=initial.indexOf(id)>=0;cb.addEventListener('change',function(){updateDefault(preferred);});var span=document.createElement('span');span.textContent=id;lab.appendChild(cb);lab.appendChild(span);choices.appendChild(lab);});if(!models.length){var empty=document.createElement('div');empty.className='status';empty.textContent='No catalog yet — discover models or enter an exact ID below.';choices.appendChild(empty);}updateDefault(preferred);}
+ function fill(){var o=sel.options[sel.selectedIndex];base.value=o.getAttribute('data-url')||'';detectedProvider=o.getAttribute('data-p')||'openai';manual.value='';var models=[];try{models=JSON.parse(o.getAttribute('data-models')||'[]');}catch(e){}renderModels(models,models,o.getAttribute('data-model')||'');endpointStatus.textContent='Recommended models are ready; discovery checks what this key can actually access.';var custom=sel.value==='custom'&&detectedProvider==='openai';selfHostedWrap.hidden=!custom;if(!custom)selfHosted.value='no';}
  sel.addEventListener('change',fill);fill();
+ manual.addEventListener('input',function(){updateDefault();});
+ filter.addEventListener('input',function(){var q=filter.value.toLowerCase();Array.prototype.forEach.call(choices.querySelectorAll('label'),function(row){row.hidden=q&&row.textContent.toLowerCase().indexOf(q)<0;});});
+ document.getElementById('discover').addEventListener('click',function(){var btn=this;var o=sel.options[sel.selectedIndex];btn.disabled=true;btn.textContent='Discovering…';endpointStatus.textContent='Checking endpoint and credentials…';fetch('/probe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:TOKEN,provider:o.getAttribute('data-p'),label:sel.value,apiKey:document.getElementById('apiKey').value,baseUrl:base.value.trim()})}).then(function(r){return r.json();}).then(function(d){if(!d.ok&&d.source==='none')throw new Error(d.error||'No model catalog found');detectedProvider=d.provider||detectedProvider;if(d.baseUrl)base.value=d.baseUrl;var live=d.models||[],recommended=[];try{recommended=JSON.parse(o.getAttribute('data-models')||'[]');}catch(e){}var wanted=live.filter(function(id){return recommended.some(function(rec){return rec.toLowerCase()===id.toLowerCase();});});if(!wanted.length&&live.length)wanted=[live[0]];renderModels(live,wanted,wanted[0]);endpointStatus.textContent=(d.source==='live'?'✓ Live catalog: ':'Using recommendations: ')+live.length+' model(s) · '+(d.hosting||'unknown')+' · '+detectedProvider;if(sel.value==='custom'){if(d.hosting==='self-hosted'){selfHosted.value='yes';selfHostedWrap.hidden=true;}else if(d.hosting==='hosted'){selfHosted.value='no';selfHostedWrap.hidden=true;}else{selfHostedWrap.hidden=detectedProvider!=='openai';}}}).catch(function(e){endpointStatus.textContent='Could not discover models: '+e.message+'. You can enter an exact ID.';}).then(function(){btn.disabled=false;btn.textContent='Refresh models from this endpoint';});});
  var msg=document.getElementById('msg');
  document.getElementById('f').addEventListener('submit',function(e){
   e.preventDefault();
@@ -228,10 +272,11 @@ export function page(token: string, hasVault = false): string {
    if(pw!==pw2){msg.className='msg err';msg.textContent='Passwords do not match.';return;}
   }
   var btn=document.getElementById('go');btn.disabled=true;btn.textContent=HASVAULT?'Unlocking…':'Encrypting…';
+  var picked=selectedModels();var exact=manual.value.trim();if(exact&&picked.indexOf(exact)<0)picked.push(exact);if(!picked.length){msg.className='msg err';msg.textContent='Select a model or enter an exact model ID.';btn.disabled=false;btn.textContent=HASVAULT?'Unlock & add':'Encrypt & save';return;}var defaultModel=model.value||picked[0];if(picked.indexOf(defaultModel)<0)defaultModel=picked[0];
   fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
-   token:TOKEN,provider:o.getAttribute('data-p'),label:sel.value,apiKey:document.getElementById('apiKey').value,
-   baseUrl:base.value.trim(),model:document.getElementById('model').value.trim(),
-   selfHosted:o.getAttribute('data-p')==='openai'&&sel.value==='custom'&&selfHosted.value==='yes',password:pw})})
+   token:TOKEN,provider:detectedProvider,label:sel.value,apiKey:document.getElementById('apiKey').value,
+   baseUrl:base.value.trim(),model:defaultModel,models:picked,
+   selfHosted:detectedProvider==='openai'&&sel.value==='custom'&&selfHosted.value==='yes',password:pw})})
   .then(function(r){return r.json()}).then(function(d){
    if(d.ok){msg.className='msg ok';msg.textContent='✓ '+(d.merged?'Key added to your vault':'Vault created')+(d.cached?' and unlocked via your keychain':'')+'. You can close this tab and return to the terminal.';btn.textContent='Done';}
    else{msg.className='msg err';msg.textContent=d.error||'Failed to save.';btn.disabled=false;btn.textContent=HASVAULT?'Unlock & add':'Encrypt & save';}
@@ -257,6 +302,59 @@ export async function runWebOnboard(write: (s: string) => void): Promise<WebOnbo
         res.end(page(token, vaultExists()));
         return;
       }
+      if (req.method === 'POST' && req.url === '/probe') {
+        let body = '';
+        req.on('data', (chunk) => {
+          body += chunk;
+          if (body.length > 1_000_000) req.destroy();
+        });
+        req.on('end', async () => {
+          try {
+            const d = JSON.parse(body) as {
+              token?: string;
+              provider?: string;
+              label?: string;
+              apiKey?: string;
+              baseUrl?: string;
+            };
+            const got = Buffer.from(d.token ?? '');
+            const exp = Buffer.from(token);
+            if (got.length !== exp.length || !timingSafeEqual(got, exp)) {
+              res.writeHead(403, { 'Content-Type': 'application/json', ...SEC_HEADERS });
+              res.end(
+                JSON.stringify({ ok: false, source: 'none', error: 'invalid session token' }),
+              );
+              return;
+            }
+            const preset = findPreset(String(d.label ?? ''));
+            const adapter =
+              preset?.kind === 'custom'
+                ? 'auto'
+                : d.provider === 'anthropic'
+                  ? 'anthropic'
+                  : 'openai';
+            const probe = await probeModelEndpoint({
+              adapter,
+              baseUrl: d.baseUrl,
+              apiKey: d.apiKey,
+              fallbackModels:
+                preset?.recommendedModels ?? (preset?.defaultModel ? [preset.defaultModel] : []),
+              hostingHint:
+                preset?.kind === 'cloud'
+                  ? 'hosted'
+                  : preset?.kind === 'local'
+                    ? 'self-hosted'
+                    : undefined,
+            });
+            res.writeHead(200, { 'Content-Type': 'application/json', ...SEC_HEADERS });
+            res.end(JSON.stringify({ ...probe, provider: probe.compatibility }));
+          } catch (error) {
+            res.writeHead(400, { 'Content-Type': 'application/json', ...SEC_HEADERS });
+            res.end(JSON.stringify({ ok: false, source: 'none', error: (error as Error).message }));
+          }
+        });
+        return;
+      }
       if (req.method === 'POST' && req.url === '/save') {
         let body = '';
         req.on('data', (c) => {
@@ -272,6 +370,7 @@ export async function runWebOnboard(write: (s: string) => void): Promise<WebOnbo
               apiKey?: string;
               baseUrl?: string;
               model?: string;
+              models?: unknown[];
               selfHosted?: boolean;
               password?: string;
             };
@@ -289,12 +388,25 @@ export async function runWebOnboard(write: (s: string) => void): Promise<WebOnbo
               res.end(JSON.stringify({ ok: false, error: 'Choose or enter a model.' }));
               return;
             }
+            const selectedModels = [
+              ...new Set(
+                (Array.isArray(d.models) ? d.models : [])
+                  .filter((value): value is string => typeof value === 'string')
+                  .map((value) => value.trim())
+                  .filter((value) => value.length > 0 && value.length <= 256),
+              ),
+            ];
+            if (!selectedModels.includes(model)) selectedModels.unshift(model);
             // Seal the key into the vault — MERGING into an existing vault so multiple providers coexist
             // (adding Z.ai no longer wipes an Anthropic key). Keyed by Shadow provider — the same shape
             // the credential resolver reads.
             let result;
             try {
-              result = persistOnboardSecret({ provider, apiKey: d.apiKey ?? '', password: d.password });
+              result = persistOnboardSecret({
+                provider,
+                apiKey: d.apiKey ?? '',
+                password: d.password,
+              });
             } catch (e) {
               const code = (e as Error).message;
               const msg =
@@ -309,9 +421,8 @@ export async function runWebOnboard(write: (s: string) => void): Promise<WebOnbo
               res.end(JSON.stringify({ ok: false, error: msg }));
               return;
             }
-            // Non-secret prefs → config.json (provider / model / baseUrl / selfHosted). Clear
-            // lastModel: the last `/model` pick otherwise OVERRIDES this freshly-onboarded provider
-            // at launch, so onboarding would silently do nothing for anyone with saved presets.
+            // Non-secret prefs → config.json (provider / model / baseUrl / selfHosted). Replace a
+            // stale lastModel with this run's explicit default entry so endpoint+model stay atomic.
             // P1A-06 step 4: same contract threading as the terminal wizard — a preset shipping
             // entry extras persists them as a ModelEntry (keeps both onboarding doors identical).
             const chosenPreset = findPreset(String(d.label ?? ''));
@@ -326,6 +437,8 @@ export async function runWebOnboard(write: (s: string) => void): Promise<WebOnbo
               entryExtras: chosenPreset?.entry
                 ? { label: chosenPreset.label, ...chosenPreset.entry }
                 : undefined,
+              selectedModels,
+              entryGroup: chosenPreset?.label ?? 'Custom endpoint',
             });
             res.writeHead(200, { 'Content-Type': 'application/json', ...SEC_HEADERS });
             res.end(JSON.stringify({ ok: true, cached: result.cached, merged: result.merged }));
@@ -346,11 +459,16 @@ export async function runWebOnboard(write: (s: string) => void): Promise<WebOnbo
       const port = (server.address() as AddressInfo).port;
       const url = `http://127.0.0.1:${port}/?t=${token}`;
       write(`\nOpening secure onboarding in your browser…\n  ${url}\n`);
-      write('If it does not open, paste that URL into any browser. Your keys stay on this machine.\n');
+      write(
+        'If it does not open, paste that URL into any browser. Your keys stay on this machine.\n',
+      );
       openBrowser(url);
     });
     // Abandon after 5 minutes so a forgotten tab doesn't leave the server up.
-    const timer = setTimeout(() => finish({ ok: false, reason: 'timed out (no submission in 5 minutes)' }), 5 * 60 * 1000);
+    const timer = setTimeout(
+      () => finish({ ok: false, reason: 'timed out (no submission in 5 minutes)' }),
+      5 * 60 * 1000,
+    );
     server.on('close', () => clearTimeout(timer));
   });
 }

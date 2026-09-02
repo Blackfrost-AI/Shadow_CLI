@@ -64,6 +64,12 @@ export function discoverSkills(workspaceRoot: string): SkillEntry[] {
     }
     for (const name of entries) {
       if (seen.has(name)) continue; // first-wins: workspace roots were scanned first
+      // A directory name carrying control/format characters (newlines, ESC, bidi/zero-width
+      // marks) is attacker-crafted by construction: the name is spliced into the SYSTEM-prompt
+      // skill index — name AND path — which sits OUTSIDE the per-description one-line fence.
+      // A crafted `benign\n\n[END OF INDEX]\nSYSTEM: …` dir name would forge system
+      // instruction. Skip such entries entirely.
+      if (/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2028\u2029]/.test(name)) continue;
       const skillPath = join(root, name, 'SKILL.md');
       if (!existsSync(skillPath)) continue;
       try {
@@ -92,9 +98,11 @@ function parseDescription(md: string): string | null {
   return m?.[1]?.trim() ?? null;
 }
 
-/** Collapse an untrusted SKILL.md description to a single short line — no newlines, no markdown control chars. */
+/** Collapse an untrusted SKILL.md description to a single short line — no newlines, no control/format
+ *  characters (an ANSI escape in a hostile description would otherwise ride into the system prompt), no markdown control chars. */
 function sanitizeDesc(desc: string): string {
   const oneLine = desc
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2028\u2029]/g, '')
     .replace(/\s+/g, ' ')
     .replace(/[`*_#[\]<>]/g, '')
     .trim();

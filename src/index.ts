@@ -70,7 +70,7 @@ import { lc } from './util/lc.js';
 import { createInterface } from 'node:readline/promises';
 import { AutoApproveGate, AutoDenyGate, type ApprovalGate } from './agent/approval.js';
 import { stopLspServices } from './agent/lsp/index.js';
-import { ReplGate } from './replGate.js';
+import { ReplGate, headlessInputSource } from './replGate.js';
 import { loadGlobalConfig, saveGlobalConfig, ensureShadowLayout, configPath, GLOBAL_DIR } from './state/globalStore.js';
 import {
   configInit,
@@ -87,7 +87,13 @@ import { buildCodexAuthUrl } from './auth/oauth.js';
 import { type OutputStyle } from './styles.js';
 import { runDoctor, formatDoctorReport } from './doctor.js';
 import { runModelCheck, formatModelCheckReport } from './doctor/modelCheck.js';
-import { buildPrivacyReport, gatherPrivacyEnv, formatPrivacyReport, type PrivacyConfigView } from './doctor/privacy.js';
+import {
+  buildPrivacyReport,
+  gatherPrivacyEnv,
+  formatPrivacyReport,
+  effectiveSessionEndpoint,
+  type PrivacyConfigView,
+} from './doctor/privacy.js';
 import { DEV_UNRESTRICTED, resolveUnrestricted } from './buildProfile.js';
 import { unconfinedBanner } from './safety/sandbox.js';
 import { runTui, attachRenderer } from './tui.js';
@@ -147,7 +153,7 @@ function helpText(): string {
     'Usage: shadow [command] [options]',
     '',
     'Commands:',
-    '  onboard              guided provider setup — pick a provider, key, model; tested + saved',
+    '  onboard              guided setup — probe endpoint, select models, test + save',
     '  onboard --web        secure setup in a local browser form → encrypted vault + master password',
     '  update               self-update: git checkout → pull+rebuild; binary install → re-fetch from host',
     '  export [path]        export session log to markdown, or standalone HTML with --html (--session, --out)',
@@ -632,8 +638,10 @@ async function runLocal(args: string[]): Promise<void> {
       process.exitCode = 1;
       return;
     }
-    const cfg = loadConfig(cwd, {});
-    const res = addLocalModel(cfg.models, parsed.value);
+    // Persist against the GLOBAL model list: loadConfig(cwd).models is the project-merged view,
+    // and saving it back to global config would replace every global preset with a project's list.
+    const globalModels = (loadGlobalConfig().models as ModelEntry[] | undefined) ?? [];
+    const res = addLocalModel(globalModels, parsed.value);
     if (!res.ok) {
       process.stderr.write(res.message + '\n');
       process.exitCode = 1;
@@ -663,8 +671,9 @@ async function runLocal(args: string[]): Promise<void> {
 
   if (sub === 'remove' || sub === 'delete') {
     const name = args[1] ?? '';
-    const cfg = loadConfig(cwd, {});
-    const res = removeLocalModel(cfg.models, name);
+    // Same as `add`: reconcile against the GLOBAL list, not the project-merged view.
+    const globalModels = (loadGlobalConfig().models as ModelEntry[] | undefined) ?? [];
+    const res = removeLocalModel(globalModels, name);
     if (!res.ok) {
       process.stderr.write(res.message + '\n');
       process.exitCode = 1;
@@ -1008,10 +1017,25 @@ async function main(): Promise<void> {
       return;
     }
     if (argv[1] === 'privacy' || argv.includes('--privacy')) {
-      // Prove the active config's privacy posture. Makes NO network calls (and no vault unlock — it only
-      // checks whether a vault exists, never reads it). `--offline` shows the offline posture.
+      // Prove the active config's privacy posture. Makes NO network calls and NO vault-unlock
+      // attempt — base-URL resolution reads the credential store only as it already sits (already
+      // unlocked, legacy plaintext file, or not at all); it never prompts. `--offline` shows the
+      // offline posture.
       const cfg = loadConfig(process.cwd(), {});
-      const report = buildPrivacyReport(cfg as unknown as PrivacyConfigView, gatherPrivacyEnv(argv.includes('--offline')));
+      // Name the endpoint a real session would talk to, not the raw config keys: recall the /model
+      // pick exactly like main() below, then fold the candidate through resolveBaseUrl (explicit >
+      // ANTHROPIC/OPENAI_BASE_URL > credential store — the same fold bootstrap applies before every
+      // request). Without it, a baseUrl supplied by the env or the credential store made the header,
+      // the egress line, and the "prompts go to" warning name a host this machine never talks to.
+      const view = cfg as unknown as PrivacyConfigView;
+      const endpoint = effectiveSessionEndpoint(view, {
+        envModel: process.env.SHADOW_MODEL,
+        envProvider: process.env.SHADOW_PROVIDER,
+      });
+      const report = buildPrivacyReport(
+        { ...view, provider: endpoint.provider, model: endpoint.model, baseUrl: endpoint.baseUrl },
+        gatherPrivacyEnv(argv.includes('--offline')),
+      );
       // P3-08: the zero-telemetry claim backed by its RUNTIME receipt — aggregate the egress journal
       // from disk (pure local read) + surface quarantine policy state, so the report never reads
       // cleaner than reality.
@@ -1731,7 +1755,16 @@ async function main(): Promise<void> {
         // One-shot automation: no human to ask, so gated calls are denied.
         const gate: ApprovalGate = yolo ? new AutoApproveGate() : new AutoDenyGate();
         await runHeadlessTask(flags.task, gate);
-      } else if (interactive) {
+      } else if (headlessInputSource(!!process.stdin.isTTY) === 'repl') {
+        // stdin is a terminal → a human is present, so the question loop below is the only thing
+        // allowed to read fd 0. stdout being REDIRECTED (`shadow | tee`) is not a pipe: this case
+        // used to fall through to the piped branch, whose fallback re-read fd 0 synchronously and
+        // blocked on the terminal until EOF — `shadow | tee` hung with no prompt.
+        if (!interactive) {
+          // The prompt + transcript go to the redirected stdout, so explain the plain renderer on
+          // the channel the user can still see (same role as the TERM=dumb note above).
+          process.stderr.write('stdin is a terminal but stdout is not — running the plain prompt loop (type a task, or "exit").\n');
+        }
         const rl = createInterface({ input: process.stdin, output: process.stdout });
         const onTurnError = (err: unknown): void => {
           // A failed turn must not tear down the session — report and continue.
@@ -1764,8 +1797,10 @@ async function main(): Promise<void> {
           rl.close();
         }
       } else {
-        // Piped / redirected stdin: nobody to approve, so deny. Use the copy captured at startup
-        // (before MCP registration could disturb fd 0) so lines written before startup are not dropped.
+        // Piped stdin: nobody to approve, so deny. Only reachable when stdin is NOT a TTY (a
+        // terminal on stdin is routed to the REPL above), so this fallback read cannot block on
+        // anything. Use the copy captured at startup (before MCP registration could disturb fd 0)
+        // so lines written before startup are not dropped.
         const gate: ApprovalGate = yolo ? new AutoApproveGate() : new AutoDenyGate();
         const input = pipedStdin ?? readFileSync(0, 'utf8');
         for (const line of input.split(/\r?\n/)) {

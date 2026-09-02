@@ -275,7 +275,13 @@ export class Context {
         cleared = true;
       }
     }
-    if (cleared) this.estimateDirty = true; // F06-12: tool_result bodies changed in place
+    if (cleared) {
+      this.estimateDirty = true; // F06-12: tool_result bodies changed in place
+      // The wire size just shrank materially — reset the last REAL reading so estimateTokens()
+      // is not floored at the stale pre-clear value (every sibling reclaim path does this; the
+      // missing reset made maybeSummarize run the full summarizer on already-shrunk history).
+      this.lastActualTokens = 0;
+    }
     return cleared;
   }
 

@@ -171,3 +171,17 @@ test('microcompaction is idempotent and preserves per-turn tool_use↔tool_resul
     assert.deepEqual(resIds, useIds, 'result ids still pair with use ids in order');
   }
 });
+
+test('microcompaction resets a stale actual-token floor so the estimate reflects cleared history', () => {
+  const ctx = overMicroGate();
+  const provider = new MockProvider();
+  // A real request reported this size BEFORE the reclaim. The bodies just shrank materially on
+  // the wire, but estimateTokens() is max(heuristic, lastActualTokens) — without the reset the
+  // stale floor kept the session reading as over the gate, and maybeSummarize burned a full
+  // summarizer round trip on already-shrunk history (compensated only by rearm hysteresis).
+  ctx.recordActualTokens(10_000_000);
+  assert.equal(ctx.microcompact(provider), true);
+  const est = ctx.estimateTokens(provider);
+  assert.ok(est < 10_000_000, 'estimate is no longer floored at the stale pre-clear reading');
+  assert.equal(est, provider.estimateTokens(ctx.messages()), 'it now equals the plain heuristic of the cleared history');
+});

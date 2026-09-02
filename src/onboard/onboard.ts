@@ -1,4 +1,5 @@
 import * as readline from 'node:readline/promises';
+import * as readlineCore from 'node:readline';
 import { stdin, stdout } from 'node:process';
 import { execSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
@@ -6,7 +7,12 @@ import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { providersForMode, type ProviderPreset, type OnboardMode } from './catalog.js';
 import { createProvider, type ProviderName } from '../provider/index.js';
-import { saveCredential, saveGlobalConfig, loadGlobalConfig, GLOBAL_DIR } from '../state/globalStore.js';
+import {
+  saveCredential,
+  saveGlobalConfig,
+  loadGlobalConfig,
+  GLOBAL_DIR,
+} from '../state/globalStore.js';
 import { addLocalModel, testLocalModel } from '../local/garage.js';
 import { defaultModelPatch } from '../config/modelPresets.js';
 import type { ModelEntry } from '../config.js';
@@ -15,6 +21,7 @@ import { normalizeBaseUrl } from '../config.js';
 import type { Message } from '../provider/provider.js';
 import { registerSecret, redactString } from '../util/redact.js';
 import { persistOnboardTarget, type OnboardTargetInput } from './persistTarget.js';
+import { parseModelSelection, probeModelEndpoint, type EndpointProbeResult } from './probe.js';
 
 const ESC = '\x1b[';
 const c = {
@@ -108,7 +115,9 @@ type SetupStep =
   | 'localBaseUrl'
   | 'localSecret'
   | 'cloudSecret'
+  | 'discoverModels'
   | 'model'
+  | 'defaultModel'
   | 'transport'
   | 'test'
   | 'contextCooler';
@@ -120,6 +129,9 @@ interface DraftSetup {
   apiKey?: string;
   authToken?: string;
   model?: string;
+  availableModels?: string[];
+  selectedModels?: string[];
+  probe?: EndpointProbeResult;
   /** Explicit trust marker for a public remote OpenAI-compatible server. */
   selfHosted?: boolean;
 }
@@ -134,6 +146,8 @@ export function persistTerminalOnboardTarget(input: {
   selfHosted?: boolean;
   /** Contract extras from the chosen catalog preset (persisted as a ModelEntry — P1A-06 step 4). */
   entryExtras?: OnboardTargetInput['entryExtras'];
+  selectedModels?: string[];
+  entryGroup?: string;
 }): void {
   persistOnboardTarget({
     provider: input.adapter,
@@ -142,6 +156,8 @@ export function persistTerminalOnboardTarget(input: {
     customEndpoint: input.customEndpoint,
     selfHosted: input.selfHosted,
     entryExtras: input.entryExtras,
+    selectedModels: input.selectedModels,
+    entryGroup: input.entryGroup,
   });
 }
 
@@ -157,9 +173,12 @@ async function askText(rl: readline.Interface, query: string): Promise<PromptRes
   return controlAnswer(raw) ?? raw;
 }
 
-async function askSecretStep(rl: readline.Interface, query: string): Promise<PromptResult> {
-  const raw = await askSecret(rl, query);
-  return controlAnswer(raw) ?? raw;
+async function askSecretStep(
+  rl: readline.Interface,
+  query: string,
+): Promise<{ value: PromptResult; rl: readline.Interface }> {
+  const { value, rl: next } = await askSecret(rl, query);
+  return { value: controlAnswer(value) ?? value, rl: next };
 }
 
 function backHint(): string {
@@ -225,7 +244,7 @@ async function offerContextCooler(rl: readline.Interface): Promise<'done' | 'bac
  * future runs connect with no flags. Returns true if a provider was saved.
  */
 export async function runOnboard(): Promise<boolean> {
-  const rl = readline.createInterface({ input: stdin, output: stdout });
+  let rl = readline.createInterface({ input: stdin, output: stdout });
   try {
     let step: SetupStep = 'mode';
     let mode: OnboardMode = 'cloud';
@@ -237,7 +256,11 @@ export async function runOnboard(): Promise<boolean> {
     // is durable — say so and report success. Only a truly empty run is "cancelled".
     const quitOutcome = (): boolean => {
       if (savedGguf) {
-        stdout.write(c.gray(`Setup closed — local model "${savedGguf.label}" is saved and active. Run \`shadow\` to use it.\n`));
+        stdout.write(
+          c.gray(
+            `Setup closed — local model "${savedGguf.label}" is saved and active. Run \`shadow\` to use it.\n`,
+          ),
+        );
         return true;
       }
       stdout.write(c.gray('Setup cancelled — nothing saved.\n'));
@@ -255,7 +278,9 @@ export async function runOnboard(): Promise<boolean> {
     const showProviderMenu = (list: ProviderPreset[]) => {
       stdout.write('\n');
       writeCentered([c.bold('Connect a model provider')]);
-      writeCentered([c.gray('No Shadow account — bring your own provider; keys stay local in ~/.shadow.')]);
+      writeCentered([
+        c.gray('No Shadow account — bring your own provider; keys stay local in ~/.shadow.'),
+      ]);
       stdout.write('\n');
       const menu = list.map((p, i) => {
         const n = c.bold(String(i + 1).padStart(2));
@@ -263,7 +288,9 @@ export async function runOnboard(): Promise<boolean> {
       });
       writeCentered(menu);
       stdout.write('\n');
-      stdout.write(c.gray('  Tip: type `back` or `b` at any prompt to go to the previous step.\n\n'));
+      stdout.write(
+        c.gray('  Tip: type `back` or `b` at any prompt to go to the previous step.\n\n'),
+      );
     };
 
     while (true) {
@@ -299,7 +326,10 @@ export async function runOnboard(): Promise<boolean> {
         }
 
         case 'ggufPath': {
-          const ans = await askText(rl, `Model to run: .gguf path, MLX folder, or mlx-community/<model> id ${backHint()}: `);
+          const ans = await askText(
+            rl,
+            `Model to run: .gguf path, MLX folder, or mlx-community/<model> id ${backHint()}: `,
+          );
           if (ans === QUIT) return quitOutcome(); // a previously saved model stays saved
           if (ans === BACK) {
             step = 'mode';
@@ -312,18 +342,22 @@ export async function runOnboard(): Promise<boolean> {
           const models = (loadGlobalConfig().models as ModelEntry[] | undefined) ?? [];
           // Re-entry with an already-registered file (e.g. `back` from a later step) must not
           // dead-end on "already exists" — reuse the existing entry and move forward.
-          const resolved = ans.startsWith('~/') || ans === '~' ? join(homedir(), ans.slice(1)) : ans;
+          const resolved =
+            ans.startsWith('~/') || ans === '~' ? join(homedir(), ans.slice(1)) : ans;
           const abs = resolve(resolved);
           const existing = models.find(
             (m) =>
-              (m.gguf && (m.gguf === abs || m.gguf.endsWith(`/${resolved.split('/').pop() ?? resolved}`))) ||
+              (m.gguf &&
+                (m.gguf === abs || m.gguf.endsWith(`/${resolved.split('/').pop() ?? resolved}`))) ||
               (m.mlx && (m.mlx === abs || m.mlx === resolved || m.mlx === ans)),
           );
           let entry: ModelEntry;
           if (existing) {
             saveGlobalConfig(defaultModelPatch(existing));
             entry = existing;
-            stdout.write(c.gray(`\n"${existing.label}" is already registered — made it the active model.\n`));
+            stdout.write(
+              c.gray(`\n"${existing.label}" is already registered — made it the active model.\n`),
+            );
           } else {
             const res = addLocalModel(models, { path: ans });
             if (!res.ok) {
@@ -333,13 +367,23 @@ export async function runOnboard(): Promise<boolean> {
             entry = res.value.entry;
             // Persist the preset AND make it the active model (same patch `shadow local use` writes).
             saveGlobalConfig({ models: res.value.models, ...defaultModelPatch(entry) });
-            stdout.write(c.green(`\n✓ Added local model "${entry.label}"`) + c.gray(entry.mlx ? ' (MLX, auto-served on demand)\n' : ` (ctx ${entry.ctx}, auto-served on demand)\n`));
+            stdout.write(
+              c.green(`\n✓ Added local model "${entry.label}"`) +
+                c.gray(
+                  entry.mlx
+                    ? ' (MLX, auto-served on demand)\n'
+                    : ` (ctx ${entry.ctx}, auto-served on demand)\n`,
+                ),
+            );
             if (res.note) stdout.write(c.yellow(`  ⚠ ${res.note}\n`));
           }
           savedGguf = entry;
           ggufTestFailed = false;
 
-          const t = await askText(rl, `Test it now? Loads the model — can take a minute. ${c.gray('[Y/n/back]')}: `);
+          const t = await askText(
+            rl,
+            `Test it now? Loads the model — can take a minute. ${c.gray('[Y/n/back]')}: `,
+          );
           if (t === QUIT) return quitOutcome(); // model is already saved; quitting here loses nothing
           if (t === BACK) {
             step = 'mode';
@@ -349,11 +393,20 @@ export async function runOnboard(): Promise<boolean> {
             stdout.write(c.gray('\nStarting llama-server and running a tiny completion…\n'));
             const result = await testLocalModel(entry, (m) => stdout.write(c.gray(`  ${m}\n`)));
             if (result.ok) {
-              stdout.write(c.green(`✓ PASS`) + c.gray(` — ${result.endpoint}${result.tokensPerSec ? ` · ${result.tokensPerSec.toFixed(1)} tok/s` : ''}\n`));
+              stdout.write(
+                c.green(`✓ PASS`) +
+                  c.gray(
+                    ` — ${result.endpoint}${result.tokensPerSec ? ` · ${result.tokensPerSec.toFixed(1)} tok/s` : ''}\n`,
+                  ),
+              );
             } else {
               ggufTestFailed = true;
               stdout.write(c.red(`✗ test failed: ${result.error}\n`));
-              stdout.write(c.gray(`  The model is saved — fix the issue above, then verify with: shadow local test ${entry.label}\n`));
+              stdout.write(
+                c.gray(
+                  `  The model is saved — fix the issue above, then verify with: shadow local test ${entry.label}\n`,
+                ),
+              );
             }
           }
           step = 'contextCooler';
@@ -363,8 +416,14 @@ export async function runOnboard(): Promise<boolean> {
         case 'provider': {
           const list = providersForMode(mode);
           showProviderMenu(list);
-          const firstReal = Math.max(0, list.findIndex((p) => !p.comingSoon));
-          const pick = await askText(rl, `Choose a provider ${c.gray(`[${firstReal + 1}]`)} ${backHint()}: `);
+          const firstReal = Math.max(
+            0,
+            list.findIndex((p) => !p.comingSoon),
+          );
+          const pick = await askText(
+            rl,
+            `Choose a provider ${c.gray(`[${firstReal + 1}]`)} ${backHint()}: `,
+          );
           if (pick === QUIT) return quitOutcome();
           if (pick === BACK) {
             step = 'mode';
@@ -377,7 +436,11 @@ export async function runOnboard(): Promise<boolean> {
             continue;
           }
           if (preset.comingSoon) {
-            stdout.write(c.yellow(`\n${preset.label.replace(/\s*\(coming soon\)/i, '')} isn't available yet — coming soon.\n`));
+            stdout.write(
+              c.yellow(
+                `\n${preset.label.replace(/\s*\(coming soon\)/i, '')} isn't available yet — coming soon.\n`,
+              ),
+            );
             stdout.write(c.gray('Pick another provider for now.\n'));
             continue;
           }
@@ -387,16 +450,27 @@ export async function runOnboard(): Promise<boolean> {
           draft.apiKey = undefined;
           draft.authToken = undefined;
           draft.model = undefined;
+          draft.availableModels = undefined;
+          draft.selectedModels = undefined;
+          draft.probe = undefined;
           draft.selfHosted = undefined;
-          step = preset.kind === 'custom' ? 'customCompatibility' : preset.kind === 'local' ? 'localBaseUrl' : 'cloudSecret';
+          step =
+            preset.kind === 'custom'
+              ? 'customBaseUrl'
+              : preset.kind === 'local'
+                ? 'localBaseUrl'
+                : 'cloudSecret';
           break;
         }
 
         case 'customCompatibility': {
-          const comp = await askText(rl, `API compatibility ${c.gray('(openai/anthropic) [openai]')} ${backHint()}: `);
+          const comp = await askText(
+            rl,
+            `API compatibility ${c.gray('(openai/anthropic) [openai]')} ${backHint()}: `,
+          );
           if (comp === QUIT) return false;
           if (comp === BACK) {
-            step = 'provider';
+            step = 'customSecret';
             break;
           }
           const value = comp.toLowerCase();
@@ -405,9 +479,16 @@ export async function runOnboard(): Promise<boolean> {
             break;
           }
           draft.adapter = value === 'anthropic' ? 'anthropic' : 'openai';
+          if (draft.adapter === 'anthropic' && draft.apiKey) {
+            draft.authToken = draft.apiKey;
+            draft.apiKey = undefined;
+          }
           // Native Anthropic requests never use OpenAI self-host-only sampling fields.
-          draft.selfHosted = false;
-          step = draft.adapter === 'openai' ? 'customSelfHosted' : 'customBaseUrl';
+          if (draft.adapter === 'anthropic') draft.selfHosted = false;
+          step =
+            draft.adapter === 'openai' && draft.probe?.hosting === 'unknown'
+              ? 'customSelfHosted'
+              : 'model';
           break;
         }
 
@@ -418,7 +499,7 @@ export async function runOnboard(): Promise<boolean> {
           );
           if (answer === QUIT) return false;
           if (answer === BACK) {
-            step = 'customCompatibility';
+            step = draft.probe?.ok ? 'discoverModels' : 'customCompatibility';
             break;
           }
           const value = answer.toLowerCase();
@@ -427,7 +508,7 @@ export async function runOnboard(): Promise<boolean> {
             break;
           }
           draft.selfHosted = value === 'y' || value === 'yes';
-          step = 'customBaseUrl';
+          step = 'model';
           break;
         }
 
@@ -435,7 +516,7 @@ export async function runOnboard(): Promise<boolean> {
           const baseUrl = await askText(rl, `Base URL ${backHint()}: `);
           if (baseUrl === QUIT) return false;
           if (baseUrl === BACK) {
-            step = draft.adapter === 'openai' ? 'customSelfHosted' : 'customCompatibility';
+            step = 'provider';
             break;
           }
           if (!baseUrl) {
@@ -448,7 +529,12 @@ export async function runOnboard(): Promise<boolean> {
         }
 
         case 'customSecret': {
-          const key = await askSecretStep(rl, `API key/token ${c.gray('(Enter to skip)')} ${backHint()}: `);
+          const secret = await askSecretStep(
+            rl,
+            `API key/token ${c.gray('(Enter to skip)')} ${backHint()}: `,
+          );
+          rl = secret.rl;
+          const key = secret.value;
           if (key === QUIT) return false;
           if (key === BACK) {
             step = 'customBaseUrl';
@@ -456,17 +542,17 @@ export async function runOnboard(): Promise<boolean> {
           }
           draft.apiKey = undefined;
           draft.authToken = undefined;
-          if (key) {
-            if (draft.adapter === 'anthropic') draft.authToken = key;
-            else draft.apiKey = key;
-          }
-          step = 'model';
+          if (key) draft.apiKey = key;
+          step = 'discoverModels';
           break;
         }
 
         case 'localBaseUrl': {
           const preset = draft.preset!;
-          const baseUrl = await askText(rl, `Base URL ${c.gray(`(Enter to use ${preset.baseUrl})`)} ${backHint()}: `);
+          const baseUrl = await askText(
+            rl,
+            `Base URL ${c.gray(`(Enter to use ${preset.baseUrl})`)} ${backHint()}: `,
+          );
           if (baseUrl === QUIT) return false;
           if (baseUrl === BACK) {
             step = 'provider';
@@ -480,7 +566,12 @@ export async function runOnboard(): Promise<boolean> {
 
         case 'localSecret': {
           const preset = draft.preset!;
-          const key = await askSecretStep(rl, `API key/token ${c.gray('(Enter to skip for local)')} ${backHint()}: `);
+          const secret = await askSecretStep(
+            rl,
+            `API key/token ${c.gray('(Enter to skip for local)')} ${backHint()}: `,
+          );
+          rl = secret.rl;
+          const key = secret.value;
           if (key === QUIT) return false;
           if (key === BACK) {
             step = 'localBaseUrl';
@@ -494,14 +585,16 @@ export async function runOnboard(): Promise<boolean> {
           } else if (preset.bearer) {
             draft.authToken = 'ollama';
           }
-          step = 'model';
+          step = 'discoverModels';
           break;
         }
 
         case 'cloudSecret': {
           const preset = draft.preset!;
           if (preset.keyUrl) stdout.write(c.gray(`  Get a key: ${preset.keyUrl}\n`));
-          const key = await askSecretStep(rl, `API key ${backHint()}: `);
+          const secret = await askSecretStep(rl, `API key ${backHint()}: `);
+          rl = secret.rl;
+          const key = secret.value;
           if (key === QUIT) return false;
           if (key === BACK) {
             step = 'provider';
@@ -513,25 +606,196 @@ export async function runOnboard(): Promise<boolean> {
           }
           draft.apiKey = key;
           draft.authToken = undefined;
-          step = 'model';
+          step = 'discoverModels';
+          break;
+        }
+
+        case 'discoverModels': {
+          const preset = draft.preset!;
+          stdout.write(c.gray('\n  Checking endpoint and fetching available models…\n'));
+          const probe = await probeModelEndpoint({
+            adapter:
+              preset.kind === 'custom'
+                ? 'auto'
+                : draft.adapter === 'anthropic'
+                  ? 'anthropic'
+                  : 'openai',
+            baseUrl: draft.baseUrl,
+            apiKey: draft.apiKey,
+            authToken: draft.authToken,
+            fallbackModels:
+              preset.recommendedModels ?? (preset.defaultModel ? [preset.defaultModel] : []),
+            hostingHint:
+              preset.kind === 'cloud'
+                ? 'hosted'
+                : preset.kind === 'local'
+                  ? 'self-hosted'
+                  : undefined,
+          });
+          draft.probe = probe;
+          draft.availableModels = probe.models;
+          if (probe.baseUrl) draft.baseUrl = probe.baseUrl;
+          if (preset.kind === 'custom' && probe.ok) {
+            draft.adapter = probe.compatibility;
+            // Auto-detection proved Anthropic compatibility with x-api-key, so retain apiKey.
+            // The manual compatibility fallback below preserves the older Bearer-token path for
+            // Anthropic-compatible self-hosted proxies whose /models route cannot be discovered.
+          }
+          if (probe.hosting === 'self-hosted') draft.selfHosted = true;
+          else if (probe.hosting === 'hosted') draft.selfHosted = false;
+
+          if (probe.ok) {
+            stdout.write(
+              c.green(
+                `  ✓ ${probe.models.length} model${probe.models.length === 1 ? '' : 's'} found`,
+              ) +
+                c.gray(
+                  ` · ${probe.compatibility} · ${probe.hosting}${probe.modelsUrl ? `\n    ${probe.modelsUrl}` : ''}\n`,
+                ),
+            );
+          } else if (probe.source === 'curated') {
+            stdout.write(
+              c.yellow('  Model listing unavailable') +
+                c.gray(
+                  ` (${probe.error ?? 'not supported'}). Showing Shadow's current recommendations instead.\n`,
+                ),
+            );
+          } else {
+            stdout.write(
+              c.yellow('  Model listing unavailable') +
+                c.gray(
+                  ` (${probe.error ?? 'not supported'}). You can still enter an exact model id.\n`,
+                ),
+            );
+          }
+
+          if (preset.kind === 'custom' && !probe.ok) {
+            step = 'customCompatibility';
+          } else if (
+            preset.kind === 'custom' &&
+            draft.adapter === 'openai' &&
+            probe.hosting === 'unknown'
+          ) {
+            step = 'customSelfHosted';
+          } else {
+            step = 'model';
+          }
           break;
         }
 
         case 'model': {
           const preset = draft.preset!;
-          const def = preset.defaultModel;
-          const mAns = await askText(rl, `Model${def ? ` ${c.gray(`[${def}]`)}` : ''} ${backHint()}: `);
+          const available = draft.availableModels ?? [];
+          const recommended = (
+            preset.recommendedModels ?? (preset.defaultModel ? [preset.defaultModel] : [])
+          )
+            .map(
+              (wanted) =>
+                available.find((model) => model.toLowerCase() === wanted.toLowerCase()) ?? wanted,
+            )
+            .filter((model, index, list) => model && list.indexOf(model) === index);
+          let shown = [
+            ...recommended.filter((model) => available.includes(model)),
+            ...available.filter((model) => !recommended.includes(model)),
+          ];
+          if (shown.length > 40) {
+            const query = await askText(
+              rl,
+              `Filter ${shown.length} models by name ${c.gray('(Enter shows recommendations + first matches)')} ${backHint()}: `,
+            );
+            if (query === QUIT) return false;
+            if (query === BACK) {
+              step = previousCredentialStep(preset);
+              break;
+            }
+            const matches = query
+              ? shown.filter((model) => model.toLowerCase().includes(query.toLowerCase()))
+              : shown;
+            if (matches.length === 0) {
+              stdout.write(
+                c.yellow(
+                  'No discovered model matches that filter — type an exact id at the next prompt.\n',
+                ),
+              );
+              shown = recommended.slice(0, 40);
+            } else {
+              shown = matches.slice(0, 40);
+            }
+          }
+
+          if (shown.length > 0) {
+            stdout.write('\n');
+            writeCentered([
+              c.bold(
+                draft.probe?.source === 'live'
+                  ? 'Models available to this key'
+                  : 'Recommended agentic models',
+              ),
+            ]);
+            const lines = shown.map((model, index) => {
+              const mark = recommended.some((item) => item.toLowerCase() === model.toLowerCase())
+                ? c.green(' recommended')
+                : '';
+              return `${c.bold(String(index + 1).padStart(2))}. ${model}${mark}`;
+            });
+            writeCentered(lines);
+            stdout.write('\n');
+          }
+
+          const defaults = recommended.filter((model) => shown.includes(model));
+          const defaultIndexes = defaults
+            .map((model) => shown.indexOf(model) + 1)
+            .filter((index) => index > 0)
+            .join(',');
+          const prompt = shown.length
+            ? `Models to add ${c.gray(`(numbers/ranges, e.g. 1,3-5; "all"; or exact id)${defaultIndexes ? ` [${defaultIndexes}]` : ''}`)} ${backHint()}: `
+            : `Model id ${backHint()}: `;
+          const mAns = await askText(rl, prompt);
           if (mAns === QUIT) return false;
           if (mAns === BACK) {
             step = previousCredentialStep(preset);
             break;
           }
-          const model = mAns || def;
-          if (!model) {
-            stdout.write(c.red('A model id is required.\n'));
+          let selected: string[] | null;
+          if (!mAns && defaultIndexes) selected = defaults;
+          else selected = parseModelSelection(mAns, shown, available);
+          // Manual escape hatch for providers whose catalog is stale or unavailable.
+          if (selected === null && mAns && !mAns.includes(',') && !/^\d+(?:-\d+)?$/.test(mAns))
+            selected = [mAns];
+          if (!selected || selected.length === 0) {
+            stdout.write(c.red('Choose at least one model by number, range, or exact model id.\n'));
             break;
           }
-          draft.model = model;
+          draft.selectedModels = selected;
+          if (selected.length === 1) {
+            draft.model = selected[0];
+            step = 'transport';
+          } else {
+            step = 'defaultModel';
+          }
+          break;
+        }
+
+        case 'defaultModel': {
+          const selected = draft.selectedModels ?? [];
+          stdout.write('\n');
+          writeCentered([c.bold('Choose the default model')]);
+          writeCentered(
+            selected.map((model, index) => `${c.bold(String(index + 1).padStart(2))}. ${model}`),
+          );
+          stdout.write('\n');
+          const answer = await askText(rl, `Default model ${c.gray('[1]')} ${backHint()}: `);
+          if (answer === QUIT) return false;
+          if (answer === BACK) {
+            step = 'model';
+            break;
+          }
+          const index = answer === '' ? 0 : Number(answer) - 1;
+          if (!Number.isInteger(index) || !selected[index]) {
+            stdout.write(c.red(`Choose a number from 1 to ${selected.length}.\n`));
+            break;
+          }
+          draft.model = selected[index];
           step = 'transport';
           break;
         }
@@ -540,10 +804,17 @@ export async function runOnboard(): Promise<boolean> {
           if (draft.adapter === 'openai' && draft.model && looksAnthropicDistilled(draft.model)) {
             stdout.write(
               `\n${c.yellow('⚠ "' + draft.model + '" looks distilled on Claude/Anthropic.')}\n` +
-                c.gray('  On the OpenAI transport such models often emit unparseable tool calls.\n') +
-                c.gray('  The Anthropic transport (e.g. Ollama /v1/messages) usually works far better.\n'),
+                c.gray(
+                  '  On the OpenAI transport such models often emit unparseable tool calls.\n',
+                ) +
+                c.gray(
+                  '  The Anthropic transport (e.g. Ollama /v1/messages) usually works far better.\n',
+                ),
             );
-            const sw = await askText(rl, `Use the Anthropic transport instead? ${c.gray('[Y/n/back]')}: `);
+            const sw = await askText(
+              rl,
+              `Use the Anthropic transport instead? ${c.gray('[Y/n/back]')}: `,
+            );
             if (sw === QUIT) return false;
             if (sw === BACK) {
               step = 'model';
@@ -560,7 +831,11 @@ export async function runOnboard(): Promise<boolean> {
               } else if (!draft.authToken) {
                 draft.authToken = 'ollama';
               }
-              stdout.write(c.gray(`  → switched to anthropic transport${draft.baseUrl ? ` (${draft.baseUrl})` : ''}\n`));
+              stdout.write(
+                c.gray(
+                  `  → switched to anthropic transport${draft.baseUrl ? ` (${draft.baseUrl})` : ''}\n`,
+                ),
+              );
             }
           }
           step = 'test';
@@ -626,19 +901,22 @@ export async function runOnboard(): Promise<boolean> {
             stdout.write(finale);
             return true;
           }
-          const { preset, adapter, model, baseUrl, apiKey, authToken, selfHosted } = draft;
+          const { preset, adapter, model, baseUrl, apiKey, authToken, selfHosted, selectedModels } =
+            draft;
           if (!preset || !adapter || !model) {
             step = 'provider';
             break;
           }
-          // Clear lastModel so this fresh pick actually becomes active — otherwise a previously
-          // `/model`-selected preset overrides the newly-onboarded provider at launch.
+          // Replace a stale lastModel with this run's explicit default. Multi-model onboarding
+          // pins the new entry label; the legacy single-target path clears the old label.
           persistTerminalOnboardTarget({
             adapter,
             model,
             baseUrl,
             customEndpoint: preset.kind === 'custom',
             selfHosted,
+            selectedModels,
+            entryGroup: preset.label,
             // P1A-06 step 4: a preset shipping a wire contract persists it as a ModelEntry so the
             // capability block + idle knob actually reach bootstrap (provider+model resolution).
             entryExtras: preset.entry ? { label: preset.label, ...preset.entry } : undefined,
@@ -648,6 +926,11 @@ export async function runOnboard(): Promise<boolean> {
 
           stdout.write(
             `\n${c.green('✓ Saved')} — ${c.bold(preset.label)} ${c.gray('·')} ${c.bold(model)}\n` +
+              (selectedModels && selectedModels.length > 1
+                ? c.gray(
+                    `  ${selectedModels.length} models added to the picker · default: ${model}\n`,
+                  )
+                : '') +
               c.gray(
                 `  config: ${GLOBAL_DIR}/config.json · credentials: ${GLOBAL_DIR}/credentials.json (chmod 600)\n`,
               ) +
@@ -733,20 +1016,50 @@ async function testConnection(o: {
   return Promise.race([probe, timeout]);
 }
 
-/** Prompt that masks typed input with `*` (falls back to plain echo if unsupported). */
-async function askSecret(rl: readline.Interface, query: string): Promise<string> {
-  const iface = rl as unknown as { _writeToOutput?: (s: string) => void };
-  const orig = iface._writeToOutput?.bind(rl);
+/**
+ * Prompt that masks typed input with `*`.
+ *
+ * `rl` is a node:readline/promises Interface — that class does NOT expose `_writeToOutput`, so
+ * hooking it is inert and every keystroke echoes in cleartext (verified on Node 22–26: an API
+ * key lands in tmux/terminal scrollback and recordings). Close the promises interface and read
+ * the secret through a node:readline interface, whose hook works — closing first also guarantees
+ * the wizard's only stdin consumer is the masked reader, so nothing else can echo the key.
+ * Returns a fresh promises interface for the rest of the wizard.
+ */
+async function askSecret(
+  rl: readline.Interface,
+  query: string,
+): Promise<{ value: string; rl: readline.Interface }> {
+  rl.close();
+  const secretRl = readlineCore.createInterface({ input: stdin, output: stdout });
+  const iface = secretRl as unknown as { _writeToOutput?: (s: string) => void };
+  const orig = iface._writeToOutput?.bind(secretRl);
+  let promptShown = false;
   if (orig) {
     iface._writeToOutput = (s: string) => {
-      if (s.includes(query)) orig(s);
-      else orig(s.replace(/[^\r\n]/g, '*'));
+      // Only the FIRST prompt write passes through verbatim. Later writes are line refreshes
+      // (prompt + the typed line), so passing them through would echo the secret on every
+      // backspace/arrow-key redraw — mask everything else.
+      if (!promptShown && s.includes(query)) {
+        promptShown = true;
+        orig(s);
+      } else {
+        orig(s.replace(/[^\r\n]/g, '*'));
+      }
     };
   }
   try {
-    return (await rl.question(query)).trim();
+    // node:readline's question() is callback-style (the promises class is the one without the
+    // masking hook). A close while the question is pending rejects — same as the promises
+    // interface did — so an EOF'd stdin cannot spin the wizard into an empty-answer loop.
+    const value = await new Promise<string>((res, rej) => {
+      secretRl.once('close', () => rej(new Error('input stream closed before the secret was entered')));
+      secretRl.question(query, (answer) => res(answer));
+    });
+    return { value: value.trim(), rl: readline.createInterface({ input: stdin, output: stdout }) };
   } finally {
     if (orig) iface._writeToOutput = orig;
+    secretRl.close();
     stdout.write('\n');
   }
 }

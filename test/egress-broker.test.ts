@@ -487,3 +487,33 @@ test('McpHttpClient honors a caller abort signal (ESC reaches MCP HTTP calls)', 
   assert.equal(res.ok, false);
   assert.ok(Date.now() - start < 5_000, 'the caller abort must cut the call short');
 });
+
+
+// ── The wall fails CLOSED on non-string targets ─────────────────────────────
+test('the fetch wall fails CLOSED on Request objects and unparseable targets', async () => {
+  // The wall used to extract a host from STRING urls only — a Request object slipped through
+  // with an empty host and egressed freely in offline mode. Unparseable targets must deny too:
+  // offline mode is a hard invariant, so an unknown target is blocked, never passed open.
+  const calls: unknown[] = [];
+  const stub = (async (url: unknown) => {
+    calls.push(url);
+    return new Response('stub');
+  }) as unknown as (url: never, init?: never) => Promise<Response>;
+  const walled = offlineFetchWall(stub);
+  setOfflineMode(true);
+  try {
+    await assert.rejects(
+      () => walled(new Request('https://example.com/req') as never),
+      /offline mode: egress to example\.com/,
+    );
+    assert.equal(calls.length, 0, 'the walled fetch never reaches the transport');
+    await walled(new Request('http://127.0.0.1:9999/local') as never); // local Request still passes
+    await assert.rejects(
+      () => walled(undefined as never),
+      /offline mode: egress to an unparseable target/,
+    );
+    assert.equal(calls.length, 1, 'exactly the local Request reached the stub');
+  } finally {
+    setOfflineMode(false);
+  }
+});

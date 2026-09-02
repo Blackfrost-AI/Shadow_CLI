@@ -358,8 +358,18 @@ function makePinnedLookup(ips: string[], validatedHost: string): (hostname: stri
       // the new host for real (pre-broker behavior) — pinning it to the original host's IPs
       // dialed the wrong server (TLS SNI/cert mismatch). Netguard-tier callers are forced to
       // redirect:'manual' below, so this path only ever runs for operator-tier traffic.
+      // The metadata-tier guarantee travels WITH the pin set though: a redirect must not be
+      // able to land on a cloud-metadata address the broker would have denied directly.
       lookup(hn, { all: true }).then(
         (rs) => {
+          const meta = rs.find((r) => isCloudMetadataIp(r.address));
+          if (meta) {
+            recordEgress(hn, 'redirect', 'denied', `cloud-metadata address ${meta.address}`);
+            (callback as (e: Error) => void)(
+              new Error(`egress blocked: redirect to ${hn} resolves to a cloud-metadata address (${meta.address})`),
+            );
+            return;
+          }
           if (rs.length === 0) {
             (callback as (e: Error) => void)(new Error(`getaddrinfo ENOTFOUND ${hn}`));
           } else if (all) {
@@ -522,15 +532,24 @@ const transport: (input: string, init?: RequestInit) => Promise<Response> = isBu
 export function offlineFetchWall<F extends (url: never, init?: never) => Promise<Response>>(origFetch: F): F {
   return ((url: unknown, init?: unknown) => {
     if (offlineModeOn) {
+      // Bun's fetch accepts a Request object as well as a string — String(Request) is not a URL,
+      // so the old `new URL(String(url))` always threw, left host='' and let the call through:
+      // `fetch(new Request('https://…'))` sailed past offline mode. Extract .url when the input
+      // is an object; anything still unparseable fails CLOSED (an unknown target is exactly what
+      // a wall exists to stop — the "let the real fetch produce its own error" indulgence only
+      // ever mattered for debugging malformed strings).
+      const raw = typeof url === 'string' ? url : (url as { url?: unknown } | null)?.url;
       let host = '';
       try {
-        host = hostKey(new URL(String(url)).hostname);
+        host = hostKey(new URL(String(raw)).hostname);
       } catch {
-        /* unparseable → let the real fetch produce its own error */
+        /* unparseable */
       }
-      if (host && !isLocalHost(host)) {
-        recordEgress(host, 'dispatch', 'denied');
-        return Promise.reject(new Error(`offline mode: egress to ${host} is blocked at the fetch wall`));
+      if (!host || !isLocalHost(host)) {
+        recordEgress(host || '(unparseable)', 'dispatch', 'denied');
+        return Promise.reject(
+          new Error(`offline mode: egress to ${host || 'an unparseable target'} is blocked at the fetch wall`),
+        );
       }
     }
     return origFetch(url as never, init as never);

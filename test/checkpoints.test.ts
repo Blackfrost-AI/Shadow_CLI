@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, readFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync, statSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -37,6 +37,34 @@ test('listCheckpointsForTurn returns empty for unknown turn', () => {
   const root = tmp();
   try {
     assert.deepEqual(listCheckpointsForTurn(root, 'none', 0), []);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('legacy hash-named .bak files without an index are NOT handed back as workspace paths', () => {
+  const root = tmp();
+  try {
+    // Old layout crash: .bak FILENAMES are content hashes, not workspace-relative paths.
+    const dir = join(root, '.shadow', 'checkpoints', 'legacy', '7');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, '3a1f99b2.bak'), 'old content');
+    assert.deepEqual(
+      listCheckpointsForTurn(root, 'legacy', 7),
+      [],
+      'returning hash names made rewindToTurn write junk hash files into the workspace root',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('saveCheckpoint keeps the .bak private (0600) and writes it atomically', () => {
+  const root = tmp();
+  try {
+    const path = saveCheckpoint(root, 'sess-2', 1, 'src/bar.ts', 'payload');
+    assert.equal(statSync(path).mode & 0o777, 0o600, 'checkpoint payload stays private');
+    assert.equal(restoreCheckpoint(path), 'payload', 'content round-trips through the atomic write');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

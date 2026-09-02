@@ -8,7 +8,7 @@ import type { ToolCall } from '../src/provider/provider.js';
 // GLOBAL_DIR to homedir() at load). touchesConfigFile() resolves a path against that GLOBAL_DIR, so
 // without the redirect the absolute-global-path assertions below would aim at the REAL ~/.shadow and miss.
 const { home: HOME } = isolateHome('cfg-gate');
-const { touchesConfigFile } = await import('../src/agent/loop.js');
+const { touchesConfigFile, writeTouchesConfigFile } = await import('../src/agent/loop.js');
 const GLOBAL_CFG = join(HOME, '.shadow', 'config.json');
 
 /**
@@ -61,4 +61,28 @@ test('missing/typed input is safe (no path → no flag, never throws)', () => {
   assert.equal(touchesConfigFile({ id: 'c1', name: 'write_file', input: undefined }), false);
   assert.equal(touchesConfigFile({ id: 'c1', name: 'run_shell', input: { command: 'echo shadow.config.json' } }), false,
     'a shell command merely MENTIONING the filename is not a config write');
+});
+
+test('multi_edit and apply_patch targeting the config are detected (the patch-grammar wedge)', () => {
+  // These go through writeTouchesConfigFile — the WRITE-tool wrapper the gate consults (the bare
+  // touchesConfigFile is the per-path probe underneath it).
+  // multi_edit carries its path at top level like write_file — same detection must apply.
+  assert.ok(writeTouchesConfigFile('multi_edit', { path: GLOBAL_CFG, edits: [] }));
+  assert.ok(writeTouchesConfigFile('multi_edit', { path: 'shadow.config.json', edits: [] }));
+  // apply_patch hides its paths inside the patch TEXT — the Add/Update/Delete headers and the
+  // Move-to line must each be scanned, or the gate is bypassed by the Codex/Grok edit grammar.
+  const patch = (body: string): { patch: string } => ({
+    patch: `*** Begin Patch\n${body}\n*** End Patch`,
+  });
+  assert.ok(writeTouchesConfigFile('apply_patch', patch('*** Update File: shadow.config.json\n@@')));
+  assert.ok(writeTouchesConfigFile('apply_patch', patch(`*** Add File: ${GLOBAL_CFG}\n+{}`)));
+  assert.ok(writeTouchesConfigFile('apply_patch', patch('*** Delete File: ./shadow.config.json')));
+  assert.ok(
+    writeTouchesConfigFile('apply_patch', patch('*** Update File: other.json\n@@\n*** Move to: shadow.config.json')),
+    'a Move-to rename onto the config is a config write',
+  );
+  // Ordinary patches stay quiet.
+  assert.equal(writeTouchesConfigFile('apply_patch', patch('*** Update File: src/index.ts\n@@')), false);
+  // Non-write tools are out of the wrapper's scope even with a config path in hand.
+  assert.equal(writeTouchesConfigFile('read_file', { path: GLOBAL_CFG }), false);
 });

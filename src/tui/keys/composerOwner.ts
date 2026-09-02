@@ -13,7 +13,6 @@ import {
   deleteCharRight,
   deleteWordLeft,
   deleteWordRight,
-  dropConsumedPastes,
   expandPastes,
   killToLineEnd,
   killToLineStart,
@@ -549,8 +548,12 @@ function handleComposer(env: KeyEnv, ch: string, key: InkKey): boolean {
     env.histIdxRef.current = env.historyRef.current.length;
     env.setLine('');
     if (env.vimEnabledRef.current) env.setVimMode('insert'); // next prompt starts ready to type
+    // Chips STAY in the registry after submit: a history entry recalled with ↑ reloads the chip
+    // text, so a re-run must still resolve it — dropping the "spent" entry here used to send the
+    // LITERAL `[Pasted text #N …]` placeholder to the model on the re-run. The registry stays
+    // bounded anyway: the insert site (tui.tsx) cap-prunes every entry no draft, queue, or
+    // history entry cites.
     env.startTurn(expandPastes(task, env.pastesRef.current));
-    env.pastesRef.current = dropConsumedPastes(env.pastesRef.current, task); // F02-06: spent chips leave the registry
     return true;
   }
 

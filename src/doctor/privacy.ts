@@ -26,6 +26,7 @@ import { vaultExists } from '../auth/vault.js';
 import { legacyCredentialsExist } from '../state/globalStore.js';
 import { available as keychainAvailable } from '../auth/keychain.js';
 import { detectLspServers } from '../agent/lsp/detect.js';
+import { resolveBaseUrl } from '../config.js';
 
 const UPDATE_HOST = 'raw.githubusercontent.com';
 const PROVIDER_DEFAULT_BASE: Record<string, string> = {
@@ -71,7 +72,19 @@ export interface PrivacyConfigView {
   pluginIndexUrl?: string;
   pluginIndexKey?: string;
   mcpServers?: Record<string, { url?: string; command?: string; args?: string[] }>;
-  models?: Array<{ label?: string; baseUrl?: string; gguf?: string; mlx?: string; vllm?: string }>;
+  models?: Array<{
+    label?: string;
+    provider?: string;
+    model?: string;
+    baseUrl?: string;
+    gguf?: string;
+    mlx?: string;
+    vllm?: string;
+  }>;
+  /** Label of the last model picked via `/model` — its preset outranks the keys above. */
+  lastModel?: string;
+  /** Set when a profile is active; a profile that declares a model outranks lastModel (P2-11). */
+  profile?: { model?: string };
   vision?: { baseUrl: string };
   hooks?: Record<string, string[] | undefined>;
   statusLine?: string;
@@ -105,6 +118,39 @@ export function gatherPrivacyEnv(offline: boolean): PrivacyEnv {
         ? 'env-only'
         : 'none';
   return { offline, credStore, keychainAvailable: keychainAvailable() };
+}
+
+/**
+ * The provider endpoint a REAL session would use for this config — what the report must name,
+ * because a bare `cfg.baseUrl` read misses two folds a startup applies before its first request:
+ *  1. lastModel recall — the preset picked via `/model` carries its own provider + baseUrl, which
+ *     makes the saved top-level keys stale (main() re-applies the same recall under the same
+ *     guard: an env-pinned SHADOW_MODEL/SHADOW_PROVIDER or a profile that declares a model wins).
+ *  2. resolveBaseUrl's precedence — explicit baseUrl > ANTHROPIC/OPENAI_BASE_URL > the credential
+ *     store's baseUrl. It never attempts an unlock (a locked vault simply yields nothing, no
+ *     prompt), so a report built on it stays unlock-free.
+ * `resolveBase` is injectable so this stays pure + unit-testable; the default is the session's
+ * own resolver.
+ */
+export function effectiveSessionEndpoint(
+  cfg: PrivacyConfigView,
+  opts: {
+    envModel?: string;
+    envProvider?: string;
+    resolveBase?: (provider: string, configured?: string) => string | undefined;
+  } = {},
+): { provider: string; model: string | undefined; baseUrl: string | undefined } {
+  const resolveBase = opts.resolveBase ?? resolveBaseUrl;
+  const preset =
+    !opts.envModel && !opts.envProvider && cfg.profile?.model == null && cfg.lastModel
+      ? cfg.models?.find((m) => m.label === cfg.lastModel)
+      : undefined;
+  const provider = preset?.provider ?? cfg.provider;
+  // The recall replaces the whole provider/model/baseUrl triple, so an absent preset baseUrl is
+  // NOT backfilled from the old top-level key: resolution falls through to env / credential store
+  // for the RECALLED provider — exactly what a session does after the same recall.
+  const baseUrl = resolveBase(provider, preset ? preset.baseUrl : cfg.baseUrl);
+  return { provider, model: preset?.model ?? cfg.model, baseUrl };
 }
 
 /** Build the report — pure. `env` carries the observed local state so it stays no-network and testable. */

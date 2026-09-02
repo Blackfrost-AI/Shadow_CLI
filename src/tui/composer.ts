@@ -67,8 +67,12 @@ export function prunePastes<T extends { id: number }>(
   return pastes.filter((p) => pasteChipReferenced(p.id, ...texts));
 }
 
-/** F02-06: after a task was spliced via expandPastes, drop the entries the SUBMITTED text carried —
- *  they are consumed; keeping them would re-leak exactly what submit just spent. */
+/** F02-06 primitive: the entries whose chips the SUBMITTED text carried. NO LONGER CALLED by the
+ *  submit paths — dropping a "spent" entry broke history re-runs (↑ recalls the chip text, and a
+ *  re-run then sent the LITERAL placeholder to the model), and the registry stays bounded anyway:
+ *  the insert site's cap-prune keeps every entry a draft, queued task, or history entry cites and
+ *  drops only the unreferenced tail. Retained (pinned by p2-08-ux) as the registry's subtraction
+ *  primitive. */
 export function dropConsumedPastes<T extends { id: number }>(pastes: T[], submitted: string): T[] {
   if (!submitted.includes('[Pasted text #')) return pastes;
   return pastes.filter((p) => !pasteChipReferenced(p.id, submitted));

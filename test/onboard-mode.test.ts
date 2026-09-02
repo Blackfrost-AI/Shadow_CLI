@@ -5,9 +5,18 @@ import { providersForMode, PROVIDERS } from '../src/onboard/catalog.js';
 test('mode "cloud" lists every cloud provider + custom, and NO local servers', () => {
   const list = providersForMode('cloud');
   const ids = list.map((p) => p.id);
-  assert.ok(ids.includes('anthropic') && ids.includes('openai') && ids.includes('qwen') && ids.includes('zai'), 'clouds present');
+  assert.ok(
+    ids.includes('anthropic') &&
+      ids.includes('openai') &&
+      ids.includes('qwen') &&
+      ids.includes('zai'),
+    'clouds present',
+  );
   assert.ok(ids.includes('custom'), 'custom endpoint reachable from cloud');
-  assert.ok(!ids.includes('ollama') && !ids.includes('lmstudio'), 'no local servers in the cloud list');
+  assert.ok(
+    !ids.includes('ollama') && !ids.includes('lmstudio'),
+    'no local servers in the cloud list',
+  );
 });
 
 test('Qwen cloud preset uses DashScope while keeping the model id user-replaceable', () => {
@@ -17,6 +26,14 @@ test('Qwen cloud preset uses DashScope while keeping the model id user-replaceab
   assert.equal(qwen.baseUrl, 'https://dashscope.aliyuncs.com/compatible-mode/v1');
   assert.equal(qwen.defaultModel, 'qwen3.8-max');
   assert.equal(qwen.kind, 'cloud');
+});
+
+test('Z.ai recommends the current GLM 5.3 agentic pair instead of legacy GLM 4.6', () => {
+  const zai = PROVIDERS.find((p) => p.id === 'zai');
+  assert.ok(zai);
+  assert.equal(zai.defaultModel, 'glm-5.3');
+  assert.deepEqual(zai.recommendedModels, ['glm-5.3', 'glm-5.3-flash']);
+  assert.ok(!zai.recommendedModels?.includes('glm-4.6'));
 });
 
 test('mode "server" lists local servers + custom, and NO cloud vendors', () => {
@@ -34,6 +51,8 @@ test('mode "file" has no provider menu (routes to the .gguf path prompt instead)
 });
 
 test('every catalog entry is reachable from at least one mode (nothing orphaned)', () => {
-  const reachable = new Set([...providersForMode('cloud'), ...providersForMode('server')].map((p) => p.id));
+  const reachable = new Set(
+    [...providersForMode('cloud'), ...providersForMode('server')].map((p) => p.id),
+  );
   for (const p of PROVIDERS) assert.ok(reachable.has(p.id), `${p.id} reachable`);
 });

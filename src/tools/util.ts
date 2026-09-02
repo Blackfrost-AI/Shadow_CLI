@@ -6,7 +6,7 @@
 // schemas replace them. Adds `atomicWrite`, the shared temp-file+rename writer
 // used by writeFile and editFile.
 
-import { writeFileSync, renameSync, mkdirSync, unlinkSync } from 'node:fs';
+import { writeFileSync, renameSync, mkdirSync, unlinkSync, existsSync, statSync } from 'node:fs';
 import { dirname, join, basename } from 'node:path';
 
 /** Clamp text fed back to the model so one tool call cannot blow the context. */
@@ -34,7 +34,10 @@ export function atomicWrite(absPath: string, content: string, mode?: number): vo
   mkdirSync(dir, { recursive: true });
   const tmp = join(dir, `.${basename(absPath)}.${process.pid}.${Date.now()}.tmp`);
   try {
-    if (mode !== undefined) writeFileSync(tmp, content, { encoding: 'utf8', mode });
+    // An edit must not change the file's permissions: the fresh temp file would otherwise land
+    // with the umask default — a 0755 script going 0644 (and a 0600 secret going world-readable).
+    const keepMode = mode ?? (existsSync(absPath) ? statSync(absPath).mode & 0o7777 : undefined);
+    if (keepMode !== undefined) writeFileSync(tmp, content, { encoding: 'utf8', mode: keepMode });
     else writeFileSync(tmp, content, 'utf8');
     renameSync(tmp, absPath);
   } catch (e) {

@@ -23,10 +23,10 @@ const CONTROL_TOKEN =
 
 export function scrubControlTokens(text: string): string {
   if (!text) return text;
-  return text
-    .replace(CONTROL_TOKEN, '')
-    .replace(/^[ \t\n]+/, '') // a removed leading token often leaves whitespace
-    .replace(/[ \t]{2,}/g, ' ');
+  // Only the stray *tokens* are removed — never content. (A global `[ \t]{2,}` collapse used to
+  // live here: it flattened every indented/fenced code block the model emitted, in the committed
+  // answer, the replayed history, and the saved session.)
+  return text.replace(CONTROL_TOKEN, '').replace(/^[ \t\n]+/, '');
 }
 
 /**

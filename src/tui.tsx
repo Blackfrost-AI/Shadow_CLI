@@ -24,7 +24,7 @@ import { EventBus, type StopReasonExt } from './agent/events.js';
 import { Budget } from './agent/budget.js';
 import { maybeNotifyUpdate } from './update/checkUpdate.js';
 import { providerErrorHint } from './util/errorHints.js';
-import { isBigPaste, expandPastes, prunePastes, dropConsumedPastes, PASTE_CAP, visibleComposerWindow, clickToCursor, parseSgrMouse, lastKeySequence, historySearchPrompt, type HistorySearchState, COMPOSER_MAX_VISIBLE_ROWS, COMPOSER_GUTTER, composerPaintRows } from './tui/composer.js';
+import { isBigPaste, expandPastes, prunePastes, PASTE_CAP, visibleComposerWindow, clickToCursor, parseSgrMouse, lastKeySequence, historySearchPrompt, type HistorySearchState, COMPOSER_MAX_VISIBLE_ROWS, COMPOSER_GUTTER, composerPaintRows } from './tui/composer.js';
 import { withSynchronizedOutput } from './tui/syncOutput.js';
 import { recommendedIndex, defaultQuestionSelection, buildQuestionAnswers, buildAutoAnswers, type QuestionSelection } from './tui/questions.js';
 import { fetchRemoteImage, imageMediaType, MAX_IMAGE_BYTES } from './util/image.js';
@@ -1162,12 +1162,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       pastesRef.current.push({ id, content: text, lines });
       const chip = `[Pasted text #${id} +${lines} lines]`;
       setComposer(s.slice(0, c) + chip + s.slice(c), c + chip.length);
-      // F02-06: keep the paste registry BOUNDED. Entries whose chip was deleted from the draft
-      // used to linger for the rest of the session; above the cap, only entries still referenced
-      // by the draft or a queued task survive.
+      // F02-06: keep the paste registry BOUNDED. Above the cap, only entries still referenced
+      // by the draft, a queued task, or a history entry survive — history counts because a
+      // recalled entry re-renders its chip and a re-run must still resolve it (the submit paths
+      // deliberately no longer drop spent chips for exactly that reason).
       if (pastesRef.current.length > PASTE_CAP) {
         const queuedText = queuedTasksRef.current.map((q) => q.text ?? '').join('\n');
-        pastesRef.current = prunePastes(pastesRef.current, [inputRef.current, queuedText]);
+        pastesRef.current = prunePastes(pastesRef.current, [inputRef.current, queuedText, ...historyRef.current]);
       }
     } else {
       setComposer(s.slice(0, c) + text + s.slice(c), c + text.length);
@@ -3049,8 +3050,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         }
         // 'message' — a path — fall through to startTurn
       }
-      startTurn(expandPastes(task, pastesRef.current)); // starts a turn; its completion resumes the drain
-      pastesRef.current = dropConsumedPastes(pastesRef.current, task); // F02-06: spent chips leave the registry
+      // Chips STAY in the registry after submit (same rule as the composer owner's submit path):
+      // a history entry recalled with ↑ re-renders its chip, so a re-run must still resolve it.
+      // Starts a turn; its completion resumes the drain.
+      startTurn(expandPastes(task, pastesRef.current));
       return;
     }
   }, [setQueued, runSlash, pushLine, startTurn]);

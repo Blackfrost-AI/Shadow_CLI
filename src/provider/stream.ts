@@ -698,6 +698,19 @@ export function stripImagesFromBody(body: unknown, reason?: string): boolean {
     if (!Array.isArray(msg.content)) continue;
     const hasImage = msg.content.some((p) => p && isImg((p as { type?: string }).type));
     if (!hasImage) continue;
+    // SIBLING GUARD: on the Anthropic wire a coalesced user turn can carry tool_result blocks
+    // alongside the image (a tool result followed by the user attaching a screenshot). Collapsing
+    // such a message to a plain string DELETED the tool_result, breaking tool_use/tool_result
+    // pairing — a recoverable image rejection then became a terminal 400 the recovery ladder
+    // can't answer. Where non-text siblings exist, drop ONLY the image parts and keep the array.
+    const hasNonTextSibling = (msg.content as { type?: string }[]).some(
+      (p) => p && !isTxt(p.type) && !isImg(p.type),
+    );
+    if (hasNonTextSibling) {
+      msg.content = (msg.content as unknown[]).filter((p) => !(p && isImg((p as { type?: string }).type)));
+      stripped = true;
+      continue;
+    }
     // Keep the text parts, drop the images, and collapse to a plain STRING — a text-only endpoint
     // accepts that where it 400s on a typed image part. A short note tells the model an image was
     // there but it can't see it, so it doesn't keep waiting on visual input it will never get.

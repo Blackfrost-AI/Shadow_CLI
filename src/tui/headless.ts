@@ -123,7 +123,10 @@ export function attachRenderer(bus: EventBus, _opts?: { animate: boolean }): () 
         process.stdout.write(`  retry ${e.attempt} in ${e.delayMs}ms (${oneLine(e.reason)})\n`);
         break;
       case 'error':
-        process.stdout.write(`  ${A.red}${e.message}${A.reset}\n`);
+        // Scrub at the RENDER site too: the loop sanitizes its own error emissions, but any
+        // other 'error' producer on the bus (agent tool, MCP, budget) reaches the terminal
+        // verbatim here — a hostile endpoint must not ride ANSI escapes into the transcript.
+        process.stdout.write(`  ${A.red}${stripCtl(e.message)}${A.reset}\n`);
         break;
       case 'assistant_done':
         // The turn's text is complete: the loop has already recovered any textual tool call and

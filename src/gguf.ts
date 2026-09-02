@@ -63,16 +63,51 @@ export const LLAMA_INSTALL_HINT =
   "  Or point Shadow at an existing binary: set $SHADOW_LLAMA_SERVER, or the model preset's\n" +
   '  "ggufServer": "/path/to/llama-server" in ~/.shadow/config.json.';
 
-interface Running {
+export interface Running {
   proc?: ChildProcess; // undefined when we reuse a server we didn't start
   baseUrl: string;
   /** The model this session-tracked server serves — hash ports can collide across entries. */
   target?: string;
+  /** Docker container backing this server (vLLM's fallback only). The container is dockerd's
+   *  child, NOT ours — killing `proc` (the docker CLI) only stops it while the CLI is alive to
+   *  proxy signals, so the stop paths need the name to `docker rm -f` it directly. */
+  container?: string;
 }
 const servers = new Map<string, Running>();
 const serverStarts = new Map<string, Promise<GgufStartResult>>();
 let exitHookInstalled = false;
 let serverEpoch = 0;
+
+/** Container name for the vLLM docker fallback on `port` — the name cleanup later `rm -f`s. */
+export function vllmContainerName(port: number): string {
+  return `shadow-vllm-${port}`;
+}
+
+/**
+ * The container a tracked server must be force-removed by on a stop path, or null when it is NOT
+ * docker-backed: llama-server / mlx / native-vllm children are our own processes — they die with
+ * their process group and keep the SIGTERM-first path. Only `docker run` children need the
+ * daemon-side removal, because dockerd owns their container.
+ */
+export function dockerStopTarget(running: Running): string | null {
+  return running.container ?? null;
+}
+
+/**
+ * `docker rm -f <container>` — synchronous AND dockerd-side, so it stops the container even when
+ * the `docker run` CLI that started it is already dead, which is exactly the state an 'exit'
+ * handler runs in (SIGKILL to the CLI's group is never proxied to the container). A missing docker
+ * binary is a no-op (spawnSync reports ENOENT without throwing). Bounded to 5s: a wedged daemon
+ * must not hang an exit handler forever, and the container it might leave behind is still a
+ * better outcome than the unbounded orphan an unbounded wait would trade it for.
+ */
+function rmDockerContainer(container: string): void {
+  try {
+    spawnSync('docker', ['rm', '-f', container], { stdio: 'ignore', timeout: 5_000 });
+  } catch {
+    /* spawn itself failed (no docker, permissions) — nothing further we can do */
+  }
+}
 
 function killServerTree(proc: ChildProcess, signal: NodeJS.Signals): void {
   try {
@@ -155,23 +190,36 @@ export async function ggufServerUp(entry: ModelEntry): Promise<boolean> {
   return serverReady(`http://127.0.0.1:${portFor(entry)}/v1`);
 }
 
-/** Immediate process-exit fallback: kill process groups without waiting. */
-export function forceStopGgufServers(): void {
+/** Immediate process-exit fallback: kill process groups without waiting. `removeDocker` is
+ *  injectable so tests can observe the container removal without a docker daemon. */
+export function forceStopGgufServers(removeDocker: (container: string) => void = rmDockerContainer): void {
   serverEpoch += 1; // invalidate starts that are still between preflight and spawn/readiness
-  for (const { proc } of servers.values()) {
-    if (proc) killServerTree(proc, 'SIGKILL');
+  for (const running of servers.values()) {
+    // Remove the container BEFORE killing the CLI: rm -f is dockerd-side and works either way, and
+    // an orphaned --gpus all --network host container outlives us — worth the ≤5s this spawnSync
+    // can block an exit handler for. Plain children just get the group kill.
+    const container = dockerStopTarget(running);
+    if (container) removeDocker(container);
+    if (running.proc) killServerTree(running.proc, 'SIGKILL');
   }
   servers.clear();
 }
 
 /** Gracefully stop every server, then escalate the whole process group if it wedges. */
-export async function stopGgufServers(graceMs = 2_000): Promise<void> {
+export async function stopGgufServers(graceMs = 2_000, removeDocker: (container: string) => void = rmDockerContainer): Promise<void> {
   serverEpoch += 1;
   const owned = [...servers.entries()].filter((entry): entry is [string, Running & { proc: ChildProcess }] => !!entry[1].proc);
   for (const [, running] of owned) killServerTree(running.proc, 'SIGTERM');
   await Promise.all(owned.map(([, running]) => waitForExit(running.proc, graceMs)));
   for (const [, running] of owned) {
-    if (running.proc.exitCode === null && running.proc.signalCode === null) killServerTree(running.proc, 'SIGKILL');
+    if (running.proc.exitCode === null && running.proc.signalCode === null) {
+      // Wedged past the grace window. For a docker-backed server SIGKILLing the group is NOT
+      // enough — the CLI dies without ever proxying anything to its container — so the container
+      // gets the daemon-side rm -f too. A CLI that already exited took its container with it.
+      const container = dockerStopTarget(running);
+      if (container) removeDocker(container);
+      killServerTree(running.proc, 'SIGKILL');
+    }
   }
   await Promise.all(owned.map(([, running]) => waitForExit(running.proc, 500)));
   for (const [baseUrl, running] of owned) {
@@ -324,12 +372,21 @@ async function ensureGgufServerUnlocked(
   const baseUrl = `http://127.0.0.1:${port}/v1`;
   const tracked = servers.get(baseUrl);
   if (tracked) {
-    if (tracked.target === entry.gguf) return { baseUrl, started: false };
-    // Hash ports live in 900 buckets — two different local models CAN collide in one session.
-    throw new Error(
-      `port ${port} is already used this session by a different local model (${tracked.target ?? 'unknown'}).\n` +
-        `  Give one of them its own port: set "ggufPort" on a model entry in ~/.shadow/config.json.`,
-    );
+    if (tracked.target === entry.gguf) {
+      // Liveness before reuse: a tracked server can die mid-session (crash, OOM kill, the user
+      // stopping llama-server by hand). Returning the stale baseUrl made every later request fail
+      // with "unable to connect" AND the corpse stayed in `servers`, blocking a respawn forever.
+      // Verify first; on a dead server forget the entry so the adopt-or-spawn logic below runs.
+      if (await isUp(baseUrl)) return { baseUrl, started: false };
+      servers.delete(baseUrl);
+      log?.(`The local server on port ${port} is down — restarting it…`);
+    } else {
+      // Hash ports live in 900 buckets — two different local models CAN collide in one session.
+      throw new Error(
+        `port ${port} is already used this session by a different local model (${tracked.target ?? 'unknown'}).\n` +
+          `  Give one of them its own port: set "ggufPort" on a model entry in ~/.shadow/config.json.`,
+      );
+    }
   }
   if (await isUp(baseUrl)) {
     // Something is already serving on this model's port. Verify what we can before adopting it —
@@ -414,6 +471,9 @@ async function superviseUntilReady(
     baseUrl: string;
     log?: (m: string) => void;
     target?: string;
+    /** Docker container behind this server (vLLM fallback) — recorded on the tracked entry so the
+     *  stop paths can `rm -f` it; nothing to remove for plain process children. */
+    container?: string;
     installHint: string;
     timeoutHelp: string;
     /** Readiness signal — defaults to /health-or-/v1/models. MLX passes a REAL inference probe
@@ -455,7 +515,7 @@ async function superviseUntilReady(
     killServerTree(proc, 'SIGKILL');
     throw new Error('local model start was cancelled during shutdown');
   }
-  servers.set(o.baseUrl, { proc, baseUrl: o.baseUrl, target: o.target });
+  servers.set(o.baseUrl, { proc, baseUrl: o.baseUrl, target: o.target, container: o.container });
 
   const deadline = Date.now() + (o.deadlineMs ?? 180_000);
   let lastNote = 0;
@@ -491,6 +551,9 @@ async function superviseUntilReady(
   killServerTree(proc, 'SIGTERM');
   await waitForExit(proc, 2_000);
   if (proc.exitCode === null && proc.signalCode === null) {
+    // Same orphan trap as the stop paths: the SIGKILL that ends a wedged CLI is never proxied to
+    // its container, so a docker-backed server gets the daemon-side rm -f alongside it.
+    if (o.container) rmDockerContainer(o.container);
     killServerTree(proc, 'SIGKILL');
     await waitForExit(proc, 500);
   }
@@ -663,11 +726,18 @@ async function ensureMlxServerUnlocked(
   const baseUrl = `http://127.0.0.1:${port}/v1`;
   const tracked = servers.get(baseUrl);
   if (tracked) {
-    if (tracked.target === entry.mlx || tracked.target === target) return { baseUrl, started: false };
-    throw new Error(
-      `port ${port} is already used this session by a different local model (${tracked.target ?? 'unknown'}).\n` +
-        `  Give one of them its own port: set "ggufPort" on a model entry in ~/.shadow/config.json.`,
-    );
+    if (tracked.target === entry.mlx || tracked.target === target) {
+      // Same liveness-before-reuse rule as the gguf path: a tracked server that died must be
+      // forgotten, not handed out — otherwise the stale entry blocks its own respawn forever.
+      if (await serverReady(baseUrl)) return { baseUrl, started: false };
+      servers.delete(baseUrl);
+      log?.(`The mlx_lm.server on port ${port} is down — restarting it…`);
+    } else {
+      throw new Error(
+        `port ${port} is already used this session by a different local model (${tracked.target ?? 'unknown'}).\n` +
+          `  Give one of them its own port: set "ggufPort" on a model entry in ~/.shadow/config.json.`,
+      );
+    }
   }
   if (await serverReady(baseUrl)) {
     // Reuse verification by INFERENCE, not catalog: mlx_lm.server's /v1/models lists the HF
@@ -831,11 +901,18 @@ async function ensureVllmServerUnlocked(
   const baseUrl = `http://127.0.0.1:${port}/v1`;
   const tracked = servers.get(baseUrl);
   if (tracked) {
-    if (tracked.target === entry.vllm || tracked.target === target) return { baseUrl, started: false };
-    throw new Error(
-      `port ${port} is already used this session by a different local model (${tracked.target ?? 'unknown'}).\n` +
-        `  Give one of them its own port: set "ggufPort" on a model entry in ~/.shadow/config.json.`,
-    );
+    if (tracked.target === entry.vllm || tracked.target === target) {
+      // Same liveness-before-reuse rule as the gguf path: a tracked server that died must be
+      // forgotten, not handed out — otherwise the stale entry blocks its own respawn forever.
+      if (await serverReady(baseUrl)) return { baseUrl, started: false };
+      servers.delete(baseUrl);
+      log?.(`The vLLM server on port ${port} is down — restarting it…`);
+    } else {
+      throw new Error(
+        `port ${port} is already used this session by a different local model (${tracked.target ?? 'unknown'}).\n` +
+          `  Give one of them its own port: set "ggufPort" on a model entry in ~/.shadow/config.json.`,
+      );
+    }
   }
   if (await serverReady(baseUrl)) {
     log?.(`Reusing the vLLM server already running on port ${port}.`);
@@ -865,7 +942,7 @@ async function ensureVllmServerUnlocked(
     const image = entry.vllmImage || process.env.SHADOW_VLLM_IMAGE || 'vllm/vllm-openai:latest';
     bin = 'docker';
     args = [
-      'run', '--rm', '--name', `shadow-vllm-${port}`, '--gpus', 'all', '--ipc=host', '--network', 'host',
+      'run', '--rm', '--name', vllmContainerName(port), '--gpus', 'all', '--ipc=host', '--network', 'host',
       '-v', `${homedir()}/.cache/huggingface:/root/.cache/huggingface`,
       ...(dirTarget ? ['-v', `${target}:${target}:ro`] : []),
       image, '--model', target, '--host', '127.0.0.1', '--port', String(port), '--served-model-name', served,
@@ -891,6 +968,9 @@ async function ensureVllmServerUnlocked(
     baseUrl,
     log,
     target: entry.vllm,
+    // Only the docker fallback backs the server with a container; native `vllm serve` is a plain
+    // child that dies with its process group.
+    container: native ? undefined : vllmContainerName(port),
     installHint: VLLM_INSTALL_HINT,
     ready: () => serverReady(baseUrl),
     // A large model (or a download) can take minutes on cold start; be generous.

@@ -41,7 +41,7 @@ import { redactString } from '../util/redact.js';
 import { sniffToolCalls, stripTextualToolIntent } from '../provider/textToolCalls.js';
 import { normalizeForeignTool } from '../tools/foreignAdapter.js';
 import { extractPatchBlock } from '../provider/applyPatch.js';
-import { scrubControlTokens, scrubForDisplay } from '../util/scrub.js';
+import { scrubControlTokens, scrubForDisplay, sanitizeTerminalEscapes } from '../util/scrub.js';
 import { envelopeSafeSlice } from '../safety/envelope.js';
 import { hasKnownReasoningMarker } from '../provider/openai.js';
 import { DEFAULT_EFFORT, effortDirective } from './effort.js';
@@ -1232,9 +1232,14 @@ export class AgentLoop {
             break;
           }
           case 'error':
-            // Redact: a provider error body can echo the request (incl. the key) and
-            // this message is shown on the HUD/stdout, not just the redacted session log.
-            this.deps.bus.emit({ type: 'error', message: redactString(`${ev.code}: ${ev.message}`) });
+            // Sanitize then redact: a provider error body can echo the request (incl. the key) AND
+            // carry raw terminal escapes (a gateway reflecting a URL, or hostile server bytes).
+            // This bus event is the SINGLE render source for provider errors (headless + TUI both
+            // print it verbatim), so sanitizing here at the emit site covers every renderer.
+            this.deps.bus.emit({
+              type: 'error',
+              message: redactString(sanitizeTerminalEscapes(`${ev.code}: ${ev.message}`, false)),
+            });
             if (ev.code === 'bad_tool_json' || ev.code === 'nameless_tool_call') {
               badJsonMsg = ev.message;
               if (ev.code === 'nameless_tool_call') namelessCall = true;
@@ -1502,9 +1507,8 @@ export class AgentLoop {
     // F07-01 (P1A-01): a write/edit that TOUCHES the safety config always gates — like the denylist,
     // it does not bend for autonomy, an `allow` rule, a session approval, or a plan-mode grant. Only a
     // live human may change the file that decides what needs a gate. (Detector is cheap; run it only
-    // on the two write-path tools so a read of the same file stays quiet.)
-    const configTouch =
-      (call.name === 'write_file' || call.name === 'edit_file') && touchesConfigFile(call);
+    // on the write-path tools so a read of the same file stays quiet.)
+    const configTouch = writeTouchesConfigFile(call.name, call.input);
 
     // Bash read-only auto-allow at auto-read+ — never bypasses denylist / forceConfirm.
     const bashReadOnlyAllow =
@@ -2036,7 +2040,7 @@ export class AgentLoop {
     // The denylist does not bend for anything, so check it before the session-approval shortcut.
     if (this.deps.forceConfirm?.({ ...call, name: canonical, input: normalized.input }, tool.risk)) return true;
     // F07-01 (P1A-01): a write/edit touching the safety config always prompts, like the denylist.
-    if ((canonical === 'write_file' || canonical === 'edit_file') && touchesConfigFile({ ...call, name: canonical })) return true;
+    if (writeTouchesConfigFile(canonical, call.input)) return true;
     // P2-12: an unconfined run_shell (sandbox requested, no host tool) escalates to the gate.
     // fail-closed never bends — treat it like the denylist, BEFORE the session-approval shortcut.
     const unconfinedEscalation =
@@ -2189,6 +2193,36 @@ export function touchesConfigFile(call: ToolCall): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * F07-01 for EVERY write-shaped tool. `touchesConfigFile` reads `input.path`, but two more
+ * first-class write tools reach the same files: `multi_edit` rewrites a file by `path`, and
+ * `apply_patch` embeds every target inside the patch text (`*** Add/Update/Delete File: <path>`
+ * plus `*** Move to:` destinations) where a single-path check cannot see it. Both enforcement
+ * sites (dispatch gating and mayNeedPermissionPrompt) funnel through here, so the config gate
+ * cannot be routed around by tool choice — at auto-edit those tools are otherwise auto-approved.
+ */
+const CONFIG_GATE_WRITE_TOOLS = new Set(['write_file', 'edit_file', 'multi_edit', 'apply_patch']);
+const PATCH_HEADER_PATH = /^\*\*\*\s+(?:Add|Update|Delete) File:[ \t]*(.+?)[ \t]*$/gm;
+const PATCH_MOVE_TO_PATH = /^\*\*\*\s+Move to:[ \t]*(.+?)[ \t]*$/gm;
+
+export function writeTouchesConfigFile(name: string, input: unknown): boolean {
+  if (!CONFIG_GATE_WRITE_TOOLS.has(name)) return false;
+  if (!input || typeof input !== 'object') return false;
+  const { path, patch } = input as { path?: unknown; patch?: unknown };
+  const probe = (p: string): boolean =>
+    touchesConfigFile({ id: 'config-gate-probe', name, input: { path: p } });
+  if (typeof path === 'string' && path && probe(path)) return true;
+  if (typeof patch === 'string' && patch) {
+    for (const m of patch.matchAll(PATCH_HEADER_PATH)) {
+      if (probe(m[1]!)) return true;
+    }
+    for (const m of patch.matchAll(PATCH_MOVE_TO_PATH)) {
+      if (probe(m[1]!)) return true;
+    }
+  }
+  return false;
 }
 
 /**

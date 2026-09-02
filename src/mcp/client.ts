@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { StringDecoder } from 'node:string_decoder';
 import type { ToolRegistry } from '../tools/registry.js';
 import type { Tool, ToolResult, ToolRisk } from '../tools/types.js';
 import { z } from 'zod';
@@ -25,6 +26,29 @@ const MCP_DEFAULT_RESULT_CAP = 16_384;
  *  header line splits the framing (same class as a raw Location header). */
 function nameSafe(s: string): string {
   return s.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim().slice(0, 64);
+}
+
+/** One MCP tool-result content part — the fields both transports read. */
+interface McpContentPart {
+  type: string;
+  text?: string;
+  resource?: { uri?: string; text?: string };
+}
+
+/**
+ * Flatten a tools/call result's content into the single text the model sees. Embedded resource
+ * text (type 'resource' carrying a resource.text) is content; parts with no text at all
+ * (image/audio, or a resource served by reference) surface their PRESENCE instead of vanishing —
+ * otherwise the model acts as if the tool returned nothing (a lost screenshot / fetched
+ * resource). Shared by the stdio and HTTP transports so a tool's result reads the same whichever
+ * transport served it (the HTTP client used to drop all of the above and answer 'ok' with no
+ * content at all).
+ */
+function mcpResultBody(parts: McpContentPart[]): string {
+  const text = parts.map((c) => c.text ?? c.resource?.text ?? '').filter(Boolean).join('\n');
+  const nonText = parts.filter((c) => c.type !== 'text' && !c.resource?.text);
+  const noteTail = nonText.map((c) => `[${c.type}${c.resource?.uri ? ` ${c.resource.uri}` : ''}]`).join(' ');
+  return [text, noteTail].filter(Boolean).join('\n');
 }
 
 /**
@@ -165,6 +189,9 @@ interface JsonRpcResponse {
 export class McpClient implements McpConnection {
   private child: ChildProcess | null = null;
   private buf = '';
+  // Holds a multi-byte UTF-8 sequence back until its remaining bytes arrive in a later chunk —
+  // decoding each pipe chunk independently cannot do that (see onData).
+  private decoder = new StringDecoder('utf8');
   private nextId = 1;
   private pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
 
@@ -221,7 +248,8 @@ export class McpClient implements McpConnection {
     // (the agent loop's own refs keep the loop alive while it is actually running). Without this a
     // configured stdio MCP server hangs every non-TTY exit. stop() still kills it explicitly.
     this.child.unref();
-    this.child.stdout?.on('data', (d: Buffer) => this.onData(d.toString()));
+    // Feed RAW Buffers to onData — it decodes across chunk boundaries (see onData).
+    this.child.stdout?.on('data', (d: Buffer) => this.onData(d));
     this.child.stderr?.on('data', () => {});
     // child stdio pipes are Sockets (have unref) though TS types them as Readable/Writable.
     const unref = (s: unknown): void => (s as { unref?: () => void } | null)?.unref?.();
@@ -281,17 +309,14 @@ export class McpClient implements McpConnection {
     const cap = resultCap ?? MCP_DEFAULT_RESULT_CAP;
     try {
       const res = (await this.request('tools/call', { name, arguments: args }, signal)) as {
-        content?: Array<{ type: string; text?: string; resource?: { uri?: string; text?: string } }>;
+        content?: McpContentPart[];
         isError?: boolean;
       };
       const parts = res.content ?? [];
-      const text = parts.map((c) => c.text ?? c.resource?.text ?? '').filter(Boolean).join('\n');
-      // Non-text MCP content (image/audio/resource) has no `.text`. Surface its PRESENCE instead of
-      // reporting an empty 'ok' — otherwise the model acts as if the tool returned nothing (a lost
-      // screenshot / fetched resource). Include a resource uri when the server gives one.
-      const nonText = parts.filter((c) => c.type !== 'text' && !c.resource?.text);
-      const noteTail = nonText.map((c) => `[${c.type}${c.resource?.uri ? ` ${c.resource.uri}` : ''}]`).join(' ');
-      const body = [text, noteTail].filter(Boolean).join('\n');
+      // mcpResultBody folds embedded resource text in and surfaces non-text content's presence
+      // (image/audio/resource-without-text) — shared with the HTTP client so both transports
+      // render a tool result identically.
+      const body = mcpResultBody(parts);
       // P3-05: a server's reply is untrusted content — a compromised or hostile MCP server can put
       // model-directed instructions in any response. Envelope it (payload byte-for-byte) on BOTH
       // the success and the isError path, and stop duplicating the body into data (the old
@@ -320,8 +345,16 @@ export class McpClient implements McpConnection {
     void registry;
   }
 
-  private onData(chunk: string): void {
-    this.buf += chunk;
+  private onData(chunk: Buffer | string): void {
+    // Pipe 'data' chunks split on BYTE boundaries, not code points, so decoding each chunk in
+    // isolation (the old `d.toString()`) emitted U+FFFD whenever a chunk ended mid-UTF-8-sequence.
+    // Inside a JSON string value the message still parsed — with a silently corrupted payload;
+    // inside structural JSON, JSON.parse threw and the catch dropped the response, stalling the
+    // pending request to its 60s timeout. StringDecoder keeps the partial sequence buffered until
+    // its tail arrives. Framing is safe across the boundary too: '\n' (0x0A) can never occur inside
+    // a multi-byte sequence (lead + continuation bytes are all ≥ 0x80), so a split never hides or
+    // fakes a line break. A sequence still incomplete at child death has no line terminator anyway.
+    this.buf += typeof chunk === 'string' ? chunk : this.decoder.write(chunk);
     // A broken/malicious server that writes megabytes with no newline would grow `buf` unbounded → OOM.
     // Cap it: on overflow, fail every pending request with a framing error and kill the child rather
     // than accumulating forever.
@@ -488,19 +521,22 @@ export class McpHttpClient implements McpConnection {
     const cap = resultCap ?? MCP_DEFAULT_RESULT_CAP;
     try {
       const res = (await this.rpc('tools/call', { name, arguments: args }, signal)) as {
-        content?: Array<{ type: string; text?: string }>;
+        content?: McpContentPart[];
         isError?: boolean;
       };
-      const text = (res.content ?? []).map((c) => c.text ?? '').join('\n');
+      // Same result mapping as the stdio transport (mcpResultBody) — embedded resource text and
+      // non-text content used to be dropped here, so a screenshot-only reply read as an empty 'ok'.
+      const parts = res.content ?? [];
+      const body = mcpResultBody(parts);
       // P3-05: same containment as the stdio transport — the reply is untrusted content; envelope
       // it on both paths (payload clamped BEFORE enveloping so the END marker survives) and drop
       // the unwrapped data duplicate.
       if (res.isError) {
-        const msg = text ? envelopUntrusted({ tool: headerTool, source, content: fitPayload(text, cap) }) : 'MCP tool error';
+        const msg = body ? envelopUntrusted({ tool: headerTool, source, content: fitPayload(body, cap) }) : 'MCP tool error';
         return fail(toolName, risk, Date.now() - start, 'mcp_error', msg);
       }
-      if (!text) return ok(toolName, risk, Date.now() - start, 'ok');
-      return ok(toolName, risk, Date.now() - start, envelopUntrusted({ tool: headerTool, source, content: fitPayload(text, cap) }));
+      if (!body) return ok(toolName, risk, Date.now() - start, parts.length ? 'tool returned non-text content' : 'ok');
+      return ok(toolName, risk, Date.now() - start, envelopUntrusted({ tool: headerTool, source, content: fitPayload(body, cap) }));
     } catch (e) {
       // Server-authored JSON-RPC errors are untrusted content too — envelope them; transport
       // failures (timeout/abort/HTTP status) stay plain.

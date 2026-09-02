@@ -1,6 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildPrivacyReport, type PrivacyConfigView, type PrivacyEnv } from '../src/doctor/privacy.js';
+import {
+  buildPrivacyReport,
+  effectiveSessionEndpoint,
+  type PrivacyConfigView,
+  type PrivacyEnv,
+} from '../src/doctor/privacy.js';
 
 const baseEnv = (over: Partial<PrivacyEnv> = {}): PrivacyEnv => ({
   offline: false,
@@ -220,4 +225,117 @@ test('P3-07: the plugin-install git clone is disclosed as a broker-bypassing egr
   // Offline: the manager refuses non-local clones, so the path is inactive.
   const off = buildPrivacyReport({ provider: 'anthropic' }, baseEnv({ offline: true }));
   assert.equal(find(off, 'Plugin install (git clone)').active, false);
+});
+
+// ── effectiveSessionEndpoint ──────────────────────────────────────────────────
+// The report must name the endpoint a real session would talk to, so the resolution here is the
+// same fold a startup applies: lastModel recall, then explicit > provider env > credential store.
+
+/** Set/restore the two provider base-URL env vars around a body, so tests never leak state. */
+function withProviderEnv(env: { anthropic?: string; openai?: string }, body: () => void): void {
+  const prev = { a: process.env.ANTHROPIC_BASE_URL, o: process.env.OPENAI_BASE_URL };
+  try {
+    if (env.anthropic === undefined) delete process.env.ANTHROPIC_BASE_URL;
+    else process.env.ANTHROPIC_BASE_URL = env.anthropic;
+    if (env.openai === undefined) delete process.env.OPENAI_BASE_URL;
+    else process.env.OPENAI_BASE_URL = env.openai;
+    body();
+  } finally {
+    if (prev.a === undefined) delete process.env.ANTHROPIC_BASE_URL;
+    else process.env.ANTHROPIC_BASE_URL = prev.a;
+    if (prev.o === undefined) delete process.env.OPENAI_BASE_URL;
+    else process.env.OPENAI_BASE_URL = prev.o;
+  }
+}
+
+test('empty cfg.baseUrl + a provider env var: the resolved host is what a session would use', () => {
+  withProviderEnv({ anthropic: 'https://proxy.corp.example/api' }, () => {
+    const e = effectiveSessionEndpoint({ provider: 'anthropic', model: 'claude-opus', models: [] });
+    assert.equal(e.provider, 'anthropic');
+    assert.equal(e.baseUrl, 'https://proxy.corp.example/api');
+    // The report built on the resolved endpoint names the env host — a bare cfg.baseUrl read
+    // would have named the provider default, a host this machine never talks to.
+    const r = buildPrivacyReport({ provider: e.provider, model: e.model, baseUrl: e.baseUrl }, baseEnv());
+    assert.equal(r.effectiveBaseUrl, 'https://proxy.corp.example/api');
+    assert.equal(find(r, 'Model provider').target, 'proxy.corp.example');
+    assert.ok(r.warnings.some((w) => w.includes('proxy.corp.example')), 'the prompts-go-to warning names the env host');
+  });
+});
+
+test('a remembered /model pick carries its own provider + endpoint past the stale saved keys', () => {
+  const cfg: PrivacyConfigView = {
+    provider: 'anthropic',
+    model: 'claude-opus',
+    baseUrl: 'https://api.anthropic.com',
+    lastModel: 'glm',
+    models: [{ label: 'glm', provider: 'openai', model: 'glm-4.6', baseUrl: 'https://api.z.ai/api/coding/paas/v4' }],
+  };
+  const e = effectiveSessionEndpoint(cfg, { resolveBase: (_p, configured) => configured });
+  assert.equal(e.provider, 'openai');
+  assert.equal(e.model, 'glm-4.6');
+  assert.equal(e.baseUrl, 'https://api.z.ai/api/coding/paas/v4');
+  const r = buildPrivacyReport({ provider: e.provider, model: e.model, baseUrl: e.baseUrl }, baseEnv());
+  assert.equal(find(r, 'Model provider').target, 'api.z.ai');
+});
+
+test('a recalled preset without its own baseUrl resolves against the RECALLED provider', () => {
+  // lastModel names an anthropic preset while the saved top-level keys say openai: after the
+  // recall it is ANTHROPIC_BASE_URL (not OPENAI_BASE_URL) a session would consult.
+  withProviderEnv({ anthropic: 'https://anthropic-proxy.example' }, () => {
+    const e = effectiveSessionEndpoint({
+      provider: 'openai',
+      baseUrl: 'https://api.openai.com/v1',
+      lastModel: 'sonnet',
+      models: [{ label: 'sonnet', provider: 'anthropic', model: 'claude-sonnet' }],
+    });
+    assert.equal(e.provider, 'anthropic');
+    assert.equal(e.baseUrl, 'https://anthropic-proxy.example');
+  });
+});
+
+test('an env-pinned provider/model outranks a stale lastModel (the guard main() applies)', () => {
+  // loadConfig folds SHADOW_PROVIDER/SHADOW_MODEL into the top-level keys BEFORE the recall, so
+  // the pinned run is already in cfg — the guard only has to stop the stale pick overwriting it.
+  const cfg: PrivacyConfigView = {
+    provider: 'openai',
+    model: 'glm-4.6',
+    baseUrl: 'https://api.openai.com/v1',
+    lastModel: 'local-llama',
+    models: [{ label: 'local-llama', provider: 'openai', model: 'llama3.1', baseUrl: 'http://127.0.0.1:11434/v1' }],
+  };
+  const e = effectiveSessionEndpoint(cfg, {
+    envModel: 'glm-4.6',
+    envProvider: 'openai',
+    resolveBase: (_p, configured) => configured,
+  });
+  assert.equal(e.provider, 'openai');
+  assert.equal(e.model, 'glm-4.6');
+  assert.equal(e.baseUrl, 'https://api.openai.com/v1');
+});
+
+test('a profile that declares a model outranks lastModel (P2-11 parity)', () => {
+  // loadConfig resolves the profile's model against the preset list and folds the endpoint into
+  // the top-level keys itself, so the recall must stand down — not clobber it with a stale pick.
+  const cfg: PrivacyConfigView = {
+    provider: 'openai',
+    model: 'glm-4.6',
+    baseUrl: 'https://api.z.ai/api/coding/paas/v4',
+    profile: { model: 'glm-4.6' },
+    lastModel: 'local-llama',
+    models: [{ label: 'local-llama', provider: 'openai', model: 'llama3.1', baseUrl: 'http://127.0.0.1:11434/v1' }],
+  };
+  const e = effectiveSessionEndpoint(cfg, { resolveBase: (_p, configured) => configured });
+  assert.equal(e.provider, 'openai');
+  assert.equal(e.model, 'glm-4.6');
+  assert.equal(e.baseUrl, 'https://api.z.ai/api/coding/paas/v4');
+});
+
+test('nothing to resolve: an unknown provider with no baseUrl reports the provider-default fallback', () => {
+  withProviderEnv({}, () => {
+    const e = effectiveSessionEndpoint({ provider: 'mock' });
+    assert.equal(e.provider, 'mock');
+    assert.equal(e.baseUrl, undefined);
+    const r = buildPrivacyReport({ provider: e.provider, model: e.model, baseUrl: e.baseUrl }, baseEnv());
+    assert.equal(r.effectiveBaseUrl, '(provider default)');
+  });
 });

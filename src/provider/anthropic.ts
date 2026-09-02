@@ -89,21 +89,20 @@ export class AnthropicProvider implements Provider {
     // rejects the `[1m]` config alias too — the wire id is always the base model.
     const body: any = {
       model: stripContext1mAlias(args.model || this.model),
-      messages: (args.messages ?? []).map((m) => ({
-        role: m.role,
-        content: m.content.map((b) => {
-          if (b.type === 'text') return { type: 'text', text: b.text };
-          if (b.type === 'tool_use') return { type: 'tool_use', id: b.id, name: b.name, input: b.input };
-          if (b.type === 'tool_result') return { type: 'tool_result', tool_use_id: b.toolCallId, content: wrapAnthropicToolResult(b.content, b.ok) };
-          if (b.type === 'thinking') return { type: 'thinking', thinking: b.thinking };
-          if (b.type === 'redacted_thinking') return { type: 'redacted_thinking', data: b.data };
-          if (b.type === 'image') return { type: 'image', source: { type: 'base64', media_type: b.mediaType, data: b.data } };
-          return b;
-        }),
-      })),
+      // Route through the same message mapping the real request uses: role conversion +
+      // alternation coalescing (a `role: 'tool'` turn in history 400'd the count request).
+      messages: toAnthropicMessages(args.messages ?? [], args.model || this.model),
     };
     if (args.system) body.system = args.system;
-    if (args.tools && args.tools.length) body.tools = args.tools;
+    if (args.tools && args.tools.length) {
+      // toSchemas() emits OpenAI-shaped {name, description, parameters}; the count_tokens wire
+      // wants {name, description, input_schema}. Forwarding verbatim 400'd EVERY call and the
+      // !res.ok fallback silently degraded the session to the local token estimator.
+      body.tools = args.tools.map((t) => {
+        const def = t as { name?: string; description?: string; parameters?: unknown; input_schema?: unknown };
+        return { name: def.name, description: def.description, input_schema: def.input_schema ?? def.parameters };
+      });
+    }
 
     const countUrl = this.url.replace(/\/messages$/, '/messages/count_tokens');
     const headers: Record<string, string> = {
@@ -159,6 +158,11 @@ export class AnthropicProvider implements Provider {
       signal: req.signal,
       nonStreamBody: buildAnthropicBody(req, model, false),
       parseNonStream: eventsFromAnthropicMessage,
+      // The marker must travel with the attempt: streamWithRetry recomputes only from the URL,
+      // so a hand-configured REMOTE self-hosted Anthropic front-end got the 120s public idle
+      // budget and — worse — the post-idle non-stream fallback re-POSTed the whole prompt (the
+      // C4 no-re-POST guard never saw the marker). OpenAIProvider passes it; parity here.
+      selfHosted: this.selfHosted,
       idleTimeoutMs: this.idleTimeoutMs,
       firstByteTimeoutMs: this.firstByteTimeoutMs,
       streamRetries: this.streamRetries,

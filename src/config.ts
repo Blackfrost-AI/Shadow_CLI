@@ -194,6 +194,9 @@ export const ModelEntrySchema = z.object({
   // Optional /model-picker category override. When unset, the group is derived:
   // a local endpoint → "Local", otherwise the model's company (Anthropic/OpenAI/xAI/…).
   group: z.string().optional(),
+  /** Entry created by onboarding's model allowlist. Lets a later onboarding run reconcile only
+   * its own stale selections without deleting presets the user added manually. */
+  onboarded: z.boolean().optional(),
   // Local .gguf auto-serve (ollama-style): when set, shadow launches a llama.cpp server
   // for this file on activation and talks to it over the OpenAI endpoint (see src/gguf.ts).
   gguf: z.string().optional(),

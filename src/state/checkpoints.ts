@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { chmodSync, mkdirSync, readFileSync, writeFileSync, readdirSync, existsSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, readdirSync, existsSync } from 'node:fs';
 import { join, isAbsolute, relative, resolve } from 'node:path';
 import { atomicWrite } from '../tools/util.js';
 
@@ -85,7 +85,10 @@ export function saveCheckpoint(
   const existing = entries.find((e) => e.relPath === key);
   if (existing && existsSync(existing.absPath)) return existing.absPath; // first write wins
 
-  writeFileSync(absPath, content, { encoding: 'utf8', mode: 0o600 });
+  // Torn-backup guard: a plain writeFileSync could leave a PARTIAL .bak behind on a crash
+  // mid-write, and /rewind would then restore truncated content over the user's real file.
+  // tmp+rename (atomicWrite) makes the backup appear whole or not at all.
+  atomicWrite(absPath, content, 0o600);
   try {
     chmodSync(absPath, 0o600); // mode is ignored for a pre-existing file (crash-recovery case)
   } catch {
@@ -146,8 +149,9 @@ export function listCheckpointsForTurn(
   if (!existsSync(dir)) return [];
   const indexed = readIndex(dir);
   if (indexed.length) return indexed;
-  // Fallback: scan `.bak` files when no index exists (legacy / partial writes).
-  return readdirSync(dir)
-    .filter((f) => f.endsWith('.bak'))
-    .map((file) => ({ relPath: file, file, absPath: join(dir, file) }));
+  // No index (legacy or a crash mid-write): the .bak FILENAMES are content hashes, not workspace
+  // paths. Handing them back made rewindToTurn() treat `3a1f.bak` as a workspace-relative path —
+  // writing junk hash files into the workspace root while "Restoring N file(s)" that were never
+  // actually restored. Return nothing instead: a turn that restores nothing is honest; junk is not.
+  return [];
 }

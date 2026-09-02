@@ -139,3 +139,35 @@ test('C7b: the default placeholder is unchanged when no reason is given', () => 
   assert.equal(stripImagesFromBody(body), true);
   assert.match((body.messages as { content: string }[])[0]!.content, /no vision support/);
 });
+
+test('C7c: on the Anthropic wire a tool_result SIBLING survives the image strip', () => {
+  // toAnthropicMessages coalesces consecutive same-role turns, so a user turn can carry a
+  // tool_result block AND an image (tool result, then the user attaches a screenshot). Collapsing
+  // that array to a string DELETED the tool_result, breaking tool_use/tool_result pairing — a
+  // recoverable image rejection became a terminal 400 no recovery ladder could answer. With
+  // non-text siblings present, only the image parts are dropped and the array stays an array.
+  const body: Record<string, unknown> = {
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'tool_result', tool_use_id: 't1', content: 'grep output', is_error: false },
+          { type: 'text', text: 'what is in this screenshot?' },
+          { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } },
+        ],
+      },
+    ],
+  };
+  assert.equal(stripImagesFromBody(body), true, 'the image was stripped');
+  const content = (body.messages as { content: unknown[] }[])[0]!.content;
+  assert.ok(Array.isArray(content), 'the message stays an array (not collapsed to a string)');
+  const result = content.find((p) => (p as { type?: string }).type === 'tool_result') as
+    | { tool_use_id: string; content: string }
+    | undefined;
+  assert.ok(result, 'the tool_result block survives');
+  assert.equal(result.tool_use_id, 't1');
+  assert.match(result.content, /grep output/);
+  assert.ok(!content.some((p) => (p as { type?: string }).type === 'image'), 'the image is gone');
+  const text = content.find((p) => (p as { type?: string }).type === 'text') as { text: string };
+  assert.match(text.text, /screenshot/, 'the user text survives alongside');
+});

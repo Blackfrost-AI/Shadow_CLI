@@ -5,14 +5,41 @@ import { page } from '../src/onboard/webOnboard.js';
 test('onboarding page embeds the one-time token and the form fields', () => {
   const html = page('TESTTOKEN123');
   assert.match(html, /TESTTOKEN123/, 'token is embedded for the /save handshake');
-  for (const id of ['id="provider"', 'id="apiKey"', 'id="baseUrl"', 'id="selfHosted"', 'id="pw"', 'id="pw2"']) {
+  for (const id of [
+    'id="provider"',
+    'id="apiKey"',
+    'id="baseUrl"',
+    'id="selfHosted"',
+    'id="discover"',
+    'id="modelChoices"',
+    'id="pw"',
+    'id="pw2"',
+  ]) {
     assert.ok(html.includes(id), `has ${id}`);
   }
   assert.match(html, /Is this endpoint self-hosted\?/);
   assert.match(html, /selfHosted:/, 'the explicit yes/no choice is included in the /save payload');
-  assert.match(html, /value="qwen"[^>]*data-url="https:\/\/dashscope\.aliyuncs\.com\/compatible-mode\/v1"/);
+  assert.match(
+    html,
+    /value="qwen"[^>]*data-url="https:\/\/dashscope\.aliyuncs\.com\/compatible-mode\/v1"/,
+  );
   assert.match(html, /value="qwen"[^>]*data-model="qwen3\.8-max"/);
-  assert.match(html, /id="model"[^>]*required/, 'the generated provider suggestion cannot fall back to a stale model');
+  assert.match(html, /value="zai"[^>]*data-model="glm-5\.3"/);
+  assert.match(html, /glm-5\.3-flash/);
+  assert.match(
+    html,
+    /id="model"[^>]*required/,
+    'the generated provider suggestion cannot fall back to a stale model',
+  );
+  assert.ok(
+    html.includes("fetch('/probe'"),
+    'model discovery stays behind the loopback onboarding server',
+  );
+  assert.match(
+    html,
+    /models:picked/,
+    'the selected model allowlist is included in the save payload',
+  );
 });
 
 test('onboarding page loads NO external resources (CSP/offline safe — a key cannot be exfiltrated)', () => {

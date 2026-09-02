@@ -17,3 +17,12 @@ test('leaves normal answer text untouched', () => {
   const t = 'Here is the answer: 42. No tokens here.';
   assert.equal(scrubControlTokens(t), t);
 });
+
+test('indented code survives — multi-space runs are NEVER collapsed (regression: code blocks flattened)', () => {
+  // The old scrub collapsed `[ \t]{2,}` to one space "for compactness", silently mangling the
+  // indented code blocks a local model is most likely to emit. Whitespace is content — only the
+  // control token itself goes. (Token placed mid-text: a string-INITIAL token still sheds the
+  // whitespace that follows it — that leading strip is deliberate, see the first test above.)
+  const code = '  const x = 1;\n    return x;\t// tabbed tail';
+  assert.equal(scrubControlTokens(`Here:\n<|im_start|>${code}<|im_end|>`), `Here:\n${code}`);
+});

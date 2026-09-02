@@ -8,6 +8,7 @@
  * DSR-batched-with-text, ^D-in-paste, Ctrl-X arming).
  */
 import { hasSgrMouse } from '../composer.js';
+import type { ContextName } from '../keybindings/types.js';
 import type { InkKey, KeyEnv } from './types.js';
 
 // Bracketed-paste markers (DECSET 2004, enabled at mount). The terminal wraps every paste in
@@ -39,6 +40,10 @@ export function dialogArmMs(): number {
   const n = Number(process.env.SHADOW_DIALOG_ARM_MS);
   return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 275;
 }
+
+/** Contexts the Ctrl-X chord resolves against — the composer owner's §3.25 order minus
+ *  Autocomplete, whose bindings are all single-key and so can never extend a two-key chord. */
+const CHORD_CONTEXTS: ContextName[] = ['Transcript', 'Chat', 'Global'];
 
 /** True when the key was consumed by a transport or reserved chord (routing must stop). */
 export function runTransportsAndReserved(env: KeyEnv, ch: string, key: InkKey): boolean {
@@ -107,11 +112,22 @@ export function runTransportsAndReserved(env: KeyEnv, ch: string, key: InkKey): 
   // runs or a modal is open.
   if (env.ctrlXArmedRef.current) {
     env.ctrlXArmedRef.current = false;
+    // The key after an armed Ctrl-X resolves as part of that chord FIRST, through the same
+    // resolver the composer owner consults — the arming press was consumed up HERE, before it
+    // could seed the resolver's pending chord, so without this the two-key chords that start
+    // with Ctrl-X (`ctrl+x m`, the /help-advertised model picker, plus any user rebinding) died
+    // and the follow-up key reached the composer as plain text. A chord CANCELLATION has already
+    // cleared the pending chord by the time this returns false, so an unrelated key falls
+    // through and still resolves normally below — Ctrl-E in particular, which then opens the
+    // editor here. A user rebind of the same `ctrl+x ctrl+e` chord wins over the hardcoded
+    // escape: it matches, so the editor never opens on top of it.
+    if (env.kbConsume(ch, key, CHORD_CONTEXTS)) return true;
     if (key.ctrl && ch === 'e') {
       env.openExternalEditor();
       return true;
     }
-    // Ctrl-X was not followed by Ctrl-E — fall through and handle this key normally.
+    // Ctrl-X was not followed by a bound chord key or Ctrl-E — fall through and handle this key
+    // normally.
   }
   if (
     key.ctrl &&
@@ -121,6 +137,10 @@ export function runTransportsAndReserved(env: KeyEnv, ch: string, key: InkKey): 
     !env.pickerOpenRef.current &&
     !env.searchRef.current
   ) {
+    // Seed the resolver's pending chord so the follow-up key (resolved in the armed block above)
+    // can complete a `ctrl+x …` chord. Arming proceeds regardless of the result: chord_started
+    // only means a Ctrl-X chord EXISTS, and the editor escape must survive even when none is.
+    env.kbConsume(ch, key, CHORD_CONTEXTS);
     env.ctrlXArmedRef.current = true;
     return true;
   }

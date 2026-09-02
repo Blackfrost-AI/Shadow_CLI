@@ -29,6 +29,8 @@ export interface ProviderPreset {
   baseUrl?: string;
   /** Suggested default model id. */
   defaultModel: string;
+  /** Curated agentic choices used when the provider does not expose a live model catalog. */
+  recommendedModels?: string[];
   /** cloud = needs an API key; local = base URL only (key optional); custom = ask everything. */
   kind: 'cloud' | 'local' | 'custom';
   /** Where to get a key (shown as a hint). */
@@ -50,6 +52,7 @@ export const PROVIDERS: ProviderPreset[] = [
     adapter: 'anthropic',
     baseUrl: 'https://api.anthropic.com',
     defaultModel: 'claude-opus-4-8',
+    recommendedModels: ['claude-opus-4-8', 'claude-sonnet-4-6'],
     kind: 'cloud',
     keyUrl: 'https://console.anthropic.com/settings/keys',
   },
@@ -59,6 +62,7 @@ export const PROVIDERS: ProviderPreset[] = [
     adapter: 'openai',
     baseUrl: 'https://api.openai.com/v1',
     defaultModel: 'gpt-5.1', // reasoning model — Shadow sends max_completion_tokens + reasoning_effort
+    recommendedModels: ['gpt-5.1'],
     kind: 'cloud',
     keyUrl: 'https://platform.openai.com/api-keys',
   },
@@ -155,11 +159,14 @@ export const PROVIDERS: ProviderPreset[] = [
   {
     // Defaults to the GLM Coding Plan endpoint (what Z.ai sells for coding agents); a pay-as-you-go
     // general-API key uses https://api.z.ai/api/paas/v4 instead — editable at the base-URL prompt.
+    // Z.ai does not guarantee an OpenAI-style /models route on every plan, so keep the current
+    // agentic pair as a curated fallback. The wizard still prefers the account's live catalog.
     id: 'zai',
     label: 'Z.ai (GLM Coding Plan)',
     adapter: 'openai',
     baseUrl: 'https://api.z.ai/api/coding/paas/v4',
-    defaultModel: 'glm-4.6',
+    defaultModel: 'glm-5.3',
+    recommendedModels: ['glm-5.3', 'glm-5.3-flash'],
     kind: 'cloud',
     keyUrl: 'https://z.ai/manage-apikey/apikey-list',
   },

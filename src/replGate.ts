@@ -3,6 +3,20 @@ import type { AutonomyLevel } from './safety/permissions.js';
 import type { ApprovalDecision, ApprovalGate, ApprovalRequest, UserQuestion } from './agent/approval.js';
 
 /**
+ * Which input the headless loop consumes when no `--task` was given: the prompt-loop
+ * REPL when a human is on stdin, else the pipe captured at startup. STDIN alone
+ * decides — stdout being redirected (`shadow | tee`, `> log`) does NOT make the run
+ * a pipe. Routing a terminal stdin to the pipe made its fallback read fd 0
+ * synchronously, which BLOCKS on the terminal until EOF: `shadow | tee` hung with no
+ * prompt. The invariant: fd 0 is read directly only when it is NOT a TTY; a TTY is
+ * read exclusively through the readline REPL. Pure so it can be unit-tested without
+ * touching real TTYs (same pattern as cli/autoOnboard.ts).
+ */
+export function headlessInputSource(stdinIsTTY: boolean): 'repl' | 'piped' {
+  return stdinIsTTY ? 'repl' : 'piped';
+}
+
+/**
  * Interactive approval for the plain REPL. A human is at the keyboard, so a gated
  * call (exec/network under the current autonomy, or a denylisted command) prompts
  * y/n/a on the SAME readline the prompt uses — never silently denied the way the
