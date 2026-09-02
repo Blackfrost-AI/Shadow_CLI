@@ -16,18 +16,16 @@ Under the hood it's a **tool-calling agentic runtime**: the model reasons, emits
 
 This is **not a chat app** — it is a tool-calling runtime.
 
-## 🔥 What's new in v5.5.0
+## 🔥 What's new in v8.5.0
 
-- **🧠 Qwen 3.8 readiness.** Alibaba Qwen/DashScope is built into onboarding, future open-weight model IDs pass through unchanged, and both current and newer reasoning stream fields are supported.
-- **🔒 Provider-scoped reasoning.** Verified DashScope Qwen 3.8 Max requests use its documented completion, effort, and preserved-thinking controls without leaking provider-specific options or reasoning history to third-party endpoints.
-- **🛟 Honest recovery.** Blank HTTP-200 completions retry and then surface an actionable error; failed partial streams can no longer execute incomplete tool calls or masquerade as success.
-- **🌡 Reliable self-host trust.** Custom onboarding remembers when a public OpenAI-compatible endpoint is self-hosted, so its configured temperature is applied consistently without reaching cloud/native providers.
-- **🛡 Dependency hardening.** The runtime HTTP stack is locked to patched `undici` 8.10.0, with a clean production audit and a truthful Node.js source-build requirement.
+- **🔎 Onboarding model discovery.** The wizard now probes your endpoint and shows the models your key can actually use — pick an allowlist and a default instead of memorizing model IDs. Adapter compatibility (OpenAI vs Anthropic wire) and self-hosted hosting are detected honestly, and your picks land as `/model` presets. Works in the terminal and in `shadow onboard --web`.
+- **🛡 The deep-review hardening line.** 25 adversarially-verified findings, all fixed and tested: redirect-aware + fail-closed egress walls, a config-write gate that also covers `multi_edit`/`apply_patch`, per-pad-class closure of the untrusted-content envelope, vault merge-verify-shred onboarding, sanitized skill-index names, escape-scrubbed error paths, and atomic writes that preserve file modes.
+- **✅ The correctness sweep.** Liveness-checked local servers plus docker vLLM orphan cleanup, honest `count_tokens` (no more silent fallback to the local estimator), MCP stdio UTF-8 framing, a piped-stdin hang fix, and the Ctrl+X M / paste-chip composer fixes.
 
 Earlier highlights:
 
-- **v5.0:** Self-hosted temperature controls, a friendlier TUI, and hardened release checks.
-- **v4.1:** See running sub-agents in the Turn-HUD, plus transcript and composer correctness fixes.
+- **v8.4 — the UX parity line:** first-run auto-onboard, Shift+Tab plan mode, Ctrl+X M model picker, `/export html`, stable `web.token`, auto-format after writes, Claude-session import, spend guardrails, LSP diagnostics after writes, and `/goal` mission mode.
+- **v8.0–8.3 — the web console era:** `shadow web` (sessions sidebar, streaming transcript, approval dock, inspector), toasts + context gauge, stream resilience, self-documenting config + instruction-file autopilot.
 - **🎭 Collaboration Mode — a live model round-table.** `/table gpt glm` seats 2–4 models in **one shared conversation**; you hold the baton and route each turn with `@handle`. Compare reasoning side by side, or let a strong model check a fast one.
 - **📊 Charts, tables & a genuinely beautiful TUI.** Fenced `chart` blocks render as real unicode **bar / line / sparkline** graphs; GFM tables get rounded grids with ledger-aligned numbers; markdown, code, and diffs are calm and readable.
 - **♿ Accessibility, first-class.** A `colorblind` (Okabe–Ito) palette and a `high-contrast` (WCAG-AAA) theme; your prompts carry a `▌` bar and failed tools a `✗` glyph, so meaning never rides on color alone.
