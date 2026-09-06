@@ -30,6 +30,7 @@ export function el(tag, attrs = {}, children = []) {
     // Absent/false attributes are omitted so callers can spread conditionals inline.
     if (v === undefined || v === null || v === false) continue;
     if (k === 'class') node.className = v;
+    else if (k === 'dataset') Object.assign(node.dataset, v);
     // Handlers as PROPERTIES (never attributes — see the comment above), normalized to the
     // lowercase DOM property name: `onClick` and `onclick` both land on node.onclick. The
     // camelCase form assigned a dead node.onClick property instead (browsers fire only the

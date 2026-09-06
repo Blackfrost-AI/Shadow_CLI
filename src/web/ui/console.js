@@ -65,12 +65,13 @@ export function createConsole(ctx) {
     'button',
     {
       class: 'icon-btn',
+      'aria-label': 'Toggle inspector',
       onClick: () => ctx.setDetails(!ctx.detailsOpen()),
     },
     ['▤'],
   );
   tipOn(btnDetails, () => (ctx.detailsOpen() ? 'Hide inspector' : 'Show inspector'));
-  const btnSettings = el('button', { class: 'icon-btn', onClick: () => ctx.openSettings() }, ['⚙']);
+  const btnSettings = el('button', { class: 'btn btn-ghost settings-trigger', 'aria-label': 'Settings', onClick: () => ctx.openSettings('models') }, ['⚙ Settings']);
   tipOn(btnSettings, () => 'Settings');
 
   const head = el('div', { class: 'con-head' }, [

@@ -11,6 +11,7 @@ import { el } from './dom.js';
 import { getJson, postJson, patchJson, del } from './api.js';
 import { toast, confirmDialog } from './ui.js';
 import { themeSetting, setTheme } from './theme.js';
+import { endpointsPane } from './endpointsPane.js';
 
 /* ------------------------------------------------------------------ bits -- */
 
@@ -44,6 +45,7 @@ const action = (labelText, onClick, { danger: isDanger = false } = {}) => {
       await onClick();
     } catch (e) {
       if (e.message !== 'cancelled') toast(`failed: ${e.message}`, { kind: 'error' });
+    } finally {
       btn.disabled = false;
       btn.textContent = was;
     }
@@ -102,26 +104,54 @@ async function modelsPane(body) {
   const models = data.models ?? [];
 
   body.append(
-    el('h3', {}, ['Models']),
-    el('p', { class: 'desc' }, [`Active: ${active.model ?? '—'} (${active.provider ?? '—'})`]),
+    el('h3', {}, ['Models & endpoints']),
+    el('p', { class: 'desc' }, ['Manage connections and verify models. Saved changes apply to new sessions.']),
+    el('p', { class: 'desc' }, [`Saved default: ${active.lastModel ?? active.model ?? '—'} · Vault ${data.vaultUnlocked ? 'unlocked' : 'locked'}`]),
+    el('p', { class: 'desc' }, ['Endpoint test: model list only. Response test: a sample with a 64-token output limit; may cost tokens. No project files or conversation history are sent.']),
   );
 
   if (!models.length) body.append(el('p', { class: 'desc' }, ['No model presets yet — add one below.']));
   const reload = () => modelsPane(body);
   for (const m of models) {
-    const isActive = active.provider === m.provider && active.model === m.model;
+    const isActive = active.lastModel ? active.lastModel === m.label : active.provider === m.provider && active.model === m.model;
     const label = m.label ?? m.model ?? '';
-    body.append(
+    const result = el('div', { class: 'model-probe-result', role: 'status', 'aria-live': 'polite', hidden: true }, []);
+    const editor = el('div', { class: 'model-editor', hidden: true }, []);
+    const testButtons = [];
+    const runProbe = async (kind) => {
+      if (kind === 'response' && !(await confirmDialog({ title: `Test ${label}?`, body: 'Sends one synthetic “Reply with OK.” request, with no tools, files or conversation history. Output is capped at 64 tokens. Your provider may charge for this test.', confirmLabel: 'Send test request' }))) return;
+      result.hidden = false;
+      result.dataset.state = 'pending';
+      result.textContent = kind === 'endpoint' ? 'Checking endpoint… (15 second limit)' : 'Waiting for a model response… (15 second limit)';
+      testButtons.forEach((b) => { b.disabled = true; });
+      try {
+        const r = await postJson(`/api/models/${encodeURIComponent(label)}/probe`, { kind });
+        result.dataset.state = r.ok ? 'ok' : 'error';
+        result.textContent = `${r.ok ? '✓' : '⚠'} ${r.message} · ${r.elapsedMs} ms${r.status ? ` · HTTP ${r.status}` : ''}`;
+      } catch (e) {
+        result.dataset.state = 'error';
+        result.textContent = `Could not run the test: ${e.message}`;
+      } finally { testButtons.forEach((b) => { b.disabled = false; }); }
+    };
+    testButtons.push(action('Test endpoint', () => runProbe('endpoint')), action('Test response', () => runProbe('response')));
+    const card = el('section', { class: 'model-card', 'aria-label': label }, [
       entry(
         [
           label,
-          isActive ? el('span', { class: 'tag-chip', style: 'margin-left:8px;' }, ['active']) : null,
+          isActive ? el('span', { class: 'tag-chip', style: 'margin-left:8px;' }, ['default']) : null,
           m.disabled ? el('span', { class: 'hint', style: 'display:inline;margin-left:8px;' }, ['disabled']) : null,
         ],
         [
-          `${m.provider ?? '—'} · ${m.model ?? '—'}${m.baseUrl ? ` · ${m.baseUrl}` : ''}${m.hasCredential ? ' · key set' : ''}`,
+          `${m.provider === 'openai' ? 'OpenAI-compatible' : m.provider ?? '—'} · ${m.model ?? '—'}`,
+          m.baseUrl ?? 'Provider default endpoint',
+          m.credentialStatus ?? (m.hasCredential ? 'Model credential configured' : 'No model-specific credential'),
         ],
         [
+          action('Edit connection', async () => {
+            if (!editor.hidden) { editor.hidden = true; return; }
+            editModel(editor, m, data.vaultUnlocked, reload);
+            editor.hidden = false;
+          }),
           isActive
             ? null
             : action('Set default', async () => {
@@ -139,24 +169,29 @@ async function modelsPane(body) {
           }, { danger: true }),
         ],
       ),
-    );
+      el('div', { class: 'model-test-actions' }, testButtons),
+      result,
+      editor,
+    ]);
+    body.append(card);
   }
 
   // -- add form --
   const fLabel = input({ placeholder: 'work-laptop' });
   const fProvider = el('select', { class: 'input' }, [
-    el('option', { value: 'anthropic' }, ['Anthropic']),
     el('option', { value: 'openai' }, ['OpenAI-compatible']),
+    el('option', { value: 'anthropic' }, ['Anthropic']),
     el('option', { value: 'mock' }, ['Mock']),
   ]);
-  const fModel = input({ placeholder: 'claude-sonnet-5' });
-  const fBase = input({ placeholder: 'https://… (optional)' });
-  const fKey = input({ placeholder: 'stored in the vault, never echoed', type: 'password' });
+  const fModel = input({ placeholder: 'Model ID reported by your server' });
+  const fBase = input({ placeholder: 'http://localhost:11434/v1', type: 'url', spellcheck: 'false' });
+  const fKey = input({ placeholder: 'Optional for a keyless local server', type: 'password', autocomplete: 'new-password' });
   const addBtn = el('button', { class: 'btn btn-primary btn-sm' }, ['Add preset']);
   addBtn.onclick = async () => {
     const payload = { label: fLabel.value.trim(), provider: fProvider.value, model: fModel.value.trim() };
     if (fBase.value.trim()) payload.baseUrl = fBase.value.trim();
     if (fKey.value) payload.apiKey = fKey.value;
+    addBtn.disabled = true;
     try {
       await postJson('/api/models', payload);
       fLabel.value = fModel.value = fBase.value = fKey.value = '';
@@ -168,7 +203,7 @@ async function modelsPane(body) {
           : `add failed: ${e.message}`,
         { kind: 'error' },
       );
-    }
+    } finally { addBtn.disabled = false; }
   };
   body.append(
     el('h3', { style: 'margin-top:24px;' }, ['Add model']),
@@ -177,6 +212,43 @@ async function modelsPane(body) {
       el('div', { class: 'set-form-row' }, [field('Model', fModel), field('Base URL', fBase)]),
       el('div', { class: 'set-form-row' }, [field('API key', fKey), el('div', { class: 'field' }, [addBtn])]),
     ]),
+  );
+}
+
+function editModel(host, model, vaultOpen, reload) {
+  const fModel = input({ value: model.model, required: true });
+  const fBase = input({ value: model.baseUrl ?? '', type: 'url', placeholder: 'Provider default', spellcheck: 'false' });
+  const fKey = input({ type: 'password', autocomplete: 'new-password', placeholder: vaultOpen ? 'Leave blank to keep the existing key' : 'Unlock the vault in your terminal to change keys', disabled: !vaultOpen });
+  const fReuse = input({ type: 'checkbox', class: '' });
+  const reuse = field('Use the existing credential with the changed endpoint', fReuse, 'Only confirm if you trust this endpoint with that key.');
+  reuse.hidden = true;
+  fBase.oninput = () => { reuse.hidden = fBase.value.trim() === (model.baseUrl ?? ''); fReuse.checked = false; };
+  const save = el('button', { class: 'btn btn-primary', type: 'button' }, ['Save connection']);
+  const cancel = el('button', { class: 'btn btn-ghost', type: 'button', onClick: () => { fKey.value = ''; host.hidden = true; } }, ['Cancel']);
+  const status = el('div', { role: 'status', class: 'model-probe-result', hidden: true }, []);
+  save.onclick = async () => {
+    save.disabled = true;
+    status.hidden = true;
+    try {
+      await patchJson(`/api/models/${encodeURIComponent(model.label)}`, {
+        action: 'update', model: fModel.value.trim(), baseUrl: fBase.value.trim(),
+        ...(fKey.value ? { apiKey: fKey.value } : {}), reuseCredential: fReuse.checked,
+      });
+      fKey.value = '';
+      await reload();
+      toast('Connection saved. Start a new session to use it.');
+    } catch (e) {
+      status.hidden = false;
+      status.dataset.state = 'error';
+      status.textContent = e.message;
+    } finally { save.disabled = false; }
+  };
+  host.replaceChildren(
+    el('h3', {}, ['Edit connection']),
+    el('div', { class: 'set-form-row' }, [field('Model ID', fModel), field('Base URL', fBase)]),
+    field('Replace API key', fKey, 'Stored encrypted on your Shadow host. The existing key is never sent to the browser.'),
+    reuse,
+    el('div', { class: 'model-test-actions' }, [save, cancel]), status,
   );
 }
 
@@ -382,7 +454,8 @@ async function projectsPane(body, ctx) {
 
 const PANES = [
   { id: 'general', label: 'General', render: (body) => generalPane(body) },
-  { id: 'models', label: 'Models', render: (body) => void modelsPane(body) },
+  { id: 'models', label: 'Models & endpoints', render: (body) => void modelsPane(body) },
+  { id: 'endpoints', label: 'Endpoints', render: (body) => void endpointsPane(body) },
   { id: 'agents', label: 'Agents', render: (body) => void agentsPane(body) },
   { id: 'mcp', label: 'MCP', render: (body) => void mcpPane(body) },
   { id: 'projects', label: 'Projects', render: (body, ctx) => void projectsPane(body, ctx) },
@@ -393,15 +466,25 @@ const PANES = [
  * `ctx.onProjectsChanged` fires when the allowlist changes so the sidebar re-renders.
  */
 export function openSettings(ctx = {}) {
+  const previousFocus = document.activeElement;
   const pane = el('div', { class: 'set-pane scroll' }, []);
   const nav = el('div', { class: 'set-nav' }, []);
 
   const close = () => {
     document.removeEventListener('keydown', onKey);
     mask.remove();
+    if (previousFocus?.isConnected) previousFocus.focus();
   };
   const onKey = (e) => {
+    if ([...document.querySelectorAll('.modal-mask')].at(-1) !== mask) return;
     if (e.key === 'Escape') close();
+    if (e.key === 'Tab') {
+      const focusable = [...mask.querySelectorAll('button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled)')].filter((el) => el.offsetParent !== null);
+      const first = focusable[0];
+      const last = focusable.at(-1);
+      if (e.shiftKey && (document.activeElement === first || !mask.contains(document.activeElement))) { e.preventDefault(); last?.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first?.focus(); }
+    }
   };
 
   const mask = el(
@@ -413,13 +496,13 @@ export function openSettings(ctx = {}) {
       },
     },
     [
-      el('div', { class: 'modal set' }, [
+      el('div', { class: 'modal set', role: 'dialog', 'aria-modal': 'true', 'aria-label': 'Settings' }, [
         el('div', { class: 'set-grid' }, [
           nav,
           el('div', { style: 'display:flex;flex-direction:column;min-width:0;min-height:0;' }, [
             el('div', { class: 'modal-head' }, [
               el('span', { class: 't' }, ['Settings']),
-              el('button', { class: 'icon-btn', title: 'Close', onClick: () => close() }, ['✕']),
+              el('button', { class: 'icon-btn settings-close', 'aria-label': 'Close settings', title: 'Close', onClick: () => close() }, ['✕']),
             ]),
             pane,
           ]),
@@ -429,8 +512,15 @@ export function openSettings(ctx = {}) {
   );
 
   const show = (id) => {
-    for (const b of [...nav.children]) b.classList.toggle('is-active', b.dataset.id === id);
-    PANES.find((p) => p.id === id)?.render(pane, ctx);
+    for (const b of [...nav.children]) {
+      b.classList.toggle('is-active', b.dataset.id === id);
+      if (b.dataset.id === id) b.setAttribute('aria-current', 'page');
+      else b.removeAttribute('aria-current');
+    }
+    // A separate host per tab keeps a late fetch from overwriting the newly selected pane.
+    const currentPane = el('div', {}, []);
+    pane.replaceChildren(currentPane);
+    PANES.find((p) => p.id === id)?.render(currentPane, ctx);
   };
   for (const p of PANES) {
     const b = el('button', { class: 'set-item', dataset: { id: p.id } }, [p.label]);
@@ -440,6 +530,7 @@ export function openSettings(ctx = {}) {
 
   document.addEventListener('keydown', onKey);
   document.body.append(mask);
-  show('general');
+  show(PANES.some((p) => p.id === ctx.initialPane) ? ctx.initialPane : 'general');
+  nav.querySelector('.is-active')?.focus();
   return { close };
 }

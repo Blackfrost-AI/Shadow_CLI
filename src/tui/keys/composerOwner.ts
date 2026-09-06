@@ -9,7 +9,7 @@
 import {
   cursorOnFirstRow,
   cursorOnLastRow,
-  cursorToRowCol,
+  cursorDisplayColumn,
   deleteCharRight,
   deleteWordLeft,
   deleteWordRight,
@@ -379,7 +379,7 @@ function handleComposer(env: KeyEnv, ch: string, key: InkKey): boolean {
   if (key.upArrow) {
     const text = env.inputRef.current;
     if (!cursorOnFirstRow(text, env.cursorRef.current, editInner)) {
-      const goal = env.goalColRef.current ?? cursorToRowCol(text, env.cursorRef.current, editInner).col;
+      const goal = env.goalColRef.current ?? cursorDisplayColumn(text, env.cursorRef.current, editInner);
       env.goalColRef.current = goal;
       const next = moveCursorVertical(text, env.cursorRef.current, -1, editInner, goal);
       env.cursorRef.current = next;
@@ -400,7 +400,7 @@ function handleComposer(env: KeyEnv, ch: string, key: InkKey): boolean {
   if (key.downArrow) {
     const text = env.inputRef.current;
     if (!cursorOnLastRow(text, env.cursorRef.current, editInner)) {
-      const goal = env.goalColRef.current ?? cursorToRowCol(text, env.cursorRef.current, editInner).col;
+      const goal = env.goalColRef.current ?? cursorDisplayColumn(text, env.cursorRef.current, editInner);
       env.goalColRef.current = goal;
       const next = moveCursorVertical(text, env.cursorRef.current, 1, editInner, goal);
       env.cursorRef.current = next;

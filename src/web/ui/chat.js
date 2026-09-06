@@ -15,12 +15,13 @@ import { createTranscript } from './render.js';
 import { createDocks } from './docks.js';
 import { toast, menu } from './ui.js';
 import { titleFromPrompt } from './util.js';
+import { readDraft, saveDraft } from './drafts.js';
 
 const AUTONOMY = [
   { level: 'manual', label: 'Manual', hint: 'ask before anything' },
   { level: 'auto-read', label: 'Auto read', hint: 'reads are free' },
   { level: 'auto-edit', label: 'Auto edit', hint: 'edits are free' },
-  { level: 'full', label: 'Full', hint: 'never asks' },
+  { level: 'full', label: 'Full', hint: 'most actions automatic; protected actions still ask' },
 ];
 
 const HERO_CHIPS = ['Explain this repository', 'Review the last commit', 'Write a test for the main module'];
@@ -28,22 +29,33 @@ const HERO_CHIPS = ['Explain this repository', 'Review the last commit', 'Write 
 export function mountChat(host, sessionId, ctx = {}) {
   const model = createSessionModel(sessionId);
   let running = false;
-  let canPrompt = true;
-  let canInterrupt = true;
+  let canPrompt = false;
+  let canInterrupt = false;
+  let sessionReady = false;
+  let submitting = false;
+  let connection = ConnState.CONNECTING;
   let autonomy = 'auto-edit';
   let dead = false;
   let titled = false;
 
   // ---- layout -------------------------------------------------------------------
   const scroller = el('div', { class: 'tl scroll' }, []);
+  const connectionLabel = el('div', { class: 'connection-status', role: 'status', 'aria-live': 'polite' }, ['Connecting to Shadow…']);
   const hero = el(
     'div',
     { class: 'tl-hero' },
     [
       el('div', { class: 'glyph' }, ['◇']),
-      el('div', { class: 'hello' }, ['What can Shadow do?']),
-      el('div', { class: 'sub' }, ['Ask anything about this project — tools, edits and shell commands run under the autonomy you set below.']),
-      el('div', { class: 'chips' }, HERO_CHIPS.map((c) => el('button', { class: 'tag-chip', onClick: () => sendText(c) }, [c]))),
+      el('div', { class: 'hello' }, ['Your project. Your models.']),
+      el('div', { class: 'sub' }, ['Start with a question or describe a change. Shadow shows its work as it goes.']),
+      el('div', { class: 'chips' }, HERO_CHIPS.map((c) => el('button', { class: 'tag-chip', onClick: () => {
+        if (ta.value.trim()) return ta.focus();
+        ta.value = c;
+        saveDraft(sessionId, c);
+        autosize();
+        syncComposer();
+        ta.focus();
+      } }, [c]))),
     ],
   );
 
@@ -51,16 +63,22 @@ export function mountChat(host, sessionId, ctx = {}) {
   const ta = el('textarea', {
     class: 'ta',
     rows: '1',
+    'aria-label': 'Message Shadow',
     placeholder: 'Send a message… (Enter · Shift+Enter for newline)',
     onkeydown: (ev) => {
       // IME composition: Enter confirms the candidate, not the message.
-      if (ev.key === 'Enter' && !ev.shiftKey && ev.keyCode !== 229) {
+      if (ev.key === 'Enter' && !ev.shiftKey && !ev.isComposing && ev.keyCode !== 229) {
         ev.preventDefault();
         sendCurrent();
       }
     },
-    oninput: () => autosize(),
+    oninput: () => {
+      saveDraft(sessionId, ta.value);
+      autosize();
+      syncComposer();
+    },
   });
+  ta.value = readDraft(sessionId);
   const sendBtn = el('button', { class: 'btn-send', title: 'Send', onClick: () => sendCurrent() }, ['↑']);
   const autoPill = el('button', { class: 'pill-auto', onClick: openAutonomy }, [
     el('span', { class: 'lv' }),
@@ -77,7 +95,7 @@ export function mountChat(host, sessionId, ctx = {}) {
   const wrap = el(
     'div',
     { style: 'display:flex;flex-direction:column;flex:1;min-height:0;position:relative;' },
-    [scroller, hero, docksHost, composer],
+    [connectionLabel, scroller, hero, docksHost, composer],
   );
   host.replaceChildren(wrap);
 
@@ -103,53 +121,88 @@ export function mountChat(host, sessionId, ctx = {}) {
     ta.style.height = `${Math.min(ta.scrollHeight, 336)}px`; // ~14 lines cap
   };
 
+  function syncComposer() {
+    const online = connection === ConnState.OPEN;
+    const stop = running && !ta.value.trim() && canInterrupt;
+    ta.disabled = sessionReady && !canPrompt;
+    ta.readOnly = submitting;
+    sendBtn.disabled = submitting || !sessionReady || !online || (!stop && (!canPrompt || !ta.value.trim()));
+    sendBtn.classList.toggle('is-stop', stop);
+    sendBtn.textContent = submitting ? '…' : stop ? '■' : '↑';
+    const label = submitting ? 'Sending…' : stop ? 'Stop' : running ? 'Queue message' : 'Send';
+    sendBtn.title = label;
+    sendBtn.setAttribute('aria-label', label);
+    autoPill.disabled = submitting || !sessionReady || !canPrompt || !online;
+    if (!sessionReady) ta.placeholder = 'Connecting — you can write your message now…';
+    else if (!canPrompt) ta.placeholder = 'Start a new session to send a message';
+    else if (!online) ta.placeholder = 'Reconnecting — your draft stays here…';
+    else ta.placeholder = running ? 'Queue a message for after this turn…' : 'Send a message… (Enter · Shift+Enter for newline)';
+  }
+
   function setRunning(v) {
     if (running === v) return;
     running = v;
-    sendBtn.classList.toggle('is-stop', v && canInterrupt);
-    sendBtn.textContent = v && canInterrupt ? '■' : '↑';
-    sendBtn.title = v && canInterrupt ? 'Stop' : 'Send';
-    ta.placeholder = v ? 'Queue a message for after this turn…' : 'Send a message… (Enter · Shift+Enter for newline)';
+    syncComposer();
     ctx.onStatus?.();
   }
 
-  function sendCurrent() {
-    const text = ta.value.trim();
+  async function sendCurrent() {
+    if (submitting || !sessionReady || connection !== ConnState.OPEN) return;
+    const draft = ta.value;
+    const text = draft.trim();
     if (!text) {
       if (running && canInterrupt) stopTurn();
       return;
     }
-    ta.value = '';
-    autosize();
-    sendText(text);
+    const accepted = await sendText(text);
+    if (accepted && ta.value === draft) {
+      ta.value = '';
+      if (!dead || readDraft(sessionId) === draft) saveDraft(sessionId, '');
+    }
+    if (!dead) {
+      autosize();
+      syncComposer();
+    }
   }
 
   async function sendText(text) {
     if (!canPrompt) {
       toast('this session is a read-only mirror', { kind: 'error' });
-      return;
+      return false;
     }
     if (running) {
       model.enqueue(text);
-      return;
+      render();
+      return true;
     }
-    model.addUserLocal(text);
-    if (!titled) {
-      titled = true;
-      ctx.onTitle?.(titleFromPrompt(text));
-    }
+    submitting = true;
     setRunning(true);
     try {
       await postJson(`/api/sessions/${sessionId}/chat`, { prompt: text });
+      if (!titled && !dead) {
+        titled = true;
+        ctx.onTitle?.(titleFromPrompt(text));
+      }
+      return true;
     } catch (e) {
       setRunning(false);
-      model.apply({ type: 'error', message: `submit failed: ${e.message}` });
+      // Keep both a failed queued prompt and any newer composer text. Never retry automatically:
+      // a lost HTTP acknowledgement can mean the server accepted the request already.
+      const current = dead ? readDraft(sessionId) : ta.value;
+      ta.value = current.includes(text) ? current : [text, current].filter(Boolean).join('\n\n');
+      saveDraft(sessionId, ta.value);
+      model.apply({ type: 'error', message: `Could not confirm sending. Your draft is kept; check the conversation before retrying. ${e.message}` });
+      if (!dead) render();
+      return false;
+    } finally {
+      submitting = false;
+      if (!dead) syncComposer();
     }
   }
 
   function stopTurn() {
-    postJson(`/api/sessions/${sessionId}/interrupt`).catch(() => {
-      /* the stop frame on the wire is the real signal */
+    postJson(`/api/sessions/${sessionId}/interrupt`).catch((e) => {
+      toast(`Could not stop the turn: ${e.message}`, { kind: 'error' });
     });
   }
 
@@ -161,13 +214,15 @@ export function mountChat(host, sessionId, ctx = {}) {
         hint: a.hint,
         selected: a.level === autonomy,
         onClick: () => {
-          autonomy = a.level;
-          autoPill.querySelector('.lbl').textContent = a.label;
-          autoPill.dataset.lv = a.level;
-          model.apply({ type: 'autonomy', level: a.level });
-          postJson(`/api/sessions/${sessionId}/autonomy`, { level: a.level }).catch((err) =>
-            toast(`autonomy change failed: ${err.message}`, { kind: 'error' }),
-          );
+          postJson(`/api/sessions/${sessionId}/autonomy`, { level: a.level })
+            .then(() => {
+              if (dead) return;
+              autonomy = a.level;
+              autoPill.querySelector('.lbl').textContent = a.label;
+              autoPill.dataset.lv = a.level;
+              model.apply({ type: 'autonomy', level: a.level });
+            })
+            .catch((err) => toast(`autonomy change failed: ${err.message}`, { kind: 'error' }));
         },
       })),
       { x: r.left, y: r.bottom + 4 },
@@ -223,6 +278,16 @@ export function mountChat(host, sessionId, ctx = {}) {
       url,
       onEvent,
       (state, detail) => {
+        connection = state;
+        connectionLabel.dataset.state = state;
+        connectionLabel.textContent = state === ConnState.OPEN
+          ? 'Connected to Shadow'
+          : state === ConnState.RECONNECTING
+            ? 'Reconnecting to Shadow… Your draft is kept.'
+            : state === ConnState.DEAD
+              ? 'Connection closed. Open the access link from your terminal again; your draft is kept.'
+              : 'Connecting to Shadow…';
+        syncComposer();
         if (state === ConnState.DEAD) {
           model.apply({ type: 'error', message: `stream lost — ${detail ?? 'closed'}` });
           render();
@@ -265,27 +330,41 @@ export function mountChat(host, sessionId, ctx = {}) {
     .then(({ sessions }) => {
       if (dead) return;
       const s = (sessions ?? []).find((x) => x.id === sessionId);
-      if (!s) return;
+      if (!s) {
+        connectionLabel.textContent = 'This session is no longer available. Start a new session from the sidebar.';
+        return;
+      }
+      sessionReady = true;
       canPrompt = s.canPrompt !== false;
       canInterrupt = s.canInterrupt !== false;
       if (!canPrompt) {
-        ta.disabled = true;
-        ta.placeholder = 'Read-only mirror — the terminal drives this session';
         autoPill.style.display = 'none';
+        hero.querySelector('.hello').textContent = s.origin === 'local' ? 'Ready when you are.' : 'Your terminal, in view.';
+        hero.querySelector('.sub').textContent = s.origin === 'local'
+          ? 'Start a session in this project to work with your model. Manage your endpoints in Settings.'
+          : 'This view follows your terminal. Start a separate session to work from the browser.';
+        hero.querySelector('.chips').replaceChildren(
+          el('button', { class: 'btn btn-primary', onClick: () => ctx.onNewSession?.() }, ['Start a session']),
+          el('button', { class: 'btn btn-ghost', onClick: () => ctx.onSettings?.() }, ['Settings']),
+        );
       }
       autonomy = s.autonomy ?? autonomy;
       autoPill.dataset.lv = autonomy;
       const known = AUTONOMY.find((a) => a.level === autonomy);
       autoPill.querySelector('.lbl').textContent = known ? known.label : autonomy;
+      syncComposer();
     })
-    .catch(() => {
-      /* the composer stays live; a 409 on submit will say the rest */
+    .catch((e) => {
+      if (!dead) toast(`Could not load this session. Reload to reconnect. ${e.message}`, { kind: 'error' });
     });
 
+  syncComposer();
+  autosize();
   render();
 
   return {
     unmount() {
+      saveDraft(sessionId, ta.value);
       dead = true;
       stream?.close();
       transcript.destroy();

@@ -16,6 +16,9 @@ import {
   caretNeedsOwnRow,
   composerPaintRows,
   moveCursorVertical,
+  cursorDisplayColumn,
+  composerViewport,
+  clickComposerCursor,
 } from '../src/tui/composer.js';
 import { Composer } from '../src/tui.js';
 import { displayWidth } from '../src/util/width.js';
@@ -123,4 +126,39 @@ test('Composer paint: caret under an emoji is the whole cluster, not half', () =
   // No lone-surrogate mojibake (the old slice(col, col+1) emitted half the emoji).
   assert.ok(!frame.includes('�'), 'no replacement char from a split cluster');
   r.unmount();
+});
+
+test('caret overflow respects a one-row viewport and stays beside its hard line', () => {
+  const text = 'abcdefgh\nlater';
+  const one = composerViewport(text, 8, 8, 1);
+  assert.equal(one.lines.length, 1);
+  assert.equal(one.caretRow, 0);
+  assert.equal(composerPaintRows(text, 8, 8, 1), 1);
+  const full = composerViewport(text, 8, 8, 8);
+  assert.deepEqual(full.lines, ['abcdefgh', '', 'later']);
+  assert.equal(full.caretRow, 1, 'caret belongs before the next hard line, not below it');
+  assert.equal(clickComposerCursor(text, 8, 1, 0, 8, 8), 8, 'clicking synthetic caret row retains source position');
+  assert.equal(clickComposerCursor(text, 8, 2, 2, 8, 8), 11, 'rows below synthetic caret map correctly');
+});
+
+test('vertical movement preserves display columns and never splits emoji clusters', () => {
+  const text = 'abcd\n你😀e\nabcdef';
+  const down = moveCursorVertical(text, 4, 1, 20);
+  assert.equal(down, 8, 'four columns is two whole wide clusters');
+  assert.equal(cursorDisplayColumn(text, down, 20), 4);
+  assert.equal(moveCursorVertical(text, down, 1, 20, 4), 14);
+  const family = 'a\n👨‍👩‍👧‍👦z';
+  assert.equal(moveCursorVertical(family, 1, 1, 20), 2, 'one column cannot land inside a wide cluster');
+});
+
+test('every viewport stays within budget through wrapping, resizing and caret motion', () => {
+  const text = 'Hello world 👨‍👩‍👧‍👦 你好\n\n' + 'longword'.repeat(12);
+  for (const width of [8, 13, 40]) for (const cap of [1, 2, 8]) {
+    for (let cursor = 0; cursor <= text.length; cursor++) {
+      const win = composerViewport(text, cursor, width, cap);
+      assert.ok(win.lines.length <= cap);
+      assert.ok(win.caretRow >= 0 && win.caretRow < win.lines.length);
+      assert.equal(composerPaintRows(text, cursor, width, cap), win.lines.length);
+    }
+  }
 });

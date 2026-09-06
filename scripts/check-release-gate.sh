@@ -123,7 +123,7 @@ if [ -f package.json ] && [ -f README.md ]; then
   # FIRST vX.Y.Z token on the line is authoritative: the line may recount prior versions later
   # (a greedy match would extract the last one and pass a stale build). Keep the current
   # version first: `Current build: vX.Y.Z — …`.
-  README_VER="$(grep -m1 'Current build:' README.md | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 | cut -c2-)"
+  README_VER="$(grep -m1 'Current build:' README.md | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n 1 | cut -c2- || true)"
   if [ -z "$PKG_VER" ] || [ -z "$README_VER" ] || [ "$PKG_VER" != "$README_VER" ]; then
     echo "RELEASE BLOCKED (1.6): README 'Current build' does not match package.json." >&2
     echo "  package.json: ${PKG_VER:-<unreadable>}" >&2

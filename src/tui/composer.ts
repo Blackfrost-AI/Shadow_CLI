@@ -189,8 +189,14 @@ export function rowColToCursor(text: string, row: number, col: number, innerWidt
   return starts[r]! + c;
 }
 
+/** The caret's terminal column, not its UTF-16 offset (emoji and CJK occupy different widths). */
+export function cursorDisplayColumn(text: string, cursor: number, innerWidth: number): number {
+  const { row, col } = cursorToRowCol(text, cursor, innerWidth);
+  return displayWidth(layoutComposer(text, innerWidth).lines[row]!.slice(0, col));
+}
+
 /** Move the caret up/down one visual row, preserving column when possible. `goalCol` (optional,
- *  source-unit column) overrides the caret's own column — the goal-column memory behind a run of
+ *  display column) overrides the caret's own column — the goal-column memory behind a run of
  *  ↑/↓ keys: passing over a SHORT row clamps the caret, and without the memory the next move
  *  would aim from the clamp instead of the column the run started from (readline semantics). */
 export function moveCursorVertical(
@@ -200,11 +206,11 @@ export function moveCursorVertical(
   innerWidth: number,
   goalCol?: number,
 ): number {
-  const { row, col } = cursorToRowCol(text, cursor, innerWidth);
+  const { row } = cursorToRowCol(text, cursor, innerWidth);
   const { lines } = layoutComposer(text, innerWidth);
   const next = row + dir;
   if (next < 0 || next >= lines.length) return cursor; // no move (caller may do history)
-  return rowColToCursor(text, next, goalCol ?? col, innerWidth);
+  return clickToCursor(text, next, goalCol ?? cursorDisplayColumn(text, cursor, innerWidth), innerWidth);
 }
 
 /** True when the caret is on the first visual row (↑ may fall through to history). */
@@ -240,15 +246,43 @@ export function composerPaintRows(
   innerWidth: number,
   maxRows: number,
 ): number {
-  const { lines } = layoutComposer(text, innerWidth);
-  const total = Math.max(1, lines.length);
-  const cap = Math.max(1, maxRows);
-  const win = Math.min(cap, total);
+  return composerViewport(text, cursor, innerWidth, maxRows).lines.length;
+}
+
+/** One paint plan for rendering, height budgeting and mouse hit-testing. Insert the caret's
+ * overflow row BEFORE windowing: appending it afterwards put it below unrelated hard lines
+ * and exceeded the height budget when a split terminal could spare only one input row. */
+export function composerViewport(text: string, cursor: number, innerWidth: number, maxRows: number) {
+  const layout = layoutComposer(text, innerWidth);
   const { row, col } = cursorToRowCol(text, cursor, innerWidth);
-  const line = lines[Math.min(row, total - 1)] ?? '';
-  if (!caretNeedsOwnRow(line, col, innerWidth)) return win;
-  if (win === cap && win > 1) return win; // window yields one row for the caret → net unchanged
-  return win + 1; // floor (win 1) or uncapped (total < maxRows): caret row painted on top
+  const lines = [...layout.lines];
+  const sourceRows = lines.map((_, i) => i);
+  let caretRow = row;
+  let caretCol = col;
+  if (caretNeedsOwnRow(lines[row]!, col, innerWidth)) {
+    lines.splice(row + 1, 0, '');
+    sourceRows.splice(row + 1, 0, -1); // synthetic caret-only row
+    caretRow++;
+    caretCol = 0;
+  }
+  const cap = Math.max(1, Math.floor(maxRows));
+  const offset = Math.min(Math.max(0, caretRow - Math.floor(cap / 2)), Math.max(0, lines.length - cap));
+  return {
+    lines: lines.slice(offset, offset + cap),
+    sourceRows: sourceRows.slice(offset, offset + cap),
+    offset,
+    totalRows: lines.length,
+    caretRow: caretRow - offset,
+    caretCol,
+  };
+}
+
+export function clickComposerCursor(
+  text: string, cursor: number, localRow: number, localCol: number, innerWidth: number, maxRows: number,
+): number {
+  const win = composerViewport(text, cursor, innerWidth, maxRows);
+  const row = win.sourceRows[Math.max(0, Math.min(win.sourceRows.length - 1, localRow))]!;
+  return row < 0 ? cursor : clickToCursor(text, row, localCol, innerWidth);
 }
 
 /**

@@ -141,6 +141,17 @@ test('ctrl+x then m drives the real dispatch path to chat:openModelPicker', () =
   assert.equal(env.inputRef.current, '', 'M is not typed into the draft');
 });
 
+test('ctrl+x then c dispatches draft copy without inserting the chord into the draft', () => {
+  const kb = realKb();
+  kb.register('chat:copyDraft');
+  const env = makeEnv(kb);
+  env.inputRef.current = 'My original draft';
+  dispatchKey(env, 'x', key({ ctrl: true }));
+  dispatchKey(env, 'c', key());
+  assert.deepEqual(kb.fired, ['chat:copyDraft']);
+  assert.equal(env.inputRef.current, 'My original draft');
+});
+
 test('the external-editor escape survives the chord seeding, and leaves no stale chord behind', () => {
   const kb = realKb();
   kb.register('chat:openModelPicker');

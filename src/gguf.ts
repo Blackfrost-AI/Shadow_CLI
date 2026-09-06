@@ -260,7 +260,9 @@ function positiveInt(value: unknown): number | undefined {
   return typeof n === 'number' && Number.isFinite(n) && n > 0 ? Math.floor(n) : undefined;
 }
 
-function contextValue(value: unknown, depth = 0): number | undefined {
+/** Best-effort context-window extraction from a served-models JSON blob (max_model_len,
+ *  context_length, …). Exported for the web endpoint harness (per-model context chips). */
+export function contextValue(value: unknown, depth = 0): number | undefined {
   if (depth > 5 || value === null || typeof value !== 'object') return undefined;
   if (Array.isArray(value)) {
     for (const item of value) {

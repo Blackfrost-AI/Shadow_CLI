@@ -23,8 +23,8 @@ export function formatWebBoot(server: Pick<WebServerHandle, 'port' | 'url'>): st
     `\nShadow web UI — http://127.0.0.1:${server.port}\n` +
     `  ${server.url}\n` +
     `  ${openCommand()} "${server.url}"\n` +
-    'Loopback only. The token in that URL is required; requests from any other\n' +
-    'host or origin are refused. Nothing leaves this machine.\n\n'
+    'The console is accessible on this machine only. Keep its access link private.\n' +
+    'Model requests go to your configured endpoint; web tools and integrations may use the network.\n\n'
   );
 }
 
@@ -48,7 +48,15 @@ export async function runWeb(opts: RunWebOptions): Promise<void> {
   }
 
   const bus = opts.bus ?? new EventBus();
-  const server = await startWebServer({ bus, port: opts.port });
+  let server: WebServerHandle;
+  try {
+    server = await startWebServer({ bus, port: opts.port });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EADDRINUSE') {
+      throw new Error(`Port ${opts.port} is already in use. Choose another with --port, or omit --port for an available one.`);
+    }
+    throw error;
+  }
 
   opts.write(formatWebBoot(server));
   opts.write('Ctrl-C to stop.\n');
@@ -56,9 +64,16 @@ export async function runWeb(opts: RunWebOptions): Promise<void> {
   if (opts.open !== false) openBrowser(server.url);
 
   await new Promise<void>((resolve) => {
+    let stopping = false;
     const stop = (): void => {
+      if (stopping) return;
+      stopping = true;
       opts.write('\nStopping web UI…\n');
-      void server.close().then(resolve);
+      void server.close().then(() => {
+        process.removeListener('SIGINT', stop);
+        process.removeListener('SIGTERM', stop);
+        resolve();
+      });
     };
     process.once('SIGINT', stop);
     process.once('SIGTERM', stop);
@@ -66,6 +81,8 @@ export async function runWeb(opts: RunWebOptions): Promise<void> {
 }
 
 /** Parse `shadow web [--port N] [--no-open]`. */
+export const WEB_USAGE = 'Usage: shadow web [--port 1-65535] [--no-open]\n\nOpens the local browser console. --no-open prints the link without opening a browser.\nThe listener binds to 127.0.0.1; remote access requires an SSH tunnel.';
+
 export function parseWebArgs(argv: string[]): { port?: number; open: boolean } {
   let port: number | undefined;
   let open = true;
@@ -73,12 +90,17 @@ export function parseWebArgs(argv: string[]): { port?: number; open: boolean } {
     const a = argv[i];
     if (a === '--no-open') open = false;
     else if (a === '--port') {
-      const n = Number(argv[++i]);
-      if (Number.isInteger(n) && n > 0 && n < 65536) port = n;
+      port = parsePort(argv[++i]);
     } else if (a.startsWith('--port=')) {
-      const n = Number(a.slice(7));
-      if (Number.isInteger(n) && n > 0 && n < 65536) port = n;
-    }
+      port = parsePort(a.slice(7));
+    } else throw new Error(`Unknown web option: ${a}\n${WEB_USAGE}`);
   }
   return { port, open };
+}
+
+function parsePort(value: string | undefined): number {
+  if (!value || !/^\d+$/.test(value) || Number(value) < 1 || Number(value) > 65535) {
+    throw new Error('Invalid --port. Use a number from 1 to 65535, or omit --port for an available one.');
+  }
+  return Number(value);
 }

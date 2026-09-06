@@ -2,7 +2,9 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, statSync } from 'node:fs';
 import { platform } from 'node:os';
 import { join } from 'node:path';
-import { loadConfig, resolveApiKey, resolveAuthToken } from './config.js';
+import { loadConfig } from './config.js';
+import { providerDiagnostic } from './doctor/provider.js';
+import { vaultExists } from './auth/vault.js';
 import { DEV_UNRESTRICTED } from './buildProfile.js';
 import { GLOBAL_DIR } from './state/globalStore.js';
 import { sandboxConfinement } from './safety/sandbox.js';
@@ -26,16 +28,23 @@ export interface DoctorReport {
   layout?: LayoutRow[];
 }
 
+/** Matches package.json engines; standalone binaries use their bundled Bun runtime. */
+export function runtimeSupported(version: string): boolean {
+  const [major = 0, minor = 0] = version.split('.').map(Number);
+  return major > 22 || (major === 22 && minor >= 19);
+}
+
 /** Run environment diagnostics (Claude `/doctor` parity baseline). */
 export function runDoctor(cwd: string): DoctorReport {
   const checks: DoctorCheck[] = [];
 
-  const nodeMajor = Number(process.versions.node.split('.')[0]);
   checks.push({
     id: 'node',
-    ok: nodeMajor >= 20,
+    ok: Boolean(process.versions.bun) || runtimeSupported(process.versions.node),
     severity: 'error',
-    detail: `Node ${process.versions.node} (require ≥20)`,
+    detail: process.versions.bun
+      ? `Bundled Bun ${process.versions.bun} — no separate Node installation needed`
+      : `Node ${process.versions.node} (require ≥22.19.0)`,
   });
 
   let rgOk = false;
@@ -121,7 +130,9 @@ export function runDoctor(cwd: string): DoctorReport {
       id: 'credentials',
       ok: true,
       severity: 'info',
-      detail: 'no credentials.json yet — run `shadow onboard`',
+      detail: vaultExists()
+        ? 'encrypted credential vault present'
+        : 'no stored credentials — keyless model servers do not need them',
     });
   }
 
@@ -138,13 +149,12 @@ export function runDoctor(cwd: string): DoctorReport {
     return finalize(checks);
   }
 
-  const hasProvider =
-    cfg.provider === 'mock' || Boolean(resolveApiKey(cfg.provider) || resolveAuthToken(cfg.provider));
+  const provider = providerDiagnostic(cfg);
   checks.push({
     id: 'provider',
-    ok: hasProvider,
-    severity: hasProvider ? 'info' : 'warn',
-    detail: hasProvider ? `provider ${cfg.provider} / ${cfg.model}` : 'no API credentials — run `shadow onboard`',
+    ok: provider.ok,
+    severity: provider.ok ? 'info' : 'warn',
+    detail: provider.detail,
   });
 
   const mcpNames = Object.keys(cfg.mcpServers ?? {});

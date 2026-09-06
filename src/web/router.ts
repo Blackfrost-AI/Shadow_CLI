@@ -5,6 +5,7 @@ import { loadGlobalMcpServers } from '../mcp/manage.js';
 import type { AutonomyLevel } from '../safety/permissions.js';
 import type { ModelEntry } from '../config.js';
 import { registerModelsRoutes, mask as maskModel } from './api/models.js';
+import { registerEndpointsRoutes } from './api/endpoints.js';
 import { registerAgentsRoutes } from './api/agents.js';
 import { registerMcpRoutes, maskConfig as maskMcp } from './api/mcp.js';
 import { registerSessionsRoutes } from './api/sessions.js';
@@ -154,6 +155,7 @@ export function createApiRouter(ctx: ApiContext): Dispatch {
 
   registerStateRoutes(route, ctx);
   registerModelsRoutes(route, ctx);
+  registerEndpointsRoutes(route, ctx);
   registerAgentsRoutes(route, ctx);
   registerMcpRoutes(route, ctx);
   registerSessionsRoutes(route, ctx);

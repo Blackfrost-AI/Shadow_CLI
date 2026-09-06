@@ -34,6 +34,13 @@ test('auth (401/403) → re-key / onboard hint', () => {
   assert.match(providerErrorHint('http_403: forbidden')!, /key|onboard|login/i);
 });
 
+test('auth guidance checks credential routing without blaming an unrelated provider', () => {
+  const hint = providerErrorHint('http_401: token expired or incorrect')!;
+  assert.match(hint, /\/provider/);
+  assert.match(hint, /Model-specific credentials take priority/);
+  assert.doesNotMatch(hint, /ANTHROPIC_API_KEY|override the saved config/);
+});
+
 test('rate limit / overloaded / server / timeout / content-filter each get a distinct hint', () => {
   assert.match(providerErrorHint('http_429: rate limit exceeded')!, /rate-limit|quota|\/model/i);
   assert.match(providerErrorHint('overloaded_error: Overloaded')!, /overload|retr|\/model/i);

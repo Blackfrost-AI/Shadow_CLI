@@ -333,6 +333,38 @@ body.is-dragging * {
 .sb-item:hover .x {
   visibility: visible;
 }
+.sb-item:focus-within .x {
+  visibility: visible;
+}
+.sb-session-open {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+  flex: 1;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.connection-status {
+  flex: none;
+  padding: 8px 20px;
+  border-bottom: 1px solid var(--sw-border-1);
+  font: var(--sw-f-xs);
+  color: var(--sw-t-secondary);
+  background: var(--sw-bg-layer-1);
+}
+.connection-status[data-state='open'] {
+  color: var(--sw-t-caption);
+  background: transparent;
+}
+.connection-status[data-state='dead'] {
+  color: var(--sw-error);
+}
 
 .sb-foot {
   display: flex;
@@ -1409,11 +1441,89 @@ body[data-sb='collapsed'] .sb-foot {
   height: min(700px, 88vh);
   max-height: none;
 }
+.settings-trigger {
+  min-height: 44px;
+  min-width: 44px;
+  gap: 8px;
+  padding: 0 14px;
+}
+.icon-btn.settings-close { width: 44px; height: 44px; }
+.model-card {
+  border: 1px solid var(--sw-border-1);
+  border-radius: 12px;
+  padding: 4px 16px 16px;
+  margin: 16px 0;
+  background: var(--sw-bg-layer-1);
+}
+.model-card .set-row { flex-wrap: wrap; border: 0; }
+.model-card .set-row > div:last-child { flex-wrap: wrap; }
+.model-card .hint { overflow-wrap: anywhere; }
+.model-card .btn, .set-pane .input, .set-pane .btn { min-height: 40px; }
+.model-test-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.model-probe-result {
+  margin-top: 12px;
+  padding: 12px;
+  border-radius: 8px;
+  background: var(--sw-hover);
+  font: var(--sw-f-s);
+  overflow-wrap: anywhere;
+}
+.model-probe-result[data-state='error'] { color: var(--sw-error); }
+.model-probe-result[data-state='ok'] { color: var(--sw-success); }
+.model-probe-result[hidden] { display: none !important; }
+/* Endpoints pane — quick-pick chip row (Ollama, llama.cpp, vLLM, LM Studio, SGLang…) */
+.ep-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.ep-chips:empty { display: none; }
+.model-editor { margin-top: 16px; border-top: 1px solid var(--sw-border-1); padding-top: 16px; }
+.model-editor input[type='checkbox'] { width: 20px; height: 20px; }
+.model-editor [hidden] { display: none !important; }
 .set-grid {
   display: grid;
   grid-template-columns: 208px minmax(0, 1fr);
   flex: 1;
   min-height: 0;
+}
+
+/* Keep the conversation usable on a phone; expanded navigation overlays it. */
+@media (max-width: 640px) {
+  .app-frame,
+  body[data-det='off'] .app-frame {
+    grid-template-columns: 56px minmax(0, 1fr);
+  }
+  .gutter, .det { display: none !important; }
+  .sb { grid-column: 1; grid-row: 1; }
+  .con { grid-column: 2; grid-row: 1; }
+  body[data-sb='expanded'] .sb {
+    position: absolute;
+    inset: 0 auto 0 0;
+    width: min(300px, calc(100vw - 48px));
+    z-index: 30;
+    box-shadow: 8px 0 32px rgb(0 0 0 / 18%);
+  }
+  .sb-item .x { visibility: visible; }
+  .con-head { flex-wrap: wrap; padding: 12px; gap: 8px; }
+  .connection-status { padding: 8px 12px; overflow-wrap: anywhere; }
+  .tl-hero { padding: 24px 16px; }
+  .composer { padding: 8px 10px max(12px, env(safe-area-inset-bottom)); }
+  .ta { font-size: 16px; }
+  .modal.set { width: 100vw; height: 100dvh; border-radius: 0; }
+  .set-grid { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .modal.set .set-nav { flex-direction: row; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--sw-border-1); }
+  .set-form-row { flex-direction: column; }
+  .set-form-row .field { width: 100%; }
+  .set-row { flex-wrap: wrap; }
+  .model-card .set-row { flex-direction: column; align-items: stretch; }
+  .model-card .set-row > div:last-child { max-width: 100%; }
+  .modal.set .set-pane { padding: 20px 16px; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
 }
 .set-nav {
   border-right: 1px solid var(--sw-border-1);
@@ -1436,6 +1546,7 @@ body[data-sb='collapsed'] .sb-foot {
   cursor: pointer;
   text-align: left;
   white-space: nowrap;
+  min-height: 44px;
 }
 .set-item:hover {
   background: var(--sw-hover);

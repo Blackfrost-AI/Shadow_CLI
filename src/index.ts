@@ -39,7 +39,7 @@ import {
 import { defaultModelPatch, findModelPreset } from './config/modelPresets.js';
 import type { Message } from './provider/provider.js';
 import { runWebOnboard } from './onboard/webOnboard.js';
-import { runWeb, parseWebArgs } from './web/cli.js';
+import { runWeb, parseWebArgs, WEB_USAGE } from './web/cli.js';
 import { runLock, CLI_HOLDER } from './web/runLock.js';
 import { updateInstalledBinary } from './update/binary.js';
 import { ensureVaultReady } from './auth/unlock.js';
@@ -981,6 +981,10 @@ async function main(): Promise<void> {
     return;
   }
   if (argv[0] === 'web') {
+    if (argv.includes('--help') || argv.includes('-h')) {
+      stdout.write(WEB_USAGE + '\n');
+      return;
+    }
     const { port, open } = parseWebArgs(argv.slice(1));
     await runWeb({ write: (s) => stdout.write(s), port, open });
     return;

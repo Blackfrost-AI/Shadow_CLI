@@ -24,7 +24,7 @@ import { EventBus, type StopReasonExt } from './agent/events.js';
 import { Budget } from './agent/budget.js';
 import { maybeNotifyUpdate } from './update/checkUpdate.js';
 import { providerErrorHint } from './util/errorHints.js';
-import { isBigPaste, expandPastes, prunePastes, PASTE_CAP, visibleComposerWindow, clickToCursor, parseSgrMouse, lastKeySequence, historySearchPrompt, type HistorySearchState, COMPOSER_MAX_VISIBLE_ROWS, COMPOSER_GUTTER, composerPaintRows } from './tui/composer.js';
+import { isBigPaste, expandPastes, prunePastes, PASTE_CAP, composerViewport, clickComposerCursor, parseSgrMouse, lastKeySequence, historySearchPrompt, type HistorySearchState, COMPOSER_MAX_VISIBLE_ROWS, COMPOSER_GUTTER, composerPaintRows } from './tui/composer.js';
 import { withSynchronizedOutput } from './tui/syncOutput.js';
 import { recommendedIndex, defaultQuestionSelection, buildQuestionAnswers, buildAutoAnswers, type QuestionSelection } from './tui/questions.js';
 import { fetchRemoteImage, imageMediaType, MAX_IMAGE_BYTES } from './util/image.js';
@@ -1054,23 +1054,23 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // raw tap below; if the terminal never answers we fall back to the bottom-anchored estimate.
   const pendingClickRef = useRef<{ x: number; y: number; token: number } | null>(null);
   const clickTokenRef = useRef(0);
+  const composerRowLimitRef = useRef(COMPOSER_MAX_VISIBLE_ROWS);
   /** Turn a click at 1-based cell (x, y) into a caret, given the cursor's resting row (1-based). */
   const resolveClick = useCallback(
     (x: number, y: number, restingRow: number) => {
       const below = belowComposerRef.current;
       if (below < 0) return; // a menu/overlay owns the rows under the composer
       const cols = process.stdout.columns ?? 80;
-      const rows = process.stdout.rows ?? 24;
       const inner = Math.max(8, cols - COMPOSER_GUTTER - PAGE_MARGIN * 2);
-      const winMax = Math.max(1, Math.min(COMPOSER_MAX_VISIBLE_ROWS, rows - 3));
-      const win = visibleComposerWindow(inputRef.current, cursorRef.current, inner, winMax);
+      const winMax = composerRowLimitRef.current;
+      const win = composerViewport(inputRef.current, cursorRef.current, inner, winMax);
       // restingRow = frameLastRow + 1; frameLastRow = lastInputRow + below (bottom rule + hint + custom)
       const lastInputRow = restingRow - 1 - below;
       const firstInputRow = lastInputRow - win.lines.length + 1;
       if (y < firstInputRow || y > lastInputRow) return; // clicked outside the input — not a caret move
       const localRow = y - firstInputRow;
       const localCol = Math.max(0, x - 1 - PAGE_MARGIN - COMPOSER_GUTTER);
-      moveCaret(clickToCursor(inputRef.current, localRow, localCol, inner, win.offset));
+      moveCaret(clickComposerCursor(inputRef.current, cursorRef.current, localRow, localCol, inner, winMax));
     },
     [moveCaret],
   );
@@ -1722,6 +1722,19 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
 
   // Alt/Option+C — copy the last answer without reaching for /copy.
   useEffect(() => kbRegister('transcript:copyLastAnswer', () => copyLast('answer')), [kbRegister, copyLast]);
+
+  // Copy the logical draft, including off-screen rows and expanded paste chips. Never scrape
+  // terminal cells: their gutter, padding and visual line breaks do not belong to the message.
+  useEffect(() => kbRegister('chat:copyDraft', () => {
+    const raw = expandPastes(inputRef.current, pastesRef.current);
+    if (!raw) return showToast('Nothing to copy — write a draft first.', 'warn');
+    const safe = redactString(raw);
+    void copyToClipboard(safe).then((ok) => showToast(
+      ok ? `Copied draft${safe !== raw ? ' (secrets redacted)' : ''} — original line breaks preserved`
+        : 'Could not copy draft — check your system clipboard helper.',
+      ok ? 'ok' : 'error',
+    ));
+  }), [kbRegister, showToast]);
 
   // Ctrl+V — paste from the SYSTEM clipboard. Terminal-native paste (Cmd+V / Ctrl+Shift+V)
   // still works and now arrives bracketed; this covers terminals/keyboards where that is
@@ -3397,6 +3410,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     !!(showPlan && planMode.path),
     !!customStatus,
   );
+  composerRowLimitRef.current = maxComposerRows;
   // What will actually paint (window + a borrowed caret-only row when the caret ends a full row),
   // so the frame budget and the Composer component can never disagree about the box height.
   const composerInputRows = composerPaintRows(input, cursor, composerInnerW, maxComposerRows);
@@ -3491,7 +3505,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // is appended ONLY if it still fits. So a narrow terminal drops the hints, never the strip — the
   // v2.9.0 regression where a longer tail silently pushed provider+mode off the row. 'Shift+Enter
   // newline' is not repeated here — it already lives in the empty-composer placeholder.
-  const HINT_TAIL = ' · Shift+Tab mode · / commands';
+  const HINT_TAIL = input ? ' · Ctrl+X C copy draft' : ' · Shift+Tab mode · / commands';
   const idleFixed = displayWidth(attachTag + vimTag) + safetyPrefixCols;
   // The hint row renders inside paddingLeft={PAGE_MARGIN} under wrap="truncate", so its usable
   // width is cols − PAGE_MARGIN, not cols — budget the strip (and the tail fits-check) against

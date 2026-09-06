@@ -79,7 +79,7 @@ function noToken(host) {
       ]),
       el('div', { class: 'kbd', style: 'margin-top:8px;' }, ['$ shadow web']),
       el('div', { class: 'sub', style: 'color:var(--sw-t-caption);font:var(--sw-f-xs);' }, [
-        'The token travels only in the URL fragment — it never reaches the server or leaves this machine.',
+        'The access link authenticates this browser to your local Shadow server. Keep it private.',
       ]),
     ]),
   ]);
@@ -115,6 +115,7 @@ function boot() {
   let mode = 'chat';
   let traj = null;
   let offNotify = null;
+  let activation = 0;
 
   const loadSessions = async () => {
     try {
@@ -128,10 +129,12 @@ function boot() {
 
   const findSession = (id) => sessionRows.find((s) => s.id === id);
 
-  const openSettingsSheet = () =>
+  const openSettingsSheet = (initialPane = 'general') =>
     openSettings({
+      initialPane,
       onProjectsChanged: () => {
         sidebar.refresh();
+        sidebar.loadProjects();
       },
     });
 
@@ -150,6 +153,7 @@ function boot() {
   const sidebar = createSidebar({
     activeId: () => activeId,
     openSession: (id) => {
+      frame.closeOnMobile();
       if (id !== activeId) location.hash = `#/s/${id}`;
     },
     newSession: (projectRoot) => void newSession(projectRoot),
@@ -183,6 +187,7 @@ function boot() {
   };
 
   const activate = async (id) => {
+    const request = ++activation;
     if (chatHandle) {
       chatHandle.unmount();
       chatHandle = null;
@@ -196,6 +201,7 @@ function boot() {
     // A session created moments ago (or by another tab) may not be in the boot-time list yet —
     // without this the header + inspector stay on placeholders until the next full reload.
     if (id && !findSession(id)) await loadSessions();
+    if (request !== activation) return;
     if (id) {
       try {
         localStorage.setItem(LAST_SESSION, id);
@@ -206,10 +212,17 @@ function boot() {
     syncMeta();
     sidebar.refresh();
     if (!id) {
+      const fallback = sessionRows.find((s) => s.canPrompt) ?? sessionRows[0];
+      if (fallback) {
+        location.hash = `#/s/${fallback.id}`;
+        return;
+      }
       details.refresh();
       return;
     }
     chatHandle = mountChat(consolePane.chatHost, id, {
+      onNewSession: () => void newSession(),
+      onSettings: openSettingsSheet,
       onStatus: () => {
         sidebar.refresh();
         syncMeta();
@@ -244,13 +257,20 @@ function boot() {
           (await getJson('/api/projects')).projects?.[0]?.path;
       }
       if (!projectRoot) {
-        toast('no project to open a session in — add one first', { kind: 'error' });
+        openSettingsSheet('projects');
+        toast('Add the project folder you want Shadow to work in, then start a session.');
         return;
       }
       const created = await postJson('/api/sessions', { projectRoot });
+      frame.closeOnMobile();
       sidebar.refresh();
       location.hash = `#/s/${created.id}`;
     } catch (err) {
+      if (err.status === 403) {
+        openSettingsSheet('projects');
+        toast('Add this project folder before starting a session.');
+        return;
+      }
       toast(`new session failed: ${err.message}`, { kind: 'error' });
     }
   };

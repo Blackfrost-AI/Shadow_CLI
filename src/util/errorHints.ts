@@ -39,7 +39,7 @@ export function providerErrorHint(raw: string): string | null {
   }
   // Auth.
   if (code === 'http_401' || code === 'http_403' || has(/invalid api key|incorrect api key|unauthorized|authentication|permission denied|forbidden|missing.*key|no api key/)) {
-    return 'Auth was rejected. Re-check your key or re-run `shadow onboard` (or /login). Env vars (ANTHROPIC_API_KEY, …) override the saved config.';
+    return 'The endpoint rejected the selected credential. Check /provider for the endpoint and key source — a working key can still be linked to the wrong model. Model-specific credentials take priority; environment keys apply only to provider-level fallback. Reconnect the key with `shadow onboard --web` if needed.';
   }
   // Rate limit / quota.
   if (code === 'http_429' || has(/rate limit|too many requests|quota|insufficient_quota|billing/)) {

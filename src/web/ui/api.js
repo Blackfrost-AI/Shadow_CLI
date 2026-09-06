@@ -23,6 +23,21 @@ async function req(path, init) {
       ...(init?.headers ?? {}),
     },
   });
+  if (!r.ok) {
+    let detail = '';
+    try {
+      const body = await r.json();
+      if (typeof body.error === 'string') detail = body.error.slice(0, 500);
+    } catch {
+      // A proxy's HTML error page is not a useful user-facing message.
+    }
+    const message = r.status === 401
+      ? 'Access expired. Open the link printed by `shadow web` again.'
+      : detail || `The server returned HTTP ${r.status}. Try again when it is available.`;
+    const error = new Error(message);
+    error.status = r.status;
+    throw error;
+  }
   return r;
 }
 

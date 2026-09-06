@@ -8,8 +8,7 @@ import { displayWidth, nextCluster } from '../util/width.js';
 import {
   COMPOSER_MAX_VISIBLE_ROWS,
   COMPOSER_GUTTER,
-  visibleComposerWindow,
-  caretNeedsOwnRow,
+  composerViewport,
 } from './composer.js';
 import { flattenItemCached } from './flatten.js';
 import { shortPath } from './format.js';
@@ -167,7 +166,7 @@ export function isChatter(kind: string | undefined): boolean {
 // T1: platform-aware — macOS sends Option+Enter as ESC-prefixed; Linux terminals send Alt+Enter.
 // The composer's newline branch keys on key.meta+return, so the hint names that path (Shift+Enter
 // is deliberately NOT advertised — without CSI-u it sends the message instead of breaking the line).
-const COMPOSER_PLACEHOLDER = `Send a message…  ( / for commands · ${NEWLINE_HINT} newline )`;
+const COMPOSER_PLACEHOLDER = `Send a message…  / commands · ${NEWLINE_HINT} newline`;
 
 /**
  * Multi-row composer: soft-wraps long lines, keeps a real caret on any row, scrolls a window when
@@ -206,15 +205,7 @@ export function Composer({
   const boxW = Math.max(12, cols - PAGE_MARGIN * 2);
   const inner = Math.max(8, boxW - COMPOSER_GUTTER);
   const maxV = Math.max(1, maxRows);
-  let win = visibleComposerWindow(input, caret, inner, maxV);
-  // A caret at the end of a row that exactly fills the width cannot paint inline (wrap="truncate"
-  // would eat the CARET cell, not the text) — it gets its own row below. When the window is AT the
-  // cap it yields one row to host the caret (height stays ≤ maxRows, matching composerPaintRows);
-  // below the cap the extra row simply fits.
-  const needCaretRow = caretNeedsOwnRow(win.lines[win.caretRow] ?? '', win.caretCol, inner);
-  if (needCaretRow && win.lines.length === maxV && maxV > 1) {
-    win = visibleComposerWindow(input, caret, inner, maxV - 1);
-  }
+  const win = composerViewport(input, caret, inner, maxV);
 
   return (
     <Box flexDirection="column" flexShrink={0} width={cols} paddingLeft={PAGE_MARGIN}>
@@ -243,9 +234,11 @@ export function Composer({
           </Text>
         ) : (
           win.lines.map((line, ri) => {
-            const gutter = ri === 0 && win.offset === 0 ? '❯ ' : '  ';
+            const gutter = ri === 0
+              ? win.offset > 0 ? '↑ ' : '❯ '
+              : ri === win.lines.length - 1 && win.offset + win.lines.length < win.totalRows ? '↓ ' : '  ';
             const onCaretRow = ri === win.caretRow;
-            if (!onCaretRow || needCaretRow) {
+            if (!onCaretRow) {
               return (
                 <Text key={ri} wrap="truncate">
                   <Text color={C.dim}>{gutter}</Text>
@@ -275,13 +268,6 @@ export function Composer({
             );
           })
         )}
-        {needCaretRow && !empty ? (
-          // The borrowed caret row: continuation indent + the inverse cell alone.
-          <Text wrap="truncate">
-            <Text color={C.dim}>{'  '}</Text>
-            <Text inverse> </Text>
-          </Text>
-        ) : null}
       </Box>
       {showHint ? (
         <Text wrap="truncate" color={C.dim}>

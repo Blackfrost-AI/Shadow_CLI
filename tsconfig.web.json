@@ -1,4 +1,20 @@
 {
+  // Transpiles an allowlisted slice of src/util into browser ESM under src/web/ui/vendor/,
+  // so the web console can render markdown, syntax highlighting and diffs using the SAME
+  // implementations the TUI uses — rather than shipping marked/highlight.js/jsdiff.
+  //
+  // This is a build STEP, not a bundler: no dependencies, no module graph rewriting, and it
+  // uses the tsc already in the repo. The three files qualify only because they are pure,
+  // dependency-free, renderer-agnostic structured-data producers (MdBlock[] / CodeSpan[] /
+  // DiffLine[]) that emit no ANSI and import nothing — which is exactly why Ink can consume
+  // them and why DOM can too.
+  //
+  // Do NOT widen `files` casually. Anything that imports node: builtins, touches the
+  // filesystem, or reaches config will not run in a browser. Adding a fourth file is an
+  // architectural decision.
+  //
+  // Regenerate via `npm run build:webui-vendor` (scripts/check-webui-assets.mjs also runs it,
+  // so a stale vendor/ fails the release gate).
   "compilerOptions": {
     "target": "ES2022",
     "module": "ES2022",

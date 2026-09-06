@@ -40,7 +40,7 @@ let toastHost = null;
  */
 export function toast(text, { kind = 'info', ms } = {}) {
   if (!toastHost) {
-    toastHost = el('div', { class: 'toast-wrap' });
+    toastHost = el('div', { class: 'toast-wrap', role: 'status', 'aria-live': 'polite', 'aria-atomic': 'false' });
     document.body.append(toastHost);
   }
   const t = el('div', { class: kind === 'error' ? 'toast is-error' : 'toast' }, [String(text)]);

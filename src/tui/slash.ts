@@ -27,7 +27,7 @@ import type { TodoItem } from '../agent/todo.js';
 import { buildCodexAuthUrl, clearSubAuth, getSubAuth, importOfficialCredential, type SubProvider } from '../auth/index.js';
 import { vaultExists } from '../auth/vault.js';
 import { addModelPreset, defaultModelPatch, findModelPreset, parseModelAddArgs, removeModelPreset, setModelPresetEnabled, splitPresetArgs } from '../config/modelPresets.js';
-import { persistPermissionRules, resolveApiKey, resolveAuthToken, resolveBaseUrl, resolveEntryCredential, type ModelEntry } from '../config.js';
+import { persistPermissionRules, resolveBaseUrl, resolveEntryCredential, type ModelEntry } from '../config.js';
 import { formatDoctorReport, runDoctor } from '../doctor.js';
 import { runModelCheck } from '../doctor/modelCheck.js';
 import { ensureLocalServer, isLocalServedEntry } from '../gguf.js';
@@ -285,6 +285,7 @@ function helpLines(topic: HelpTopic): BannerLine[] {
       { text: 'Keyboard shortcuts', color: C.cyan, bold: true },
       { text: 'Compose', color: C.purple, bold: true },
       { text: `  Enter send  ·  ${NEWLINE_HINT} newline  ·  Ctrl+V paste  ·  Ctrl+R search history`, dimColor: true },
+      { text: '  Ctrl+X then C copies the draft without terminal padding or soft-wrap breaks.', dimColor: true },
       { text: '  ↑/↓ move through a multi-line draft; at its edges they browse history.', dimColor: true },
       { text: 'Navigate', color: C.purple, bold: true },
       { text: '  / opens commands  ·  ↑/↓ select  ·  Tab completes  ·  Esc closes', dimColor: true },
@@ -884,8 +885,17 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
     case '/provider': {
       const target = activeTargetRef.current;
       const baseUrl = target.baseUrl;
-      const hasApiKey = Boolean(resolveApiKey(currentRef.current.provider, { model: currentRef.current.model }));
-      const hasAuthToken = Boolean(resolveAuthToken(currentRef.current.provider));
+      const matches = (m: ModelEntry) => m.provider === currentRef.current.provider && m.model === currentRef.current.model;
+      const entry = opts.cfg.models?.find((m) => matches(m) && m.label === opts.cfg.lastModel)
+        ?? opts.cfg.models?.find((m) => matches(m) && resolveBaseUrl(m.provider, m.baseUrl) === baseUrl);
+      const credential = resolveEntryCredential(entry ?? { provider: currentRef.current.provider }, { vaultIsLocked: vaultExists() && !vaultUnlocked() });
+      const hasApiKey = credential.ok && Boolean(credential.apiKey);
+      const hasAuthToken = credential.ok && Boolean(credential.authToken);
+      const envName = currentRef.current.provider === 'anthropic' ? 'ANTHROPIC_API_KEY' : 'OPENAI_API_KEY';
+      const source = !credential.ok ? `model credential ${credential.reason}`
+        : credential.source === 'credRef' ? `model vault slot: ${entry?.credRef}`
+          : credential.source === 'inline' ? 'model-specific key'
+            : process.env[envName] ? envName : `shared provider slot: ${currentRef.current.provider} (check this key belongs to the endpoint)`;
       const total = opts.cfg.models?.length ?? 0;
       const disabled = opts.cfg.models?.filter((m) => m.disabled).length ?? 0;
       pushLine({
@@ -898,6 +908,7 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
             ? [{ text: `temperature: ${formatTemperature(opts.cfg.temperature ?? 1.0)} · self-hosted sampling`, dimColor: true }]
             : []),
           { text: `auth: api key ${hasApiKey ? 'present' : 'missing'} · bearer ${hasAuthToken ? 'present' : 'missing'}`, dimColor: true },
+          { text: `configured credential source: ${source}`, dimColor: true },
           { text: `presets: ${total} configured${disabled ? ` · ${disabled} disabled` : ''}`, dimColor: true },
           { text: 'Commands: /model list · /model add · /model use <label> · /model default <label>', dimColor: true },
         ],

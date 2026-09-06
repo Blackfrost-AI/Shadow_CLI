@@ -1,6 +1,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { readJsonBody, type ApiContext, type RouteFn } from '../router.js';
-import { loadGlobalConfig, saveGlobalConfig, vaultUnlocked } from '../../state/globalStore.js';
+import { loadGlobalConfig, saveGlobalConfig, vaultUnlocked, setUnlockedVault, type CredentialEntry } from '../../state/globalStore.js';
+import { randomUUID } from 'node:crypto';
 import {
   addModelPreset,
   removeModelPreset,
@@ -8,8 +9,10 @@ import {
   findModelPreset,
   defaultModelPatch,
 } from '../../config/modelPresets.js';
-import { ModelEntrySchema } from '../../config.js';
-import { migratePresetKeysIntoVault } from '../../auth/credRefMigrate.js';
+import { ModelEntrySchema, resolveEntryCredential, resolveBaseUrl } from '../../config.js';
+import { getSessionKey } from '../../auth/unlock.js';
+import { saveSecrets, unlockWithKey, vaultExists } from '../../auth/vault.js';
+import { credentialStatus, endpointLabel, probeModel } from '../modelProbe.js';
 import type { ModelEntry } from '../../config.js';
 
 /**
@@ -18,10 +21,8 @@ import type { ModelEntry } from '../../config.js';
  * `saveGlobalConfig` for persistence. Secrets NEVER appear in a response — `mask()` is the
  * only shape returned over the wire.
  *
- * Credential flow on add: if a key is submitted AND the vault is unlocked, the entry is
- * written with its plaintext key, then `migratePresetKeysIntoVault` seals it into the vault
- * and scrubs the plaintext (the same path startup runs). If the vault is locked, a key
- * submission is refused with a 409 — we never silently store a plaintext key in config.json.
+ * Submitted keys are sealed and verified before config is saved with a credential reference.
+ * Locked-vault submissions are refused; keys never pass through plaintext config files.
  */
 
 /**
@@ -34,13 +35,14 @@ export function mask(entry: ModelEntry): Record<string, unknown> {
     label: entry.label,
     provider: entry.provider,
     model: entry.model,
-    baseUrl: entry.baseUrl ?? null,
+    baseUrl: endpointLabel(entry.baseUrl),
     selfHosted: entry.provider === 'openai' && entry.selfHosted === true,
     fallback: entry.fallback ?? null,
     group: entry.group ?? null,
     disabled: entry.disabled === true,
     hasCredential: Boolean(entry.credRef ?? entry.apiKey ?? entry.authToken),
     credRef: typeof entry.credRef === 'string' ? entry.credRef : undefined,
+    credentialStatus: credentialStatus(entry),
   };
 }
 
@@ -49,11 +51,27 @@ function allEntries(): ModelEntry[] {
   return Array.isArray(cfg.models) ? (cfg.models as ModelEntry[]) : [];
 }
 
-/** Seal any plaintext keys on the given entries into the vault, returning the scrubbed set. */
-function sealKeys(write: (s: string) => void): { sealed: boolean; entries: ModelEntry[] } {
-  if (!vaultUnlocked()) return { sealed: false, entries: allEntries() };
-  migratePresetKeysIntoVault(write);
-  return { sealed: true, entries: allEntries() };
+/** Seal before saving config; never stage a submitted key in plaintext on disk. A fresh slot
+ * also avoids rotating another model's shared credential when editing this preset. */
+function withSealedKey(entry: ModelEntry, apiKey: string): ModelEntry {
+  const key = getSessionKey();
+  if (!vaultUnlocked() || !key) throw new Error('vault-locked: unlock the credential vault in your terminal first');
+  const data = unlockWithKey(key);
+  const slot = `model.${randomUUID()}`;
+  data[slot] = { apiKey, ...(entry.baseUrl ? { baseUrl: entry.baseUrl } : {}) };
+  saveSecrets(data, key);
+  setUnlockedVault(unlockWithKey(key) as Record<string, CredentialEntry>);
+  const { apiKey: _apiKey, authToken: _token, ...safe } = entry;
+  return { ...safe, credRef: slot };
+}
+
+function validEndpoint(value: unknown): boolean {
+  if (value == null || value === '') return true;
+  if (typeof value !== 'string') return false;
+  try {
+    const u = new URL(value);
+    return ['http:', 'https:'].includes(u.protocol) && !u.username && !u.password && !u.search && !u.hash;
+  } catch { return false; }
 }
 
 /**
@@ -61,6 +79,21 @@ function sealKeys(write: (s: string) => void): { sealed: boolean; entries: Model
  * keeps each surface in its own file while the router stays a thin dispatcher.
  */
 export function registerModelsRoutes(route: RouteFn, _ctx: ApiContext): void {
+  let probing = false;
+
+  route('POST', /^\/api\/models\/([^/]+)\/probe$/, async (req, res, match) => {
+    const body = await readJsonBody(req) as { kind?: string } | null;
+    if (body?.kind !== 'endpoint' && body?.kind !== 'response') return { status: 400, body: { error: 'kind must be endpoint | response' } };
+    const entry = findModelPreset(allEntries(), decodeURIComponent(match[1]!));
+    if (!entry) return { status: 404, body: { error: 'Model preset not found' } };
+    if (probing) return { status: 409, body: { error: 'A model test is already running. Wait for it to finish.' } };
+    probing = true;
+    const controller = new AbortController();
+    const cancel = () => controller.abort();
+    res.once('close', cancel);
+    try { return { status: 200, body: await probeModel(entry, body.kind, controller.signal) }; }
+    finally { probing = false; res.off('close', cancel); }
+  });
 
 // ── GET /api/models ──────────────────────────────────────────────────────────
 
@@ -94,7 +127,9 @@ export function registerModelsRoutes(route: RouteFn, _ctx: ApiContext): void {
 
     // Validate the entry shape via the same schema config.ts uses. Strip any incoming credRef —
     // the caller never sets it; it is minted by the vault migration from the label.
-    const { apiKey, ...fields } = body;
+    const { apiKey, credRef: _ref, authToken: _token, ...fields } = body;
+    if (!validEndpoint(fields.baseUrl)) return { status: 400, body: { error: 'Use an HTTP(S) base URL without credentials, a query or a fragment.' } };
+    if (apiKey != null && typeof apiKey !== 'string') return { status: 400, body: { error: 'API key must be text' } };
     const parsed = ModelEntrySchema.safeParse({ ...fields });
     if (!parsed.success) {
       return { status: 400, body: { error: parsed.error.issues[0]?.message ?? 'invalid model' } };
@@ -111,16 +146,12 @@ export function registerModelsRoutes(route: RouteFn, _ctx: ApiContext): void {
       };
     }
 
-    const entry: ModelEntry = { ...parsed.data, ...(hasSecret ? { apiKey: String(apiKey) } : {}) };
+    let entry: ModelEntry = parsed.data;
     const added = addModelPreset(allEntries(), entry);
     if (!added.ok) return { status: 409, body: { error: added.message } };
-    saveGlobalConfig({ models: added.value });
-
-    // Seal the key (if any) into the vault, leaving a credRef pointer. Returns the scrubbed entry.
-    const log: string[] = [];
-    const { entries } = sealKeys((s) => log.push(s.trim()));
-    const saved = findModelPreset(entries, entry.label);
-    return { status: 201, body: { model: saved ? mask(saved) : null, sealed: hasSecret, log } };
+    if (hasSecret) entry = withSealedKey(entry, String(apiKey).trim());
+    saveGlobalConfig({ models: added.value.map((m) => m.label === entry.label ? entry : m) });
+    return { status: 201, body: { model: mask(entry), sealed: hasSecret } };
   });
 
   // ── PATCH /api/models/:label ─────────────────────────────────────────────────
@@ -128,10 +159,42 @@ export function registerModelsRoutes(route: RouteFn, _ctx: ApiContext): void {
 
   route('PATCH', /^\/api\/models\/(.+)$/, async (req: IncomingMessage, _res: ServerResponse, match: RegExpMatchArray) => {
     const label = decodeURIComponent(match[1] ?? '');
-    const body = (await readJsonBody(req)) as { action?: string } | null;
+    const body = (await readJsonBody(req)) as Record<string, unknown> | null;
     const action = body?.action;
+    if (action === 'update' && body) {
+      const entries = allEntries();
+      const old = findModelPreset(entries, label);
+      if (!old) return { status: 404, body: { error: 'Model preset not found' } };
+      if (!validEndpoint(body.baseUrl)) return { status: 400, body: { error: 'Use an HTTP(S) base URL without credentials, a query or a fragment.' } };
+      if (body.apiKey != null && typeof body.apiKey !== 'string') return { status: 400, body: { error: 'API key must be text' } };
+      const parsed = ModelEntrySchema.safeParse({
+        ...old,
+        ...(body.model !== undefined ? { model: body.model } : {}),
+        ...(body.baseUrl !== undefined ? { baseUrl: body.baseUrl || undefined } : {}),
+        ...(body.selfHosted !== undefined ? { selfHosted: body.selfHosted } : {}),
+      });
+      if (!parsed.success) return { status: 400, body: { error: parsed.error.issues[0]?.message ?? 'Invalid model' } };
+      let next = parsed.data;
+      if (next.selfHosted && next.provider !== 'openai') return { status: 400, body: { error: 'selfHosted is only valid for OpenAI-compatible presets' } };
+      const newKey = typeof body.apiKey === 'string' ? body.apiKey.trim() : '';
+      const credential = resolveEntryCredential(old);
+      const hasCredential = Boolean(old.credRef || old.apiKey || old.authToken || (credential.ok && (credential.apiKey || credential.authToken)) || (vaultExists() && !vaultUnlocked()));
+      if (next.baseUrl !== old.baseUrl && hasCredential && !newKey && body.reuseCredential !== true) {
+        return { status: 409, body: { error: 'Confirm reusing the saved credential with the changed endpoint, or provide a new API key.' } };
+      }
+      if (newKey) next = withSealedKey(next, newKey);
+      const cfg = loadGlobalConfig();
+      // Update the saved default's endpoint too, without changing the active sessions.
+      const defaultMatches = cfg.provider === old.provider && cfg.model === old.model
+        && resolveBaseUrl(old.provider, cfg.baseUrl as string | undefined) === resolveBaseUrl(old.provider, old.baseUrl);
+      saveGlobalConfig({
+        models: entries.map((m) => m.label === old.label ? next : m),
+        ...(defaultMatches ? { model: next.model, baseUrl: next.baseUrl, selfHosted: next.selfHosted ?? false } : {}),
+      });
+      return { status: 200, body: { model: mask(next) } };
+    }
     if (action !== 'enable' && action !== 'disable' && action !== 'default') {
-      return { status: 400, body: { error: 'action must be enable | disable | default' } };
+      return { status: 400, body: { error: 'action must be enable | disable | default | update' } };
     }
 
     const entries = allEntries();

@@ -30,7 +30,7 @@ export function createSidebar(ctx) {
   let sessions = [];
 
   // ---- head ------------------------------------------------------------------
-  const btnCollapse = el('button', { class: 'icon-btn', onClick: () => ctx.toggleSidebar() }, ['«']);
+  const btnCollapse = el('button', { class: 'icon-btn', 'aria-label': 'Toggle sidebar', onClick: () => ctx.toggleSidebar() }, ['«']);
   tipOn(btnCollapse, () => 'Toggle sidebar');
   const head = el('div', { class: 'sb-head' }, [
     el('span', { class: 'sb-logo', style: 'color:var(--sw-t-primary);' }, [
@@ -46,6 +46,7 @@ export function createSidebar(ctx) {
     'button',
     {
       class: 'sb-new',
+      'aria-label': 'New session',
       onClick: () => ctx.newSession(),
     },
     [el('span', {}, ['✎']), el('span', { class: 'label' }, ['New session'])],
@@ -95,6 +96,7 @@ export function createSidebar(ctx) {
           'button',
           {
             class: 'icon-btn sm x',
+            'aria-label': `Close ${s.title || 'session'}`,
             onClick: async (e) => {
               e.stopPropagation();
               const ok = await confirmDialog({
@@ -118,13 +120,17 @@ export function createSidebar(ctx) {
           ['✕'],
         );
         return el(
-          'button',
+          'div',
           {
             class: 'sb-item' + (s.id === active ? ' is-active' : ''),
-            onClick: () => ctx.openSession(s.id),
           },
           [
-            busy
+            el('button', {
+              class: 'sb-session-open',
+              'aria-label': s.title || 'Untitled session',
+              'aria-current': s.id === active ? 'page' : undefined,
+              onClick: () => ctx.openSession(s.id),
+            }, [busy
               ? el('span', { class: 'sb-dot' + (s.status === 'error' ? ' err' : ''), style: 'margin-top:8px;' })
               : el('span', { class: 'glyph', style: 'width:16px;text-align:center;color:var(--sw-t-caption);flex:none;' }, [
                   isMirror ? '◆' : '·',
@@ -137,7 +143,8 @@ export function createSidebar(ctx) {
                 s.canPrompt ? '' : 'read-only',
               ]),
             ]),
-            closeBtn,
+            ]),
+            isMirror ? null : closeBtn,
           ],
         );
       }),
@@ -145,9 +152,9 @@ export function createSidebar(ctx) {
   };
 
   // ---- footer --------------------------------------------------------------------
-  const btnTheme = el('button', { class: 'icon-btn', onClick: onTheme }, [themeGlyph()]);
+  const btnTheme = el('button', { class: 'icon-btn', 'aria-label': 'Change theme', onClick: onTheme }, [themeGlyph()]);
   tipOn(btnTheme, () => 'Theme: light / dark / auto');
-  const btnSettings = el('button', { class: 'icon-btn', onClick: () => ctx.openSettings() }, ['⚙']);
+  const btnSettings = el('button', { class: 'btn btn-ghost settings-trigger', 'aria-label': 'Settings', onClick: () => ctx.openSettings('models') }, [el('span', { 'aria-hidden': 'true' }, ['⚙']), el('span', { class: 'label' }, ['Settings'])]);
   tipOn(btnSettings, () => 'Settings');
 
   function onTheme() {

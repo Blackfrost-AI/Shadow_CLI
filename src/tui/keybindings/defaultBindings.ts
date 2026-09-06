@@ -25,6 +25,8 @@ const RAW_DEFAULTS: Record<ContextName, Record<string, string>> = {
     // One-key model switch (1.3): an opencode-style leader chord opens the fuzzy model picker —
     // /model stays the explicit path. The registered handler mirrors /model's idle behavior.
     'ctrl+x m': 'chat:openModelPicker',
+    // Copy source text, not the padded/wrapped terminal rows. Two strokes: Ctrl+X, then C.
+    'ctrl+x c': 'chat:copyDraft',
     up: 'chat:historyPrevious',
     down: 'chat:historyNext',
     escape: 'chat:cancel',

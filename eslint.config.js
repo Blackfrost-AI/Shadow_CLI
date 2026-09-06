@@ -2,7 +2,10 @@ import js from '@eslint/js';
 import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
-  { ignores: ['dist/**', 'node_modules/**', '.tmp/**', 'eval/**/*.mjs', 'src/web/ui/vendor/**', '.claude/**'] },
+  // `overhaul/**` is a nested self-contained clone (git-ignored via /overhaul/, ships its OWN
+  // eslint.config.js) — the root lint must not reach into it, or build-hygiene's "lint exits 0"
+  // gate goes red on files this repo doesn't even track.
+  { ignores: ['dist/**', 'node_modules/**', '.tmp/**', 'eval/**/*.mjs', 'src/web/ui/vendor/**', '.claude/**', 'overhaul/**'] },
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
@@ -70,6 +73,7 @@ export default tseslint.config(
         matchMedia: 'readonly',
         alert: 'readonly',
         confirm: 'readonly',
+        prompt: 'readonly',
       },
     },
   },

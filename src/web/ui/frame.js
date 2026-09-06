@@ -147,6 +147,13 @@ export function createFrame(panes) {
       concessions();
     },
     isSidebarCollapsed: () => sbCollapsed,
+    closeOnMobile() {
+      if (window.innerWidth <= 640) {
+        sbCollapsed = true;
+        sbPinned = false;
+        apply();
+      }
+    },
     /** Show/hide the details pane (the header button). Turning it on clears the override. */
     setDetails(open) {
       detForcedOff = !open;

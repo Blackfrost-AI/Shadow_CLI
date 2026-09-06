@@ -93,6 +93,62 @@ test('GET /api/models lists presets with secrets masked', async () => {
   });
 });
 
+test('connection edits preserve a preset’s credential reference and require endpoint consent', async () => {
+  seedModels([{ label: 'Edit', provider: 'openai', model: 'old-model', baseUrl: 'http://127.0.0.1:8000/v1', credRef: 'model.saved' }]);
+  await withServer(async (h) => {
+    const update = (body: unknown) => raw(h.port, 'PATCH', '/api/models/Edit', auth(h, 'application/json'), JSON.stringify(body));
+    assert.equal((await update({ action: 'update', model: 'new-model' })).status, 200);
+    let saved = JSON.parse(readFileSync(CONFIG, 'utf8')).models[0];
+    assert.equal(saved.credRef, 'model.saved');
+    assert.equal(saved.model, 'new-model');
+    assert.equal((await update({ action: 'update', baseUrl: 'http://127.0.0.1:9000/v1' })).status, 409);
+    assert.equal((await update({ action: 'update', baseUrl: 'http://127.0.0.1:9000/v1', reuseCredential: true })).status, 200);
+    saved = JSON.parse(readFileSync(CONFIG, 'utf8')).models[0];
+    assert.equal(saved.baseUrl, 'http://127.0.0.1:9000/v1');
+    assert.equal(saved.credRef, 'model.saved');
+  });
+});
+
+test('model probes are explicit, authenticated and validate their test kind', async () => {
+  seedModels([{ label: 'Demo', provider: 'mock', model: 'demo' }]);
+  await withServer(async (h) => {
+    const probe = '/api/models/Demo/probe';
+    assert.equal((await raw(h.port, 'POST', probe, { host: `127.0.0.1:${h.port}`, 'content-type': 'application/json' }, '{"kind":"endpoint"}')).status, 401);
+    assert.equal((await raw(h.port, 'POST', probe, auth(h, 'application/json'), '{}')).status, 400);
+    const r = await raw(h.port, 'POST', probe, auth(h, 'application/json'), '{"kind":"endpoint"}');
+    assert.equal(r.status, 200);
+    assert.equal(JSON.parse(r.body).ok, true);
+    assert.match(JSON.parse(r.body).message, /no network request/);
+  });
+});
+
+test('adding and rotating a model key seals it before config is written and preserves other slots', async () => {
+  const { createVault, unlockWithKey } = await import('../src/auth/vault.js');
+  const { ensureVaultReady, lockVault } = await import('../src/auth/unlock.js');
+  const key = createVault('fixture-password', { 'model.other': { apiKey: 'keep-other-key' } });
+  process.env.SHADOW_VAULT_PASSWORD = 'fixture-password';
+  seedModels([]);
+  try {
+    await ensureVaultReady(() => {});
+    await withServer(async (h) => {
+      const added = await raw(h.port, 'POST', '/api/models', auth(h, 'application/json'), JSON.stringify({ label: 'Keyed', provider: 'openai', model: 'sample', apiKey: 'fixture-first-key' }));
+      assert.equal(added.status, 201);
+      const before = JSON.parse(readFileSync(CONFIG, 'utf8')).models[0];
+      assert.ok(before.credRef);
+      assert.doesNotMatch(readFileSync(CONFIG, 'utf8'), /fixture-first-key/);
+      const updated = await raw(h.port, 'PATCH', '/api/models/Keyed', auth(h, 'application/json'), JSON.stringify({ action: 'update', apiKey: 'fixture-second-key' }));
+      assert.equal(updated.status, 200);
+      const after = JSON.parse(readFileSync(CONFIG, 'utf8')).models[0];
+      assert.notEqual(after.credRef, before.credRef, 'rotation does not overwrite a possibly shared slot');
+      assert.doesNotMatch(readFileSync(CONFIG, 'utf8'), /fixture-first-key|fixture-second-key/);
+      const secrets = unlockWithKey(key) as Record<string, { apiKey: string }>;
+      assert.equal(secrets[after.credRef]!.apiKey, 'fixture-second-key');
+      assert.equal(secrets['model.other']!.apiKey, 'keep-other-key');
+      assert.doesNotMatch(added.body + updated.body, /fixture-first-key|fixture-second-key|keep-other-key/);
+    });
+  } finally { lockVault(); delete process.env.SHADOW_VAULT_PASSWORD; }
+});
+
 test('POST /api/models adds a keyless preset and persists it', async () => {
   seedModels([]);
   await withServer(async (h) => {

@@ -198,26 +198,13 @@ function previousCredentialStep(preset: ProviderPreset | undefined): SetupStep {
  * user chooses. Failures are non-fatal — onboarding always completes.
  */
 async function offerContextCooler(rl: readline.Interface): Promise<'done' | 'back' | 'quit'> {
-  stdout.write('\n');
-  writeCentered(
-    boxed([
-      c.bold('Save 70–90% on token burn — Context Cooler'),
-      '',
-      'An MCP server that runs sandboxed scripts against your data',
-      'and a search index — the agent pulls back compact answers',
-      'instead of re-reading raw files. Optional, not bundled.',
-      '',
-      c.gray(CC_URL),
-    ]),
-  );
-  stdout.write('\n');
-  const ans = await askText(rl, `  Install Context Cooler now? ${c.gray('[Y/n/back]')}: `);
+  stdout.write(c.gray('\nOptional: Context Cooler adds a local search index for compact tool results.\n'));
+  stdout.write(c.gray(`You can add it later: ${CC_URL}\n`));
+  const ans = await askText(rl, `  Install Context Cooler now? ${c.gray('[y/N/back]')}: `);
   if (ans === BACK) return 'back';
   if (ans === QUIT) return 'quit';
   const choice = ans.toLowerCase();
-  if (choice === 'n' || choice === 'no') {
-    stdout.write(c.gray('\n  No worries — you know where to stay cool.\n'));
-    stdout.write(c.gray(`  ${CC_URL}\n`));
+  if (choice !== 'y' && choice !== 'yes') {
     return 'done';
   }
   const dir = join(homedir(), '.shadow', 'context-cooler');
@@ -279,7 +266,7 @@ export async function runOnboard(): Promise<boolean> {
       stdout.write('\n');
       writeCentered([c.bold('Connect a model provider')]);
       writeCentered([
-        c.gray('No Shadow account — bring your own provider; keys stay local in ~/.shadow.'),
+        c.gray('No Shadow account. Credentials are stored locally and sent to your chosen provider.'),
       ]);
       stdout.write('\n');
       const menu = list.map((p, i) => {
@@ -297,23 +284,23 @@ export async function runOnboard(): Promise<boolean> {
       switch (step) {
         case 'mode': {
           // The positioning choice comes FIRST: local is a front door, not a submenu buried
-          // under nine cloud vendors. Enter defaults to Cloud (the most common fresh-user key).
+          // under cloud vendors. A self-hosted endpoint is the default starting point.
           showBanner();
           writeCentered([c.bold('How do you want to run Shadow?')]);
           stdout.write('\n');
           writeCentered([
             `${c.bold('1')}. Local file    ${c.gray('— a .gguf or MLX model on this machine (auto-served)')}`,
-            `${c.bold('2')}. Local server  ${c.gray('— Ollama / LM Studio / llama.cpp already running')}`,
+            `${c.bold('2')}. Model server  ${c.gray('— Ollama, LM Studio, vLLM or your own endpoint')}`,
             `${c.bold('3')}. Cloud         ${c.gray('— Anthropic, OpenAI, Z.ai (GLM), OpenRouter, …')}`,
           ]);
           stdout.write('\n');
-          const pick = await askText(rl, `Choose ${c.gray('[3]')} ${backHint()}: `);
+          const pick = await askText(rl, `Choose ${c.gray('[2]')} ${backHint()}: `);
           if (pick === QUIT) return quitOutcome();
           if (pick === BACK) {
             stdout.write(c.gray('Already at the first step.\n'));
             continue;
           }
-          const choice = pick === '' ? '3' : pick;
+          const choice = pick === '' ? '2' : pick;
           if (choice === '1') mode = 'file';
           else if (choice === '2') mode = 'server';
           else if (choice === '3') mode = 'cloud';
