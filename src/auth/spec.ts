@@ -14,6 +14,16 @@ export interface ProviderAuthSpec {
   apiBaseUrl: string;
   /** Subscription backend base for an OAuth access token (kind=subscription). */
   subscriptionBaseUrl: string;
+  /**
+   * Wire protocol the SUBSCRIPTION backend speaks.
+   *
+   * Not cosmetic: the Codex subscription backend is a ChatGPT host that serves the RESPONSES api,
+   * so the request must land on `<subscriptionBaseUrl>/responses`. Shadow's default `openai` wire
+   * appends `/chat/completions`, which that host does not serve — the token is valid and the call
+   * is still a 404. The credential therefore has to carry its wire alongside its base URL, exactly
+   * as it carries its identity headers, or the two can be recombined into a request that cannot work.
+   */
+  subscriptionWire: 'chat' | 'responses';
   /** OAuth issuer for Shadow's own opt-in flow (codex only). */
   authBaseUrl?: string;
   clientId?: string;
@@ -28,15 +38,34 @@ export interface ProviderAuthSpec {
 export const SPECS: Record<SubProvider, ProviderAuthSpec> = {
   codex: {
     apiBaseUrl: 'https://api.openai.com/v1',
-    subscriptionBaseUrl: 'https://chatgpt.com/backend-api/codex', // VERIFY before live use
+    subscriptionBaseUrl: 'https://chatgpt.com/backend-api/codex',
+    // The ChatGPT backend serves the Responses api — see subscriptionWire's note.
+    subscriptionWire: 'responses',
     authBaseUrl: 'https://auth.openai.com',
     clientId: 'app_EMoamEEZ73f0CkXaXp7hrann', // first-party Codex client (from the 0.141.0 binary)
     redirectUri: 'http://localhost:1455/auth/callback',
     scopes: 'openid profile email offline_access',
     ownOAuth: true,
+    /**
+     * The identity headers the ChatGPT backend requires, mirroring the official client's request.
+     *
+     * `chatgpt-account-id` selects the workspace the subscription belongs to; without it the
+     * backend cannot tell which account is being billed and refuses the call. `OpenAI-Beta:
+     * responses=experimental` opts into the Responses surface the Codex path uses. `originator`
+     * identifies the client to that surface.
+     *
+     * PROVENANCE: these shapes are transcribed from the official Codex client's wire contract, not
+     * discovered by Shadow against a live endpoint. A wrong name here surfaces as a 4xx on the
+     * first call — never as a token sent somewhere it does not belong, because the same code path
+     * binds this credential to `subscriptionBaseUrl` and refuses to pair it with any other host.
+     */
     extraHeaders: (c) => {
-      const h: Record<string, string> = { 'OAI-Product-Sku': 'codex' };
-      if (c.accountId) h['ChatGPT-Account-ID'] = c.accountId;
+      const h: Record<string, string> = {
+        'OAI-Product-Sku': 'codex',
+        'OpenAI-Beta': 'responses=experimental',
+        originator: 'codex_cli_rs',
+      };
+      if (c.accountId) h['chatgpt-account-id'] = c.accountId;
       return h;
     },
   },
@@ -46,6 +75,8 @@ export const SPECS: Record<SubProvider, ProviderAuthSpec> = {
     // consumer ToS bars bot access / reverse engineering. Sanctioned paths: api key,
     // Enterprise OIDC. See SUBSCRIPTION-OAUTH-AND-TOS.md.
     subscriptionBaseUrl: 'https://api.x.ai/v1',
+    // xAI's subscription backend IS its public API base, which speaks chat completions.
+    subscriptionWire: 'chat',
     ownOAuth: false,
     extraHeaders: () => ({}),
   },

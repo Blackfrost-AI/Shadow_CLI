@@ -1,6 +1,7 @@
 import type { Interface as ReadlineInterface } from 'node:readline/promises';
 import type { AutonomyLevel } from './safety/permissions.js';
 import type { ApprovalDecision, ApprovalGate, ApprovalRequest, UserQuestion } from './agent/approval.js';
+import { sanitizeTerminalEscapes } from './util/scrub.js';
 
 /**
  * Which input the headless loop consumes when no `--task` was given: the prompt-loop
@@ -27,14 +28,19 @@ export class ReplGate implements ApprovalGate {
   constructor(
     private readonly rl: ReadlineInterface,
     private readonly raiseAutonomy: () => AutonomyLevel,
+    private readonly options: { plain?: boolean } = {},
   ) {}
+
+  private write(text: string): void {
+    process.stdout.write(this.options.plain ? sanitizeTerminalEscapes(text, false) : text);
+  }
 
   async request(req: ApprovalRequest): Promise<ApprovalDecision> {
     if (req.kind === 'user_question' && req.questions?.length) {
       return this.askQuestions(req.questions);
     }
 
-    process.stdout.write(
+    this.write(
       `\n\x1b[1;33m${promptLabel(req.kind)}\x1b[0m ${req.preview}\n  [${req.risk}] ${req.reason}\n`,
     );
     // F07-09: an acknowledge-only dialog offers NO approve/deny verbs — the call is already
@@ -59,10 +65,10 @@ export class ReplGate implements ApprovalGate {
   private async askQuestions(questions: UserQuestion[]): Promise<ApprovalDecision> {
     const answers: Array<{ question: string; selected: string[] }> = [];
     for (const q of questions) {
-      process.stdout.write(`\n\x1b[1;36m${q.header ? `${q.header}: ` : ''}${q.question}\x1b[0m\n`);
+      this.write(`\n\x1b[1;36m${q.header ? `${q.header}: ` : ''}${q.question}\x1b[0m\n`);
       q.options.forEach((o, i) => {
         const desc = o.description ? ` — ${o.description}` : '';
-        process.stdout.write(`  ${i + 1}. ${o.label}${desc}\n`);
+        this.write(`  ${i + 1}. ${o.label}${desc}\n`);
       });
       const raw = (await this.rl.question(q.multiSelect ? 'Enter numbers (comma-separated) or empty to skip: ' : 'Enter number [1]: ')).trim();
       if (!raw) {

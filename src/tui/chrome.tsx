@@ -20,6 +20,19 @@ import { C } from './theme.js';
 /** Left/right page margin for transcript content — floats content off the terminal edges
  *  like the reference client instead of running flush to column 1. */
 export const PAGE_MARGIN = 4;
+
+/**
+ * Columns the draft itself gets — the ONE measure the paint and the caret maths must share.
+ *
+ * They were derived separately: the paint floored the BOX at 12 columns (`max(12, cols - 8)`) while
+ * the caret maths floored the result at 8 (`max(8, cols - 10)`). Above 20 columns the two agree, so
+ * the drift was invisible; below it they diverged (16 columns → 10 vs 8), and the painted row, the
+ * ↑/↓ row maths, the goal column and click-to-caret were all working from a different width than
+ * the one on screen.
+ */
+export function composerInnerWidth(cols: number): number {
+  return Math.max(8, Math.max(12, cols - PAGE_MARGIN * 2) - COMPOSER_GUTTER);
+}
 export const MARGIN_PAD = ' '.repeat(PAGE_MARGIN);
 
 /** The single palette handed to flattenItem (the FlatItem stock renderer). `dim` is the
@@ -202,8 +215,8 @@ export function Composer({
   // distance from the right — anything else reads as a misaligned column. `inner` is what's left
   // for text after the `❯ ` gutter (also the continuation indent), and it is exactly the width the
   // caret math uses, so the draft now wraps at the rule's right end instead of 8 columns short.
+  const inner = composerInnerWidth(cols);
   const boxW = Math.max(12, cols - PAGE_MARGIN * 2);
-  const inner = Math.max(8, boxW - COMPOSER_GUTTER);
   const maxV = Math.max(1, maxRows);
   const win = composerViewport(input, caret, inner, maxV);
 
@@ -293,6 +306,7 @@ export function FlatItem({
   continuation = false,
   foldLargeTables = true,
   toolRun,
+  maxRows,
 }: {
   item: TranscriptItem;
   cols: number;
@@ -302,6 +316,8 @@ export function FlatItem({
   foldLargeTables?: boolean;
   /** Tool-call stacking descriptor (set only for items in a run of ≥2 consecutive tools). */
   toolRun?: ToolRun;
+  /** Live preview: format the complete pending Markdown block, then take its physical tail. */
+  maxRows?: number;
 }) {
   const inner = Math.max(20, cols - PAGE_MARGIN * 2);
   const w = item.kind === 'banner' ? inner : Math.min(inner, PROSE_MAX_COLS);
@@ -321,7 +337,7 @@ export function FlatItem({
   );
   return (
     <Box flexDirection="column" paddingLeft={PAGE_MARGIN}>
-      {lines.map((ln) => {
+      {(maxRows === undefined ? lines : lines.slice(-Math.max(1, maxRows))).map((ln) => {
         const empty = ln.spans.every((s) => s.text === '');
         if (empty) return <Text key={ln.key}> </Text>; // preserve block-gap blank lines
         return (

@@ -5,7 +5,7 @@ process — everything here runs against this repository alone, with no private 
 
 **Audience:** contributors and anyone building their own artifacts.
 
-**Current release baseline:** `v8.6.0`.
+**Current release baseline:** `v8.7.0`.
 
 > **Maintainer note:** the *official* release pipeline (binary hosting, signing keys) is private
 > and intentionally not part of this repo. This guide covers the parts that are.

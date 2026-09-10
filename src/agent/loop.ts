@@ -35,7 +35,7 @@ import { SessionLog, type SessionLog as SessionLogType } from '../state/session.
 import type { TodoList } from './todo.js';
 import type { PlanModeState } from './planMode.js';
 import type { MissionState } from './mission.js';
-import { createReadTracker } from '../tools/readTracker.js';
+import { createReadTracker, type ReadTracker } from '../tools/readTracker.js';
 import type { FormatterConfig } from './formatter.js';
 import { redactString } from '../util/redact.js';
 import { sniffToolCalls, stripTextualToolIntent } from '../provider/textToolCalls.js';
@@ -45,8 +45,36 @@ import { scrubControlTokens, scrubForDisplay, sanitizeTerminalEscapes } from '..
 import { envelopeSafeSlice } from '../safety/envelope.js';
 import { hasKnownReasoningMarker } from '../provider/openai.js';
 import { DEFAULT_EFFORT, effortDirective } from './effort.js';
-import { resolve as resolvePath, join } from 'node:path';
+import { resolve as resolvePath, join, dirname, basename } from 'node:path';
+import { realpathSync } from 'node:fs';
 import { GLOBAL_DIR } from '../state/globalStore.js';
+
+/**
+ * Path equality for the config gate that survives respelling: a case-insensitive filesystem
+ * (`~/.SHADOW/CONFIG.JSON` IS `~/.shadow/config.json` on macOS and Windows) and a symlinked home.
+ * A path that does not exist yet is canonicalised through its deepest existing ancestor, which is
+ * exactly how the jail resolves a write to a file that is about to be created.
+ *
+ * The lower-case comparison is deliberately unconditional: on a case-SENSITIVE filesystem a
+ * differently-cased sibling is a different file, so this can only over-report — and over-reporting
+ * costs one prompt, while under-reporting hands the model the file that decides what needs a prompt.
+ */
+function sameFile(a: string, b: string): boolean {
+  const canonical = (p: string): string => {
+    try {
+      return realpathSync(p);
+    } catch {
+      const parent = dirname(p);
+      if (parent === p) return p;
+      try {
+        return join(realpathSync(parent), basename(p));
+      } catch {
+        return p;
+      }
+    }
+  };
+  return canonical(a).toLowerCase() === canonical(b).toLowerCase();
+}
 
 export interface LoopDeps {
   provider: Provider;
@@ -146,6 +174,14 @@ export interface LoopDeps {
    * must pass a shared instance, or every grant expires the moment the user types again.
    */
   approvals?: SessionApprovals;
+  /**
+   * SESSION-scoped read-before-edit tracker, for exactly the reason `approvals` is: a loop is
+   * constructed PER USER MESSAGE, so a tracker owned by the loop forgot every file read in an
+   * earlier turn and refused the next edit with "read it in this conversation first" — a read the
+   * model HAD performed, one message earlier. It also dropped the stale-file (mtime) protection
+   * across turn boundaries. Optional: a loop without one keeps its own (tests, one-shot runs).
+   */
+  readTracker?: ReadTracker;
   /** Goal or other durable UI state held outside Context message history. */
   continuityState?: string;
 }
@@ -178,7 +214,13 @@ export class AgentLoop {
   private toolUseRetries = 0; // distinct budget: tool_use signaled but no call parsed
   private lastCallSig: string | null = null; // loop guard: signature of the previous tool call
   private consecutiveRepeats = 0; // loop guard: how many times that signature ran back-to-back
-  private readonly readTracker = createReadTracker();
+  /**
+   * Read-before-edit tracker. Session-scoped when the caller passes one (same reason as
+   * `approvals`: a loop is built per user message, so a per-loop instance forgot every read from
+   * the previous turn and refused the next edit of a file the model had just read). Falls back to
+   * a private instance for standalone loops and tests.
+   */
+  private readonly readTracker: ReadTracker;
   private readonly approvedPlanExitIds = new Set<string>();
   private fallbackUsed = false;
   /**
@@ -231,6 +273,7 @@ export class AgentLoop {
     this.modelSignal = AbortSignal.any([deps.signal, this.modelAbort.signal]);
     this.autonomy = autonomy;
     this.approvals = deps.approvals ?? new SessionApprovals();
+    this.readTracker = deps.readTracker ?? createReadTracker();
     this.effort = deps.effort ?? DEFAULT_EFFORT;
     this.now = deps.now ?? Date.now;
     const g = deps.spendGuard ? createBudgetState(deps.spendGuard) : null;
@@ -1508,7 +1551,10 @@ export class AgentLoop {
     // it does not bend for autonomy, an `allow` rule, a session approval, or a plan-mode grant. Only a
     // live human may change the file that decides what needs a gate. (Detector is cheap; run it only
     // on the write-path tools so a read of the same file stays quiet.)
-    const configTouch = writeTouchesConfigFile(call.name, call.input);
+    const configTouch = writeTouchesConfigFile(call.name, call.input, [
+      this.deps.workspaceRoot,
+      ...(this.deps.additionalRoots ?? []),
+    ]);
 
     // Bash read-only auto-allow at auto-read+ — never bypasses denylist / forceConfirm.
     const bashReadOnlyAllow =
@@ -2040,7 +2086,14 @@ export class AgentLoop {
     // The denylist does not bend for anything, so check it before the session-approval shortcut.
     if (this.deps.forceConfirm?.({ ...call, name: canonical, input: normalized.input }, tool.risk)) return true;
     // F07-01 (P1A-01): a write/edit touching the safety config always prompts, like the denylist.
-    if (writeTouchesConfigFile(canonical, call.input)) return true;
+    if (
+      writeTouchesConfigFile(canonical, call.input, [
+        this.deps.workspaceRoot,
+        ...(this.deps.additionalRoots ?? []),
+      ])
+    ) {
+      return true;
+    }
     // P2-12: an unconfined run_shell (sandbox requested, no host tool) escalates to the gate.
     // fail-closed never bends — treat it like the denylist, BEFORE the session-approval shortcut.
     const unconfinedEscalation =
@@ -2176,7 +2229,7 @@ function shellCommandOf(input: unknown): string | null {
  * jail's resolveWithin+realpath confines writes to granted roots, and the global config's realpath
  * lives outside them — so the symlink targets outside the jail are already refused upstream.
  */
-export function touchesConfigFile(call: ToolCall): boolean {
+export function touchesConfigFile(call: ToolCall, roots?: readonly string[]): boolean {
   const input = call.input;
   if (!input || typeof input !== 'object') return false;
   const p = (input as { path?: unknown }).path;
@@ -2186,13 +2239,25 @@ export function touchesConfigFile(call: ToolCall): boolean {
   // `x/shadow.config.json.bak` still prompts — a false positive costs one prompt, never a bypass
   // (see the doc comment above). It deliberately does NOT match a `.ts` extension
   // (`src/shadow.config.json.ts` is source code, not the config that disarms the gates).
-  if (/(^|[/\\])shadow\.config\.json([/\\]|$|\.(?!ts$))/.test(p)) return true;
-  // Absolute path that resolves to the global trusted config (~/.shadow/config.json) under any name.
-  try {
-    return resolvePath(p) === join(GLOBAL_DIR, 'config.json');
-  } catch {
-    return false;
+  //
+  // The leading `.` and the `i` flag close two respellings of the same file: `.shadow/config.json`
+  // (a `./`-relative path — the old class required `^`, `/` or `\` before the name, so the most
+  // natural way to write it did not match) and `.SHADOW/CONFIG.JSON`, which IS the global config on
+  // a case-insensitive filesystem.
+  if (/(^|[/\\]|\.)shadow\.config\.json([/\\]|$|\.(?!ts$))/i.test(p)) return true;
+  // A path that reaches the global trusted config (~/.shadow/config.json) under ANY other name —
+  // a bare `config.json`, an `--workspace` that IS `$HOME`, a symlinked home. Relative paths land
+  // where the JAIL puts them (against the workspace root, not the process cwd), so every base the
+  // path can land in is probed; comparing through realpath also catches the symlinked spelling.
+  const globalCfg = join(GLOBAL_DIR, 'config.json');
+  for (const base of [undefined, ...(roots ?? [])]) {
+    try {
+      if (sameFile(base ? resolvePath(base, p) : resolvePath(p), globalCfg)) return true;
+    } catch {
+      /* an unresolvable spelling cannot be the config */
+    }
   }
+  return false;
 }
 
 /**
@@ -2207,12 +2272,12 @@ const CONFIG_GATE_WRITE_TOOLS = new Set(['write_file', 'edit_file', 'multi_edit'
 const PATCH_HEADER_PATH = /^\*\*\*\s+(?:Add|Update|Delete) File:[ \t]*(.+?)[ \t]*$/gm;
 const PATCH_MOVE_TO_PATH = /^\*\*\*\s+Move to:[ \t]*(.+?)[ \t]*$/gm;
 
-export function writeTouchesConfigFile(name: string, input: unknown): boolean {
+export function writeTouchesConfigFile(name: string, input: unknown, roots?: readonly string[]): boolean {
   if (!CONFIG_GATE_WRITE_TOOLS.has(name)) return false;
   if (!input || typeof input !== 'object') return false;
   const { path, patch } = input as { path?: unknown; patch?: unknown };
   const probe = (p: string): boolean =>
-    touchesConfigFile({ id: 'config-gate-probe', name, input: { path: p } });
+    touchesConfigFile({ id: 'config-gate-probe', name, input: { path: p } }, roots);
   if (typeof path === 'string' && path && probe(path)) return true;
   if (typeof patch === 'string' && patch) {
     for (const m of patch.matchAll(PATCH_HEADER_PATH)) {

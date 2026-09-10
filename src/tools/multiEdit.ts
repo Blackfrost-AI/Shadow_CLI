@@ -85,7 +85,9 @@ export const multiEdit: Tool<MultiEditInput, MultiEditData> = {
             ? `matches ${r.count} times — add context or set replace_all`
             : r.reason === 'ambiguous'
               ? 'no exact match and the closest fuzzy match is ambiguous'
-              : 'old_string not found (must match exactly after prior edits)';
+              : r.reason === 'empty'
+                ? 'old_string is empty — quote the exact text to replace'
+                : 'old_string not found (must match exactly after prior edits)';
         return fail('multi_edit', 'write', Date.now() - start, r.reason, `edit #${i + 1}: ${why}. No changes were written.`);
       }
       text = r.updated;

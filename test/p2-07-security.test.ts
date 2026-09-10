@@ -74,6 +74,44 @@ test('F07-05: commandReadsOutsideRoots scopes viewers + search commands like the
   }
 });
 
+test('BYPASS: a session grant does not vouch for non-viewer segments that name outside paths', () => {
+  // The operand scans above only understand commands whose operands are files BY DEFINITION
+  // (cat/head/grep/find). Every other way of naming a file simply contributed nothing, so one `(s)`
+  // grant on ANY gated command auto-ran them: `bash -c 'cat ~/.aws/credentials'`, `cp ~/.ssh/id_rsa
+  // /tmp`, `tar -czf /tmp/o.tgz ~/.ssh`, `python3 -c "open('/etc/passwd')"`.
+  const ws = mkdtempSync(join(tmpdir(), 'shadow-grant-'));
+  try {
+    for (const cmd of [
+      `bash -c 'cat /etc/passwd'`,
+      `sh -c 'cat /etc/shadow'`,
+      `zsh -lc 'cat ~/.aws/credentials'`,
+      'cp /etc/passwd /tmp/x',
+      'tar -czf /tmp/o.tgz /etc',
+      `python3 -c "open('/etc/passwd')"`,
+      'sudo cat /etc/shadow',
+      `awk 'BEGIN{system("cat /etc/shadow")}'`,
+      `cd .. && cat .ssh/id_rsa`,
+      'cat a >&/etc/cron.d/x', // `>&word` with a non-numeric word IS a file redirect
+    ]) {
+      assert.equal(commandReadsOutsideRoots(cmd, [ws]), true, `grant path must demote: ${cmd}`);
+    }
+    // Ordinary work under a grant keeps riding it — a demotion here would re-prompt on every turn.
+    for (const cmd of [
+      'npm test',
+      'git commit -m "fix: thing"',
+      `git commit -m "src/tui: fix wrap"`,
+      'git diff HEAD~3',
+      'git log v2~1..v2',
+      'cat src/a.ts > out.txt',
+      `cat ${ws}/a.ts`,
+    ]) {
+      assert.equal(commandReadsOutsideRoots(cmd, [ws]), false, `ordinary work must still ride: ${cmd}`);
+    }
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
 // ── F07-05 + F07-09: loop-level gate harness ────────────────────────────────────────────────
 import { AgentLoop, type LoopDeps } from '../src/agent/loop.js';
 import { EventBus } from '../src/agent/events.js';

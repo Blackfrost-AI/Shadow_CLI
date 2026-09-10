@@ -106,7 +106,9 @@ test('P1A-12: never-closing unbalanced { JSON envelope stays bounded even with h
   }
   const { streamBuf, maxHeld, maxLive } = runHotPath(deltas);
   assert.ok(maxHeld <= MAX_HELD_BYTES, `held capped, saw ${maxHeld} bytes`);
-  assert.ok(maxLive <= MAX_HELD_BYTES + ONE_KB * 2, `live bounded, saw ${maxLive}`);
+  // Inline Markdown now retains a prose paragraph. Both independent caps can therefore be
+  // occupied by malformed text becoming visible while an unfinished tool suffix stays held.
+  assert.ok(maxLive <= MAX_HELD_BYTES + MAX_LIVE_REST_BYTES + ONE_KB * 2, `both buffers bounded, saw ${maxLive}`);
   // No byte is lost: at the end every emitted byte is either committed OR still in the live buffer;
   // the cap RELOCATES overflow to visible, it never drops it. (`committed` is text now; length it.)
   const consumed = streamBuf.length;
@@ -122,7 +124,7 @@ test('P1A-12: a giant single delta (>150KB patch) processes in bounded memory wi
   const { maxHeld, maxLive } = runHotPath([delta]);
   const wall = performance.now() - t0;
   assert.ok(maxHeld <= MAX_HELD_BYTES, `held capped, saw ${maxHeld}`);
-  assert.ok(maxLive <= MAX_HELD_BYTES + ONE_KB * 4, `live bounded, saw ${maxLive}`);
+  assert.ok(maxLive <= MAX_HELD_BYTES + MAX_LIVE_REST_BYTES + ONE_KB * 4, `both buffers bounded, saw ${maxLive}`);
   assert.ok(wall < 5000, `giant single delta took ${wall.toFixed(0)}ms`);
 });
 

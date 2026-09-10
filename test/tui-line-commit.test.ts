@@ -147,10 +147,9 @@ test('P1A-13: a 4-tick fence is NOT closed by a 3-tick fence line — only a >=4
 
 test('P1A-13: a >=4-space-indented fence line is NOT a fence (indented code block)', () => {
   // CommonMark: a fence opener may be indented at most 3 spaces. A 4-space-indented ``` is an
-  // indented code block, not a fence, so it must NOT enter fence-hold semantics — the lines
-  // commit immediately as ordinary prose instead of being held for a (never-arriving) close.
-  const r = extractCommittableUnits('    ```\nnot a fence\n    ```\n');
-  assert.deepEqual(texts(r), ['    ```', 'not a fence', '    ```'], 'indented ``` lines commit as prose, not fence-held');
+  // indented code block, not a fence, so a paragraph boundary releases it without a fence close.
+  const r = extractCommittableUnits('    ```\nnot a fence\n    ```\n\n');
+  assert.deepEqual(texts(r), ['    ```\nnot a fence\n    ```'], 'a blank line releases prose containing inline delimiters');
   assert.equal(r.rest, '');
 });
 
@@ -216,4 +215,28 @@ test('no content is lost or duplicated: every non-blank line appears exactly onc
   const flat = [...texts(r), r.rest].join('\n').split('\n').filter((l) => l.trim() !== '');
   const original = buf.split('\n').filter((l) => l.trim() !== '');
   assert.deepEqual(flat, original, 'reconstruction (minus dropped blank separators) matches the input, in order');
+});
+
+test('inline Markdown spanning source lines stays together across stream chunks', () => {
+  for (const [head, tail] of [
+    ['A **bold\n', 'phrase** stays bold.\n\n'],
+    ['An `inline\n', 'code` span.\n\n'],
+    ['Read [this\n', 'link](https://example.test).\n\n'],
+    ['A ~~removed\n', 'phrase~~.\n\n'],
+  ]) {
+    const open = extractCommittableUnits(head!);
+    assert.equal(open.units.length, 0, 'the opening delimiter is not committed literally');
+    assert.equal(open.rest, head);
+    const closed = extractCommittableUnits(open.rest + tail);
+    assert.deepEqual(texts(closed), [(head! + tail!).trimEnd()]);
+    assert.equal(closed.rest, '');
+  }
+});
+
+test('a Markdown paragraph still ends before a new block and does not consume its padding', () => {
+  const result = extractCommittableUnits('Use **bold** text.\n- first\n- second\n\n');
+  assert.deepEqual(result.units, [
+    { text: 'Use **bold** text.', pad: false },
+    { text: '- first\n- second', pad: true },
+  ]);
 });

@@ -5,7 +5,8 @@ import { z } from 'zod';
 import { loadGlobalConfig, saveGlobalConfig, getCredential } from './state/globalStore.js';
 import type { PermissionRule } from './safety/rules.js';
 import { resolveSubscriptionAuth } from './auth/index.js';
-import { subProviderFor } from './auth/spec.js';
+import { SPECS, subProviderFor } from './auth/spec.js';
+import type { ResolvedAuth, SubProvider } from './auth/types.js';
 import type { Effort } from './provider/provider.js';
 
 /**
@@ -197,6 +198,18 @@ export const ModelEntrySchema = z.object({
   /** Entry created by onboarding's model allowlist. Lets a later onboarding run reconcile only
    * its own stale selections without deleting presets the user added manually. */
   onboarded: z.boolean().optional(),
+  /**
+   * Track whatever the endpoint is currently serving (see src/local/autoEndpoint.ts).
+   *
+   * For a self-hosted box whose loaded model changes — a DGX, a workstation, a shared lab server.
+   * At build time Shadow asks the endpoint's model catalog and puts the reported id on the wire, so
+   * swapping the model on the box needs no Shadow-side edit. `model` then acts as the FALLBACK used
+   * when the box is unreachable, which is why it stays required: a down endpoint must degrade to a
+   * named model and a clear connection error, not to an empty request.
+   *
+   * The discovered base URL is adopted too, so a URL written with or without `/v1` self-corrects.
+   */
+  autoModel: z.boolean().optional(),
   // Local .gguf auto-serve (ollama-style): when set, shadow launches a llama.cpp server
   // for this file on activation and talks to it over the OpenAI endpoint (see src/gguf.ts).
   gguf: z.string().optional(),
@@ -311,6 +324,8 @@ const ConfigSchema = z.object({
     .optional(),
   parallelTools: z.boolean().default(true),
   lastStyle: z.enum(outputStyles).default('proactive'),
+  reducedMotion: z.boolean().default(false),
+  showLogo: z.boolean().default(false),
   lastTheme: z
     .enum(['og', 'shadow', 'dark', 'light', 'matrix', 'mono', 'pipboy', 'cyberpunk', 'coder-chick', 'colorblind', 'high-contrast'])
     .default('og'),
@@ -834,6 +849,37 @@ function readEnvOverrides(): Record<string, unknown> {
   return out;
 }
 
+/**
+ * A credential resolved together with THE ENDPOINT IT IS BOUND TO.
+ *
+ * `resolveApiKey` returns a bare bearer, and every caller then paired it with a base URL computed
+ * somewhere else (`resolveBaseUrl`). For an API key that is fine — the key is not host-bound. For a
+ * SUBSCRIPTION token it is not: the token is issued for one backend, and combining it with a
+ * different base URL sends a ChatGPT credential to whatever host that URL names. That is the same
+ * class of disclosure `resolveEntryCredential` refuses for `credRef` slots, and it is why this type
+ * carries `baseUrl`, `extraHeaders` and `wire` as a single indivisible unit: a subscription
+ * credential cannot be consumed without also consuming where it may go.
+ */
+export interface ProviderCredential {
+  /** The bearer to send, when one was resolved. */
+  bearer?: string;
+  /** The base URL this bearer must be sent to. Absent = the caller's configured/default base. */
+  baseUrl?: string;
+  /** Identity headers the endpoint requires (`chatgpt-account-id`, …). */
+  extraHeaders?: Record<string, string>;
+  /** The wire the endpoint speaks. A subscription backend is not necessarily chat-completions. */
+  wire?: 'chat' | 'responses';
+  source: 'env' | 'store' | 'subscription';
+  subProvider?: SubProvider;
+  /** Unix seconds expiry, when known. */
+  expiresAt?: number;
+  /**
+   * Set when a subscription credential was deliberately NOT used. Human-readable and safe to show:
+   * it names the two endpoints that disagree, never the secret.
+   */
+  conflict?: string;
+}
+
 export interface ResolveKeyOpts {
   model?: string;
   allowImport?: boolean;
@@ -842,34 +888,89 @@ export interface ResolveKeyOpts {
    * fallback, no adapter-slot fallback. See `resolveEntryCredential` for why.
    */
   slot?: string;
+  /** The base URL the caller would otherwise use. Lets the resolver detect a host conflict. */
+  configuredBaseUrl?: string;
+}
+
+/** The env/store API key for a provider, ignoring any subscription import. */
+function storeOrEnvKey(provider: string): string | undefined {
+  if (provider === 'anthropic') return process.env.ANTHROPIC_API_KEY || getCredential('anthropic')?.apiKey;
+  if (provider === 'openai') return process.env.OPENAI_API_KEY || getCredential('openai')?.apiKey;
+  return undefined;
+}
+
+/**
+ * Resolve the credential for a provider together with the endpoint it belongs to.
+ *
+ * Precedence is unchanged from `resolveAuth` (env/store key → imported subscription → nothing).
+ * What is new is the ENDPOINT BINDING for the subscription tier:
+ *
+ *  - No base URL configured → the credential supplies its own (`subscriptionBaseUrl`), along with
+ *    the identity headers and wire that backend requires. This is the path that makes an imported
+ *    Codex subscription work.
+ *  - A base URL configured that IS the subscription backend (a user pinning it explicitly) → same
+ *    thing; the configured value is honoured and the headers still apply.
+ *  - A base URL configured that is anything ELSE → the subscription credential is REFUSED and
+ *    reported as a conflict. The caller falls through to the API-key path. This is deliberate, and
+ *    it closes a real leak: the previous code returned the subscription bearer unconditionally, so
+ *    a user with both an imported Codex token and a custom `baseUrl` (a proxy, a gateway) sent
+ *    their ChatGPT credential to that third-party host on every request.
+ */
+export function resolveProviderCredential(provider: string, opts: ResolveKeyOpts = {}): ProviderCredential {
+  // Slot lookups never fall back (see resolveApiKey): a miss must stay a miss.
+  if (opts.slot) {
+    const bearer = getCredential(opts.slot)?.apiKey;
+    return { bearer, source: 'store' };
+  }
+
+  const envKey = storeOrEnvKey(provider);
+  const allowImport = opts.allowImport ?? process.env.SHADOW_ALLOW_IMPORT === '1';
+  const sub = allowImport && provider !== 'mock' ? subProviderFor(provider, opts.model ?? '') : undefined;
+  const auth: ResolvedAuth | undefined = sub
+    ? resolveSubscriptionAuth({
+        provider,
+        subProvider: sub,
+        envBearer: envKey ?? resolveAuthToken(provider),
+        allowImport: true,
+        nowSec: Math.floor(Date.now() / 1000),
+      })
+    : undefined;
+
+  // Tier 2: an explicit key wins outright, and the subscription is never consulted.
+  if (auth?.source === 'env' || envKey) {
+    return { bearer: auth?.bearer ?? envKey, source: 'env' };
+  }
+  if (!auth || !sub) return { source: 'env' };
+
+  const spec = SPECS[sub];
+  const wanted = normalizeBaseUrl(opts.configuredBaseUrl);
+  if (auth.baseUrl && wanted && wanted.replace(/\/+$/, '') !== auth.baseUrl.replace(/\/+$/, '')) {
+    return {
+      source: 'env',
+      conflict:
+        `an imported ${sub} subscription credential was NOT used: it is valid only at ` +
+        `${auth.baseUrl}, but baseUrl is set to ${wanted}. Sending it elsewhere would disclose ` +
+        `the token, so Shadow kept it local. Clear baseUrl (or unset it for this model) to use the subscription.`,
+    };
+  }
+  return {
+    bearer: auth.bearer,
+    baseUrl: auth.baseUrl,
+    extraHeaders: auth.extraHeaders,
+    wire: spec.subscriptionWire,
+    expiresAt: auth.expiresAt,
+    source: 'subscription',
+    subProvider: sub,
+  };
 }
 
 /** API key: env first, then store; with allowImport, subscription/OAuth import may supply a bearer. */
 export function resolveApiKey(provider: string, opts: ResolveKeyOpts = {}): string | undefined {
-  // Slot lookups never fall back. Every custom preset (z.ai, Gemini, Together, local vLLM) shares
-  // the single 'openai' adapter, so a fallback here would hand OPENAI_API_KEY to whatever host the
-  // preset's baseUrl names — disclosing the key to a third party. A miss must stay a miss.
-  if (opts.slot) return getCredential(opts.slot)?.apiKey;
-  const envKey =
-    provider === 'anthropic'
-      ? process.env.ANTHROPIC_API_KEY || getCredential('anthropic')?.apiKey
-      : provider === 'openai'
-        ? process.env.OPENAI_API_KEY || getCredential('openai')?.apiKey
-        : undefined;
-
-  const allowImport = opts.allowImport ?? process.env.SHADOW_ALLOW_IMPORT === '1';
-  if (allowImport && provider !== 'mock') {
-    const sub = subProviderFor(provider, opts.model ?? '');
-    const auth = resolveSubscriptionAuth({
-      provider,
-      subProvider: sub,
-      envBearer: envKey ?? resolveAuthToken(provider),
-      allowImport: true,
-      nowSec: Math.floor(Date.now() / 1000),
-    });
-    if (auth?.bearer) return auth.bearer;
-  }
-  return envKey;
+  // Delegates so the bearer can never be obtained WITHOUT the endpoint-binding check that guards
+  // the subscription tier. A caller that needs the binding itself (to send the headers and the wire
+  // that go with the token) uses `resolveProviderCredential`; a caller that only needs a bearer —
+  // a presence check, a sub-agent — gets one that is known not to be bound somewhere else.
+  return resolveProviderCredential(provider, opts).bearer;
 }
 
 /** Bearer token: env (ANTHROPIC_AUTH_TOKEN), then the credentials store. */

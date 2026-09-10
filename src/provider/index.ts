@@ -13,6 +13,18 @@ export interface ProviderOptions {
   apiKey?: string;
   authToken?: string;
   baseUrl?: string;
+  /**
+   * Identity headers the endpoint requires, from a subscription credential
+   * (`chatgpt-account-id`, `OpenAI-Beta`, …). They are part of the credential, not configuration:
+   * a request carrying the bearer without them is refused by that host.
+   */
+  extraHeaders?: Record<string, string>;
+  /**
+   * Force a wire regardless of `SHADOW_WIRE_API`. A subscription credential names the wire its
+   * backend serves (see ProviderAuthSpec.subscriptionWire) — the Codex backend is Responses-only,
+   * so letting the env default pick chat-completions would post to a path it does not serve.
+   */
+  wire?: 'chat' | 'responses';
   /** Explicit opt-in for a remote self-hosted endpoint; local/LAN URLs are detected automatically. */
   selfHosted?: boolean;
   /** P1A-06: declarative per-model capability block (see config.ts ModelCapabilities). Consulted
@@ -95,10 +107,14 @@ export function createProvider(opts: ProviderOptions): Provider {
       });
     case 'openai':
       // SHADOW_WIRE_API=responses selects /v1/responses (Codex-class); default is chat completions.
-      return useResponsesWire()
+      // `opts.wire` is the credential's own requirement and therefore outranks the env default: a
+      // Codex subscription token only exists on the Responses backend, so honouring an env that
+      // says otherwise would post a valid token to a path that host does not serve.
+      return opts.wire === 'responses' || (opts.wire !== 'chat' && useResponsesWire())
         ? new ResponsesProvider({
             apiKey: opts.apiKey,
             baseUrl: opts.baseUrl,
+            extraHeaders: opts.extraHeaders,
             model: opts.model,
             selfHosted: opts.selfHosted,
             idleTimeoutMs: opts.idleTimeoutMs,
@@ -109,6 +125,7 @@ export function createProvider(opts: ProviderOptions): Provider {
         : new OpenAIProvider({
             apiKey: opts.apiKey,
             baseUrl: opts.baseUrl,
+            extraHeaders: opts.extraHeaders,
             model: opts.model,
             selfHosted: opts.selfHosted,
             idleTimeoutMs: opts.idleTimeoutMs,

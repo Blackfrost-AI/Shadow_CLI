@@ -12,7 +12,7 @@
 import type { ImportedCredential } from './types.js';
 import { SPECS } from './spec.js';
 import { createPkce, randomState, type Pkce } from './pkce.js';
-import { jwtExp } from './importStore.js';
+import { jwtAccountId, jwtExp } from './importStore.js';
 import { shadowFetch } from '../safety/egress.js';
 
 export interface AuthUrl {
@@ -54,6 +54,10 @@ function intoCredential(t: TokenResponse, nowSec: number): ImportedCredential {
     token: access,
     refreshToken: t.refresh_token,
     idToken: t.id_token,
+    // Recover the workspace binding from the id_token. A refresh response does not repeat the
+    // `account_id` field the auth.json parser reads, and that id is required on every request, so
+    // without this a rotation would drop it and break the next call.
+    accountId: jwtAccountId(t.id_token),
     expiresAt: jwtExp(access) ?? (t.expires_in ? nowSec + t.expires_in : undefined),
   };
 }

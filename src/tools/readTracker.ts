@@ -18,6 +18,12 @@ export interface ReadTracker {
   check(absPath: string): { ok: true } | { ok: false; reason: string };
   /** True only if read_file (or write_file creating it) was called for this path this run. */
   hasSeen(absPath: string): boolean;
+  /**
+   * Drop everything remembered. A session-scoped tracker must be reset when the SESSION changes
+   * underneath it (/resume, /fork, /clear): those all load an empty conversation, so a file read
+   * in the previous session is no longer something the model has "seen in this conversation".
+   */
+  clear(): void;
 }
 
 export function createReadTracker(): ReadTracker {
@@ -46,5 +52,9 @@ export function createReadTracker(): ReadTracker {
       return { ok: true };
     },
     hasSeen: (p) => seenThisRun.has(p),
+    clear: () => {
+      mtimes.clear();
+      seenThisRun.clear();
+    },
   };
 }

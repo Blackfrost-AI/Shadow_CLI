@@ -68,17 +68,20 @@ test("xterm's modifyOtherKeys encoding works too", async (t) => {
 test('the hint text no longer advertises a binding that does not work', () => {
   // Composer hints live in tui.tsx; the /help rows + the /terminal-setup listing live in
   // tui/slash.ts (P3-02 decomposition); the key combo itself is platform-aware via tui/platform.ts.
+  // P3-02 moved the composer placeholder out of tui.tsx into tui/chrome.tsx; scan where the hint
+  // actually lives now, or this guard silently stops covering the placeholder it exists to protect.
+  const composerSrc = readFileSync(new URL('../src/tui/chrome.tsx', import.meta.url), 'utf8');
   const tuiSrc = readFileSync(new URL('../src/tui.tsx', import.meta.url), 'utf8');
   const slashSrc = readFileSync(new URL('../src/tui/slash.ts', import.meta.url), 'utf8');
   const platformSrc = readFileSync(new URL('../src/tui/platform.ts', import.meta.url), 'utf8');
-  const src = tuiSrc + slashSrc + platformSrc;
+  const src = composerSrc + tuiSrc + slashSrc + platformSrc;
 
   // Never promise Shift+Enter to terminals that cannot send it — that was the whole 3.x bug.
   assert.doesNotMatch(src, /Shift\+Enter newline/, 'stop promising what the default terminal cannot do');
 
   // T1: the placeholder and hint rows are now assembled from the platform-aware NEWLINE_HINT
   // rather than a hardcoded combo, so the advertised key matches the OS actually in use.
-  assert.match(tuiSrc, /NEWLINE_HINT/, 'the placeholder uses the platform-aware hint');
+  assert.match(composerSrc, /NEWLINE_HINT/, 'the placeholder uses the platform-aware hint');
   assert.match(slashSrc, /NEWLINE_HINT/, 'the /help rows use the platform-aware hint');
 
   // platform.ts advertises what works today on each OS: Option+Enter on darwin (the composer's

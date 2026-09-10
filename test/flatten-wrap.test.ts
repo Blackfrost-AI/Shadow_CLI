@@ -67,23 +67,12 @@ test('wide table vertical fallback wraps instead of terminal hard-wrapping mid-w
   }
 });
 
-test('assistant ⏺ turn bullet: on the first block, indent-only on continuations (once per turn)', () => {
-  // A streamed answer commits as MANY assistant items; the ⏺ must mark the turn ONCE. The first
-  // block draws the orange ⏺ on line 0; a continuation block (same turn) gets the 2-col indent so it
-  // aligns under the first block's text — never a second dot.
-  const DOT = process.platform === 'darwin' ? '⏺' : '●';
-  const nonBlank = (rows: { spans: { text: string; color?: string }[] }[]) => rows.filter((r) => r.spans.some((s) => s.text.trim() !== ''));
-
-  // Wraps via WIDTH (a soft \n in the source now reflows to a space — see transcript-wrap-polish).
-  const first = nonBlank(flattenItem({ id: 1, kind: 'assistant', text: 'first line second line' }, 20, false, T));
-  assert.equal(first[0]!.spans[0]!.text, `${DOT} `, 'first block: ⏺ on the first content line');
-  assert.equal(first[0]!.spans[0]!.color, '#d97757', 'the dot is Claude orange');
-  assert.equal(first[1]!.spans[0]!.text, '  ', 'wrapped line of the first block aligns under the dot (indent)');
-  assert.equal(first.filter((r) => r.spans[0]!.text === `${DOT} `).length, 1, 'exactly one ⏺ in the first block');
-
+test('assistant Markdown has no per-block speaker header and continuations align', () => {
+  const nonBlank = (rows: { spans: { text: string }[] }[]) => rows.filter((r) => r.spans.some((s) => s.text.trim() !== ''));
+  const first = nonBlank(flattenItem({ id: 1, kind: 'assistant', text: 'first line second line', speaker: { handle: 'SHADOW', model: 'fixture', color: T.cyan } }, 20, false, T));
+  assert.deepEqual(first.map(r => r.spans.map(s => s.text).join('')), ['  first line second', '  line']);
   const cont = nonBlank(flattenItem({ id: 2, kind: 'assistant', text: 'continued paragraph' }, 60, false, T, true));
-  assert.equal(cont[0]!.spans[0]!.text, '  ', 'continuation block: indent, NOT a second ⏺');
-  assert.ok(cont.every((r) => r.spans[0]!.text !== `${DOT} `), 'no ⏺ anywhere in a continuation block');
+  assert.deepEqual(cont.map(r => r.spans.map(s => s.text).join('')), ['  continued paragraph']);
 });
 
 test('user prompt: ▌ bar on EVERY line, bright body (fg), leading blank', () => {
@@ -269,7 +258,7 @@ test('nested list items keep their depth indent AND wrap with a hanging indent u
   // Body indent is 2 (the ⏺ gutter). Top-level marker at col 2; its wrapped row aligns under the TEXT.
   const top = lines.find((l) => l.includes('top level'))!;
   const topCont = lines[lines.indexOf(top) + 1]!;
-  assert.match(top, /^(⏺|●) • top level/, 'marker on the first row');
+  assert.match(top, /^ {2}• top level/, 'marker on the first row');
   assert.match(topCont, /^ {4}\S/, 'continuation aligns under the text (hanging indent), not the margin');
   const nested = lines.find((l) => l.includes('nested item'))!;
   assert.match(nested, /^ {2} {2}◦ nested item/, 'nested bullet keeps its 2-space depth indent + ◦ glyph');
@@ -305,21 +294,21 @@ test('link label renders in the cyan link accent; the (url) tail stays dim', () 
   assert.equal(url.color, T.dim, 'url tail = dim');
 });
 
-test('collaboration speaker: colored ⏺ handle header once per turn, body indents (no orange dot)', () => {
+test('collaboration speaker: colored ◆ handle header once per turn, body indents (no orange dot)', () => {
   const spk = { handle: 'grok', color: '#38dbf5', model: 'openai/grok-4' };
   // First block of the seat's turn (continuation=false) → header row + indented body.
   // (Assistant items open with a leading gap blank line, so the header is the first NON-empty row.)
   const first = flattenItem({ id: 1, kind: 'assistant', text: 'the KV cache is the OOM', speaker: spk } as never, 60, false, T, false);
-  const headRow = first.find((r) => r.spans.map((s) => s.text).join('').includes('⏺'))!;
+  const headRow = first.find((r) => r.spans.map((s) => s.text).join('').includes('◆'))!;
   const head = headRow.spans.map((s) => s.text).join('');
-  assert.match(head, /⏺ grok/, 'header shows the ⏺ + handle');
+  assert.match(head, /◆ grok/, 'header shows the ⏺ + handle');
   assert.match(head, /openai\/grok-4/, 'header shows the model');
   assert.equal(headRow.spans[0]!.color, '#38dbf5', 'header is painted the seat color, not orange');
   // No orange assistant bullet anywhere in a speaker turn (the header is the only bullet).
   assert.ok(!first.slice(1).some((r) => (r.spans[0]?.color) === '#d97757'), 'body has no orange ⏺');
   // A continuation block (same turn) draws neither a second header nor a bullet — just indent.
   const cont = flattenItem({ id: 2, kind: 'assistant', text: 'add -ctk q8_0', speaker: spk } as never, 60, false, T, true);
-  assert.ok(!cont.some((r) => r.spans.map((s) => s.text).join('').includes('⏺')), 'continuation has no ⏺ header');
+  assert.ok(!cont.some((r) => r.spans.map((s) => s.text).join('').includes('◆')), 'continuation has no ⏺ header');
 });
 
 test('computeToolRuns: only collapsible tools stack; edits/shell break the group', () => {

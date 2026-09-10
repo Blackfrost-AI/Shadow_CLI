@@ -266,6 +266,7 @@ export class ResponsesProvider implements Provider {
   /** Wire discriminator — `/v1/responses` vs `/v1/chat/completions`. */
   readonly wire = 'responses' as const;
   private readonly apiKey: string | undefined;
+  private readonly extraHeaders: Record<string, string> | undefined;
   private readonly baseUrl: string;
   private readonly model: string;
   private readonly selfHosted: boolean;
@@ -283,6 +284,8 @@ export class ResponsesProvider implements Provider {
   constructor(opts: {
     apiKey?: string;
     baseUrl?: string;
+    /** Identity headers a subscription credential requires (see ProviderOptions.extraHeaders). */
+    extraHeaders?: Record<string, string>;
     model: string;
     selfHosted?: boolean;
     idleTimeoutMs?: number;
@@ -291,6 +294,7 @@ export class ResponsesProvider implements Provider {
     reasoningRoundtrip?: 'last' | 'none';
   }) {
     this.apiKey = opts.apiKey;
+    this.extraHeaders = opts.extraHeaders;
     this.baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
     this.model = opts.model;
     this.selfHosted = opts.selfHosted === true || isLocalBaseUrl(this.baseUrl);
@@ -306,7 +310,7 @@ export class ResponsesProvider implements Provider {
 
   async *send(req: CompletionRequest): AsyncIterable<ProviderEvent> {
     const model = req.model || this.model;
-    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    const headers: Record<string, string> = { 'content-type': 'application/json', ...this.extraHeaders };
     if (this.apiKey) headers.Authorization = `Bearer ${this.apiKey}`;
     const bodyOpts = {
       selfHosted: this.selfHosted,

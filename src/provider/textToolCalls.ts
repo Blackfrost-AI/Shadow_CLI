@@ -144,39 +144,83 @@ function includeOpeningJsonFence(text: string, start: number): number {
   return /^\s*$/.test(before.slice(open.bodyStart)) ? open.index : start;
 }
 
-/** Top-level balanced `{...}` spans, quote-aware (handles ' and "). */
+/**
+ * The single balanced `{...}` span that begins at index 0 of `s`, or null.
+ *
+ * `balancedObjects` costs O(len) or worse per CALL, and the `call:NAME{` recovery loop below used to
+ * call it once per match while only ever reading `objs[0]` and requiring `start === 0` — so a reply
+ * with unbalanced braces (a degenerate repetition is the classic case) cost O(len²) per match and
+ * O(len³) per turn, on EVERY turn that produced no native tool calls. Measured on the old code: a
+ * 30 KB payload took 41 s to scan and 45 KB took 149 s, freezing the session with no output at all.
+ * One forward pass, stopping at the close, makes it O(span).
+ */
+function leadingBalancedObject(s: string): string | null {
+  if (s[0] !== '{') return null;
+  let depth = 0;
+  let inStr = false;
+  let quote = '';
+  let esc = false;
+  for (let j = 0; j < s.length; j++) {
+    const c = s[j]!;
+    if (esc) {
+      esc = false;
+      continue;
+    }
+    if (inStr) {
+      if (c === '\\') esc = true;
+      else if (c === quote) inStr = false;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      inStr = true;
+      quote = c;
+    } else if (c === '{') {
+      depth++;
+    } else if (c === '}') {
+      depth--;
+      if (depth === 0) return s.slice(0, j + 1);
+    }
+  }
+  return null;
+}
+
+/**
+ * Top-level balanced `{...}` spans, quote-aware (handles ' and "), in one left-to-right pass.
+ *
+ * A stack replaces the old "for every `{`, rescan the whole remaining suffix counting depth" loop,
+ * which was O(len²) whenever braces did not balance — the shape a degenerate repetition reply
+ * produces. The spans it reports are the same ones that loop produced for balanced input; the only
+ * inputs that differ are ones with an UNCLOSED quote before a brace, where restarting the count per
+ * brace used to let a later brace be read as balanced. Treating the text's own string context as
+ * authoritative is both cheaper and more faithful to what the model actually wrote.
+ */
 function balancedObjects(s: string): Array<{ raw: string; start: number }> {
   const out: Array<{ raw: string; start: number }> = [];
+  const open: number[] = [];
+  let inStr = false;
+  let quote = '';
+  let esc = false;
   for (let i = 0; i < s.length; i++) {
-    if (s[i] !== '{') continue;
-    let depth = 0;
-    let inStr = false;
-    let quote = '';
-    let esc = false;
-    for (let j = i; j < s.length; j++) {
-      const c = s[j]!;
-      if (esc) {
-        esc = false;
-        continue;
-      }
-      if (inStr) {
-        if (c === '\\') esc = true;
-        else if (c === quote) inStr = false;
-        continue;
-      }
-      if (c === '"' || c === "'") {
-        inStr = true;
-        quote = c;
-      } else if (c === '{') {
-        depth++;
-      } else if (c === '}') {
-        depth--;
-        if (depth === 0) {
-          out.push({ raw: s.slice(i, j + 1), start: i });
-          i = j;
-          break;
-        }
-      }
+    const c = s[i]!;
+    if (esc) {
+      esc = false;
+      continue;
+    }
+    if (inStr) {
+      if (c === '\\') esc = true;
+      else if (c === quote) inStr = false;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      inStr = true;
+      quote = c;
+    } else if (c === '{') {
+      open.push(i);
+    } else if (c === '}') {
+      const start = open.pop();
+      // A span is top-level when nothing else is still open around it — the same "depth returns to
+      // zero" test the old scanner applied, and it yields the same non-overlapping spans in order.
+      if (start !== undefined && open.length === 0) out.push({ raw: s.slice(start, i + 1), start });
     }
   }
   return out;
@@ -358,12 +402,19 @@ export function sniffToolCalls(text: string, isKnownTool: (name: string) => bool
   let m: RegExpExecArray | null;
   const callRe = /call:\s*([A-Za-z_]\w*)\s*(?=\{)/g;
   const toRemove: string[] = [];
+  // An object cannot close without a `}` after its opening brace, so a match past the last one is
+  // skipped in O(1) instead of scanning to the end of the text just to fail. Without this, a
+  // degenerate reply of N `call:name{` markers cost N full-suffix scans — the other half of the
+  // freeze (8k markers / 128 KB still spent a full second here).
+  const lastCloseBrace = cleaned.lastIndexOf('}');
   while ((m = callRe.exec(cleaned)) !== null) {
     const name = m[1]!;
-    const objs = balancedObjects(cleaned.slice(m.index + m[0].length));
-    const first = objs[0];
-    if (first && first.start === 0) {
-      if (take(name, parseLoose(first.raw) ?? first.raw)) toRemove.push(m[0] + first.raw);
+    if (m.index + m[0].length > lastCloseBrace) continue;
+    // Only the object immediately after the name counts (see leadingBalancedObject for why this is
+    // not a balancedObjects() call).
+    const first = leadingBalancedObject(cleaned.slice(m.index + m[0].length));
+    if (first !== null) {
+      if (take(name, parseLoose(first) ?? first)) toRemove.push(m[0] + first);
     }
   }
   for (const r of toRemove) cleaned = cleaned.replace(r, '');

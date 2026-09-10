@@ -183,3 +183,22 @@ test('j/k without a width fall back to HARD-line motion (unit-test default)', ()
   assert.equal(run('foo\nbar\nqux', 5, 'k').cursor, 1);
   assert.equal(run('foo\nb', 2, 'j').cursor, 5, 'column clamps to the shorter line');
 });
+
+test('vim `a` (append) steps a whole GRAPHEME, never one UTF-16 unit', () => {
+  // Every other motion in vim.ts is grapheme-safe; `a` alone did `cursor + 1`. On an emoji (a
+  // surrogate PAIR) or a flag/combining cluster the caret landed INSIDE the cluster, so the next
+  // keystroke split it — and the draft, the painted frame, and the string sent to the provider all
+  // carried a lone surrogate from then on.
+  const draft = 'ab😀cd';
+  const r = vimNormalKey(draft, 2, '', 'a'); // caret ON the emoji
+  assert.equal(r.mode, 'insert');
+  assert.equal(r.cursor, 4, 'past the whole cluster, not into its surrogate pair');
+  const typed = draft.slice(0, r.cursor) + 'X' + draft.slice(r.cursor);
+  assert.equal(
+    /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(typed),
+    false,
+    `a lone surrogate was produced: ${JSON.stringify(typed)}`,
+  );
+  // A plain ASCII buffer keeps the old behaviour exactly.
+  assert.equal(vimNormalKey('abc', 0, '', 'a').cursor, 1);
+});

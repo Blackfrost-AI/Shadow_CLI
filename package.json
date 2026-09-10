@@ -1,6 +1,6 @@
 {
   "name": "shadow",
-  "version": "8.6.0",
+  "version": "8.7.0",
   "description": "Shadow — a high-performance, agentic CLI runtime that lets an LLM operate as a coding/sysadmin agent over a local workspace.",
   "type": "module",
   "private": true,
@@ -51,6 +51,7 @@
     "@eslint/js": "^9.17.0",
     "@types/node": "^22.10.0",
     "@types/react": "^18.3.12",
+    "@xterm/headless": "6.0.0",
     "eslint": "^9.17.0",
     "ink-testing-library": "^4.0.0",
     "linkedom": "0.18.13",

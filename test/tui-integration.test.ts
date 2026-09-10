@@ -147,7 +147,7 @@ test('the spinner shows a live elapsed counter while a slow model is responding'
   await new Promise((r) => setTimeout(r, 1300)); // let the elapsed counter tick past 1s
   const frame = lastFrame() ?? '';
   assert.match(frame, /\([1-9]\d*s\)/, 'spinner shows elapsed seconds, not a dead spinner');
-  assert.match(frame, /Esc interrupt/);
+  assert.match(frame, /Esc stop/);
   unmount();
 });
 
@@ -604,7 +604,7 @@ test('type-ahead: /goal typed while running begins live and queues its kickoff t
   stdin.write('go');
   await new Promise((r) => setTimeout(r, 20));
   stdin.write('\r');
-  await waitFor(() => /Esc interrupt/.test(seen()), 1500);
+  await waitFor(() => /Esc stop/.test(seen()), 1500);
 
   // /goal is live-safe (SLASH_WHILE_RUNNING): the mission begins immediately, but the
   // kickoff TURN is deferred to the queue — a second concurrent loop must never start.
@@ -829,12 +829,12 @@ test('Esc interrupts a running turn (and the session survives)', async () => {
   await new Promise((r) => setTimeout(r, 20));
   stdin.write('\r');
   await new Promise((r) => setTimeout(r, 200));
-  assert.match(lastFrame() ?? '', /Esc interrupt/, 'turn is running');
+  assert.match(lastFrame() ?? '', /Esc stop/, 'turn is running');
   stdin.write('\x1b'); // Esc → interrupt
   await new Promise((r) => setTimeout(r, 200));
   const frame = lastFrame() ?? '';
   assert.match(frame, /interrupted/, 'Esc reports the interrupt');
-  assert.doesNotMatch(frame, /Esc interrupt/, 'the running turn stopped');
+  assert.doesNotMatch(frame, /Esc stop/, 'the running turn stopped');
   assert.match(frame, /❯/, 'composer still present — the session survived');
   unmount();
 });

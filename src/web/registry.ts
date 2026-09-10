@@ -1,6 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { EventBus } from '../agent/events.js';
 import { SessionApprovals } from '../agent/approval.js';
+import { createReadTracker, type ReadTracker } from '../tools/readTracker.js';
 import type { ApprovalDecision } from '../agent/approval.js';
 import type { AgentSession } from '../agent/bootstrap.js';
 import type { AutonomyLevel } from '../safety/permissions.js';
@@ -118,6 +119,10 @@ export interface WebSession {
    *  alarm-fatigue bug approval.ts exists to fix — see the TUI's sessionApprovalsRef pattern).
    *  The ACP editor's "Allow for this session" option lands here. */
   readonly approvals: SessionApprovals;
+  /** Session-lifetime read-before-edit tracker, same reasoning as `approvals` above: each turn
+   *  builds a fresh AgentLoop, so a loop-owned tracker forgot every file read on the previous turn
+   *  and refused the next edit of a file the model had just read. */
+  readonly readTracker: ReadTracker;
   /** Asks parked by WebApprovalGate, keyed by approval id — answered via registry.decide().
    *  Empty for the mirror/local sessions (nothing gates through them). */
   readonly pendingApprovals: Map<string, PendingApproval>;
@@ -275,6 +280,7 @@ export function createSessionRegistry(deps: { builder: AgentBuilder; runTurn: Tu
       building: null,
       abort: null,
       approvals: new SessionApprovals(),
+      readTracker: createReadTracker(),
       pendingApprovals: new Map<string, PendingApproval>(),
       getAbort: init.getAbort,
       async close(): Promise<void> {

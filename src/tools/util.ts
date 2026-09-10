@@ -102,7 +102,7 @@ export type EditStrategy = 'exact' | 'trailing-ws' | 'indent' | 'fuzzy';
 
 export type EditResult =
   | { ok: true; updated: string; count: number; strategy: EditStrategy }
-  | { ok: false; reason: 'not-found' | 'multiple' | 'ambiguous'; count: number };
+  | { ok: false; reason: 'not-found' | 'multiple' | 'ambiguous' | 'empty'; count: number };
 
 /** A fuzzy block must score at least this to be considered a match at all. */
 const FUZZY_THRESHOLD = 0.85;
@@ -277,6 +277,13 @@ export function applyStringEdit(
   newStr: string,
   replaceAll: boolean,
 ): EditResult {
+  // An EMPTY old_string is not a no-op and not "match everything" — it has no meaning as a piece of
+  // text, and the line-based ladder below treats it as one blank line, so it matched every blank
+  // line in the file: `old_string: ""` + `replace_all` rewrote each of them, dropped the file's
+  // trailing newline, and reported success ("replaced 3 occurrence(s)"). Refuse it by name; the
+  // regex-free ladders and the exact path all agree that an empty needle is not a real edit.
+  if (oldStr === '') return { ok: false, reason: 'empty', count: 0 };
+
   // 1. exact substring (the common, safe case)
   const exact = countOccurrences(text, oldStr);
   if (exact > 0) {
@@ -290,7 +297,18 @@ export function applyStringEdit(
   const eol = /\r\n/.test(text) ? '\r\n' : '\n';
   const fileLines = text.split(/\r?\n/);
   const oldLines = oldStr.replace(/\r\n/g, '\n').split('\n');
-  const newLF = newStr.replace(/\r\n/g, '\n');
+  let newLF = newStr.replace(/\r\n/g, '\n');
+  // A trailing newline in old_string is the line TERMINATOR of its last line, not an extra blank
+  // line. Left in place, `split('\n')` produced a phantom `''` element that findBlockMatches then
+  // required the file to satisfy literally — so a multi-line block copied WITH its trailing newline
+  // (exactly the case the tolerant ladders exist for) could never match: the exact strategy failed
+  // on whitespace and both line ladders failed on the phantom blank, reporting a spurious
+  // "not found". Drop one trailing empty per side, so the block spans the same number of lines the
+  // model selected and the splice does not insert a blank line of its own.
+  if (oldLines.length > 1 && oldLines[oldLines.length - 1] === '') {
+    oldLines.pop();
+    if (newLF.endsWith('\n')) newLF = newLF.slice(0, -1);
+  }
 
   for (const [strategy, norm] of [
     ['trailing-ws', stripTrailingWs],

@@ -169,6 +169,9 @@ export function* eventsFromOpenAICompletion(
 
   const choice = o.choices?.[0];
   const message = choice?.message;
+  // Declared out here: the finish_reason handling below must know whether this response actually
+  // carried tool calls (see the stopReason guard near the end).
+  const toolCalls = message?.tool_calls ?? [];
   if (message) {
     const reasoningField = typeof message.reasoning_content === 'string'
       ? 'reasoning_content'
@@ -191,17 +194,35 @@ export function* eventsFromOpenAICompletion(
       }
     }
 
-    const toolCalls = message.tool_calls ?? [];
     let idx = 0;
     const usedIds = new Set<string>();
     for (const tc of toolCalls) {
       const name = tc.function?.name ?? '';
-      const args = tc.function?.arguments ?? '';
+      const rawArgs = tc.function?.arguments as unknown;
+      // Several compatible endpoints (Ollama among them) send arguments as an already-decoded
+      // OBJECT, not the JSON string the OpenAI wire specifies. Passing that straight to
+      // parseToolArgs threw on `raw.trim()` — an unhandled TypeError in the middle of a turn. The
+      // SSE parser serializes the same shape; do it here too so both wires agree.
+      const args =
+        typeof rawArgs === 'string' ? rawArgs : rawArgs == null ? '' : JSON.stringify(rawArgs);
       if (!name && !args) continue;
       let id = tc.id || `call_${idx}`;
       while (usedIds.has(id)) id = `call_${idx}_${usedIds.size}`;
       usedIds.add(id);
       const sig = tc.extra_content?.google?.thought_signature;
+      // A call with args but NO name must not be emitted as `name: ''` — that becomes
+      // `unknown tool: ` downstream and burns a round trip. The SSE parser reports the identical
+      // case as a recoverable `nameless_tool_call`, which is what its comment claims parity with.
+      if (!name) {
+        yield {
+          type: 'error',
+          recoverable: true,
+          code: 'nameless_tool_call',
+          message: 'tool call returned without a name (endpoint omitted the function name) — resend the call',
+        };
+        idx++;
+        continue;
+      }
       const parsed = parseToolArgs(args);
       if (parsed.ok) {
         yield {
@@ -219,10 +240,14 @@ export function* eventsFromOpenAICompletion(
       idx++;
     }
 
-    if (toolCalls.length > 0 && stopReason === 'end_turn') stopReason = 'tool_use';
+    // Emitting tool calls IS a tool_use turn, whatever finish_reason says: many compatible servers
+    // pair `tool_calls` with `finish_reason: "stop"`, and reporting end_turn there ends the turn
+    // with the call never run. The SSE parser infers tool_use in exactly this case.
+    if (toolCalls.length > 0) stopReason = 'tool_use';
   }
 
-  if (choice?.finish_reason) stopReason = mapOpenAIFinishLocal(choice.finish_reason);
+  // …so a finish_reason may only overwrite the inference when the endpoint did NOT return calls.
+  if (choice?.finish_reason && toolCalls.length === 0) stopReason = mapOpenAIFinishLocal(choice.finish_reason);
 
   if (splitInline) {
     for (const span of splitter.flush()) {

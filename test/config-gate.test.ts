@@ -86,3 +86,23 @@ test('multi_edit and apply_patch targeting the config are detected (the patch-gr
   // Non-write tools are out of the wrapper's scope even with a config path in hand.
   assert.equal(writeTouchesConfigFile('read_file', { path: GLOBAL_CFG }), false);
 });
+
+test('config gate closes the respellings: ./ prefix, case, and the workspace base', () => {
+  // `.shadow/config.json` is how a model naturally writes `./.shadow/config.json`, and the old
+  // leading class (`^|[/\\]`) did not match it — so with `--workspace $HOME` the most obvious
+  // spelling of the global config skipped the gate at auto-edit, where a `write` risk is otherwise
+  // auto-approved. On a case-insensitive filesystem `.SHADOW/CONFIG.JSON` is the same file.
+  assert.equal(touchesConfigFile({ id: 'c', name: 'write_file', input: { path: '.shadow/config.json' } }, [HOME]), true);
+  assert.equal(touchesConfigFile({ id: 'c', name: 'write_file', input: { path: './shadow.config.json' } }), true);
+  assert.equal(touchesConfigFile({ id: 'c', name: 'write_file', input: { path: GLOBAL_CFG.toUpperCase() } }), true);
+  assert.equal(touchesConfigFile({ id: 'c', name: 'write_file', input: { path: 'shadow.config.json' } }, [HOME]), true);
+  // A relative path is resolved against the WORKSPACE the write lands in, not the process cwd.
+  assert.equal(
+    touchesConfigFile({ id: 'c', name: 'write_file', input: { path: '.shadow/config.json' } }, ['/somewhere-else']),
+    false,
+    'the same spelling outside the home workspace is an ordinary file',
+  );
+  // Ordinary source files stay quiet (the gate is not "anything named config.json").
+  assert.equal(touchesConfigFile({ id: 'c', name: 'write_file', input: { path: 'config.json' } }, ['/ws']), false);
+  assert.equal(touchesConfigFile({ id: 'c', name: 'write_file', input: { path: 'src/shadow.config.json.ts' } }), false);
+});

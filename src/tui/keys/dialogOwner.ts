@@ -8,7 +8,7 @@ import { shellCommandOf } from '../format.js';
 import { recommendedIndex } from '../questions.js';
 import { raiseAutonomy } from '../../safety/permissions.js';
 import type { ContextName } from '../keybindings/types.js';
-import { queuedTaskKind } from './common.js';
+import { pushHistory, queuedTaskKind } from './common.js';
 import { dialogArmMs } from './reserved.js';
 import type { FocusOwnerHandler, InkKey, KeyEnv } from './types.js';
 
@@ -24,8 +24,7 @@ function handleDialog(env: KeyEnv, ch: string, key: InkKey): boolean {
     const task = env.inputRef.current.trim();
     const taskKind = queuedTaskKind(env, task);
     env.setQueued([...env.queuedTasksRef.current, { text: task, kind: taskKind }]);
-    env.historyRef.current.push(task);
-    env.histIdxRef.current = env.historyRef.current.length;
+    pushHistory(env, task);
     env.setLine('');
     env.dialogTypeaheadRef.current = false;
     // P1A-15: an Enter that lands inside the arm window was almost certainly the user

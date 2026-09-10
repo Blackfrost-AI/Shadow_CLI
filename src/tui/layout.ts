@@ -168,7 +168,8 @@ export function formatStatusStrip(
   const gauge = Number.isFinite(input.contextPct) && (input.contextPct as number) >= 0
     ? formatContextGauge(input.contextPct as number, input.triggerRatio)
     : null;
-  const gaugeText = gauge ? `${gauge.bar}${gauge.label} · ` : '';
+  // formatUsage already includes ctx N%. Keep its label once and use only the bar here.
+  const gaugeText = gauge ? `${gauge.bar}${/\bctx\s+\d/.test(input.status) ? '' : gauge.label} · ` : '';
   const ctx = `${gaugeText}${input.status}`;
   const extras = `${input.effortStatus ?? ''}${input.planStatus ?? ''}${input.todoStatus ?? ''}${input.sandboxStatus ?? ''}`;
   const full = `${core}${extras} · ${ctx}`;
@@ -269,4 +270,3 @@ export function fitHud(
   add(1, () => (f.marginTop = true)); // cosmetic blank above the composer — first to go
   return f;
 }
-

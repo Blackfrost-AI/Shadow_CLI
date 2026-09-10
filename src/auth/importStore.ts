@@ -29,15 +29,45 @@ export function grokAuthPath(): string {
 
 /** Decode a JWT's `exp` (unix seconds) without verifying the signature. */
 export function jwtExp(token: string): number | undefined {
+  const payload = jwtPayload(token);
+  return typeof payload?.exp === 'number' ? payload.exp : undefined;
+}
+
+/**
+ * Decode a JWT's payload (no signature verification) — `undefined` for anything unparseable.
+ * Shared by `jwtExp` and `jwtAccountId` so both agree on what "a JWT" is.
+ */
+function jwtPayload(token: string): Json | undefined {
   const parts = token.split('.');
   if (parts.length < 2) return undefined;
   try {
     const json = Buffer.from(parts[1]!.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
-    const payload = JSON.parse(json) as { exp?: unknown };
-    return typeof payload.exp === 'number' ? payload.exp : undefined;
+    const payload: unknown = JSON.parse(json);
+    return payload && typeof payload === 'object' ? (payload as Json) : undefined;
   } catch {
     return undefined;
   }
+}
+
+/**
+ * The ChatGPT workspace/account id inside an id_token.
+ *
+ * Needed because a REFRESH response returns an access token and (usually) an id_token but NOT the
+ * `account_id` field the auth.json parser reads — so without this, every rotation would drop the
+ * workspace binding and the next request would fail even though the token itself was fresh. The
+ * claim path is nested (`https://api.openai.com/auth.chatgpt_account_id`); the flat spellings are
+ * checked too because the claim layout is the issuer's, not ours.
+ */
+export function jwtAccountId(token: string | undefined): string | undefined {
+  if (!token) return undefined;
+  const p = jwtPayload(token);
+  if (!p) return undefined;
+  const auth = p['https://api.openai.com/auth'];
+  if (auth && typeof auth === 'object') {
+    const nested = str((auth as Json).chatgpt_account_id);
+    if (nested) return nested;
+  }
+  return str(p.chatgpt_account_id) ?? str(p.account_id);
 }
 
 type Json = Record<string, unknown>;

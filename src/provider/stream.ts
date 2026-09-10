@@ -13,7 +13,7 @@
  */
 import type { ProviderEvent } from './provider.js';
 import { isLocalBaseUrl } from '../safety/offline.js';
-import { shadowFetch } from '../safety/egress.js';
+import { shadowFetch, STREAM_AGENT_TIMEOUT_MS } from '../safety/egress.js';
 
 const MAX_ATTEMPTS = 5; // ~24s of ride-out across the ladder — see backoff()
 /** Max times we shrink an over-budget output cap and retry a 400 that says the request is too long. */
@@ -34,7 +34,12 @@ export const SELF_HOSTED_DEFAULT_IDLE_MS = 300_000;
  */
 export function resolveIdleBudget(idleTimeoutMs: number | undefined, url: string, selfHosted?: boolean): number {
   const selfHostedEff = selfHosted === true || isLocalBaseUrl(url);
-  return idleTimeoutMs ?? (selfHostedEff ? SELF_HOSTED_DEFAULT_IDLE_MS : IDLE_MS);
+  const budget = idleTimeoutMs ?? (selfHostedEff ? SELF_HOSTED_DEFAULT_IDLE_MS : IDLE_MS);
+  // Stay strictly INSIDE the transport's own deadline. The streaming agent raises undici's 300 s
+  // default so a budget above it can take effect at all (see STREAM_AGENT_TIMEOUT_MS); this clamp
+  // guarantees the watchdog — the one that reports the actionable message — is always the one that
+  // fires, however absurd the configured value.
+  return Math.min(budget, STREAM_AGENT_TIMEOUT_MS - 60_000);
 }
 /** The non-stream rescue gets its own bound — it used to inherit no timeout at all. */
 const NON_STREAM_TIMEOUT_MS = 180_000;
@@ -77,7 +82,11 @@ class IdleWatchdog {
 
   private trip(): void {
     this.fired = true;
-    this.lastTripFrame = this.ms;
+    // `lastTripFrame` is already the frame this timer was ARMED with (the constructor for the first
+    // window, `nextKickFrame` after a hop, `this.ms` for every later kick). Re-stamping it with
+    // `this.ms` here reported the FIRST-BYTE budget for a steady-state trip, so the error told the
+    // user to raise a number that had nothing to do with the wait they just experienced — and the
+    // two call sites disagreed with each other, since one passes the frame it knows.
     this.controller.abort();
   }
 
@@ -308,14 +317,22 @@ export async function* streamWithRetry(a: StreamAttempt): AsyncIterable<Provider
           body: JSON.stringify(a.body),
           signal: fetchSignal,
         },
-        { purpose: 'provider', origin: 'user' },
+        // `streaming` raises the agent's undici deadlines past every budget Shadow honours, so the
+        // idle watchdog above (which names the knob to raise) is what decides — instead of undici's
+        // 300 s default firing mid-body first, reporting the opaque `terminated` while the user's
+        // raised budget never took effect.
+        { purpose: 'provider', origin: 'user', streaming: true },
       );
     } catch (e) {
       idle.clear();
       if (a.signal?.aborted) return; // user interrupt — stop silently (loop reports 'interrupted')
       if (idle.fired) {
         if (yield* nonStreamFallback(a, 'idle', selfHosted)) return;
-        yield idleError(frameMs);
+        // The frame the watchdog actually waited out, not the steady-state one: with a
+        // `firstByteTimeoutMs` set, the trip that matters may be the FIRST-BYTE budget, and naming
+        // the wrong number sends the user to tune the wrong knob (the other call site already
+        // passes the frame it knows — the two now agree).
+        yield idleError(idle.lastTripFrame);
         return;
       }
       if (attempt < maxRetries) {
@@ -480,7 +497,7 @@ export async function fetchNonStreamResponse(
       body: JSON.stringify(body),
       signal,
     },
-    { purpose: 'provider', origin: 'user' },
+    { purpose: 'provider', origin: 'user', streaming: true },
   );
   if (!res.ok) {
     const message = await readErrorMessage(res);

@@ -217,6 +217,128 @@ function readsOutsideRoots(head: string, roots: readonly string[]): boolean {
   return false;
 }
 
+/**
+ * Strip any leading/trailing quote characters from a whitespace-split token.
+ *
+ * A quoted operand containing a space is split by the tokenizer above, so the pieces carry
+ * DANGLING quotes: `bash -c 'cat /etc/passwd'` yields `'cat` and `/etc/passwd'`. Stripping only
+ * a matched pair would leave the stray quote on the path and hand it to `outsideRoots`, which
+ * (correctly) refuses to vouch for anything quoting-shaped — turning a findable path into a
+ * blind demotion. Peeling the stray quotes recovers the real path so it can be judged honestly.
+ */
+function stripWrappingQuotes(token: string): string {
+  return token.replace(/^["']+|["']+$/g, '');
+}
+
+/**
+ * Redirection targets are file READS (`<`) and WRITES (`>`) that the operand scanner cannot see:
+ * `cat </etc/passwd` arrives as ONE token, and `</etc/passwd` is not absolute, so it resolved
+ * "inside" the workspace and auto-ran — likewise `head -1 </etc/shadow`, `cat 0</etc/passwd`,
+ * `wc -l</etc/passwd` and `grep -c . <~/.aws/credentials`. The write side is the mirror image:
+ * a GLUED output target (`cat a >/etc/cron.d/x`) was invisible to every grant-path check, since
+ * `segmentWrites` looks only for `-o`/`--output` flags and the operand scan saw `>/etc/cron.d/x`
+ * as a non-absolute token that resolved inside.
+ *
+ * Heredocs and herestrings (`<<EOF`, `<<-EOF`, `<<<word`) feed inline TEXT and fd duplication
+ * (`2>&1`, `<&0`) points a descriptor at another descriptor — neither names a file, so neither is
+ * scoped here. Everything else names one, and a target outside the granted roots (or a dangling
+ * operator with nothing after it) means: refuse to vouch.
+ */
+function redirectionsOutsideRoots(head: string, roots: readonly string[]): boolean {
+  let quote: string | null = null;
+  for (let i = 0; i < head.length; i++) {
+    const c = head[i]!;
+    if (quote) {
+      if (c === quote) quote = null;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      quote = c;
+      continue;
+    }
+    if (c === '\\') {
+      i++; // an escaped character is literal, never an operator
+      continue;
+    }
+    if (c !== '<' && c !== '>') continue;
+    const next = head[i + 1] ?? '';
+    if (c === '<' && next === '<') {
+      // `<<`/`<<-` heredoc, `<<<` herestring — the target is a delimiter word or inline text.
+      i++;
+      if (head[i + 1] === '-') i++;
+      if (head[i + 1] === '<') i++;
+      continue;
+    }
+    if (next === c) i++; // `>>` append still writes a file — fall through and scope its target
+    if (next === '&' && /\d/.test(head[i + 2] ?? '')) {
+      // Descriptor duplication (`2>&1`, `>&2`, `<&0`): a descriptor, never a path.
+      i++;
+      while (i + 1 < head.length && /\d/.test(head[i + 1]!)) i++;
+      continue;
+    }
+    if (next === '&') i++; // `>&word` with a NON-numeric word IS a file redirect, same as `&>word`
+    // The target is the next token, and it may be glued to the operator (`</etc/passwd`, `>out`).
+    let j = i + 1;
+    while (j < head.length && /\s/.test(head[j]!)) j++;
+    if (j >= head.length) return true; // dangling operator: nothing to vouch for
+    let target = '';
+    let tq: string | null = null;
+    for (; j < head.length; j++) {
+      const d = head[j]!;
+      if (tq) {
+        if (d === tq) tq = null;
+        else target += d;
+        continue;
+      }
+      if (d === '"' || d === "'") {
+        tq = d;
+        continue;
+      }
+      if (/\s/.test(d)) break;
+      target += d;
+    }
+    if (outsideRoots(target, roots)) return true;
+    i = j - 1;
+  }
+  return false;
+}
+
+/**
+ * Every path-looking token in a segment, whatever the command or its position — the belt to the
+ * viewer/search operand braces above.
+ *
+ * A session grant vouches that shell commands may RUN; it does not vouch for which FILES they
+ * touch, and the scans above only understood commands whose operands are files by definition
+ * (`cat`/`head`/`grep`/`find`). That left every other way of naming a file un-scoped on the grant
+ * path: `bash -c 'cat ~/.aws/credentials'`, `sh -c '…'`, `cp ~/.ssh/id_rsa /tmp`, `tar -czf
+ * /tmp/o.tgz ~/.ssh`, `python3 -c "open('/etc/passwd')"`. One `(s)` on ANY gated command rode them
+ * all, because a segment with a non-viewer head simply contributed nothing.
+ *
+ * A token is path-looking when it is absolute, starts with `~`, or contains a separator; a flag's
+ * `=value` half is checked too (`--file=/etc/patterns` reads a file). Prose arguments are not — a
+ * commit subject (`-m "src/tui: fix wrap"`) has no separator, or one that resolves inside — so
+ * ordinary work under a grant keeps riding it. Anything that still smells expandable (`$`, `~`,
+ * globs, inner quotes, backslashes) fails closed in `outsideRoots`.
+ */
+function unscopedPathOperands(head: string, roots: readonly string[]): boolean {
+  if (!roots.length) return false; // no roots configured → nothing to scope against
+  for (const raw of head.split(/\s+/)) {
+    if (!raw) continue;
+    const token = stripWrappingQuotes(raw);
+    if (!token || token === '-' || token === '/dev/null' || token === '/dev/stdin') continue;
+    // A bare flag names no file; only the `--flag=value` form carries a path.
+    const value = token.startsWith('-') ? (/^--?[^=\s]+=(.*)$/.exec(token)?.[1] ?? '') : token;
+    // Path-shaped = carrying a separator, `~`-rooted, or a bare parent step. A mid-token `~` is
+    // literal data, not an expansion: `git diff HEAD~3` and `git log v2~1..v2` are git revision
+    // grammar and stay vouchable (same rule the prefix-grant tail check applies). A bare `..`
+    // matters because a segment can leave the jail without ever naming a path — `cd .. && cat
+    // .ssh/id_rsa` reads a SIBLING directory's file, which resolves "inside" from the workspace.
+    if (!value || (!value.includes('/') && !value.startsWith('~') && value !== '..')) continue;
+    if (outsideRoots(value, roots)) return true;
+  }
+  return false;
+}
+
 function outsideRoots(operand: string, roots: readonly string[]): boolean {
   // A glob or a variable can expand to anything; refuse to vouch for it.
   if (/[*?[\]$~]/.test(operand)) return true;
@@ -255,10 +377,14 @@ export function isBashReadOnly(command: string, roots: readonly string[] = []): 
 
   // Output redirection WRITES to a file — `echo secret > f` / `cmd >> f` / `cmd &> f` AND fd-numbered
   // `echo x 1> f` / `2> f` / `3> f` must never ride the read-only fast path (silent overwrite/truncate,
-  // no approval). We ONLY exempt fd DUPLICATION (`2>&1`, `1>&2`, `>&2`, …) which points a descriptor at
-  // another descriptor, not at a file. Strip the dup forms, then reject on ANY remaining `>`. (The old
-  // `[^0-9&]>` guard exempted every digit-before-`>`, so `1> file` slipped through as read-only.)
-  const withoutFdDup = normalized.replace(/\d*>&\d+/g, '');
+  // no approval). We ONLY exempt fd DUPLICATION (`2>&1`, `1>&2`, `>&2`, `<&0`, …) which points a
+  // descriptor at another descriptor, not at a file. Strip the dup forms, then reject on ANY remaining
+  // `>`. (The old `[^0-9&]>` guard exempted every digit-before-`>`, so `1> file` slipped through.)
+  //
+  // The stripped form is what gets SPLIT below, too: a dup's `&` is not a command separator, and
+  // splitting on it made every `cmd 2>&1` read as the chain `cmd 2>` + `1` — so a plain
+  // `echo hi 2>&1` was gated as if the `1` were a second command.
+  const withoutFdDup = normalized.replace(/\d*[<>]&\d+/g, '');
   if (/>/.test(withoutFdDup)) return false;
 
   // A command substitution `$(...)`, legacy backticks, or process substitution
@@ -269,8 +395,9 @@ export function isBashReadOnly(command: string, roots: readonly string[] = []): 
   if (/\$\(|`|<\(|>\(/.test(normalized)) return false;
 
   // Split the chain on `;`, `&` (background), `&&`, and `||`. Every link must
-  // be read-only — a single mutating link disqualifies the whole command.
-  const chainParts = normalized.split(/\s*(?:&&|\|\||;|&)\s*/);
+  // be read-only — a single mutating link disqualifies the whole command. Splitting the
+  // fd-dup-stripped form keeps a dup's `&` from reading as a separator (see above).
+  const chainParts = withoutFdDup.split(/\s*(?:&&|\|\||;|&)\s*/);
   if (chainParts.length === 0) return false;
 
   for (const part of chainParts) {
@@ -279,6 +406,9 @@ export function isBashReadOnly(command: string, roots: readonly string[] = []): 
       const head = segment.trim();
       if (!head || !isReadOnlySegment(head)) return false;
       if (readsOutsideRoots(head, roots)) return false;
+      // Input/output redirection names a file the operand scan cannot see: `head -1 </etc/shadow`
+      // rode the fast path at the default autonomy because `</etc/shadow` read as a relative path.
+      if (redirectionsOutsideRoots(head, roots)) return false;
       // F07-02: recursive search commands must scope their PATH operands too — grep -rI foo /etc,
       // rg -il token ~, find ~ -name x all demote to the gate, never auto-run. (git grep was never
       // on the read-only fast path — no prefix exists — so it gates regardless of operands.)
@@ -302,21 +432,30 @@ export function isBashReadOnly(command: string, roots: readonly string[] = []): 
  * `git log --output=/etc/cron.d/x` past the jail either.
  *
  * Walks chains and pipelines exactly like `isBashReadOnly` so a scoped answer covers the whole
- * command, not just its head. Non-viewer/non-search segments contribute nothing (their operands
- * are not file reads this layer can vouch for) — callers layer their own rules on top.
+ * command, not just its head. EVERY segment is scanned for path-looking operands and redirection
+ * targets — not only the ones whose command reads files by definition. A segment with a non-viewer
+ * head (`bash -c …`, `cp`, `tar`, `python3 -c …`) contributes nothing it cannot vouch for, so it
+ * demotes rather than passing silently.
  */
 export function commandReadsOutsideRoots(command: string, roots: readonly string[]): boolean {
   if (!roots.length) return false;
   if (/[\r\n]/.test(command)) return true; // same shape rule as the fast path: refuse to vouch
   const normalized = normalizeCommand(command);
   if (!normalized) return false;
-  for (const part of normalized.split(/\s*(?:&&|\|\||;|&)\s*/)) {
+  // Same fd-duplication rule as the fast path: a dup's `&` is not a separator, and stripping the
+  // dup leaves the file it named (if any) as a plain operand for the scope checks below.
+  for (const part of normalized.replace(/\d*[<>]&\d+/g, '').split(/\s*(?:&&|\|\||;|&)\s*/)) {
     for (const segment of part.split(/\s*\|\s*/)) {
       const head = segment.trim();
       if (!head) continue;
       if (segmentWrites(head)) return true;
       if (readsOutsideRoots(head, roots)) return true;
       if (searchReadsOutsideRoots(head, roots)) return true;
+      if (redirectionsOutsideRoots(head, roots)) return true;
+      // …and every OTHER way a segment can name a file (`bash -c`, `cp`, `tar`, `python3 -c`, …).
+      // The scans above only understand commands whose operands are files by definition, so a
+      // segment with a non-viewer head used to contribute nothing at all.
+      if (unscopedPathOperands(head, roots)) return true;
     }
   }
   return false;

@@ -32,6 +32,7 @@ const DEFAULT_BASE_URL = 'https://api.openai.com/v1';
 export class OpenAIProvider implements Provider {
   readonly name = 'openai';
   private readonly apiKey: string | undefined;
+  private readonly extraHeaders: Record<string, string> | undefined;
   private readonly baseUrl: string;
   private readonly model: string;
   private readonly selfHosted: boolean;
@@ -60,6 +61,8 @@ export class OpenAIProvider implements Provider {
   constructor(opts: {
     apiKey?: string;
     baseUrl?: string;
+    /** Identity headers a subscription credential requires (see ProviderOptions.extraHeaders). */
+    extraHeaders?: Record<string, string>;
     model: string;
     selfHosted?: boolean;
     idleTimeoutMs?: number;
@@ -70,6 +73,7 @@ export class OpenAIProvider implements Provider {
     reasoningRoundtrip?: 'last' | 'none';
   }) {
     this.apiKey = opts.apiKey;
+    this.extraHeaders = opts.extraHeaders;
     this.baseUrl = (opts.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
     this.model = opts.model;
     // Shadow's existing local-endpoint boundary covers loopback, mDNS and private/LAN IPs.
@@ -96,7 +100,7 @@ export class OpenAIProvider implements Provider {
       capabilities: this.capabilities,
       reasoningRoundtrip: this.reasoningRoundtrip,
     });
-    const headers: Record<string, string> = { 'content-type': 'application/json' };
+    const headers: Record<string, string> = { 'content-type': 'application/json', ...this.extraHeaders };
     if (this.apiKey) headers.Authorization = `Bearer ${this.apiKey}`;
     const bodyOpts = {
       selfHosted: this.selfHosted,
@@ -828,9 +832,19 @@ export async function* parseOpenAISSE(
         if (tc.function?.name) cur.name = tc.function.name;
         const sig = tc.extra_content?.google?.thought_signature;
         if (typeof sig === 'string' && sig) cur.signature = sig;
-        if (typeof tc.function?.arguments === 'string') {
-          cur.args += tc.function.arguments;
-          yield { type: 'tool_call_partial', id: cur.id, name: cur.name, jsonDelta: tc.function.arguments };
+        // Arguments arrive as a JSON STRING on the OpenAI/vLLM wires, but several compatible
+        // endpoints — Ollama among them, which this CLI offers as a first-class provider — send
+        // them as an already-decoded OBJECT. Handling only the string form dropped those silently:
+        // the call came out with `input: {}` and ran with no arguments at all, with no error to
+        // explain why. Serializing the object restores both the accumulation and the live preview.
+        const rawArgs = tc.function?.arguments as unknown;
+        if (typeof rawArgs === 'string') {
+          cur.args += rawArgs;
+          yield { type: 'tool_call_partial', id: cur.id, name: cur.name, jsonDelta: rawArgs };
+        } else if (rawArgs != null && typeof rawArgs === 'object') {
+          const json = JSON.stringify(rawArgs);
+          cur.args += json;
+          yield { type: 'tool_call_partial', id: cur.id, name: cur.name, jsonDelta: json };
         }
       }
 

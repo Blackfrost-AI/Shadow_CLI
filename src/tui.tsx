@@ -1,19 +1,21 @@
-import React, { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react';
 import { render, Box, Text, Static, useApp, useInput, useStdin, useStdout } from 'ink';
-import { itemIsCollapsible, computeToolRunsAppendable, type ToolRunsCache } from './tui/flatten.js';
+import { itemIsCollapsible } from './tui/flatten.js';
+import { useActivity } from './tui/useActivity.js';
+import { useActivityView, ActivityOverlay } from './tui/activityView.js';
+import { activityLabel, isRoutineCall } from './tui/activity.js';
 import { type BannerLine, type TranscriptItem } from './tui/rows.js';
-import { collapseKind, displayToolArg, displayToolName, formatReconSummary, isCollapsibleTool, isWriteTool, reconCount, type CollapseKind } from './tui/toolDisplay.js';
+import { displayToolArg, displayToolName } from './tui/toolDisplay.js';
 import { renderSubAgentPanel, type SubAgentView } from './tui/subagentPanel.js';
 import { emitNotification, NOTIFY_MIN_TURN_MS, NOTIFY_APPROVAL_WAIT_MS } from './util/notify.js';
 import { discoverCustomCommands } from './tui/customCommands.js';
 import { resolveEditor, openEditorFile } from './tui/externalEditor.js';
 import { atMentionToken, walkWorkspaceFiles, rankFileCandidates, expandFileMentions } from './tui/fileMentions.js';
 import { supportsInlineImages, saveAndOpen, canOpenViewer } from './util/termImage.js';
-import { extractCommittableUnits, clampTail, clampLiveRest, stripTrailingNewlines, dupKey, repeatStep, leadsWithBlock } from './tui/streamCommit.js';
+import { extractCommittableUnits, clampLiveRest, stripTrailingNewlines, dupKey, repeatStep, leadsWithBlock } from './tui/streamCommit.js';
 import { computeLayout, formatStatusStrip, pinnedMaxItems, composerMaxRows, fitHud, type HudFit } from './tui/layout.js';
 import { clampToastText, toastColor, TOAST_TTL_MS, type ToastKind } from './tui/toast.js';
 import { decideInstructionAutopilot, seedInstructionFile, autopilotToastText, autopilotEnabledForBoot } from './tui/instructionAutopilot.js';
-import { IS_DARWIN, NEWLINE_HINT } from './tui/platform.js';
 import { PendingOverlay, ModelPickerOverlay } from './tui/overlays.js';
 import { buildSeats, resolveTableEntries, parseTableInput, seatTag, MIN_SEATS, MAX_SEATS, type Seat, type SpeakerTag } from './tui/roundTable.js';
 import { spawn, spawnSync } from 'node:child_process';
@@ -36,6 +38,7 @@ import { missionHudLine, missionPinnedRow } from './tui/missionHud.js';
 import { drainTurnInput } from './tui/turnInput.js';
 import { AgentLoop } from './agent/loop.js';
 import { buildLoopDeps } from './agent/loopDeps.js';
+import { createReadTracker } from './tools/readTracker.js';
 import { runLock, CLI_HOLDER } from './web/runLock.js';
 import { type ApprovalGate, type ApprovalRequest, AutoApproveGate, SessionApprovals } from './agent/approval.js';
 import { raiseAutonomy, type AutonomyLevel } from './safety/permissions.js';
@@ -46,10 +49,14 @@ import { clampLocalContextBudget, keepLastTurnsForBudget, triggerRatioForBudget 
 import { familyProfile } from './config/familyProfiles.js';
 import { SessionLog } from './state/session.js';
 import { createProvider, entryStreamContract, type ProviderName } from './provider/index.js';
+import { subProviderFor } from './auth/spec.js';
+import { ensureFreshSubscriptionCredential } from './auth/refresh.js';
+import { resolveAutoModel } from './local/autoEndpoint.js';
 
 import { configuredContextWindow, detectServerContextWindow, ensureLocalServer, isLocalServedEntry, mlxOfflineReady } from './gguf.js';
 
-import { resolveBaseUrl, resolveEntryCredential, type ShadowConfig, type ModelEntry } from './config.js';
+import { resolveBaseUrl, resolveEntryCredential,
+  resolveProviderCredential, type ShadowConfig, type ModelEntry } from './config.js';
 import { vaultExists } from './auth/vault.js';
 
 import { type OutputStyle } from './styles.js';
@@ -81,7 +88,7 @@ import { sanitizeTerminalEscapes, scrubForDisplay } from './util/scrub.js';
 import { splitStreamToolIntentCapped } from './tui/streamIntent.js';
 import { scrubbedEnv } from './util/safeEnv.js';
 import { displayWidth, takeByWidth } from './util/width.js';
-import { stripCtl, formatUsage, shellCommandOf, agentAttr, oneLine, formatDiffStats } from './tui/format.js';
+import { stripCtl, formatUsage, shellCommandOf, agentAttr, oneLine } from './tui/format.js';
 import { THEMES, THEME_NAMES, C, normalizeThemeName, applyTheme, paletteSnapshot, backgroundSequence, themeBackground, type ThemeName, type Palette } from './tui/theme.js';
 import { SLASH_COMMANDS, SLASH_NAME_WIDTH, findSlashCommand, runSlashCommand, slashDispatchName, type SlashCommand, type SlashCtx } from './tui/slash.js';
 import { slashMatches, classifySlash, type SlashMenuItem, type ArgContext } from './tui/slashMenu.js';
@@ -93,6 +100,7 @@ import {
   PinnedState,
   StatusStrip,
   ChromeMarkers,
+  composerInnerWidth,
   isChatter,
   Composer,
   FlatItem,
@@ -196,7 +204,6 @@ export function runStatusLine(cmd: string, ctx: StatusLineCtx, cb: (line: string
 // IS_DARWIN moved to ./tui/platform.js (shared with slash help lines) — imported below.
 const SPINNER = ['◐', '◓', '◑', '◒']; // light/dark halves chase around the circle
 // The signature left-gutter dot on assistant turns; color (not shape) carries tool state.
-const BLACK_CIRCLE = IS_DARWIN ? '⏺' : '●';
 // The spinner glyph + live-region ⏺ accent — reads the THEME token so the streaming
 // preview matches the committed transcript under /theme (incl. colorblind/high-contrast).
 // (Historically Claude's warm brand orange, now og's `accent` value.)
@@ -204,7 +211,6 @@ const CLAUDE_ORANGE = '#d97757'; // fallback only — prefer C.accent at render 
 // The activity label shown beside the spinner while a turn runs. One brand-consistent word
 // ('Shadowing…') instead of a rotating grab-bag of generic verbs. A CUSTOM per-action label (a tool
 // or the app setting a contextual verb) can override it in future; there is no such source today.
-const DEFAULT_STATUS_VERB = 'Shadowing';
 // Bracketed-paste markers moved to src/tui/keys/reserved.ts (P3-01 focus-owner router).
 
 
@@ -364,7 +370,10 @@ function useTerminalSize(): { cols: number; rows: number } {
     const apply = () =>
       setSize({ cols: stdout?.columns ?? 80, rows: stdout?.rows ?? 24 });
     apply();
-    stdout?.on?.('resize', apply);
+    // Ink's own listener renders immediately. Update React's frame budget first so it never
+    // renders the old, taller layout into a smaller terminal and triggers its overflow reset.
+    if (stdout?.prependListener) stdout.prependListener('resize', apply);
+    else stdout?.on?.('resize', apply);
     return () => {
       stdout?.off?.('resize', apply);
     };
@@ -391,25 +400,10 @@ const SYNTH_RETURN_KEY = { return: true, name: 'return', sequence: '\r' } as unk
 const BATON_ORANGE = '#d97757';
 
 
-/** Large tool/diff output and reasoning are collapsible; everything else renders full.
- *  Collapsible items START collapsed; Ctrl-O expands ALL. Threshold lives in flatten.ts so the
- *  renderer and the classifier never drift (was 3 here / 8 in flattenTranscript). */
+/** Legacy/restored tool bodies stay compact; current tool output lives in activity details. */
 function isCollapsible(item: TranscriptItem): boolean {
   return itemIsCollapsible(item);
 }
-
-/**
- * Cap a multi-line tool body before it enters the transcript. Prefer the TAIL (shell logs,
- * test runners) — the end is usually the signal. A head notice records how many lines were
- * dropped so the fold count still reads honestly after expand.
- */
-const MAX_TRANSCRIPT_BODY_LINES = 200;
-function capTranscriptBody(rawLines: string[]): string[] {
-  if (rawLines.length <= MAX_TRANSCRIPT_BODY_LINES) return rawLines;
-  const omitted = rawLines.length - MAX_TRANSCRIPT_BODY_LINES;
-  return [`… ${omitted} earlier lines omitted …`, ...rawLines.slice(-MAX_TRANSCRIPT_BODY_LINES)];
-}
-
 
 // DiffPanel removed — diffs now render as a single collapsible transcript item
 // (see the tool_end handler); no separate always-expanded live panel to flood the view.
@@ -417,6 +411,7 @@ function capTranscriptBody(rawLines: string[]): string[] {
 // ── Main TUI component ────────────────────────────────────────────────────────
 export function TuiApp({ opts }: { opts: TuiOpts }) {
   const { exit } = useApp();
+  const { stdout } = useStdout();
   const { bus, context, sessionLog } = opts;
   // P2-11 (/fork): the session log is a MOUNT-TIME prop, but /fork must swap the live log to a
   // new session id without remounting the app. Every read/write goes through this ref; /fork
@@ -430,10 +425,15 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const [style, setStyle] = useState<OutputStyle>(opts.styleState?.style ?? opts.cfg.lastStyle ?? 'proactive');
 
   const terminalSize = useTerminalSize();
+  const activity = useActivity();
+  const activityView = useActivityView(activity.history, terminalSize.cols, terminalSize.rows);
+  const activityKeysRef = useRef(activityView.handleKey);
+  activityKeysRef.current = activityView.handleKey;
+  const reducedMotion = opts.cfg.reducedMotion || process.env.SHADOW_REDUCED_MOTION === '1';
   const [committed, setCommitted] = useState<TranscriptItem[]>([]);
   // (No live-banner state: the welcome card commits to <Static> once at startup — see showBanner.)
-  const [showAllExpanded, setShowAllExpanded] = useState(false); // Ctrl-O: reveal ALL collapsible blocks
-  /** Per-item expands (Alt/Option+O on the latest). Cleared when Ctrl-O collapses/expands all. */
+  const [showAllExpanded, setShowAllExpanded] = useState(false); // legacy restored body folds
+  /** Answer-table folds are independent of activity inspection. */
   const [expandedIds, setExpandedIds] = useState<Set<number>>(() => new Set());
   const [stream, setStream] = useState('');
   const [think, setThink] = useState(''); // live extended-reasoning text (dim, cleared per step)
@@ -524,9 +524,15 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   }, [shellClear]);
   useEffect(() => () => void (shellTimerRef.current && clearTimeout(shellTimerRef.current)), []);
   useEffect(() => () => void (toastTimerRef.current && clearTimeout(toastTimerRef.current)), []);
-  // The tool currently executing — rendered as a persistent live ⏺ Name(args) row that appears the
-  // instant the call starts and resolves in place (into the committed green/red ⏺ row) on tool_end.
-  const [activeTool, setActiveTool] = useState<{ name: string; arg: string; agent?: { subagentType?: string; description?: string } } | null>(null);
+  // Keep overlapping calls alive until their own end event; one result must not hide another call.
+  type ActiveTool = { name: string; arg: string; agent?: { subagentType?: string; description?: string } };
+  const [activeTool, setActiveTool] = useState<ActiveTool | null>(null);
+  const activeToolsRef = useRef(new Map<string, ActiveTool>());
+  const finishActiveTool = (id: string) => {
+    activeToolsRef.current.delete(id);
+    const remaining = [...activeToolsRef.current.values()].at(-1);
+    setActiveTool(remaining ? { ...remaining } : null);
+  };
   // Sub-agent visibility (BUG 3): live delegated agents keyed by taskId. Populated from
   // SUBAGENT_START/SUBAGENT_END lifecycle events emitted by the agent tool, and from the TAGGED
   // tool_start/tool_end forwarded events (SubagentBus.meta) for each agent's current activity.
@@ -572,7 +578,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // Mid-turn recon burst (read/grep/glob…): counts accumulate so the live row reads
   // "Reading 3 files, Grepping 1 pattern · path" instead of flashing every single call.
   // Cleared when a signal tool (edit/shell/…) starts or the turn ends.
-  const [liveRecon, setLiveRecon] = useState<{ kinds: Partial<Record<CollapseKind, number>>; hint?: string } | null>(null);
+
   const [shellPid, setShellPid] = useState<number | null>(null); // active run_shell child, for the HUD
   const [shellWarn, setShellWarn] = useState<string | null>(null); // set when that child may survive ESC
   const [running, setRunning] = useState(false);
@@ -586,6 +592,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const dialogTypeaheadRef = useRef(false);
   /** Session-lifetime "approve for session/prefix" grants, shared by every per-message AgentLoop. */
   const sessionApprovalsRef = useRef(new SessionApprovals());
+  /** Session-lifetime read-before-edit tracker, for the same reason: a per-message loop would
+   * forget every file read one message ago and refuse the next edit as "read it first". */
+  const sessionReadTrackerRef = useRef(createReadTracker());
   const [questionIndex, setQuestionIndexState] = useState(0);
   const [questionSelections, setQuestionSelectionsState] = useState<QuestionSelection>({});
   const [questionCursor, setQuestionCursorState] = useState<Record<number, number>>({}); // highlighted option per question
@@ -633,37 +642,45 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const [todoCollapsed, setTodoCollapsed] = useState(true);
   // The transcript is an Ink <Static> that owns the terminal's NATIVE scrollback
   // (mouse-wheel / scrollbar work, reference-client style). `staticEpoch` is bumped to
-  // force a re-flush when committed items must repaint (Ctrl-O collapse, /clear).
+  // force a re-flush when committed items must repaint (/expand, /clear).
   const [staticEpoch, setStaticEpoch] = useState(0);
   // ── Reflow (Static remount when committed rows must repaint) ─────────────────
   // Ink <Static> paints each item once; toggling collapse needs a remount (epoch bump).
   //   soft — clear the VISIBLE screen only (2J+H). Keeps native scrollback so PgUp history
-  //          survives Ctrl-O. May leave one stale pre-fold copy above the re-emit — rare and
+  //          survives /expand. May leave one stale pre-fold copy above the re-emit — rare and
   //          user-initiated; far less of a flashbang than wiping the whole scrollback.
-  //   hard — also wipe scrollback (2J+3J+H). Used by app:redraw (explicit Ctrl+L), where a ghost
-  //          composer or stacked rewrap must be scrubbed on demand. Startup already cleared
-  //          pre-launch history. RESIZE deliberately never reflows — see below (P3-03).
+  //   hard — rebuild native scrollback from the complete saved transcript. Also used after a
+  //          settled resize: native rewrap changes the live frame's physical height behind Ink's
+  //          back, so repainting only its remembered row count strands composer rules in history.
   const reflow = useCallback((mode: 'soft' | 'hard' = 'hard') => {
-    const out = process.stdout;
-    if (out.isTTY) out.write(reflowSequence(mode));
+    if (stdout.isTTY) stdout.write(reflowSequence(mode));
     setStaticEpoch((n) => n + 1);
-  }, []);
+  }, [stdout]);
   // Ctrl-T only mutates LIVE chrome (PinnedState / one-line summary) — never the committed
   // Static transcript — so it must NOT reflow. A reflow on every task-list toggle was wiping
   // the screen for a pure live-height change.
-  //
-  // RESIZE → deliberately NO reflow (P3-03). When COLUMNS change, the terminal NATIVELY rewraps
-  // the already-printed <Static> scrollback to the new width — the committed history reflows
-  // in place, so re-emitting it (epoch bump) would stack a second copy over the rewrapped one
-  // and wiping it (3J) would destroy it: the old resize bug was exactly that hard reflow
-  // wiping scrollback mid-stream. Rows-only resize never rewraps text at all, so it needs
-  // nothing. The setSize re-render repaints the live HUD/composer below. Known tradeoff: when
-  // NARROWING, the terminal reflows the last live frame's printed rows too, so Ink's tracked
-  // frame height goes stale and a few ghost rows can persist ABOVE the live region — they do
-  // not self-heal (later renders only erase the tracked height). Recovery is any explicit
-  // repaint: Ctrl-O/Ctrl-T soft reflow, app:redraw (opt-in ctrl+l binding), or /clear. That is
-  // strictly cheaper than the old behavior, which destroyed the entire scrollback on every
-  // resize including pure rows changes.
+  // React owns the logical transcript; geometry changes never clear that state, pending Markdown,
+  // or the draft. Wait for the resize gesture to settle before replaying it once at the new width.
+  // Height changes also need this: a shrinking viewport can push mutable rows into scrollback.
+  // KEEP_SCROLLBACK opts out of rebuilding the terminal's pre-launch history as well as startup.
+  useEffect(() => {
+    if (!stdout.isTTY || process.env.SHADOW_KEEP_SCROLLBACK === '1') return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let previousCols = stdout.columns;
+    let previousRows = stdout.rows;
+    const resized = () => {
+      if (stdout.columns === previousCols && stdout.rows === previousRows) return;
+      previousCols = stdout.columns;
+      previousRows = stdout.rows;
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => reflow('hard'), 120);
+    };
+    stdout.on('resize', resized);
+    return () => {
+      stdout.off('resize', resized);
+      if (timer) clearTimeout(timer);
+    };
+  }, [stdout, reflow]);
   const lastUsageRef = useRef<{ inputTokens: number; outputTokens: number; costUSD: number; contextPct: number } | null>(null);
   const costWarnedRef = useRef(false);
   // Session-level cost accumulation. The per-turn Budget resets each turn, so we
@@ -830,6 +847,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // Bracketed paste (mode 2004): between the \x1b[200~ … \x1b[201~ markers every input chunk
   // is BUFFERED here and inserted atomically at the end — embedded newlines can't submit
   // mid-paste and pasted Esc/Tab bytes can't fire their key handlers.
+  /** Reports a deliberately-skipped input, since showToast is defined after the paste helpers. */
+  const noticeRef = useRef<(text: string) => void>(() => {});
   const pastingRef = useRef(false);
   const pasteBufRef = useRef('');
   // Active model — `providerRef` is the live Provider OBJECT the next turn runs on;
@@ -866,7 +885,17 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const runOneRef = useRef<((task: string) => void) | null>(null);
   const selectModelRef = useRef<((entry: ModelEntry) => Promise<void>) | null>(null);
   const buildProviderRef = useRef<((entry: ModelEntry, opts?: { clampBudget?: boolean; applyPolicy?: () => boolean }) => Promise<
-    | { ok: true; client: Provider; provider: ProviderName; model: string; baseUrl?: string; selfHosted: boolean }
+    | {
+        ok: true;
+        client: Provider;
+        provider: ProviderName;
+        /** The model id for the WIRE (an `autoModel` entry re-reads it from its endpoint). */
+        model: string;
+        /** The entry's identity — what `cfg.model` and every entry lookup are keyed on. */
+        entryModel: string;
+        baseUrl?: string;
+        selfHosted: boolean;
+      }
     | { ok: false; error: string; fatal?: boolean }
   >) | null>(null);
   const handleTableInputRef = useRef<((raw: string) => void) | null>(null);
@@ -1076,6 +1105,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   );
   const handleMouse = useCallback(
     (raw: string) => {
+      if (activityView.ref.current) return;
       if (!mouseEnabledRef.current) return;
       const ev = parseSgrMouse(raw);
       // Left-button PRESS only. Wheel (64/65), right/middle, drags and releases are ignored —
@@ -1145,6 +1175,14 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // (\r\n and bare \r → \n) by every caller — macOS terminals paste line ends as \r, which
   // used to defeat the chip's line count and render as invisible garbage in the composer.
   const insertPastable = useCallback((rawText: string) => {
+    if (activityView.ref.current) {
+      // The inspector captures navigation and protects the hidden draft, so the paste is correctly
+      // refused — but it used to be refused SILENTLY: a deliberate paste (or Ctrl+V) did nothing and
+      // said nothing, not even the failure toast pasteFromClipboard shows for an empty clipboard.
+      // Reported through a ref because showToast/pushLine are declared further down this component.
+      noticeRef.current('Paste not inserted — the activity inspector is open (close it to edit the draft)');
+      return;
+    }
     // Strip escapes and stray C0 bytes, matching what the TYPED path already does. Bracketed paste
     // delivers whatever the clipboard holds verbatim: pasting terminal output (or a crafted blob)
     // put raw CSI/OSC bytes straight into the draft, where they corrupted the rendered composer,
@@ -1258,22 +1296,31 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // Ref so pushLine (stable, no deps) can trigger markdown-image scanning without a hook cycle
   // (scan → pushImage → pushLine). Assigned below where enqueueMdImages is defined.
   const enqueueMdImagesRef = useRef<(text: string) => void>(() => {});
+  const interruptionReportedRef = useRef(false);
   const pushLine = useCallback((l: Omit<TranscriptItem, 'id' | 'kind'> & { kind?: TranscriptItem['kind'] }) => {
+    // Escape acknowledges immediately, even if provider cancellation takes time. The later stop
+    // event uses the same marker so it cannot add a second interruption row for this turn.
+    if (l.meta === 'interrupted') {
+      if (interruptionReportedRef.current) return;
+      interruptionReportedRef.current = true;
+    }
     drainUnitsRef.current?.(); // ordering: a queued answer block must never land below this row
     const kind = l.kind ?? 'system';
     // Collaboration Mode: while a seat holds the baton, tag its assistant turns with the active
     // speaker so the flattener draws the colored attribution header. Explicit speaker on the call wins.
-    const speaker = l.speaker ?? (kind === 'assistant' ? speakerRef.current ?? undefined : undefined);
+    const speaker = l.speaker ?? (kind === 'assistant' ? speakerRef.current ?? { handle: 'SHADOW', model: currentRef.current.model, color: C.accent } : undefined);
+    const closedActivity = activity.close();
+    const activityEntry = closedActivity ? { ...closedActivity, id: lineId.current++ } : null;
     const entry = { id: lineId.current++, kind, ...l, speaker } as TranscriptItem;
     setCommitted((c) => {
-      const next = [...c, entry];
+      const next = [...c, ...(activityEntry ? [activityEntry] : []), entry];
       committedRef.current = next;
       return next;
     });
     // Markdown ![](url) in a committed assistant answer → enqueue an inline render. Remote http(s)
     // is opt-in (SHADOW_FETCH_REMOTE_IMAGES=1); local paths + data: URIs always load. Fire-and-forget.
     if (kind === 'assistant' && typeof l.text === 'string') enqueueMdImagesRef.current(l.text);
-  }, []);
+  }, [activity.close]);
   pushLineRef.current = pushLine;
   const drainUnits = useCallback(() => {
     if (pendingUnitsRef.current.length === 0) return;
@@ -1291,6 +1338,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   }, []);
 
   const repaintFromContext = useCallback(() => {
+    activity.reset();
+    activityView.dismiss();
     drainUnitsRef.current?.(); // flush queued stream blocks INTO the list the next line wipes
     setCommitted([]);
     committedRef.current = [];
@@ -1309,7 +1358,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         pushLine({ kind: 'user', text: `❯ ${text}`, color: C.green, bold: true, meta: 'you' });
       } else if (m.role === 'assistant') {
         const display = sanitizeAssistantText(text);
-        if (display.trim()) pushLine({ kind: 'assistant', text: display, color: C.fg, meta: 'assistant' });
+        if (display.trim()) pushLine({ kind: 'assistant', text: display, color: C.fg, meta: 'assistant', speaker: { handle: 'SHADOW', model: 'restored history', color: C.accent } });
       }
     }
     if (tools > 0) {
@@ -1482,7 +1531,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         workspace: opts.workspaceRoot,
         help: '/help · /model · Shift+Tab mode',
         yolo: opts.bypass,
-        art: SHADOW_ART,
+        art: opts.cfg.showLogo ? SHADOW_ART : undefined,
       },
     });
   }, [opts, pushLine]);
@@ -1518,34 +1567,14 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const kbRegister = kb.register;
   const kbLoadedRef = useRef(kb.loaded);
   kbLoadedRef.current = kb.loaded;
-  // Ctrl-O: ALL collapsible blocks (thoughts + tool output) — matching Claude Code. Soft reflow
-  // remounts Static so folds repaint without nuking scrollback (no 3J flashbang).
+  // Inspect a frozen activity snapshot; never re-emit Static history to open tool details.
   useEffect(() => kbRegister('transcript:toggleFoldLatest', () => {
-    setExpandedIds(new Set()); // per-item expands are superseded by the global toggle
-    setShowAllExpanded((v) => !v);
-    reflow('soft');
-  }), [kbRegister, reflow]);
-  // Alt/Option+O: expand/collapse only the MOST RECENT collapsible block (inspect one shell dump
-  // without opening every earlier fold). Earlier folds stay reachable via Ctrl-O (all).
+    if (activityView.ref.current) activityView.dismiss(); else activityView.open();
+  }), [kbRegister, activityView.open, activityView.dismiss]);
   useEffect(() => kbRegister('transcript:toggleFoldOne', () => {
-    const items = committedRef.current;
-    let latest: TranscriptItem | undefined;
-    for (let i = items.length - 1; i >= 0; i--) {
-      if (isCollapsible(items[i]!)) {
-        latest = items[i];
-        break;
-      }
-    }
-    if (!latest) return;
-    setShowAllExpanded(false);
-    setExpandedIds((prev) => {
-      const next = new Set(prev);
-      if (next.has(latest!.id)) next.delete(latest!.id);
-      else next.add(latest!.id);
-      return next;
-    });
-    reflow('soft');
-  }), [kbRegister, reflow]);
+    activityView.open(undefined, true);
+  }), [kbRegister, activityView.open]);
+
   // B6 — `app:redraw` is the action loader.ts uses as ITS DOCUMENTED EXAMPLE
   // (`{"ctrl+l": "app:redraw"}`), but Global was `{}` and nothing registered the id — so a user
   // copying the doc's own example got a binding that parsed, warned about nothing, and never
@@ -1560,10 +1589,12 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       return;
     }
     setTodoCollapsed((v) => !v);
-    // Soft reflow: remount Static chrome without wiping scrollback (hard was a flashbang for a
-    // pure live-height change).
-    reflow('soft');
-  }), [kbRegister, reflow, pushLine]);
+    // NO reflow. The pinned block is LIVE chrome — it is not part of the committed <Static>
+    // transcript — so the state change repaints it on the next render with nothing to rebuild. The
+    // `reflow('soft')` that used to sit here wrote a 2J+H, bumped staticEpoch and re-emitted the
+    // ENTIRE committed transcript, i.e. a visible screen clear plus O(transcript) I/O, for a
+    // one-line height toggle — the exact behavior the `reflow` doc above says Ctrl-T must not do.
+  }), [kbRegister, pushLine]);
 
   // Re-run the /statusline command (if any) and stash its output for the footer.
   const refreshStatusLine = useCallback(() => {
@@ -1613,6 +1644,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       setToast(null);
     }, TOAST_TTL_MS);
   }, [pushLine]);
+  noticeRef.current = (text) => showToast(text, 'error');
 
   // Shift+Tab: plan-mode fast lane (1.2). `chat:cycleMode` is a default Chat binding, but until
   // this registration nothing handled it — the key fell through to the bare-Tab ring. Tab keeps
@@ -1653,11 +1685,15 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       });
       return;
     }
+    // Match on the ENTRY identity (`cfg.model`), not `currentRef.current.model`: the latter is the
+    // WIRE model, which an `autoModel` entry re-reads from its endpoint, so comparing it here would
+    // fail to highlight the preset that is actually active — or, worse, highlight a different preset
+    // whose model id happens to equal the detected id.
     const active = rows.findIndex(
       (r) =>
         r.kind === 'model' &&
         r.entry.provider === currentRef.current.provider &&
-        r.entry.model === currentRef.current.model,
+        r.entry.model === opts.cfg.model,
     );
     setPickerIndex(active >= 0 ? active : firstSelectableRow(rows));
     setPickerOpen(true);
@@ -1817,6 +1853,14 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     setPlanMode, setPickerIndex, setPickerOpen, setAutonomy, setEffort,
     setStyle, setVimEnabled, setVimMode, setThemeTick, setCustomStatus, setComposer,
     pushLine, showToast, showBanner, exit, refreshStatusLine, copyLast, refreshRewindTurns,
+    openActivity: (id) => activityView.open(id),
+    resetActivity: () => { activity.reset(); activityView.dismiss(); },
+    expandAnswer: (id) => {
+      const item = id === undefined ? [...committedRef.current].reverse().find(it => it.kind === 'assistant') : committedRef.current.find(it => it.id === id && it.kind === 'assistant');
+      if (!item) { showToast('No matching answer to expand.', 'warn'); return; }
+      setExpandedIds(prev => { const next = new Set(prev); if (next.has(item.id)) next.delete(item.id); else next.add(item.id); return next; });
+      reflow('soft');
+    },
     showResumeRecap, pushImage, loadCustomCommands,
     startTurnRef, kbLoadedRef, firstRef, answerOpenRef, committedRef, attachmentsRef,
     pastesRef, lastUsageRef, sessionCostRef, prevTurnCostRef, sessionInTokRef,
@@ -1824,7 +1868,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     costWarnedRef, fileListLoadedRef, missionRef, startTableRef, currentRef,
     selectModelRef, asyncCommandRef, providerRef, activeTargetRef, styleRef,
     autonomyRef, loopRef, effortRef, runningRef, compactingRef, compactAbortRef,
-    sessionLogRef, sessionApprovalsRef, rewindableTurnsRef, additionalRootsRef,
+    sessionLogRef, sessionApprovalsRef, sessionReadTrackerRef, rewindableTurnsRef, additionalRootsRef,
     statusLineRef, vimEnabledRef, vimPendingRef, vimFindRef, vimCountRef, vimRegRef,
     flushQueueRef, runOneRef, repaintFromContextRef,
     // /goal begin while a turn runs: queue the kickoff like a wakeup (never a second
@@ -1853,11 +1897,22 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       entry: ModelEntry,
       opts2: { clampBudget?: boolean; applyPolicy?: () => boolean } = {},
     ): Promise<
-      | { ok: true; client: Provider; provider: ProviderName; model: string; baseUrl?: string; selfHosted: boolean }
+      | {
+          ok: true;
+          client: Provider;
+          provider: ProviderName;
+          /** The model id for the WIRE (an `autoModel` entry re-reads it from its endpoint). */
+          model: string;
+          /** The entry's identity — what `cfg.model` and every entry lookup are keyed on. */
+          entryModel: string;
+          baseUrl?: string;
+          selfHosted: boolean;
+        }
       | { ok: false; error: string; fatal?: boolean }
     > => {
       let provider = entry.provider;
-      let baseUrl = resolveBaseUrl(entry.provider, entry.baseUrl);
+      const configuredBaseUrl = resolveBaseUrl(entry.provider, entry.baseUrl);
+      let baseUrl = configuredBaseUrl;
       let detectedWindow: number | undefined;
       const cred = resolveEntryCredential(entry, { vaultIsLocked: vaultExists() && !vaultUnlocked() });
       if (!cred.ok) {
@@ -1871,7 +1926,39 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           fatal: false,
         };
       }
-      let apiKey = cred.apiKey;
+      // Same endpoint binding as boot: a /model switch onto a model with an imported subscription
+      // credential must carry that credential's base URL, headers and wire, or it would send the
+      // token to the previous model's endpoint. The refresh runs first for the same reason it does
+      // at boot — a switch is a natural moment to notice the token aged out.
+      const allowImport = process.env.SHADOW_ALLOW_IMPORT === '1';
+      if (allowImport) {
+        const subForEntry = subProviderFor(entry.provider, entry.model);
+        if (subForEntry) {
+          const refreshed = await ensureFreshSubscriptionCredential(subForEntry, {
+            nowSec: Math.floor(Date.now() / 1000),
+            allowNetwork: !opts.offline,
+          });
+          if (refreshed.error) pushLine({ text: `  ⚠ subscription token: ${refreshed.error}`, color: C.yellow });
+        }
+      }
+      const entryCred =
+        cred.source === 'provider'
+          ? resolveProviderCredential(entry.provider, { model: entry.model, allowImport, configuredBaseUrl })
+          : { bearer: cred.apiKey, source: 'store' as const };
+      if (entryCred.conflict) pushLine({ text: `  ⚠ ${entryCred.conflict}`, color: C.yellow });
+      if (entryCred.baseUrl) baseUrl = entryCred.baseUrl;
+      let apiKey = entryCred.bearer;
+      // Auto endpoint: ask the box what it is serving right now and use that id on the wire, so a
+      // restarted server with a new model needs no config edit. The probe also corrects a base URL
+      // written without `/v1`. Never fatal — an unreachable box keeps the declared id.
+      const auto = await resolveAutoModel(entry);
+      if (auto.baseUrl) baseUrl = auto.baseUrl;
+      if (auto.contextWindow) detectedWindow = auto.contextWindow;
+      if (auto.error && entry.autoModel) pushLine({ text: `  ⚠ ${auto.error}`, color: C.yellow });
+      else if (auto.detected && auto.model !== entry.model) {
+        pushLine({ text: `  ${entry.label} serves ${auto.model}`, dimColor: true });
+      }
+      const wireModel = auto.model ?? entry.model;
       const mlxReadyOffline = entry.mlx ? mlxOfflineReady(entry.mlx) : false;
       if (opts.offline && !isLocalModelTarget({ gguf: entry.gguf, mlx: mlxReadyOffline ? entry.mlx : undefined, vllm: entry.vllm, baseUrl })) {
         // A soft refusal (yellow), with the actionable local-model hint preserved verbatim.
@@ -1929,10 +2016,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         // reverted the idle watchdog to 120s and dropped the self-hosted contract mid-session.
         ...entryStreamContract(entry, opts.cfg.stream),
         provider,
-        model: entry.model,
+        model: wireModel,
         apiKey,
         authToken: cred.authToken,
         baseUrl,
+        // A local launcher rewrote baseUrl; otherwise the credential's endpoint contract travels with it.
+        extraHeaders: isLocalServedEntry(entry) ? undefined : entryCred.extraHeaders,
+        wire: isLocalServedEntry(entry) ? undefined : entryCred.wire,
         selfHosted:
           provider === 'openai'
             ? entry.selfHosted === true ||
@@ -1948,7 +2038,12 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         ok: true,
         client,
         provider,
-        model: entry.model,
+        // The WIRE model: what the loop, the footer and sub-agents must use.
+        model: wireModel,
+        // The entry's IDENTITY, which `cfg.model` and every entry lookup are keyed on. The two
+        // differ exactly when `autoModel` re-read the id from the endpoint, and conflating them
+        // would break the /model picker's active-row match.
+        entryModel: entry.model,
         baseUrl,
         selfHosted,
       };
@@ -1989,6 +2084,11 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           // best-effort persistence; the live switch already applies this session
         }
         pushLine({ text: `Model → ${entry.label} (${built.provider}/${built.model})`, color: C.cyan });
+        // `entryModel`, never `built.model`: an autoModel entry's identity is the preset, and that is
+        // what `cfg.models.find(m => m.model === cfg.model)` and the picker's active row are keyed on.
+        // Set HERE rather than only in /model's handler, because `/local use` reaches selectModel
+        // without touching it — which left cfg.model pointing at the previous preset.
+        opts.cfg.model = built.entryModel;
         const prof = familyProfile(entry.model);
         if (prof?.note) pushLine({ text: `  ${prof.family}: ${prof.note}`, dimColor: true });
       } finally {
@@ -2028,6 +2128,12 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         pastingRef.current = false;
         pasteBufRef.current = '';
         dialogShownAtRef.current = Date.now(); // arm the type-ahead guard — see onKey §1
+        if (req) {
+          activityView.dismiss();
+          drainUnitsRef.current?.();
+          const closed = activity.close();
+          if (closed) pushLine(closed);
+        }
         setPending(req);
         // P1B-04: if the user has stepped away, ping them when an approval sits unanswered. The
         // timer self-guards on the SAME request still being pending, so a prompt answer never fires
@@ -2114,13 +2220,14 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // Spinner animation while a run is in flight.
   useEffect(() => {
     if (!running) return;
-    const id = setInterval(() => setTick((t) => t + 1), 120);
+    const id = setInterval(() => setTick((t) => t + 1), reducedMotion ? 1000 : 120);
     return () => clearInterval(id);
-  }, [running]);
+  }, [running, reducedMotion]);
 
   // Subscribe to loop events.
   useLayoutEffect(() => {
     return bus.on((e) => {
+      if (e.type === 'text' || e.type === 'thinking' || e.type === 'assistant_done' || e.type === 'tool_end' || e.type === 'mode') activity.lastProviderAt.current = Date.now();
       switch (e.type) {
         case 'text':
           if (e.delta) {
@@ -2182,18 +2289,12 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           }
           break;
         case 'reasoning_done': {
-          // Through pushLine (the single choke point every transcript item flows through) so a
-          // future hook on commit sees reasoning items too. durationMs drives `thought for Ns`.
+          // Retain reasoning in activity details without breaking the compact work group.
           const durationMs =
             thinkStartedAtRef.current != null ? Math.max(0, Date.now() - thinkStartedAtRef.current) : 0;
           thinkStartedAtRef.current = null;
-          pushLine({
-            kind: 'reasoning',
-            text: e.text.trimEnd(),
-            dimColor: true,
-            meta: 'reasoning',
-            durationMs,
-          });
+          drainUnitsRef.current?.();
+          activity.reasoning(e.text.trimEnd(), durationMs);
           setThinkNow('');
           break;
         }
@@ -2210,7 +2311,6 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           const finalText = sanitizeAssistantText(streamed ? streamBufRef.current : (e.text ?? ''));
           setStreamNow('');
           setThinkNow('');
-          // (Reasoning is folded by default now — no per-item collapse needed; Ctrl-O reveals all.)
           if (finalText.trim()) {
             // Weak local models re-emit the final line/paragraph after a tool step; committing it
             // again printed the answer twice. Same turn-scoped detector as the streaming path — the
@@ -2251,17 +2351,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           {
             const name = e.call.name;
             const arg = previewOf(e.call.input);
-            setActiveTool({ name, arg, agent: name === 'agent' ? agentAttr(e.call.input) : undefined });
-            if (isCollapsibleTool(name)) {
-              const kind = collapseKind(name);
-              setLiveRecon((prev) => {
-                const kinds = { ...(prev?.kinds ?? {}) };
-                kinds[kind] = (kinds[kind] ?? 0) + 1;
-                return { kinds, hint: arg || prev?.hint };
-              });
-            } else {
-              // Signal tool (edit/shell/fetch/agent) breaks the recon burst.
-              setLiveRecon(null);
+            const active = { name, arg, agent: name === 'agent' ? agentAttr(e.call.input) : undefined };
+            activeToolsRef.current.set(e.call.id, active);
+            setActiveTool(active);
+            if (!isRoutineCall(name, e.call.input)) {
+              drainUnitsRef.current?.();
+              const closed = activity.close();
+              if (closed) pushLine(closed);
             }
           }
           clearToolLine();
@@ -2283,104 +2379,16 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             break;
           }
           clearToolLine();
-          setActiveTool(null);
+          finishActiveTool(e.call.id);
           setShellPid(null);
           setShellWarn(null);
-          // Nest shell stdout / edit diffs ON the tool header item so collapse is one unit:
-          //   ⏺ run_shell($ npm test) — exit 0 (1.2s)
-          //     ⌄ output 47 lines · ^O          ← default ( > TOOL_BODY_COLLAPSE_THRESHOLD )
-          // Short bodies (≤ threshold) stay inline under ⎿. Cap huge bodies before commit so
-          // React state + Static never hold multi-MB dumps.
-          const sd = e.result.data as { stdout?: string; stderr?: string } | undefined;
-          // F05-04: shell output is real terminal output — keep SGR color spans (colors are the
-          // only escapes that can't move the cursor or flip modes) but strip everything else
-          // before this text reaches <Text>. See sanitizeTerminalEscapes for the documented choice.
-          const shellOut = sanitizeTerminalEscapes([sd?.stdout ?? '', sd?.stderr ?? ''].join('\n'), true).replace(/^\n+|\n+$/g, '');
-          const diff = e.result.meta?.diff;
-          let bodyLines: BannerLine[] | undefined;
-          let bodyMeta: string | undefined;
-          if (shellOut.trim()) {
-            bodyMeta = 'output';
-            bodyLines = capTranscriptBody(shellOut.split('\n')).map((l) => ({ text: l, color: C.dim }));
-          } else if (diff && diff.length) {
-            bodyMeta = 'diff';
-            bodyLines = capTranscriptBody(diff.map((d) => `${d.tag} ${d.text}`)).map((text) => {
-              const tag = text.startsWith('+') ? '+' : text.startsWith('-') ? '-' : ' ';
-              return {
-                text,
-                color: tag === '+' ? C.green : tag === '-' ? C.red : undefined,
-                dimColor: tag === ' ' || text.startsWith('…'),
-              };
-            });
-          } else if (e.call.name === 'agent') {
-            // The sub-agent's full answer IS its result. Surface it as a foldable body so the
-            // delegated work is VISIBLE — the header's one-line preview is only a gist, and without
-            // this a long exploration answer is truncated to ~90 chars with no way to read the rest.
-            // Same cap+collapse rules as shell output, so a huge answer can't flood the transcript.
-            const ans = (e.result.data as { answer?: string } | undefined)?.answer;
-            if (ans && ans.trim()) {
-              bodyMeta = 'answer';
-              // Model text, not terminal output — no legitimate SGR source, so strip every
-              // escape before render (F05-04).
-              bodyLines = capTranscriptBody(sanitizeTerminalEscapes(ans, false).split('\n')).map((l) => ({ text: l, color: C.dim }));
-            }
-          }
-          // Diff headers: just the calm `+N −M` stats (redesign: Update(path) — +12 −3). The
-          // model-facing "Edited path — replaced N occurrence(s)" is redundant once the display
-          // name + arg already name the file. Shell / other tools keep their one-line summary.
-          let summary = oneLine(e.result.summary);
-          if (bodyMeta === 'diff' && bodyLines) {
-            const stats = formatDiffStats(bodyLines);
-            if (stats && isWriteTool(e.call.name)) summary = stats;
-            else if (stats) summary = summary ? `${summary} · ${stats}` : stats;
-          }
-          pushLine({
-            kind: 'tool',
-            text: `${e.result.ok ? '✓' : '✗'} ${e.call.name} ${Math.max(0, Math.round(e.result.meta.durationMs))}ms — ${summary}`,
-            color: e.result.ok ? C.green : C.red,
-            meta: bodyMeta ?? e.call.name,
-            tool: {
-              name: e.call.name,
-              arg: previewOf(e.call.input) || undefined,
-              ok: e.result.ok,
-              durationMs: Math.max(0, e.result.meta.durationMs),
-              summary,
-              agent: e.call.name === 'agent' ? agentAttr(e.call.input) : undefined,
-            },
-            lines: bodyLines,
-          });
+          drainUnitsRef.current?.();
+          for (const item of activity.complete(e)) pushLine(item);
           // view_image returns the image it loaded into model context — echo it inline so the user
           // can see what the model is looking at (the tool result alone is just a path string).
           if (e.call.name === 'view_image') {
             const im = (e.result as { images?: { mediaType: string; data: string }[] }).images?.[0];
             if (im) pushImage(im.data, im.mediaType, previewOf(e.call.input) || 'view_image', 'view_image');
-          }
-          // Rare: both shell capture AND a UI diff on the same call — nest shell above, keep
-          // the diff as its own foldable sibling so neither body is dropped.
-          if (shellOut.trim() && diff && diff.length) {
-            const diffLines = capTranscriptBody(diff.map((d) => `${d.tag} ${d.text}`)).map((text) => {
-              const tag = text.startsWith('+') ? '+' : text.startsWith('-') ? '-' : ' ';
-              return {
-                text,
-                color: tag === '+' ? C.green : tag === '-' ? C.red : undefined,
-                dimColor: tag === ' ' || text.startsWith('…'),
-              };
-            });
-            const stats = formatDiffStats(diffLines);
-            pushLine({
-              kind: 'tool',
-              text: stats ? `diff ${stats}` : '',
-              meta: 'diff',
-              lines: diffLines,
-              tool: stats
-                ? {
-                    name: 'diff',
-                    ok: e.result.ok,
-                    durationMs: 0,
-                    summary: stats,
-                  }
-                : undefined,
-            });
           }
           break;
         }
@@ -2397,7 +2405,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             break;
           }
           clearToolLine();
-          setActiveTool(null);
+          finishActiveTool(e.call.id);
           pushLine({ kind: 'blocked', text: `  blocked ${friendlyDeniedReason(e.reason)}`, color: C.yellow, meta: e.call.name });
           break;
         case 'retry':
@@ -2585,6 +2593,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           });
           break;
         case 'stop':
+          { drainUnitsRef.current?.(); const closed = activity.close(); if (closed) pushLine(closed); }
           lastStopReasonRef.current = e.reason;
           // Keep the /rewind menu honest: a turn just produced (or failed to produce) a snapshot.
           refreshRewindTurns();
@@ -2608,11 +2617,12 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           setStreamNow('');
           setThinkNow('');
           clearToolLine();
+          activeToolsRef.current.clear();
           setActiveTool(null);
-          setLiveRecon(null);
+
           setShellPid(null);
           setShellWarn(null);
-          if (e.reason !== 'end_turn') pushLine({ text: `  · ${e.reason}`, dimColor: true });
+          if (e.reason !== 'end_turn') pushLine({ text: `  · ${e.reason}`, dimColor: true, meta: e.reason === 'interrupted' ? 'interrupted' : undefined });
           // P1B-04: ping when a LONG turn finishes, so the user can tab away during a slow
           // self-hosted run and be called back. Guarded to a TTY (never into a pipe) and to turns
           // past the threshold; `notify: off` silences it.
@@ -2654,6 +2664,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         // (the echoed prompt line stays clean, exactly like @-file inlining).
         if (h.context) task = `${task}\n\nAdditional context (user_prompt_submit hook):\n${h.context}`;
       }
+      // Initialize before the first running render (including time spent waiting for the lock).
+      // A zero or previous-turn timestamp briefly displayed hours of elapsed time at submission.
+      runStartRef.current = Date.now();
+      interruptionReportedRef.current = false;
       runningRef.current = true;
       setRunning(true);
       // Process-wide run lock: exactly one turn executes at a time across the TUI and every web
@@ -2672,12 +2686,12 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         // ESC while queued behind another session: nothing but `running` (and the controller) has
         // been touched. Re-enable the composer and drain type-ahead, exactly as a finished turn does.
         controllerRef.current = null;
+        { drainUnitsRef.current?.(); const closed = activity.close(); if (closed) pushLine(closed); }
         runningRef.current = false;
         setRunning(false);
         flushQueueRef.current?.();
         return;
       }
-      runStartRef.current = Date.now();
       answerOpenRef.current = false;
       padCarryRef.current = false;
       // New turn → reset the turn-scoped verbatim-repeat detector. This is the single choke point every
@@ -2758,6 +2772,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         // grants held on the loop itself expired as soon as the user typed again — "(s) approve for
         // session" re-prompted one message later.
         approvals: sessionApprovalsRef.current,
+        readTracker: sessionReadTrackerRef.current,
         priorStopReason: lastStopReasonRef.current,
         // mission continuity rides the loop's compaction continuity (deps.mission), not the TUI.
         resolveFallback: async (entry, fallbackSignal) => {
@@ -2771,7 +2786,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           currentRef.current = { provider: built.provider, model: built.model };
           activeTargetRef.current = { baseUrl: built.baseUrl, selfHosted: built.selfHosted };
           opts.cfg.provider = built.provider;
-          opts.cfg.model = built.model;
+          // The entry IDENTITY, never the wire model: writing the detected id here would leave
+          // `cfg.model` unable to match its own preset on the next lookup.
+          opts.cfg.model = built.entryModel;
           setCurrent({ provider: built.provider, model: built.model });
           opts.onModelSwitch?.(built.client, built.model);
           return { provider: built.client, model: built.model };
@@ -2808,18 +2825,13 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         setStreamNow('');
         setThinkNow('');
         clearToolLine();
+        activeToolsRef.current.clear();
         setActiveTool(null);
-        setLiveRecon(null);
+
+        { drainUnitsRef.current?.(); const closed = activity.close(); if (closed) pushLine(closed); }
         runningRef.current = false;
         setRunning(false);
-        // Per-task timer: total wall-clock the agent worked on this turn — paralleling the
-        // per-tool `(2.3s)` and per-thought `thought for 9s`, but for the whole task. Only when
-        // it took ≥1s; a sub-second turn is noise. Emitted here (the single turn-end choke
-        // point) so success, error, and abort all report how long the agent spent.
-        const turnSec = Math.max(0, Math.round((Date.now() - runStartRef.current) / 1000));
-        if (turnSec >= 1) {
-          pushLine({ text: `⏺ done · ${formatDuration(turnSec)}`, dimColor: true });
-        }
+        // Turn completion is visible in the answer and idle footer; keep timers out of history.
         // Turn ended — drain any type-ahead the user queued while it ran. flushQueue
         // either starts the next queued turn (which re-enters this finally on its own
         // completion) or runs queued slash commands in order.
@@ -3085,6 +3097,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       // stable refs + useCallback actions, built per keystroke so every owner reads live
       // state exactly as the old inline chain did.
       const env: KeyEnv = {
+        activity: { isOpen: () => !!activityView.ref.current, handleKey: (ch, key) => activityKeysRef.current(ch, key) },
         rawChunkRef,
         rawKeyRef,
         ctrlCArmedRef,
@@ -3143,7 +3156,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         cfg: opts.cfg,
         planMode: opts.planMode,
         autoAnswerEnabled: AUTO_ANSWER_ENABLED,
-        composerInnerWidth: () => Math.max(8, (process.stdout.columns ?? 80) - COMPOSER_GUTTER - PAGE_MARGIN * 2),
+        composerInnerWidth: () => composerInnerWidth(process.stdout.columns ?? 80),
         exit,
         pushLine,
         setQueued,
@@ -3241,7 +3254,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     return () => releaseMode('mouse');
   }, [mouseEnabled]);
 
-  const spinner = SPINNER[tick % SPINNER.length];
+  const spinner = (reducedMotion ? '·' : SPINNER[tick % SPINNER.length]);
   // Elapsed seconds of the current turn — re-derived each spinner tick (~120ms) so a
   // slow/stalled model reads as "still waiting", not a frozen UI.
   const elapsedSec = running ? Math.floor((Date.now() - runStartRef.current) / 1000) : 0;
@@ -3259,18 +3272,6 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // is an Ink <Static> that owns the terminal's native scrollback, so the vertical
   // chrome math never clips it; todo/plan render as a pinned block above the composer.
   const layout = computeLayout(terminalSize.cols, terminalSize.rows);
-  // Tool-call stacking: group consecutive committed tools into runs so a tool-heavy turn collapses
-  // to one summary row instead of flooding scrollback. P3-02: memoized on the append-only committed
-  // array via the appendable cache — a pure spinner tick (setTick, no new lines) re-renders but
-  // scans ZERO transcript slots (deps unchanged → useMemo skips; the cache ref extends the previous
-  // run-map on append and is invalidated wholesale by Ctrl-O / repaint). The flatten.ts counters
-  // (toolRunsStats.itemsScanned) are the instrumented proof.
-  const toolRunsCacheRef = useRef<ToolRunsCache | undefined>(undefined);
-  const toolRuns = useMemo(() => {
-    const { runs, cache } = computeToolRunsAppendable(committed, showAllExpanded, toolRunsCacheRef.current);
-    toolRunsCacheRef.current = cache;
-    return runs;
-  }, [committed, showAllExpanded]);
   // ── Turn-HUD frame budget ─────────────────────────────────────────────────────
   // While a turn runs, the live region is a CONSTANT-HEIGHT HUD (fixed stream window + exactly one
   // status line + at most one pinned-tasks line) so the composer never moves mid-turn — the Claude
@@ -3289,7 +3290,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // Constant live-slot budget (redesign: chrome never moves). fitHud may still drop these rows
   // on a tiny terminal; when they fit they stay reserved idle AND running so the composer does
   // not jump when a turn starts/ends or when thinking ↔ streaming swaps.
-  const LIVE_SLOT_ROWS = 2;
+  const LIVE_SLOT_ROWS = 3;
   // Strip INPUT only — the string is formatted per host row (status line / composer hint), each
   // with the width actually left beside it, so formatStatusStrip's shrink ladder can do its job.
   const stripInput = {
@@ -3374,6 +3375,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // `running` alone — because live events can arrive without this TUI owning the turn.)
   // F10-02: a running (or just-finished, lingering) sub-agent keeps the live slot open even after the
   // launching turn ends — a background agent must not vanish the moment its parent turn completes.
+  // `running` and the thought / in-flight-tool flags belong in this expression, not just the stream
+  // tail: with them missing the reserve collapsed during the think and tool phases and reappeared
+  // at the first text delta, so the composer — and the whole chrome group below it — jumped rows
+  // mid-turn, which is exactly the movement the reserve exists to prevent.
   const liveActive = running || !!think || !!stream || !!activeTool || subAgents.size > 0;
   const liveWant = menuOpen || !liveActive ? 0 : LIVE_SLOT_ROWS;
   // Pinned agent state: ONE line by default. Ctrl-T expands the full list (idle OR mid-turn).
@@ -3434,7 +3439,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // reference-client style activity line: an orange pulsing sparkle (rendered separately, below) + a playful
   // per-turn verb + a quiet metric tail. No 'working… 0s · Esc to interrupt' clutter — the elapsed
   // only appears after a beat, and the interrupt hint already lives in the composer footer.
-  const statusVerb = running ? `${DEFAULT_STATUS_VERB}…` : '';
+  const statusVerb = activeTool
+    ? `${activeTool.agent?.subagentType ?? displayToolName(activeTool.name)} ${displayToolArg(activeTool.agent?.description ?? activeTool.arg, 56)}${activeToolsRef.current.size > 1 ? ` · +${activeToolsRef.current.size - 1} active` : ''}`
+    : think ? 'Thinking…' : running || activity.summary?.tools ? 'Working…' : '';
   // SAFETY MARKERS ride OUTSIDE the strip so its shrink ladder can never drop them: OFFLINE is the
   // privacy contract's always-visible signal, sandbox:off is the "guardrails are OFF" warning.
   // They render as bold color badges instead of disappearing into the same quiet gray as model
@@ -3454,23 +3461,17 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const statusSafetyPrefixCols = statusSafetyText ? displayWidth(statusSafetyText) + 3 : 0;
   // When the live slot can't render (tiny terminal / slash menu open) the activeTool row is
   // invisible — surface the running tool here instead so a long tool call is never unindicated.
-  const toolTag = toolLine
-    ? ` · ${toolLine.trim()}`
-    : activeTool && hudFit.liveRows === 0
-      ? liveRecon && reconCount(liveRecon.kinds) >= 2 && isCollapsibleTool(activeTool.name)
-        ? ` · ${formatReconSummary(liveRecon.kinds, { live: true })}…`
-        : ` · ${displayToolName(activeTool.name)}…`
-      : '';
+  const toolTag = activity.summary?.tools
+    ? ` · ${activityLabel(activity.summary)}`
+    : '';
   // 'model slow to respond' means the MODEL is quiet — a tool executing (activeTool) is not the
   // model being slow, so an in-flight tool suppresses the heuristic.
-  const statusPrefix = running
-    ? `${elapsedSec >= 1 ? ` (${formatDuration(elapsedSec)})` : ''}${toolTag}${shellPid ? ` · shell ${shellPid}` : ''}${shellPid && shellWarn ? ' · ⚠ may survive Esc' : elapsedSec >= 25 && !toolLine && !activeTool ? ' · model slow to respond' : ''}`
-    : '';
+  const statusPrefix = `${running && elapsedSec >= 1 ? ` (${formatDuration(elapsedSec)})` : ''}${toolTag}${shellPid ? ` · shell ${shellPid}` : ''}${shellPid && shellWarn ? ' · ⚠ may survive Esc' : running && Date.now() - activity.lastProviderAt.current >= 25000 && !toolLine && !activeTool ? ' · model slow to respond' : ''}`;
   // Phase B: status strip is merged — while running, model/mode/ctx ride this same status line.
   // On a tiny terminal where the composer hint cannot fit, its safety badges move here too. The strip is formatted against
   // the width actually REMAINING beside the verb/elapsed/tool prefix, so its ctx/cost tail shrinks
   // instead of being truncated off the row edge. Idle merge lives in the composer hint (below).
-  const runningStrip = running
+  const runningStrip = running && !hudFit.hint
     ? formatStatusStrip(
         stripInput,
         Math.max(
@@ -3505,7 +3506,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // is appended ONLY if it still fits. So a narrow terminal drops the hints, never the strip — the
   // v2.9.0 regression where a longer tail silently pushed provider+mode off the row. 'Shift+Enter
   // newline' is not repeated here — it already lives in the empty-composer placeholder.
-  const HINT_TAIL = input ? ' · Ctrl+X C copy draft' : ' · Shift+Tab mode · / commands';
+  const HINT_TAIL = running ? ' · Esc stop · Ctrl+O activity' : input ? ' · Ctrl+X C copy draft' : ' · / commands · Ctrl+O activity';
   const idleFixed = displayWidth(attachTag + vimTag) + safetyPrefixCols;
   // The hint row renders inside paddingLeft={PAGE_MARGIN} under wrap="truncate", so its usable
   // width is cols − PAGE_MARGIN, not cols — budget the strip (and the tail fits-check) against
@@ -3530,16 +3531,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     vimTag +
     (menu.length > 0
       ? `↑/↓ select · Tab complete · Enter ${running ? 'queues' : 'runs'} · Esc cancel`
-      : running
-        ? // Width ladder (same law as the composer placeholder): the full steering hint is ~86
-          // columns and used to clip mid-token on narrow terminals. Each step keeps the two
-          // things a running turn must tell you — you can steer, and Esc interrupts.
-          layout.cols - PAGE_MARGIN - idleFixed >= 86
-          ? `Type to steer · Enter steers · ${NEWLINE_HINT} newline · Esc interrupts · Ctrl-C ×2 quits`
-          : layout.cols - PAGE_MARGIN - idleFixed >= 45
-            ? 'Type to steer · Enter steers · Esc interrupts'
-            : 'steer · Esc interrupts'
-        : table
+      : table && !running
           ? tableLegend
           : `${idleStrip}${idleTail}`);
 
@@ -3568,7 +3560,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     <Box flexDirection="column">
       {/* Committed transcript → <Static>: each item is printed to native scrollback
           ONCE and never repainted, so the mouse wheel / scrollbar / PgUp all work while
-          the live region below stays small. `staticEpoch` (Ctrl-O fold, /clear) forces a
+          the live region below stays small. `staticEpoch` (answer-table expansion, /clear) forces a
           fresh flush when a committed item's rendered state must change. */}
       <Static key={staticEpoch} items={committed}>
         {(item, index) => (
@@ -3584,14 +3576,14 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             // ⏺ once per contiguous assistant run: continuation if the previous committed item was
             // also an assistant block — so a multi-line/multi-paragraph answer reads as ONE turn.
             continuation={item.kind === 'assistant' && index > 0 && committed[index - 1]?.kind === 'assistant'}
-            // Ctrl-O expands large GFM tables too (same global fold as tools/reasoning).
-            foldLargeTables={!showAllExpanded}
-            // Tool-call stacking: the run descriptor for this item (undefined for lone tools).
-            toolRun={toolRuns.get(index)}
+            // Answer tables expand independently of the activity inspector.
+            foldLargeTables={!expandedIds.has(item.id)}
+
           />
         )}
       </Static>
 
+      {activityView.view && !pending ? <ActivityOverlay view={activityView.view} cols={terminalSize.cols} rows={terminalSize.rows} /> : <>
       {/* ── Constant-height Turn HUD ──
           (1) LIVE SLOT: always mounted at hudFit.liveRows (when the budget allows), idle or running.
               Content is bottom-aligned; idle leaves blank rows. Composer never jumps at turn
@@ -3611,8 +3603,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
               // The parent's own activeTool row (usually the `agent` call itself) reserves 1 row.
               // Per-type colors, read from the live palette (C is a mutated singleton).
               const SUBAGENT_COLORS = [C.cyan, C.purple, C.green, C.yellow, C.accent];
-              const reserved = (activeTool || stream || think) ? 1 : 0;
-              const panelRows = Math.max(1, hudFit.liveRows - reserved);
+              const panelRows = Math.max(1, hudFit.liveRows);
               const lines = renderSubAgentPanel(Array.from(subAgents.values()), panelRows, SUBAGENT_COLORS.length);
               return (
                 <Box flexDirection="column" paddingLeft={PAGE_MARGIN}>
@@ -3626,86 +3617,15 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
                 </Box>
               );
             })() : null}
-            {activeTool && !previewStream ? (
-                // Persistent live tool row: the ⏺ is orange while the call runs (matches the spinner),
-                // then tool_end commits the resolved green/red ⏺ row to <Static> in its place.
-                // Recon bursts (≥2 read/grep/…) show a progressive Claude-style group line so the
-                // HUD doesn't flash every single Read — "Reading 3 files, Grepping 1 pattern · path".
-                <Box paddingLeft={PAGE_MARGIN}>
-                  <Text wrap="truncate">
-                    <Text color={C.accent ?? CLAUDE_ORANGE}>{BLACK_CIRCLE} </Text>
-                    {activeTool.name === 'agent' && activeTool.agent ? (
-                      <>
-                        <Text color={C.cyan}>▸ </Text>
-                        <Text bold>{activeTool.agent.subagentType ?? 'subagent'}</Text>
-                        <Text color={C.dim}>{` · ${activeTool.agent.description ?? activeTool.arg}`}</Text>
-                      </>
-                    ) : liveRecon && reconCount(liveRecon.kinds) >= 2 && isCollapsibleTool(activeTool.name) ? (
-                      <>
-                        <Text bold>{formatReconSummary(liveRecon.kinds, { live: true })}</Text>
-                        {(liveRecon.hint || activeTool.arg) ? (
-                          <Text color={C.dim}>{` · ${displayToolArg(liveRecon.hint || activeTool.arg, 40)}`}</Text>
-                        ) : null}
-                      </>
-                    ) : (
-                      <>
-                        <Text bold>{displayToolName(activeTool.name)}</Text>
-                        {activeTool.arg ? (
-                          <Text color={C.dim}>{`(${displayToolArg(activeTool.arg, 72)})`}</Text>
-                        ) : null}
-                      </>
-                    )}
-                  </Text>
-                </Box>
-              ) : null}
-              {think && !previewStream ? (
-                // While the model thinks, a single compact ∴ Thinking… indicator aligned under the
-                // gutter — NEVER the raw multi-line thought (that was the ugly split). The full thought
-                // still commits COLLAPSED to the transcript on reasoning_done.
-                <Box paddingLeft={PAGE_MARGIN}>
-                  <Text italic color={C.dim}>{'∴ Thinking…'}</Text>
-                </Box>
-              ) : null}
-              {previewStream ? (
-                (() => {
-                  const clamped = clampTail(previewStream, hudFit.liveRows);
-                  // An OPEN code fence would render as a bordered code box needing ~4 rows — in this
-                  // short slot Ink clips it to a broken/empty box. Show the newest raw code lines as
-                  // plain dim text (no box), indented under the gutter so it aligns with the answer.
-                  if (/^\s*(```|~~~)/.test(clamped)) {
-                    const codeTail = previewStream
-                      .split('\n')
-                      .filter((l) => !/^\s*(```|~~~)/.test(l))
-                      .slice(-hudFit.liveRows);
-                    return (
-                      <Box flexDirection="column" paddingLeft={PAGE_MARGIN}>
-                        {codeTail.map((l, k) => (
-                          <Text key={k} wrap="truncate"><Text>{'  '}</Text><Text color={C.dim}>{l || ' '}</Text></Text>
-                        ))}
-                      </Box>
-                    );
-                  }
-                  // The uncommitted tail as a real transcript node: ⏺ only when nothing has committed
-                  // yet (turn start); once a line is in <Static> the tail is a continuation and aligns
-                  // under it — one seamless answer, live and committed rendered identically.
-                  return (
-                    <FlatItem
-                      // `tight` once the turn has committed a block: without it flattenItem opens
-                      // the preview with a blank gap row, which split the in-progress paragraph
-                      // down the middle AND ate one of the two live rows, so the tail could only
-                      // ever show one line. At turn start (nothing committed) the gap is correct —
-                      // it separates the answer from the user's prompt above.
-                      item={{ id: -1, kind: 'assistant', text: clamped, color: C.fg, tight: answerOpenRef.current } as TranscriptItem}
-                      cols={terminalSize.cols}
-                      collapsed={false}
-                      continuation={answerOpenRef.current}
-                    />
-                  );
-                })()
-              ) : null}
+            {previewStream ? <FlatItem
+              item={{ id: -1, kind: 'assistant', text: previewStream, color: C.fg, tight: true,
+                speaker: speakerRef.current ?? { handle: 'SHADOW', model: current.model, color: C.accent } }}
+              cols={terminalSize.cols} collapsed={false} foldLargeTables={false}
+              continuation={answerOpenRef.current} maxRows={hudFit.liveRows}
+            /> : null}
             </Box>
           ) : null}
-          {hudFit.status && running ? (
+          {hudFit.status && (running || activeTool || activity.summary?.tools || think) ? (
             // Only while a turn runs. Idle, this used to paint a blank spacer row "to keep the
             // band" — which, stacked on the composer's own marginTop, put TWO empty rows above
             // the input on every idle screen. One (marginTop) is the breathing room; two is a gap.
@@ -3713,7 +3633,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
               <Text wrap="truncate">
                 <Text color={C.accent ?? CLAUDE_ORANGE}>{spinner}</Text>
                 <Text> {statusVerb}</Text>
-                <Text color={C.dim}>{`${statusPrefix} · `}</Text>
+                <Text color={C.dim}>{`${statusPrefix}${runningStrip || statusSafetyMarkers.length ? ' · ' : ''}`}</Text>
                 <ChromeMarkers
                   markers={statusSafetyMarkers}
                   trailing={statusSafetyMarkers.length > 0 && runningStrip.length > 0}
@@ -3882,6 +3802,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           </Box>
         ) : null}
       </Box>
+      </>}
     </Box>
   );
 }

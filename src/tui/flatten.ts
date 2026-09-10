@@ -23,9 +23,6 @@ import { displayWidth, takeByWidth, nextCluster, stripInvisible } from '../util/
 
 export { TABLE_COLLAPSE_THRESHOLD };
 
-// the reference client vocabulary: the ⏺ turn bullet + the warm brand orange it's drawn in.
-const ASSISTANT_DOT = process.platform === 'darwin' ? '⏺' : '●';
-const CLAUDE_ORANGE = '#d97757';
 // OSC 8 hyperlinks: stable for the process (env-derived), so resolve once at module load.
 const LINKS = supportsHyperlinks();
 // Inline images: likewise TTY+terminal-derived and stable. Gated so image escapes never leak into
@@ -525,6 +522,7 @@ function blockToLines(
   keyPrefix: string,
   /** When true, GFM tables with more than TABLE_COLLAPSE_THRESHOLD body rows fold to one line. */
   foldLargeTables = false,
+  tableHint = 'Ctrl+O',
 ): ViewportLine[] {
   const out: ViewportLine[] = [];
   switch (block.type) {
@@ -635,14 +633,13 @@ function blockToLines(
     }
     case 'table': {
       const bodyRows = block.rows.length;
-      // Large tables fold by default (same language as tool output). Ctrl-O / showAllExpanded
-      // sets foldLargeTables=false so the full grid paints.
+      // Large tables fold independently of activity; the caller supplies their expansion hint.
       if (foldLargeTables && bodyRows > TABLE_COLLAPSE_THRESHOLD) {
         const colsN = block.align.length;
         const n = `${bodyRows}×${colsN}`;
         out.push({
           key: `${keyPrefix}tfold`,
-          spans: [{ text: `  ⌄ table ${n} · ^O`, color: theme.dim }],
+          spans: [{ text: `  ▸ table ${n} · ${tableHint}`, color: theme.dim }],
         });
         break;
       }
@@ -684,6 +681,7 @@ function kindColor(kind: string, theme: ViewportTheme): string | undefined {
 export interface FlattenItem {
   id: number | string;
   kind: string;
+  activityId?: number;
   text: string;
   color?: string;
   dimColor?: boolean;
@@ -722,7 +720,7 @@ export function flattenItem(
   continuation = false,
   /**
    * Fold GFM tables with more than TABLE_COLLAPSE_THRESHOLD body rows to one summary line.
-   * Callers pass true when global folds are collapsed (!showAllExpanded); Ctrl-O expands tables too.
+   * The stock TUI expands tables per answer with /expand; activity output has its own viewer.
    */
   foldLargeTables = false,
   /** Tool-call stacking: when this tool item is part of a run of ≥2 consecutive tools, the run
@@ -745,6 +743,7 @@ export function flattenItem(
   //    a failure) and used to weld onto the end of the answer above them with no separator at all
   const ownBlock =
     item.kind === 'assistant' ||
+    item.kind === 'activity' ||
     item.kind === 'reasoning' ||
     item.kind === 'finding' ||
     item.kind === 'system' ||
@@ -797,7 +796,9 @@ export function flattenItem(
         if (toolRun.collapsed) return out; // collapsed: the header is the whole run
       }
     }
-    out.push({ key: `${kp}tool`, spans: truncateSpans(renderToolResult(item.tool, theme), cols) });
+    const hint = item.activityId ? ` · /activity ${item.activityId}` : '';
+    const header = truncateSpans(renderToolResult(item.tool, theme), Math.max(4, cols - displayWidth(hint)));
+    out.push({ key: `${kp}tool`, spans: truncateSpans([...header, { text: hint, color: theme.dim }], cols) });
     if (item.lines && item.lines.length > 0) {
       appendToolBody(out, kp, item.lines, collapsed, theme, cols, color, item.meta);
     }
@@ -877,26 +878,23 @@ export function flattenItem(
     const bodyLines: ViewportLine[] = [];
     parseMarkdown(item.text).forEach((b, bi) => {
       if (bi > 0) bodyLines.push({ key: `${kp}bg${bi}`, spans: [{ text: '' }] }); // one blank between blocks
-      bodyLines.push(...blockToLines(b, cols - 2, theme, `${kp}b${bi}`, foldLargeTables));
+      bodyLines.push(...blockToLines(b, cols - 2, theme, `${kp}b${bi}`, foldLargeTables, `/expand ${item.id}`));
     });
-    // Collaboration Mode: a seat's turn opens with a colored `⏺ handle  provider/model` header row
-    // (once per turn — `!continuation`), then the body indents under it with no orange bullet, so a
-    // multi-model transcript reads as a legible group chat with unambiguous per-model attribution.
+    // Ordinary replies read as Markdown. Only collaboration needs per-message attribution;
+    // the active model is already visible in the footer.
     const spk = item.speaker;
-    if (spk && !continuation) {
+    if (spk && spk.handle !== 'SHADOW' && !continuation) {
       out.push({
         key: `${kp}spk`,
-        spans: [
-          { text: `${ASSISTANT_DOT} `, color: spk.color },
+        spans: truncateSpans([
+          { text: '◆ ', color: spk.color },
           { text: spk.handle, color: spk.color, bold: true },
           { text: `  ${spk.model}`, color: theme.dim },
-        ],
+        ], cols),
       });
     }
-    bodyLines.forEach((ln, i) => {
-      // ⏺ on the first line of a NEW turn only; continuation items (same turn) align under it. A
-      // speaker turn already drew its header, so its body always indents (no second bullet).
-      const gutter: StyledSpan = i === 0 && !continuation && !spk ? { text: `${ASSISTANT_DOT} `, color: theme.accent ?? CLAUDE_ORANGE } : { text: '  ' };
+    bodyLines.forEach((ln) => {
+      const gutter: StyledSpan = { text: '  ' };
       out.push({ key: ln.key, spans: [gutter, ...ln.spans] });
     });
     return out;

@@ -290,3 +290,39 @@ test('formatBytes renders human-readable sizes', () => {
   assert.equal(formatBytes(2048), '2.0 KB');
   assert.equal(formatBytes(5 * 1024 * 1024), '5.0 MB');
 });
+
+test('the keep rule protects the newest by TIME, not by filename', () => {
+  // Session ids are ISO stamps, so name order usually matches age — but the names do not have to be
+  // stamps: a `--from-claude` import lands as `claude-*.jsonl` and a fork gets its own spelling.
+  // `SessionLog.list` orders by FILENAME, and letters collate AFTER digits, so those names came back
+  // as "newest": the keep rule pinned a stale imported log as the newest session while the genuinely
+  // newest ISO log was the one archived — the exact opposite of what `sessionRetentionKeep` promises.
+  const ws = mkdtempSync(join(tmpdir(), 'shadow-retention-mtime-'));
+  try {
+    const dir = join(ws, '.shadow', 'sessions');
+    mkdirSync(dir, { recursive: true });
+    const stamp = (name: string, iso: string): string => {
+      const p = join(dir, name);
+      writeFileSync(p, '{}\n');
+      const t = new Date(iso);
+      utimesSync(p, t, t);
+      return p;
+    };
+    // The NEWEST session, with the ISO name the codebase normally writes.
+    const newest = stamp('2026-08-01T00-00-00-000Z-newest.jsonl', '2026-08-01T00:00:00Z');
+    // A STALE imported log whose name collates as "newer" than any digit.
+    const stale = stamp('claude-imported.jsonl', '2020-01-01T00:00:00Z');
+
+    const swept = planRetention(ws, { sessionRetentionDays: 7, sessionRetentionKeep: 1 }).map((c) => c.path);
+    assert.ok(
+      !swept.includes(newest),
+      `the newest session must be the one keep:1 protects (plan: ${JSON.stringify(swept)})`,
+    );
+    assert.ok(
+      swept.includes(stale),
+      `the stale imported log is the one to archive (plan: ${JSON.stringify(swept)})`,
+    );
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});

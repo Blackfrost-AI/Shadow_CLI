@@ -1,5 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { isBashReadOnly, READ_ONLY_PREFIXES } from '../src/safety/bashReadOnly.js';
 
 test('READ_ONLY_PREFIXES is exported and non-empty', () => {
@@ -55,9 +58,22 @@ test('isBashReadOnly: fd-numbered file redirects are NOT read-only (security —
   assert.equal(isBashReadOnly('grep foo file 3> z'), false, '3> writes a file — must gate');
   assert.equal(isBashReadOnly('cat data > f'), false, 'plain > writes');
   assert.equal(isBashReadOnly('cat data >> f'), false, 'append writes');
-  // fd DUPLICATION (2>&1) also gates conservatively (the `&` splits the chain) — safe: it never
-  // auto-runs a write, it just asks. The security invariant is only that FILE redirects never slip through.
-  assert.equal(isBashReadOnly('grep foo file 2>&1'), false, 'conservatively gates (safe over convenient)');
+  // fd DUPLICATION (`2>&1`, `>&2`, `<&0`) is NOT a file redirect — it points a descriptor at another
+  // descriptor — so it is stripped before the chain split and the idiom rides the fast path instead
+  // of gating on the `&` as if it separated two commands. The invariant the cases above protect is
+  // unchanged: stripping only ever removes `[<>]&<digits>`, so a remaining `>` is still caught by the
+  // check above. Pinned against every shape where a dup sits next to a real target:
+  assert.equal(isBashReadOnly('grep foo file 2>&1'), true, 'pure duplication names no file');
+  for (const writes of [
+    'cat a 2>&1> /etc/x', // dup, then a real file target
+    'cat a >&out.txt', // `>&word` with a NON-numeric word IS a file redirect
+    'cat a >&2>/etc/x',
+    'cat a 2>&1 > /etc/x',
+    'cat a 2>&',
+    'cat a 2>&1|tee /etc/x',
+  ]) {
+    assert.equal(isBashReadOnly(writes), false, `${writes} must still gate — a file target remains`);
+  }
 });
 
 // ── T0-2 / T0-3 / T0-4 · the read-only fast path was not read-only ──────────────────────────
@@ -184,4 +200,37 @@ test('F07-02: shape-only classification (no roots) keeps grep/rg/find auto-allow
   assert.equal(isBashReadOnly('rg -il token ~'), true);
   assert.equal(isBashReadOnly('find / -name x'), true);
   assert.equal(isBashReadOnly('grep foo /etc/passwd', []), true);
+});
+
+// ── Redirect-target scoping (BYPASS: `head -1 </etc/shadow` auto-ran at the default autonomy) ──
+test('isBashReadOnly: INPUT redirection to an out-of-jail file demotes to the gate', () => {
+  // `</etc/passwd` arrives glued to the operator, so the operand scanner saw one non-absolute
+  // token and resolved it INSIDE the workspace — the read rode the fast path and its contents
+  // became a tool result → provider next turn. Same class as the quoted-operand bypass.
+  const ws = mkdtempSync(join(tmpdir(), 'shadow-redir-'));
+  try {
+    for (const cmd of [
+      'head -1 </etc/shadow',
+      'cat </etc/passwd',
+      'cat 0</etc/passwd',
+      'wc -l</etc/passwd',
+      'grep -c . <~/.aws/credentials',
+      'sort -u </etc/passwd',
+      'tail -n 5 </etc/passwd',
+      'cat /etc/passwd | head -1</etc/shadow',
+    ]) {
+      assert.equal(isBashReadOnly(cmd, [ws]), false, `${cmd} reads a file outside the jail`);
+    }
+    // An in-jail redirect is still a plain read and keeps riding the fast path.
+    assert.equal(isBashReadOnly(`cat <${ws}/a.ts`, [ws]), true);
+    assert.equal(isBashReadOnly(`wc -l <${ws}/a.ts`, [ws]), true);
+    // Heredocs / herestrings feed inline text — no file is named, so nothing is scoped.
+    assert.equal(isBashReadOnly('cat <<EOF', [ws]), true);
+    assert.equal(isBashReadOnly('cat <<-EOF', [ws]), true);
+    assert.equal(isBashReadOnly('cat <<<word', [ws]), true);
+    // A dangling operator names nothing we can vouch for.
+    assert.equal(isBashReadOnly('cat <', [ws]), false);
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
 });

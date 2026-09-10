@@ -20,6 +20,7 @@ import {
   isCloudMetadataIp,
   pinnedAgent,
   pinnedAgentCacheSizeForTests,
+  EgressAgent,
   offlineFetchWall,
   closeAgentsForTests,
 } from '../src/safety/egress.js';
@@ -515,5 +516,39 @@ test('the fetch wall fails CLOSED on Request objects and unparseable targets', a
     assert.equal(calls.length, 1, 'exactly the local Request reached the stub');
   } finally {
     setOfflineMode(false);
+  }
+});
+// ── The transport deadline a raised idle budget runs into ────────────────────────────────────
+test('the agent deadline is real, and raising it is what lets a longer budget take effect', async () => {
+  // Undici arms bodyTimeout when the response HEADERS land and refreshes it per body chunk, so it
+  // is a second deadline in the same race as Shadow's idle watchdog — and it defaults to 300 000 ms.
+  // A user who raised `stream.idleTimeoutMs`/`SHADOW_IDLE_MS` to 600 s (a documented, legal value)
+  // therefore still died at 300 s with the opaque `terminated` instead of the watchdog's message
+  // naming the knob. This pins the mechanism the streaming agent relies on.
+  const server = createServer((_req, res) => {
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.write('a'); // headers + a first chunk arrive at once…
+    setTimeout(() => res.end('b'), 900); // …then the body stalls, like a slow prefill
+  });
+  await new Promise<void>((r) => server.listen(0, '127.0.0.1', () => r()));
+  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/`;
+  try {
+    const tight = new EgressAgent({ timeoutsMs: { body: 200, headers: 200 } });
+    await assert.rejects(
+      async () => {
+        const res = await fetch(url, { dispatcher: tight } as never);
+        await res.text();
+      },
+      (e: Error) => e.message.includes('terminated'),
+      'a deadline shorter than the gap must abort the body',
+    );
+    await tight.close();
+
+    const roomy = new EgressAgent({ timeoutsMs: { body: 10_000, headers: 10_000 } });
+    const res = await fetch(url, { dispatcher: roomy } as never);
+    assert.equal(await res.text(), 'ab', 'raising the deadline lets the same body through');
+    await roomy.close();
+  } finally {
+    server.close();
   }
 });

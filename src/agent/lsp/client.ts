@@ -29,6 +29,14 @@ export interface ServerConnection {
   notifyOpen(absPath: string, text: string, version: number): void;
   /** textDocument/didChange with FULL text (Shadow sends whole-file sync — no ranges). */
   notifyChange(absPath: string, text: string, version: number): void;
+  /**
+   * Has THIS server instance been told about the file? The answer resets with the process, which is
+   * the whole point: after a crash and restart a document must be didOpen-ed again, and sending
+   * didChange for a document the new instance never opened is an LSP protocol violation — the
+   * server ignores it, so notes stop permanently for that file and every later write pays the full
+   * diagnostics deadline waiting for a report that can never come.
+   */
+  hasOpen(absPath: string): boolean;
   /** Diagnostics reflecting the last sent version, or [] by the deadline. NEVER rejects. */
   awaitDiagnostics(uri: string, deadlineMs: number, signal?: AbortSignal): Promise<LspDiagnostic[]>;
   /** SIGTERM the tree → SIGKILL after the grace window. Idempotent. */
@@ -201,6 +209,10 @@ export function createLspConnection(spec: LspServerSpec, opts: CreateConnectionO
       sentVersion.set(uri, version);
       const languageId = SERVER_LANGUAGE[spec.id] ?? (extname(absPath).slice(1) || 'plaintext');
       peer.notify('textDocument/didOpen', { textDocument: { uri, languageId, version, text } });
+    },
+
+    hasOpen(absPath) {
+      return sentVersion.has(pathToFileURL(absPath).href);
     },
 
     notifyChange(absPath, text, version) {

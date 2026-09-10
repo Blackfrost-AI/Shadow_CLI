@@ -66,7 +66,7 @@ import { flattenItem } from '../src/tui/flatten.js';
 import type { ViewportTheme } from '../src/tui/flatten.js';
 
 const theme: ViewportTheme = { fg: '#fff', dim: '#888', green: 'g', cyan: 'c', yellow: 'y', red: 'r', purple: 'p' };
-const rowText = (rows: { spans: { text: string }[] }[]): string[] => rows.map((r) => r.spans.map((s) => s.text).join(''));
+const rowText = (rows: { spans: { text: string }[] }[]): string[] => rows.map((r) => r.spans.map((s) => s.text).join('')).filter(line => line !== '◆ SHADOW');
 
 test('hard-wrapped paragraph prose reflows to the terminal width', () => {
   const para = [

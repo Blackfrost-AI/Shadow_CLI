@@ -1,10 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { resolvePermissionRule } from '../src/safety/rules.js';
+import {
+  isValidRulePattern,
+  resolvePermissionRule,
+  type PermissionRule,
+} from '../src/safety/rules.js';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
-import type { ProviderEvent } from '../src/provider/provider.js';
+import type { ProviderEvent, ToolCall } from '../src/provider/provider.js';
 import { ToolRegistry } from '../src/tools/registry.js';
 import { AgentLoop, type LoopDeps } from '../src/agent/loop.js';
 import { Budget } from '../src/agent/budget.js';
@@ -128,4 +132,27 @@ test('T0-7: file tools match on path, not on the whole blob', () => {
   const rules = [{ tool: 'write_file', pattern: 'src/.*', action: 'allow' as const }];
   assert.equal(resolvePermissionRule(write('src/a.ts'), 'p', rules), 'allow');
   assert.equal(resolvePermissionRule(write('/etc/hosts', 'writing to src/a.ts'), 'p', rules), null);
+});
+
+test('a deny/ask rule whose regex does not compile FAILS CLOSED; a broken allow grants nothing', () => {
+  // `compile()` swallows a bad RegExp and returns null, and the match loop skipped every null — so a
+  // TYPO turned a deny into a silent no-op while `/permissions list` still showed it as active. For
+  // the restricting actions the safe direction is to match: the user wrote a restriction, and
+  // honouring it conservatively only ever costs a prompt.
+  const cmd = (command: string): ToolCall => ({ id: 'c', name: 'run_shell', input: { command } });
+  const broken = (action: 'deny' | 'ask' | 'allow'): PermissionRule[] => [
+    { tool: 'run_shell', pattern: 'rm -rf(', action },
+  ];
+  assert.equal(resolvePermissionRule(cmd('ls'), '', broken('deny')), 'deny', 'broken deny still denies');
+  assert.equal(resolvePermissionRule(cmd('ls'), '', broken('ask')), 'ask', 'broken ask still asks');
+  assert.equal(resolvePermissionRule(cmd('ls'), '', broken('allow')), null, 'broken allow grants nothing');
+  // A working pattern is unaffected.
+  assert.equal(resolvePermissionRule(cmd('ls'), '', [{ tool: 'run_shell', pattern: '^rm', action: 'deny' }]), null);
+  assert.equal(resolvePermissionRule(cmd('rm -rf /'), '', [{ tool: 'run_shell', pattern: '^rm', action: 'deny' }]), 'deny');
+});
+
+test('isValidRulePattern rejects what compile() cannot use', () => {
+  assert.equal(isValidRulePattern('rm -rf(', 'deny'), false);
+  assert.equal(isValidRulePattern('^npm test', 'allow'), true);
+  assert.equal(isValidRulePattern('', 'deny'), true, 'an empty pattern means "every call"');
 });

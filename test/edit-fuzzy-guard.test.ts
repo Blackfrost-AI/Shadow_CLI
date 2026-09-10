@@ -42,3 +42,38 @@ test('single-line whitespace drift is still handled by the EXACT-adjacent strate
   const r = applyStringEdit(FILE, '  const RETRY_LIMIT = 3;   ', '  const RETRY_LIMIT = 9;', false);
   assert.equal(r.ok, true, 'trailing-ws repair does not depend on fuzzy');
 });
+
+test('an EMPTY old_string is refused, never a wildcard over every blank line', () => {
+  // countOccurrences() returns 0 for an empty needle (its `if (!needle) return 0` guard), so the
+  // exact strategy was skipped and the LINE-BASED ladder ran with oldLines === [''] — matching every
+  // blank line in the file. `old_string: ""` + replace_all then rewrote each one, dropped the
+  // file's trailing newline, and reported "replaced 3 occurrence(s) (matched via trailing-ws)".
+  const file = 'a\n\nb\n\nc\n';
+  const r = applyStringEdit(file, '', 'Z', true);
+  assert.equal(r.ok, false, 'an empty old_string is never a valid edit');
+  assert.equal((r as { reason: string }).reason, 'empty');
+  // …and the same without replace_all (which previously reported the baffling "matches 3 times").
+  assert.equal(applyStringEdit(file, '', 'Z', false).ok, false);
+});
+
+test('a multi-line old_string that ends with a newline still matches (the phantom blank line)', () => {
+  // `split('\n')` yields a trailing '' for a trailing newline, and findBlockMatches required the
+  // FILE to have a blank line there — so a block copied WITH its terminator (the exact case the
+  // tolerant ladders exist for) could never match: exact failed on whitespace and both ladders
+  // failed on the phantom blank, reporting a spurious "not found".
+  const drifted = 'a\n  b\n  c\nd\n';
+  const r = applyStringEdit(drifted, 'b\nc\n', 'B\nC\n', false);
+  assert.equal(r.ok, true, 'trailing newline must not break the ladder');
+  assert.ok(r.ok);
+  // No blank line is inserted, and the block keeps the file's own indentation.
+  assert.equal(r.updated, 'a\n  B\n  C\nd\n');
+  // Exact match with a trailing newline is unchanged (it never reached the ladder).
+  assert.deepEqual(applyStringEdit('a\nb\nc\nd\n', 'b\nc\n', 'B\nC\n', false), {
+    ok: true,
+    updated: 'a\nB\nC\nd\n',
+    count: 1,
+    strategy: 'exact',
+  });
+  // A trailing newline in old_string with none in new_string simply joins the lines.
+  assert.equal(applyStringEdit('a\n  b\n  c\nd\n', 'b\nc\n', 'B', false).ok, true);
+});

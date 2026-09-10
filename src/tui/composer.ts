@@ -441,6 +441,60 @@ export function lastKeySequence(raw: string): string {
   return last || raw;
 }
 
+/**
+ * Split a raw stdin chunk into printable-text runs and key-sequence parts, in order.
+ *
+ * Ink parses ONE keypress per stdin `data` chunk (`parseKeypress(data)`, then a single handler
+ * call), so any read the terminal batches hands the composer the WHOLE chunk. Terminals batch for
+ * exactly the inputs people type fastest: a held arrow (`\x1b[D\x1b[D`), Home landing in the same
+ * read as the key pressed after it, and everything over tmux/SSH. The composer treated the chunk as
+ * text, so `abc\x1b[D` (type "abc", press Left) had its ESC removed by the control-byte filter and
+ * `[D` inserted literally — the draft read "abc[D" and the arrow was silently lost — while
+ * `abc\x7f` (type "abc", press Backspace) dropped the deletion the same way.
+ *
+ * Returns [] when the chunk carries no escape or lone DEL byte, so callers keep their fast path.
+ *
+ * `\r` is deliberately NOT a key here: a bare CR inside a chunk is how an UNBRACKETED paste spells
+ * its line endings, and `batchedTextReturn` already owns the one shape that is really a typed Enter
+ * (a trailing bare CR, gated on the paste flag). Callers gate this on the same flag.
+ */
+export function splitKeyChunk(raw: string): Array<{ text: string } | { seq: string }> {
+  if (!raw.includes('\x1b') && !raw.includes('\x7f')) return [];
+  const parts: Array<{ text: string } | { seq: string }> = [];
+  let text = '';
+  const flush = (): void => {
+    if (text) {
+      parts.push({ text });
+      text = '';
+    }
+  };
+  let i = 0;
+  while (i < raw.length) {
+    const c = raw[i]!;
+    if (c === '\x7f') {
+      flush();
+      parts.push({ seq: c }); // Backspace is one byte, never text
+      i++;
+      continue;
+    }
+    if (c !== '\x1b') {
+      text += c;
+      i++;
+      continue;
+    }
+    const end = keySeqEnd(raw.slice(i));
+    if (end <= 0) {
+      text += raw.slice(i); // incomplete/garbage tail: keep it, the control-byte strip drops the ESC
+      break;
+    }
+    flush();
+    parts.push({ seq: raw.slice(i, i + end) });
+    i += end;
+  }
+  flush();
+  return parts;
+}
+
 // ── Word / line motion + kills (readline + macOS Option-key semantics) ────────
 //
 // One shared definition of a "word" for every motion and kill, so Option+←, Option+Delete and

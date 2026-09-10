@@ -406,6 +406,14 @@ export interface EgressAgentOptions {
   validatedHost?: string;
   /** The global-dispatcher instance: records allow-verdicts for traffic that bypassed shadowFetch. */
   primary?: boolean;
+  /**
+   * Undici's own body/header deadline. Undici defaults BOTH to 300 000 ms, which silently caps any
+   * longer budget: it fires mid-body, so it beats a watchdog configured to be more patient, and it
+   * reports the opaque `terminated` instead of the actionable message that watchdog produces.
+   * `streamingFetch` raises it past any budget Shadow will honour; leave unset everywhere else,
+   * where undici's default IS the backstop for callers with no bound of their own.
+   */
+  timeoutsMs?: { body: number; headers: number };
 }
 
 /**
@@ -415,11 +423,14 @@ export interface EgressAgentOptions {
  */
 export class EgressAgent extends Agent {
   constructor(private readonly egressOpts: EgressAgentOptions = {}) {
-    super(
-      egressOpts.pinTo && egressOpts.pinTo.length
+    super({
+      ...(egressOpts.pinTo && egressOpts.pinTo.length
         ? { connect: { lookup: makePinnedLookup(egressOpts.pinTo, egressOpts.validatedHost ?? '') as never } }
-        : {},
-    );
+        : {}),
+      ...(egressOpts.timeoutsMs
+        ? { bodyTimeout: egressOpts.timeoutsMs.body, headersTimeout: egressOpts.timeoutsMs.headers }
+        : {}),
+    });
   }
 
   override dispatch(opts: Dispatcher.DispatchOptions, handler: Dispatcher.DispatchHandler): boolean {
@@ -467,7 +478,13 @@ function hostFromOrigin(origin: string | undefined): string {
 export async function closeAgentsForTests(): Promise<void> {
   await Promise.all([...agentCache.values()].map((a) => a.close()));
   agentCache.clear();
+  await Promise.all([...streamAgentCache.values()].map((a) => a.close()));
+  streamAgentCache.clear();
   await unpinnedAgent.close();
+  if (unpinnedStreamAgent) {
+    await unpinnedStreamAgent.close();
+    unpinnedStreamAgent = null;
+  }
   await primaryAgent.close();
 }
 
@@ -509,6 +526,48 @@ setGlobalDispatcher(primaryAgent);
 
 /** Non-pinning enforcing agent for requests whose host could not be resolved ahead of time. */
 const unpinnedAgent = new EgressAgent({});
+
+/**
+ * Ceiling for the streaming agents' undici deadlines (1 hour).
+ *
+ * A provider stream carries its OWN watchdog (`stream.idleTimeoutMs` / `SHADOW_IDLE_MS` /
+ * `idleTimeoutMs`), which aborts with an actionable message naming the knob to raise. Undici's
+ * 300 s default body deadline is a SECOND, silent deadline in the same race — so a user who raised
+ * the budget to 600 s, exactly as the docs and `stream-per-config-knobs` describe, got an opaque
+ * `stream_error: terminated` at 300 s instead, and the setting could never take effect. Raising the
+ * net past every budget Shadow honours lets the watchdog decide; the net still exists so a stalled
+ * socket cannot hang a turn forever.
+ */
+export const STREAM_AGENT_TIMEOUT_MS = 60 * 60 * 1000;
+let unpinnedStreamAgent: EgressAgent | null = null;
+const streamAgentCache = new Map<string, EgressAgent>();
+
+/** The streaming variant of a pinned agent — same pinning, deadlines undici cannot impose early. */
+function streamingAgent(ips: string[], validatedHost: string): EgressAgent {
+  if (ips.length === 0) {
+    unpinnedStreamAgent ??= new EgressAgent({ timeoutsMs: { body: STREAM_AGENT_TIMEOUT_MS, headers: STREAM_AGENT_TIMEOUT_MS } });
+    return unpinnedStreamAgent;
+  }
+  const key = [...ips].sort().join(',') + '|' + validatedHost.toLowerCase();
+  let agent = streamAgentCache.get(key);
+  if (agent) return agent;
+  agent = new EgressAgent({
+    pinTo: ips,
+    validatedHost,
+    timeoutsMs: { body: STREAM_AGENT_TIMEOUT_MS, headers: STREAM_AGENT_TIMEOUT_MS },
+  });
+  // Bounded like agentCache: a session can observe many pin sets, and each retains a pool graph.
+  if (streamAgentCache.size >= AGENT_CACHE_MAX) {
+    const oldest = streamAgentCache.keys().next().value as string | undefined;
+    if (oldest) {
+      const evicted = streamAgentCache.get(oldest);
+      streamAgentCache.delete(oldest);
+      void evicted?.close().catch(() => undefined);
+    }
+  }
+  streamAgentCache.set(key, agent);
+  return agent;
+}
 
 /**
  * Transport selection. On Node, `globalThis.fetch` IS undici and honors the `dispatcher` init
@@ -650,6 +709,12 @@ export interface ShadowFetchOptions {
   ssrf?: 'netguard' | 'metadata' | 'none';
   /** Caller already validated + resolved this URL (web tools' per-hop re-validation). */
   pinnedIps?: string[];
+  /**
+   * A long-lived PROVIDER STREAM. Uses an agent whose undici body/header deadlines are raised past
+   * every budget Shadow honours, so the stream's own idle watchdog is the one that decides (and
+   * names the knob to raise) instead of undici's fixed 300 s default firing first with `terminated`.
+   */
+  streaming?: boolean;
 }
 
 /**
@@ -744,7 +809,11 @@ export async function shadowFetch(url: string, init?: RequestInit, opts?: Shadow
   }
 
   recordEgress(host, purpose, 'allowed', q === 'flag' ? 'quarantine' : undefined);
-  const dispatcher: Agent = ips && ips.length > 0 ? pinnedAgent(ips, host) : unpinnedAgent;
+  const dispatcher: Agent = opts?.streaming
+    ? streamingAgent(ips ?? [], host)
+    : ips && ips.length > 0
+      ? pinnedAgent(ips, host)
+      : unpinnedAgent;
   // `dispatcher` is undici's init option; the DOM-flavored RequestInit type doesn't know it.
   return transport(url, { ...effectiveInit, dispatcher } as unknown as RequestInit);
 }

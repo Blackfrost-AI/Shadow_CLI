@@ -74,10 +74,15 @@ test('renderBrand: narrow terminal falls back to the compact ✦ form', () => {
   assert.equal(rows[0]![1]!.text, 'shadow', 'compact form under a narrow width');
 });
 
-test('renderToolResult: a single ⏺ dot carries status by COLOR, display name bold, args in parens, dim tail', () => {
+test('renderToolResult: status is spelled out, display name bold, args in parens, dim tail', () => {
+  // SUCCESS states its outcome in WORDS (`✓ DONE `) rather than a bare dot whose only signal was
+  // color: the word survives a monochrome terminal, a screenshot and red-green CVD, and it reads
+  // unambiguously next to the failure form instead of depending on the reader knowing the palette.
+  // Routine successes mostly leave no receipt at all now (they group into a tool run), so this form
+  // appears on edits, failures and actions — which is where the extra clarity is worth the width.
   const ok = renderToolResult({ name: 'run_shell', arg: 'npm test', ok: true, durationMs: 10200, summary: '630 pass' }, T);
-  assert.equal(ok[0]!.text, '⏺ ', 'single dot, not ✓');
-  assert.equal(ok[0]!.color, T.green, 'green = ok (color carries state)');
+  assert.equal(ok[0]!.text, '✓ DONE ', 'outcome spelled out');
+  assert.equal(ok[0]!.color, T.green, 'green = ok (color reinforces the word)');
   assert.equal(ok[1]!.text, 'Bash', 'human display name, not run_shell');
   assert.equal(ok[1]!.bold, true, 'name is bold');
   assert.ok(ok.some((s) => s.text === '(npm test)'), 'arg in parens, printed once');
@@ -86,9 +91,9 @@ test('renderToolResult: a single ⏺ dot carries status by COLOR, display name b
   assert.ok(ok.every((s) => s.dim !== true), 'no faint attribute');
 
   const fail = renderToolResult({ name: 'web_fetch', arg: 'example.com', ok: false, durationMs: 400, summary: '404' }, T);
-  assert.equal(fail[0]!.text, '✗ ', 'failure swaps the SHAPE to ✗ — state must survive without color (WCAG 1.4.1)');
-  assert.equal(fail[0]!.color, T.red, 'red = error (color reinforces the shape)');
-  assert.equal(fail[0]!.bold, true, 'failure glyph is bold');
+  assert.equal(fail[0]!.text, '✗ FAILED ', 'failure states the outcome too — no reliance on color (WCAG 1.4.1)');
+  assert.equal(fail[0]!.color, T.red, 'red = error (color reinforces the word)');
+  assert.equal(fail[0]!.bold, true, 'failure marker is bold');
   assert.equal(fail[1]!.text, 'Fetch', 'web_fetch → Fetch');
   assert.ok(fail.some((s) => s.text === ' (0.4s)'));
 
@@ -118,7 +123,7 @@ test('renderToolResult: subagent (agent tool) renders as ▸ type · description
     T,
   );
   const text = r.map((s) => s.text).join('');
-  assert.equal(r[0]!.text, '⏺ ', 'status dot first');
+  assert.equal(r[0]!.text, '✓ DONE ', 'status first');
   assert.equal(r[1]!.text, '▸ ', '▸ delegation marker');
   assert.equal(r[1]!.color, T.cyan);
   assert.equal(r[2]!.text, 'explore');

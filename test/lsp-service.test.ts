@@ -39,12 +39,18 @@ function isAlive(pid: number): boolean {
   }
 }
 
-const FAKE_LSP = `import { writeFileSync } from 'node:fs';
+const FAKE_LSP = `import { writeFileSync, appendFileSync } from 'node:fs';
 const argv = process.argv.slice(2);
 const pidfile = argv.find((a) => !a.startsWith('--'));
 if (pidfile) writeFileSync(pidfile, String(process.pid));
 const SILENT = argv.includes('--silent');
 const DIE = argv.includes('--die-after-init');
+// --log=<path>: append every method this INSTANCE receives, so a test can prove what a restarted
+// server was told (didOpen vs didChange). --die-after-first-diag: exit right after the first
+// publish, which is how a crash mid-session is simulated.
+const LOG = (argv.find((a) => a.startsWith('--log=')) || '').slice('--log='.length);
+const DIE_AFTER_FIRST = argv.includes('--die-after-first-diag');
+const log = (line) => { if (LOG) { try { appendFileSync(LOG, line + '\\n'); } catch {} } };
 let buf = '';
 const send = (msg) => {
   const body = JSON.stringify(msg);
@@ -64,10 +70,14 @@ const handle = (msg) => {
   }
   if (msg.id !== undefined && msg.method) { send({ jsonrpc: '2.0', id: msg.id, result: {} }); return; }
   if (msg.method === 'textDocument/didOpen' || msg.method === 'textDocument/didChange') {
+    log(msg.method + ' ' + msg.params.textDocument.uri);
     if (SILENT) return;
     const td = msg.params.textDocument;
     const text = (msg.params.contentChanges && msg.params.contentChanges[0] && msg.params.contentChanges[0].text) || td.text || '';
-    setTimeout(() => send({ jsonrpc: '2.0', method: 'textDocument/publishDiagnostics', params: { uri: td.uri, version: td.version, diagnostics: diagsFor(text) } }), 10);
+    setTimeout(() => {
+      send({ jsonrpc: '2.0', method: 'textDocument/publishDiagnostics', params: { uri: td.uri, version: td.version, diagnostics: diagsFor(text) } });
+      if (DIE_AFTER_FIRST) setTimeout(() => process.exit(0), 5);
+    }, 10);
   }
 };
 process.stdin.on('data', (chunk) => {
@@ -478,5 +488,70 @@ test('getLspService: cached per workspace root; stopLspServices clears the cache
     rmSync(a, { recursive: true, force: true });
     rmSync(b, { recursive: true, force: true });
     stopLspServices();
+  }
+});
+
+// ── Restart correctness: a fresh instance must be re-OPENED, not didChange-d ────────────────────
+test('service (lsp): after a server crash the restarted instance is re-OPENED, not didChange-d', async () => {
+  // `versions` lives on the SERVICE and survives a restart, so the old `version === 1` test was true
+  // only for the first write of a file EVER. Once the server had died and ensureReady built a fresh
+  // connection, the next write to an already-written file sent textDocument/didChange for a document
+  // that instance had never received didOpen for — an LSP protocol violation the server ignores, so
+  // diagnostics for that file stopped for the rest of the session and every later write waited out
+  // the whole deadline for a report that could never arrive.
+  const fx = makeFixture('lsp');
+  const logPath = join(fx.root, 'methods.log');
+  const methods = (): string[] =>
+    (() => {
+      try {
+        return readFileSync(logPath, 'utf8').trim().split('\n').filter(Boolean);
+      } catch {
+        return [];
+      }
+    })();
+  try {
+    const svc = createLspService({
+      projectDir: fx.root,
+      config: {
+        timeoutMs: 900,
+        servers: {
+          typescript: {
+            command: process.execPath,
+            args: [join(fx.root, 'fake-lsp.mjs'), `--log=${logPath}`, '--die-after-first-diag'],
+          },
+        },
+      },
+    });
+    // Warm the server up on a DEDICATED file so the didOpen under test is a.ts's first.
+    assert.ok(await waitReady(fx, svc), 'the server became ready');
+    const abs = fx.write('a.ts', 'const a = 1;');
+    // Instance 1: open the document (the didOpen that matters), publish once, then exit.
+    await svc.collect(abs);
+    assert.ok(
+      await until(() => methods().some((l) => l.includes('a.ts') && l.startsWith('textDocument/didOpen')), 4000),
+      `instance 1 was opened (log: ${JSON.stringify(methods())})`,
+    );
+    // Let the process actually exit; after this point no collect can reach instance 1.
+    await new Promise((r) => setTimeout(r, 400));
+
+    // Drive collects until a SECOND didOpen appears — that is the restarted instance being opened.
+    const restarted = await until(async () => {
+      await svc.collect(abs);
+      return methods().filter((l) => l.includes('a.ts') && l.startsWith('textDocument/didOpen')).length >= 2;
+    }, 8000);
+
+    const seen = methods();
+    assert.ok(
+      restarted,
+      `the restarted instance must receive didOpen (log: ${JSON.stringify(seen)})`,
+    );
+    assert.equal(
+      seen.filter((l) => l.includes('a.ts') && l.startsWith('textDocument/didChange')).length,
+      0,
+      `no didChange may precede a didOpen on any instance (log: ${JSON.stringify(seen)})`,
+    );
+  } finally {
+    fx.cleanup();
+    rmSync(logPath, { force: true });
   }
 });

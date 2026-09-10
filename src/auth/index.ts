@@ -21,6 +21,8 @@ export { getSubAuth, setSubAuth, clearSubAuth, subAuthPath } from './store.js';
 export { resolveAuth, type ResolveInput } from './resolve.js';
 export { importOfficialCredential, importAllOfficial, type ImportOutcome } from './importAction.js';
 export { buildCodexAuthUrl, exchangeCodexCode, refreshCodex } from './oauth.js';
+export { ensureFreshSubscriptionCredential, REFRESH_MARGIN_SEC, type RefreshOutcome } from './refresh.js';
+export { subscriptionAuthStatus, subscriptionAuthLines, type SubAuthStatus } from './status.js';
 
 import type { SubProvider, ResolvedAuth } from './types.js';
 import { getSubAuth } from './store.js';

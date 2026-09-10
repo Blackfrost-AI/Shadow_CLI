@@ -21,7 +21,6 @@ import {
   moveCursorVertical,
   nextGrapheme,
   prevGrapheme,
-  stripSgrMouse,
   wordLeft,
   wordRight,
 } from '../composer.js';
@@ -31,38 +30,20 @@ import { C } from '../theme.js';
 import { cycleAutonomy } from '../../safety/permissions.js';
 import type { ContextName } from '../keybindings/types.js';
 import type { SlashMenuItem } from '../slashMenu.js';
-import { queuedTaskKind } from './common.js';
-import type { FocusOwnerHandler, InkKey, KeyEnv } from './types.js';
+import { pushHistory, queuedTaskKind } from './common.js';
+import { FORWARD_DELETE, HOME_KEYS, END_KEYS, SHIFT_ENTER, insertChunk } from './common.js';
 
-// Keys Ink's `key` object has no field for (Home/End) or actively mis-reports (forward-delete,
-// which it collapses onto the same key.delete as Backspace). Matched against the RAW stdin chunk
-// (App.js emits it before parsing), so the leading ESC is required — without it `OH` would make a
-// typed capital H read as Home.
-const HOME_KEYS = /^\x1b(\[1~|\[7~|\[H|OH)$/;
-const END_KEYS = /^\x1b(\[4~|\[8~|\[F|OF)$/;
-const FORWARD_DELETE = /^\x1b\[3(;\d+)?~$/;
-/**
- * Shift+Enter, in the encodings terminals actually send once configured (A3).
- *
- * Out of the box Terminal.app, iTerm2 and the VS Code terminal all send a BARE `\r` for
- * Shift+Enter — indistinguishable from Enter — so the `key.shift` test could never be true and
- * the composer spent the whole 3.x line advertising a binding that did not work. A terminal
- * configured for CSI-u (kitty/foot/WezTerm natively; iTerm2 + VS Code via `/terminal-setup`)
- * sends `ESC [ 13 ; 2 u`; xterm's modifyOtherKeys sends `ESC [ 27 ; 2 ; 13 ~`.
- */
-const SHIFT_ENTER = /^\x1b\[(?:13;(\d+)u|27;(\d+);13~)$/;
 /**
  * Shift+Tab — the encodings terminals actually send. Most terminals (Terminal.app, iTerm2,
  * xterm) send the classic `ESC [ Z`; CSI-u terminals (kitty/foot/WezTerm) send `ESC [ 9 ; 2 u`
  * and xterm modifyOtherKeys sends `ESC [ 27 ; 2 ; 9 ~`. Ink does not reliably deliver these as
- * `key.shift`+`key.tab`, so §4 checks the raw bytes BEFORE the bare-Tab ring. This is the fast
- * lane of the `chat:cycleMode` binding — when the terminal DOES set the shift flag, the
- * resolver's registered handler already consumed the key; this branch is the fallback.
+ * `key.shift`+`key.tab`, so the raw bytes are checked BEFORE the bare-Tab ring.
  */
 const SHIFT_TAB = /^\x1b(?:\[(?:9;(\d+)u|27;(\d+);9~)|\[Z)$/;
 
 /** Slash commands safe to run LIVE while a turn is executing; everything else queues. */
 const SLASH_WHILE_RUNNING = new Set(['/help', '/cost', '/usage', '/context', '/connections', '/fast', '/effort', '/version', '/copy', '/plan', '/goal']);
+import type { FocusOwnerHandler, InkKey, KeyEnv } from './types.js';
 
 function handleComposer(env: KeyEnv, ch: string, key: InkKey): boolean {
   // Goal-column memory: a RUN of ↑/↓ keeps aiming at the column the run started from; any other
@@ -110,7 +91,7 @@ function handleComposer(env: KeyEnv, ch: string, key: InkKey): boolean {
       env.setThinkNow('');
       env.answerOpenRef.current = false;
       env.padCarryRef.current = false;
-      env.pushLine({ text: '  ⎋ interrupted', dimColor: true });
+      env.pushLine({ text: '  · interrupted', dimColor: true, meta: 'interrupted' });
     } else if (env.queuedTasksRef.current.length > 0) {
       env.setQueued([]);
       env.pushLine({ text: '  queued input cleared', dimColor: true });
@@ -458,8 +439,7 @@ function handleComposer(env: KeyEnv, ch: string, key: InkKey): boolean {
     if (env.asyncCommandRef.current) {
       if (!task) return true;
       env.setQueued([...env.queuedTasksRef.current, { text: task, kind: queuedTaskKind(env, task) }]);
-      env.historyRef.current.push(task);
-      env.histIdxRef.current = env.historyRef.current.length;
+      pushHistory(env, task);
       env.setLine('');
       env.pushLine({ text: '  queued — model capability check in progress', dimColor: true });
       return true;
@@ -476,8 +456,7 @@ function handleComposer(env: KeyEnv, ch: string, key: InkKey): boolean {
         env.setLine('');
         return true;
       }
-      env.historyRef.current.push(task);
-      env.histIdxRef.current = env.historyRef.current.length;
+      pushHistory(env, task);
       env.setLine('');
       if (env.vimEnabledRef.current) env.setVimMode('insert');
       env.handleTableInputRef.current?.(task);
@@ -487,8 +466,7 @@ function handleComposer(env: KeyEnv, ch: string, key: InkKey): boolean {
     // Queue instead of racing; the queue flushes when compaction finishes.
     if (env.compactingRef.current) {
       env.setQueued([...env.queuedTasksRef.current, { text: task, kind: queuedTaskKind(env, task) }]);
-      env.historyRef.current.push(task);
-      env.histIdxRef.current = env.historyRef.current.length;
+      pushHistory(env, task);
       env.setLine('');
       env.pushLine({ text: '  queued — compaction in progress (Esc cancels it)', dimColor: true });
       return true;
@@ -509,8 +487,7 @@ function handleComposer(env: KeyEnv, ch: string, key: InkKey): boolean {
       const kind = queuedTaskKind(env, task);
       // Queue FIRST: requestSteer may unwind the loop synchronously enough for finally to flush.
       env.setQueued([...env.queuedTasksRef.current, { text: task, kind }]);
-      env.historyRef.current.push(task);
-      env.histIdxRef.current = env.historyRef.current.length;
+      pushHistory(env, task);
       env.setLine('');
       if (kind === 'steer') {
         // Ask the CURRENT loop every time. A queued message left over from an earlier loop must
@@ -544,8 +521,7 @@ function handleComposer(env: KeyEnv, ch: string, key: InkKey): boolean {
       env.exit();
       return true;
     }
-    env.historyRef.current.push(task);
-    env.histIdxRef.current = env.historyRef.current.length;
+    pushHistory(env, task);
     env.setLine('');
     if (env.vimEnabledRef.current) env.setVimMode('insert'); // next prompt starts ready to type
     // Chips STAY in the registry after submit: a history entry recalled with ↑ reloads the chip
@@ -570,9 +546,12 @@ function handleComposer(env: KeyEnv, ch: string, key: InkKey): boolean {
     // Ink's parser with NO flags set, so they used to splice an invisible C0 byte into the
     // draft — shifting every later caret index and riding out to the provider on submit.
     // Tab and newline survive; nothing else unprintable does.
-    const clean = stripSgrMouse(ch).replace(/\r\n?/g, '\n').replace(/[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g, '');
-    if (!clean) return true;
-    env.insertPastable(clean);
+    // The chunk may hold TYPED TEXT AND A KEY: terminals batch keypresses into one read, and Ink
+    // dispatches a single keypress for the whole chunk (its `key` object describes only the first
+    // token), so a trailing key has to be applied here and only the text inserted. Inserting the raw
+    // chunk typed the key's parameter bytes into the draft ("abc[D") and lost the key itself.
+    // Gated on the paste flag inside insertChunk, same reason batchedTextReturn is.
+    insertChunk(env, ch, SHIFT_ENTER);
     return true;
   }
   return false; // unbound control/meta chord — nothing claimed it

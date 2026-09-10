@@ -162,6 +162,31 @@ async function readBoundedJson(response: Response): Promise<unknown> {
   return JSON.parse(new TextDecoder().decode(merged));
 }
 
+/**
+ * Did the request fail to REACH the host (as opposed to reaching it and getting a non-2xx)?
+ *
+ * The candidate list toggles a PATH on the same origin (`/models` vs `/v1/models`), so it only
+ * helps when the host is up and the path is wrong. When the connection itself is refused or the
+ * name does not resolve, every remaining candidate targets the same unreachable origin and is
+ * guaranteed to fail the same way — trying them just multiplies the timeout the caller waits.
+ * Named so the intent is legible at the call site rather than an inline string match.
+ */
+function isUnreachableError(error: unknown): boolean {
+  const code = (error as { cause?: { code?: string }; code?: string } | undefined);
+  const c = code?.cause?.code ?? code?.code ?? '';
+  if (['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH', 'ECONNRESET'].includes(c)) return true;
+  const msg = error instanceof Error ? error.message : String(error);
+  // A TIMEOUT counts too. The candidates differ only by a PATH on the same origin, so a host that
+  // swallowed one request is not going to answer the other — and a black-holed route (a VPN that is
+  // down drops packets rather than refusing them) would otherwise cost one full timeout PER
+  // candidate. The asymmetry is what settles it: bailing early costs at most a missed alternate
+  // path on a pathological proxy, while not bailing costs every user a multiplicative boot delay
+  // whenever their inference box is off.
+  const name = (error as { name?: string } | undefined)?.name ?? '';
+  if (name === 'TimeoutError' || name === 'AbortError') return true;
+  return /ECONNREFUSED|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH|fetch failed|timed out|timeout/i.test(msg);
+}
+
 function safeError(error: unknown): string {
   const clean = redactString(error instanceof Error ? error.message : String(error));
   return clean.length > 300 ? clean.slice(0, 300) + '…' : clean;
@@ -235,6 +260,8 @@ export async function probeModelEndpoint(
         });
       } catch (error) {
         lastError = safeError(error);
+        // A dead host fails every path variant identically; stop rather than serially re-timing-out.
+        if (isUnreachableError(error)) return fallback(lastError);
         continue;
       }
       if (!response.ok) {

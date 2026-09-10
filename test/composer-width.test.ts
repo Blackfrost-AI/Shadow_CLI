@@ -70,3 +70,16 @@ test('a click maps DISPLAY columns to the right source index past a wide char', 
   // Past the end clamps to the row end.
   assert.equal(clickToCursor(text, 0, 99, 20), 4);
 });
+
+test('displayWidth counts a TAB to the next tab stop, not as zero width', () => {
+  // `charWidth` reports 0 for a tab (it is a C0 control), but the terminal advances to the next
+  // multiple of 8. Measuring it as 0 made every character AFTER a pasted tab short by 1–7 columns,
+  // so click-to-caret and the caret row/column math landed on the wrong cell — and the draft looked
+  // correct, so the error was invisible until the click went somewhere else.
+  assert.equal(displayWidth('a\tb'), 9); // a → col 1, tab → col 8, b
+  assert.equal(displayWidth('ab\tc'), 9);
+  assert.equal(displayWidth('\tx'), 9);
+  assert.equal(displayWidth('12345678\tx'), 17, 'a tab AT a stop advances a full 8');
+  assert.equal(displayWidth('日本\tx'), 9, 'wide chars feed the column arithmetic');
+  assert.equal(displayWidth('no tabs'), 7, 'the ASCII fast path is unchanged');
+});

@@ -191,22 +191,27 @@ function shortSummary(summary: string, arg: string | undefined, max = 90): strin
 }
 
 /**
- * One-row tool result: `⏺ Update(src/tui.tsx) — +12 −3 (0.4s)`. The glyph (green ⏺ / red ✗) is the
- * ONLY color — name, arg, summary and timing all sit in the quiet gray so a wall of tool calls reads
- * as texture, not noise. Display names are human verbs (Read/Update/Bash), never snake_case.
+ * One-row tool result: `✓ DONE Update(src/tui.tsx) — +12 −3 (0.4s)`. The outcome is spelled out
+ * (`✓ DONE ` / `✗ FAILED `) and colored — the WORD carries the state, so it survives a monochrome
+ * terminal, a screenshot and red-green CVD, and never depends on the reader knowing the palette.
+ * Name, arg, summary and timing all sit in the quiet gray so a wall of tool calls reads as texture,
+ * not noise. Display names are human verbs (Read/Update/Bash), never snake_case.
+ *
+ * Routine successes mostly never reach here: consecutive reads/searches group into a tool run (see
+ * `renderToolStack`), so this row is what EDITS, failures and one-off actions leave behind.
  */
-/** The signature bullet: ⏺ on macOS, ● elsewhere (the reference client figures.ts). */
+/** The signature bullet the grouped-run header and the banner use (⏺ on macOS, ● elsewhere). */
 const TOOL_DOT = process.platform === 'darwin' ? '⏺' : '●';
 
 export function renderToolResult(t: ToolInfo, theme: ViewportTheme): StyledSpan[] {
-  // Success keeps the calm ⏺ dot; FAILURE swaps the shape to a bold ✗ (WCAG 1.4.1: green-vs-red
-  // on an identical glyph is invisible to red-green CVD and in mono — the state must survive
-  // with color removed). Failures are rare, so the shape change is signal, not noise. Bold tool
-  // name, args in parens 'Name(args)', summary + elapsed as a dim tail. (the reference client vocabulary.)
+  // BOTH outcomes are written out — `✓ DONE ` / `✗ FAILED ` — because a green dot and a red dot are
+  // the same dot to red-green CVD, to a monochrome terminal and to a screenshot (WCAG 1.4.1: color
+  // may never be the only carrier of meaning). Bold tool name, args in parens 'Name(args)', summary
+  // and elapsed as a dim tail.
   const spans: StyledSpan[] = [
     t.ok
-      ? { text: `${TOOL_DOT} `, color: theme.green }
-      : { text: '✗ ', color: theme.red, bold: true },
+      ? { text: '✓ DONE ', color: theme.green }
+      : { text: '✗ FAILED ', color: theme.red, bold: true },
   ];
   // Subagent calls render distinctly: `▸ <type> · <description>` instead of the anonymous
   // `agent(prompt)`, so a delegated sub-agent is visible at a glance. The ▸ marker signals
@@ -312,7 +317,9 @@ export interface BannerLine {
 }
 export interface TranscriptBase {
   id: number;
-  kind: 'user' | 'assistant' | 'tool' | 'system' | 'blocked' | 'error' | 'banner' | 'reasoning' | 'finding' | 'image';
+  kind: 'user' | 'assistant' | 'tool' | 'activity' | 'system' | 'blocked' | 'error' | 'banner' | 'reasoning' | 'finding' | 'image';
+  /** Details live outside the Static transcript and are opened independently. */
+  activityId?: number;
   text: string;
   color?: string;
   dimColor?: boolean;

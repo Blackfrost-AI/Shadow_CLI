@@ -127,12 +127,21 @@ export const stripInvisible = (s: string): string => s.replace(OSC_RE, '').repla
  * stripped — they occupy no columns but do occupy characters, which is how a styled row could
  * measure "too wide" and get needlessly split.
  */
+/** Columns a tab advances to — the terminal default, and what xterm/Ink do in practice. */
+export const TAB_WIDTH = 8;
+
 export function displayWidth(s: string): number {
   const clean = stripInvisible(s);
   if (isPlainAscii(clean)) return clean.length; // F06-06: fast path — no segmentation
-  let w = 0;
-  for (const g of graphemes(clean)) w += clusterWidth(g);
-  return w;
+  // A TAB is NOT zero-width. `charWidth` reports 0 for it (it is a C0 control), but the terminal
+  // advances to the next tab stop, so everything after a pasted tab measured short by 1-7 columns —
+  // caret placement and click-to-caret then landed on the wrong cell, and the error was invisible
+  // (the draft looked right). Only the COLUMN is needed to resolve it, so this stays one pass.
+  let col = 0;
+  for (const g of graphemes(clean)) {
+    col += g === '\t' ? TAB_WIDTH - (col % TAB_WIDTH) : clusterWidth(g);
+  }
+  return col;
 }
 
 /** True when every UTF-16 unit is printable ASCII (0x20..0x7e) — then width === length, and no

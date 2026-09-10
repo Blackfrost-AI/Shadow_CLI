@@ -91,3 +91,49 @@ test('without a readTracker (e.g. isolated tests) the guard is inert', async () 
     rmSync(ws, { recursive: true, force: true });
   }
 });
+
+test('a read in an EARLIER TURN still authorizes the edit (the tracker is per-SESSION, not per-loop)', async () => {
+  // A new AgentLoop is built for every user message (TUI, REPL, and web all do this), and each loop
+  // used to create its OWN tracker — so a file read in turn 1 was "unseen" in turn 2, and the edit
+  // was refused with "read it in this conversation first" for a read the model HAD performed one
+  // message earlier. The same lifetime bug was already fixed for approval grants (SessionApprovals);
+  // this pins the read guard to the same rule.
+  const ws = mkdtempSync(join(tmpdir(), 'rbe-session-'));
+  try {
+    writeFileSync(join(ws, 'f.txt'), 'alpha bravo\n');
+    // ONE tracker, shared by every turn's loop — the only change the fix makes at the call sites.
+    const sessionTracker = createReadTracker();
+    const turn = (): ToolContext => ({
+      workspaceRoot: ws,
+      signal: new AbortController().signal,
+      log: () => {},
+      dryRun: false,
+      readTracker: sessionTracker,
+    });
+
+    const readCtx = turn(); // turn 1's loop
+    await readFile.run({ path: 'f.txt' }, readCtx);
+
+    const editCtx = turn(); // turn 2's loop — a DIFFERENT ToolContext, same session
+    const r = await editFile.run({ path: 'f.txt', old_string: 'alpha', new_string: 'ALPHA' }, editCtx);
+    assert.equal(r.ok, true, `cross-turn edit must be allowed: ${r.summary ?? r.error?.message}`);
+    assert.equal(readFileSync(join(ws, 'f.txt'), 'utf8'), 'ALPHA bravo\n');
+
+    // …and the stale-file protection survives the turn boundary too (it is the same tracker).
+    const p = join(ws, 'f.txt');
+    writeFileSync(p, 'beta\n');
+    const future = statSync(p).mtimeMs / 1000 + 5;
+    utimesSync(p, future, future);
+    const stale = await editFile.run({ path: 'f.txt', old_string: 'beta', new_string: 'BETA' }, turn());
+    assert.equal(stale.ok, false, 'an external change between turns is still caught');
+    assert.match(stale.error?.message ?? '', /changed on disk/);
+
+    // clear() (called on /resume, /fork, /clear) drops the memory: the next edit re-gates.
+    sessionTracker.clear();
+    const after = await editFile.run({ path: 'f.txt', old_string: 'beta', new_string: 'BETA' }, turn());
+    assert.equal(after.ok, false, 'after clear() the read must be re-established');
+    assert.equal(after.error?.code, 'read_required');
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});

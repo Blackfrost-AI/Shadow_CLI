@@ -93,7 +93,22 @@ export function planRetention(
   const { sessionRetentionDays: days, sessionRetentionKeep: keep } = cfg;
   if (days == null && keep == null) return []; // retention OFF unless explicitly opted in
 
-  const paths = SessionLog.list(workspaceRoot); // newest first (ISO stamps sort lexicographically)
+  // "Newest" must mean newest BY TIME, not by filename. Session ids are ISO stamps so the two
+  // usually agree, but the names do not have to be: a `--from-claude` import lands as
+  // `claude-*.jsonl` and a fork gets its own spelling, and those sort among the ISO names by letter
+  // rather than by age. Whichever way they fell, a freshly written log could be classified as old
+  // and swept while a stale ISO-era one stayed protected — so the keep rule is applied to a
+  // genuinely time-ordered list. A log that cannot be stat'd sorts last and is skipped below.
+  const paths = SessionLog.list(workspaceRoot)
+    .map((path) => {
+      try {
+        return { path, mtimeMs: statSync(path).mtimeMs };
+      } catch {
+        return { path, mtimeMs: 0 };
+      }
+    })
+    .sort((a, b) => b.mtimeMs - a.mtimeMs)
+    .map((e) => e.path);
   const now = Date.now();
   const out: RetentionCandidate[] = [];
   paths.forEach((path, idx) => {

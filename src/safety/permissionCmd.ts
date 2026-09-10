@@ -1,4 +1,4 @@
-import type { PermissionAction, PermissionRule } from './rules.js';
+import { isValidRulePattern, type PermissionAction, type PermissionRule } from './rules.js';
 
 export type PermissionCmdResult =
   | { ok: true; rules: PermissionRule[]; message: string }
@@ -45,6 +45,17 @@ export function applyPermissionCommand(
     if (last) {
       const m = last.match(/^\/(.+)\/$/);
       pattern = m ? m[1] : last;
+    }
+    // Validate BEFORE storing. A pattern that does not compile used to be accepted silently and then
+    // behave differently from what the list showed: an `allow` granted nothing (fail-closed) and a
+    // `deny` protected nothing (fail-open), while `/permissions list` displayed both as active. A
+    // deny now fails CLOSED at match time, so letting a typo through would instead look like Shadow
+    // refusing innocent commands — better to say so at the moment the rule is written.
+    if (pattern && !isValidRulePattern(pattern, action)) {
+      return {
+        ok: false,
+        message: `That pattern is not a valid regular expression: /${pattern}/. Nothing was changed.`,
+      };
     }
     const next = [...rules, { action, tool, ...(pattern ? { pattern } : {}) }];
     return {

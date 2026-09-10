@@ -38,6 +38,18 @@ const PATTERNS: Array<[RegExp, string]> = [
   [/AIza[A-Za-z0-9_-]{30,}/g, '[REDACTED]'],
   // AWS access key ids (long-term AKIA + temporary STS ASIA).
   [/A(?:KIA|SIA)[0-9A-Z]{16}/g, '[REDACTED]'],
+  // AWS SECRET access keys are 40 base64-ish characters with no distinguishing prefix, so shape
+  // matching cannot reach them — but the assignment that introduces one always names it, and
+  // `AWS_SECRET_ACCESS_KEY=` slipped past the KEY=VALUE pass below (its group must END with one of
+  // the listed suffixes, and this key ends in `KEY`).
+  [/((?:aws[_-]?)?secret[_-]?access[_-]?key\s*[:=]\s*["']?)([A-Za-z0-9/+=]{16,})/gi, '$1[REDACTED]'],
+  // Private-key blocks (PEM / OpenSSH / PKCS#8). The header line is not the secret, but the base64
+  // body beneath it IS the key — a `.pem` or `id_rsa` read inside the workspace would otherwise be
+  // written verbatim into `.shadow/sessions/*.jsonl` and exported transcripts.
+  [
+    /-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----/g,
+    '-----BEGIN PRIVATE KEY-----[REDACTED]-----END PRIVATE KEY-----',
+  ],
   // JSON Web Tokens: header.payload.signature.
   [/eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,}/g, '[REDACTED]'],
   // Credentials embedded in a connection-string URL: scheme://user:PASS@host.
@@ -105,19 +117,33 @@ export function maskSecret(value: unknown): string {
  * config: `redact()` alone only catches recognised shapes.
  */
 export function redactConfig<T>(value: T): T {
-  return redactConfigValue(value, new WeakSet<object>()) as T;
+  return redactConfigValue(value, new WeakMap<object, unknown>()) as T;
 }
 
-function redactConfigValue(value: unknown, seen: WeakSet<object>): unknown {
+/**
+ * The traversal records each container in `built` BEFORE descending into it, so the map answers two
+ * different questions correctly: a shared reference (the same object appearing twice — a DAG, not a
+ * cycle) gets the already-redacted copy, and a genuine cycle gets the container currently being
+ * filled, which is itself redacted by the time the walk finishes. The previous guard could not tell
+ * the two apart and returned the RAW original for every revisit, i.e. anything appearing twice was
+ * written to the session log unredacted.
+ */
+function redactConfigValue(value: unknown, built: WeakMap<object, unknown>): unknown {
   if (typeof value === 'string') return redactString(value);
   if (value === null || typeof value !== 'object') return value;
   if (value instanceof Date) return new Date(value.getTime());
-  if (seen.has(value)) return value;
-  seen.add(value);
-  if (Array.isArray(value)) return value.map((v) => redactConfigValue(v, seen));
+  const cached = built.get(value);
+  if (cached !== undefined) return cached;
+  if (Array.isArray(value)) {
+    const out: unknown[] = [];
+    built.set(value, out);
+    for (const v of value) out.push(redactConfigValue(v, built));
+    return out;
+  }
   const out: Record<string, unknown> = {};
+  built.set(value, out);
   for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-    out[k] = isSecretKey(k) && v != null && v !== '' ? maskSecret(v) : redactConfigValue(v, seen);
+    out[k] = isSecretKey(k) && v != null && v !== '' ? maskSecret(v) : redactConfigValue(v, built);
   }
   return out;
 }
@@ -129,19 +155,26 @@ function redactConfigValue(value: unknown, seen: WeakSet<object>): unknown {
  * than recursing forever.
  */
 export function redact<T>(value: T): T {
-  return redactValue(value, new WeakSet<object>()) as T;
+  return redactValue(value, new WeakMap<object, unknown>()) as T;
 }
 
-function redactValue(value: unknown, seen: WeakSet<object>): unknown {
+/** See `redactConfigValue` — a revisit must yield the redacted copy, never the raw original. */
+function redactValue(value: unknown, built: WeakMap<object, unknown>): unknown {
   if (typeof value === 'string') return redactString(value);
   if (value === null || typeof value !== 'object') return value;
   if (value instanceof Date) return new Date(value.getTime());
-  if (seen.has(value)) return value; // best-effort cycle guard
-  seen.add(value);
-  if (Array.isArray(value)) return value.map((v) => redactValue(v, seen));
+  const cached = built.get(value);
+  if (cached !== undefined) return cached;
+  if (Array.isArray(value)) {
+    const out: unknown[] = [];
+    built.set(value, out);
+    for (const v of value) out.push(redactValue(v, built));
+    return out;
+  }
   const out: Record<string, unknown> = {};
+  built.set(value, out);
   for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-    out[k] = redactValue(v, seen);
+    out[k] = redactValue(v, built);
   }
   return out;
 }

@@ -34,7 +34,7 @@ import type { TranscriptBase } from '../rows.js';
 export type InkKey = import('ink').Key;
 
 /** The exactly-one-per-frame keystream owner. Precedence is the FOCUS_OWNERS table order. */
-export type FocusOwner = 'dialog' | 'picker' | 'search' | 'vim' | 'composer';
+export type FocusOwner = 'dialog' | 'activity' | 'picker' | 'search' | 'vim' | 'composer';
 
 /** Structural ref — avoids importing React types; all the component passes are `useRef`s. */
 export interface Ref<T> {
@@ -71,6 +71,7 @@ export interface FocusOwnerHandler {
  * old inline if-chain did.
  */
 export interface KeyEnv {
+  activity?: { isOpen(): boolean; handleKey(ch: string, key: InkKey): boolean };
   // ── raw key stream ──────────────────────────────────────────────────────────
   /** The WHOLE last raw stdin chunk (DSR reports may batch with typed text). */
   rawChunkRef: Ref<string>;

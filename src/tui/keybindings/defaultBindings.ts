@@ -63,11 +63,11 @@ const RAW_DEFAULTS: Record<ContextName, Record<string, string>> = {
     right: 'question:next',
   },
   Transcript: {
-    'ctrl+o': 'transcript:toggleFoldLatest', // all folds (name is historical; behavior = all)
+    'ctrl+o': 'transcript:toggleFoldLatest', // activity inspector (action id kept for saved bindings)
     // NOT ctrl+shift+o: terminals send the same byte (0x0F) for Ctrl+O and Ctrl+Shift+O, so Ink
     // reports both as ctrl+o (shift=false) and the shift binding can never match — it would just
-    // fire toggle-all. Alt/Option+O is a distinct sequence that actually reaches this action.
-    'meta+o': 'transcript:toggleFoldOne', // latest collapsible only (Alt/Option+O)
+    // open the inspector. Alt/Option+O is a distinct sequence that reaches the latest result.
+    'meta+o': 'transcript:toggleFoldOne', // latest activity details (Alt/Option+O)
     'ctrl+t': 'transcript:toggleTaskList',
     // Alt/Option+C — copy the last assistant answer (same as /copy). NOT ctrl+c (reserved:
     // interrupt/quit) and NOT ctrl+shift+c (indistinguishable from ctrl+c in most terminals).

@@ -188,7 +188,8 @@ export const THEMES = {
     menuSelBg: '#31465f',
   },
   // Maximum-contrast mode: pure white text, loud accents, brighter "quiet" tier —
-  // for low vision, glare, or projector terminals. Everything clears AAA (7:1).
+  // for low vision, glare, or projector terminals. Contrast depends on the terminal background;
+  // validate supported foreground/background pairs instead of claiming palette-wide conformance.
   'high-contrast': {
     fg: '#ffffff',
     body: '#ffffff',
@@ -252,7 +253,7 @@ export const THEME_DESCRIPTIONS: Record<CanonicalThemeName, string> = {
   mono: 'Minimal grayscale for plain terminal focus.',
   light: 'Near-black text and restrained color for light terminals.',
   colorblind: 'Okabe–Ito accessible palette — accents stay distinct under deuteranopia, protanopia, and tritanopia.',
-  'high-contrast': 'Maximum contrast (WCAG AAA): pure white text, loud accents, brighter quiet tier.',
+  'high-contrast': 'Bright text and status colors for dark terminals; use light on a light background.',
 };
 
 export const THEME_ALIASES: Record<string, CanonicalThemeName> = {

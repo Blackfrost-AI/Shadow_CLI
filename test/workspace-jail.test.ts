@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, readFileSync, mkdirSync, writeFileSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { resolveWithin } from '../src/safety/workspaceJail.js';
@@ -77,4 +77,38 @@ test('resolveWithin: a workspace at a top-level directory is not mangled', () =>
   // …and still rejects a real escape from that same shape.
   assert.throws(() => resolveWithin(['/work/repo'], '/work/other/x.ts'));
   assert.throws(() => resolveWithin(['/work/repo'], '../escape.ts'));
+});
+
+test('resolveWithin: `..` after a symlink is resolved PHYSICALLY (the linkout/../ escape)', () => {
+  // POSIX resolves `link/..` by following `link` FIRST; `path.resolve` collapses it lexically, so
+  // `<ws>/linkout/../outside/secret.txt` was judged inside (`<ws>/outside/secret.txt`) while the OS
+  // opened a file outside the jail. A symlink can ship inside a cloned repo, so the escape needed no
+  // cooperation from the model — and it also defeated the session/prefix-grant demotion, which
+  // shares this resolver.
+  const base = resolve(mkdtempSync(join(tmpdir(), 'ws-linkout-')));
+  const ws = join(base, 'ws');
+  const outside = join(base, 'outside');
+  try {
+    mkdirSync(ws);
+    mkdirSync(outside);
+    writeFileSync(join(outside, 'secret.txt'), 'SECRET\n');
+    writeFileSync(join(ws, 'inside.txt'), 'ok\n');
+    mkdirSync(join(ws, 'sub'));
+    symlinkSync(outside, join(ws, 'linkout')); // points OUT of the jail
+    symlinkSync(join(ws, 'sub'), join(ws, 'linkin')); // stays inside
+
+    assert.throws(
+      () => resolveWithin([ws], 'linkout/../outside/secret.txt'),
+      /outside the workspace/,
+      'the symlink is followed BEFORE `..` is applied',
+    );
+    assert.throws(() => resolveWithin([ws], 'linkout/secret.txt'), /outside the workspace/);
+    // A `..` that stays physically inside is still fine — the fix is not "reject every `..`".
+    assert.equal(resolveWithin([ws], 'sub/../inside.txt'), join(ws, 'inside.txt'));
+    assert.equal(resolveWithin([ws], 'linkin/../inside.txt'), join(ws, 'inside.txt'));
+    // …and a brand-new file below a not-yet-existing directory still resolves inside.
+    assert.equal(resolveWithin([ws], 'new/deep/file.txt'), join(ws, 'new/deep/file.txt'));
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+  }
 });

@@ -139,25 +139,12 @@ test('P3-02: the append-only invariant the cache relies on is pinned in tui.tsx 
   assert.equal(resets, 2, 'the other two sites replace the array wholesale with []');
 });
 
-test('P3-02 phase 3: the spinner tick runs no transcript logic — toolRuns is memoized on the appendable cache', () => {
-  // The 120ms spinner tick re-renders TuiApp. Before the fix, the render body recomputed the tool-run
-  // map from scratch on EVERY tick — an O(committed) transcript scan 8×/sec for as long as a turn ran.
-  // The fix derives it in a useMemo keyed on the ONLY two inputs that change it (committed + allExpanded),
-  // extending the previous run-map via the appendable cache. A pure tick touches neither dep, so React
-  // skips the memo and scans zero slots (toolRunsStats.itemsScanned — the instrumented proof the
-  // acceptance criterion demands, measured in the zero-scan contract test above). A bare full-recompute
-  // call left in the render body would silently re-introduce the per-tick scan, so the pin names both halves.
+test('P3-02 phase 3: spinner renders never rebuild tool groups from committed history', () => {
+  // Groups now accumulate at the event boundary and close before entering Ink Static. The old
+  // cached regrouping pass is gone: even a memoized update could not repaint already-printed rows.
+  // Keep the original performance contract: no historical tool scan on a spinner render.
   const tui = readFileSync(new URL('../src/tui.tsx', import.meta.url), 'utf8');
-  // Half 1: the render body derives the map in a useMemo over the appendable cache, keyed correctly.
-  const i = tui.indexOf('const toolRuns = useMemo(');
-  assert.ok(i > 0, 'toolRuns is derived in a useMemo, not recomputed bare');
-  const body = tui.slice(i, i + 400);
-  assert.match(
-    body,
-    /computeToolRunsAppendable\(committed, showAllExpanded, toolRunsCacheRef\.current\)/,
-    'the memo extends the previous run-map through the appendable cache',
-  );
-  assert.match(body, /\[committed, showAllExpanded\]/, 'keyed on exactly the two inputs a tick cannot touch');
-  // Half 2: no bare full-recompute survives in the render body (the `(` guard excludes …Appendable).
-  assert.doesNotMatch(tui, /computeToolRuns\(/, 'no bare full-recompute call remains — that was the per-tick scan');
+  assert.match(tui, /const activity = useActivity\(\)/, 'activity is maintained separately from Static');
+  assert.doesNotMatch(tui, /computeToolRuns(?:Appendable)?\(/, 'no historical regrouping in the component');
+  assert.doesNotMatch(tui, /toolRun=\{/, 'Static rows cannot absorb already-committed children');
 });

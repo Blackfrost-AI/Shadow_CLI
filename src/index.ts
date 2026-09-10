@@ -10,6 +10,7 @@ import {
   resolveAuthToken,
   resolveBaseUrl,
   resolveEntryCredential,
+  resolveProviderCredential,
   type ShadowConfig,
   type ModelEntry,
 } from './config.js';
@@ -60,6 +61,13 @@ import { Budget } from './agent/budget.js';
 import { Context } from './agent/context.js';
 import { AgentLoop } from './agent/loop.js';
 import { buildLoopDeps } from './agent/loopDeps.js';
+import { subProviderFor } from './auth/spec.js';
+import { subscriptionAuthLines } from './auth/status.js';
+import { codexAuthPath, grokAuthPath, importOfficialCredential, type SubProvider } from './auth/index.js';
+import { isOfflineMode } from './safety/egress.js';
+import { ensureFreshSubscriptionCredential } from './auth/refresh.js';
+import { resolveAutoModel } from './local/autoEndpoint.js';
+import { createReadTracker } from './tools/readTracker.js';
 import { createAgentSession } from './agent/bootstrap.js';
 import { MAX_WAKEUPS_PER_WINDOW } from './agent/wakeup.js';
 import { raiseAutonomy, type AutonomyLevel } from './safety/permissions.js';
@@ -83,7 +91,6 @@ import { SessionLog } from './state/session.js';
 import { scanClaudeSessions, importClaudeSession } from './state/claudeImport.js';
 import { isDumbTerm, queryTerminalBackground, themeForBackground } from './util/themeDetect.js';
 import { normalizeThemeName } from './tui/theme.js';
-import { buildCodexAuthUrl } from './auth/oauth.js';
 import { type OutputStyle } from './styles.js';
 import { runDoctor, formatDoctorReport } from './doctor.js';
 import { runModelCheck, formatModelCheckReport } from './doctor/modelCheck.js';
@@ -103,6 +110,7 @@ import { readVersion } from './version.js';
 import { runAcp } from './acp/cli.js';
 import { runHookPhase } from './hooks/runner.js';
 import { parseArgs } from './cli/flags.js';
+import { attachScreenReader } from './tui/screenReader.js';
 import { shouldAutoOnboard, NO_PROVIDER_HINT } from './cli/autoOnboard.js';
 
 // INSTALL_DIR (package root) is imported from ./installDir.js at the top — its own module so
@@ -194,6 +202,8 @@ function helpText(): string {
     '  --plan-mode          explore/read first, write a plan, then approve before implementing',
     '  --task "<text>"      run a single task non-interactively and exit',
     '  --repl               force the plain-text REPL (skip the Ink HUD)',
+    '  --screen-reader      stable text output, named speakers, and text approvals',
+    '  --reduced-motion     disable the TUI spinner animation',
     '  --offline            hard no-cloud, no-web mode: requires a LOCAL model, drops web_fetch/',
     '                       web_search + MCP, and denies run_shell network. Nothing leaves the box',
     '                       except traffic to your local model server.',
@@ -604,6 +614,8 @@ function localUsage(): string {
     'usage: shadow local <command>',
     '',
     '  add <path-to.gguf | mlx-folder | mlx-community/model> [--name <n>] [--ctx <n>] [--gpu-layers <n>]   register a local model',
+    '  add --endpoint <http://<host>:<port>/v1> [--name <n>] [--model <id>]   register a LAN server,',
+    '                                                                    tracking whatever model it serves',
     '  list                                                               list registered local models',
     '  test <name>                                                        start it + run a connection test',
     '  use <name>                                                         make it the default model',
@@ -650,6 +662,14 @@ async function runLocal(args: string[]): Promise<void> {
     saveGlobalConfig({ models: res.value.models });
     const e = res.value.entry;
     stdout.write(lc.green(`✓ Added local model "${e.label}"`) + '\n');
+    if (e.autoModel && e.baseUrl) {
+      // An endpoint entry launches nothing here, so none of the local-runtime advice below applies.
+      stdout.write(`    endpoint:   ${e.baseUrl}\n`);
+      stdout.write(`    model:      detected from the server (fallback "${e.model}" if it is unreachable)\n`);
+      if (res.note) stdout.write(lc.yellow(`    ⚠ ${res.note}`) + '\n');
+      stdout.write(lc.gray(`  Next: shadow local use ${e.label}`) + '\n');
+      return;
+    }
     if (e.mlx) {
       stdout.write(`    target:     ${e.mlx}  (mlx)\n`);
     } else {
@@ -767,13 +787,14 @@ async function runDoctorModel(name: string | undefined, cwd: string): Promise<vo
   }
 
   const provider = entry?.provider ?? cfg.provider;
-  const model = entry?.model ?? cfg.model;
+  let model = entry?.model ?? cfg.model;
   const label = entry?.label ?? `${provider}/${model}`;
   const isLocal = isLocalServedEntry(entry);
   const allowImport = process.env.SHADOW_ALLOW_IMPORT === '1';
 
   let startProvider = provider;
-  let baseUrl = resolveBaseUrl(provider, entry?.baseUrl ?? (provider === cfg.provider ? cfg.baseUrl : undefined));
+  const configuredBaseUrl = resolveBaseUrl(provider, entry?.baseUrl ?? (provider === cfg.provider ? cfg.baseUrl : undefined));
+  let baseUrl = configuredBaseUrl;
   const cred = resolveEntryCredential(entry, { vaultIsLocked: vaultExists() && !vaultUnlocked() });
   if (!cred.ok) {
     process.stderr.write(
@@ -786,7 +807,24 @@ async function runDoctorModel(name: string | undefined, cwd: string): Promise<vo
   }
   // Slot resolution never falls back to the adapter key, so a miss above cannot leak your
   // OpenAI key to this preset's baseUrl. allowImport only applies to the provider-level path.
-  let apiKey = cred.source === 'provider' ? resolveApiKey(provider, { model, allowImport }) : cred.apiKey;
+  // Same endpoint binding as boot: `/model test` must exercise the credential's OWN endpoint, or a
+  // subscription check would report on a host the token is not valid at (and send it there).
+  if (allowImport) {
+    const subForModel = subProviderFor(provider, model);
+    if (subForModel) {
+      await ensureFreshSubscriptionCredential(subForModel, {
+        nowSec: Math.floor(Date.now() / 1000),
+        allowNetwork: !isOfflineMode(),
+      });
+    }
+  }
+  const providerCred =
+    cred.source === 'provider'
+      ? resolveProviderCredential(provider, { model, allowImport, configuredBaseUrl })
+      : { bearer: cred.apiKey, source: 'store' as const };
+  if (providerCred.conflict) process.stderr.write(lc.yellow(`⚠ ${providerCred.conflict}\n`));
+  if (providerCred.baseUrl) baseUrl = providerCred.baseUrl;
+  let apiKey = providerCred.bearer;
   const authToken = cred.authToken;
 
   if (entry && isLocalServedEntry(entry)) {
@@ -804,6 +842,13 @@ async function runDoctorModel(name: string | undefined, cwd: string): Promise<vo
     }
   }
 
+  // `/model test` on an `autoModel` entry must exercise the model the endpoint ACTUALLY serves —
+  // probing the preset's fallback id would report a false "model not found".
+  const autoProbe = await resolveAutoModel(entry ?? undefined);
+  if (autoProbe.baseUrl) baseUrl = autoProbe.baseUrl;
+  if (autoProbe.model) model = autoProbe.model;
+  if (autoProbe.error && entry?.autoModel) process.stderr.write(lc.yellow(`⚠ ${autoProbe.error}\n`));
+
   let probeProvider;
   try {
     probeProvider = createProvider({
@@ -814,6 +859,9 @@ async function runDoctorModel(name: string | undefined, cwd: string): Promise<vo
       apiKey,
       authToken,
       baseUrl,
+      // A local launcher rewrote baseUrl; otherwise the credential's endpoint contract travels with it.
+      extraHeaders: isLocal ? undefined : providerCred.extraHeaders,
+      wire: isLocal ? undefined : providerCred.wire,
       // A named remote preset must opt in itself. The top-level marker applies only when no
       // preset owns this diagnostic target, so testing a cloud preset cannot inherit it.
       selfHosted: entry?.selfHosted ?? (!entry ? cfg.selfHosted : undefined),
@@ -843,18 +891,68 @@ async function runDoctorModel(name: string | undefined, cwd: string): Promise<vo
 }
 
 async function runLogin(args: string[]): Promise<void> {
-  const provider = args[0];
-  if (provider === 'codex') {
-    const { url } = buildCodexAuthUrl();
-    stdout.write(`Open this URL to sign in with ChatGPT/Codex:\n${url}\n`);
-    stdout.write('After authorization, exchange the callback code with shadow import (when wired).\n');
+  const provider = args[0] ?? 'status';
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  if (provider === 'status' || provider === 'show') {
+    stdout.write('Subscription credentials (~/.shadow/subscription-auth.json):\n');
+    for (const line of subscriptionAuthLines(nowSec)) stdout.write(`  ${line}\n`);
+    stdout.write('\nAPI keys live in the vault — `shadow onboard` (or `shadow onboard --web`) to set them.\n');
     return;
   }
+
+  if (provider === 'import') {
+    // The lowest-ToS-exposure route, and the one that works today: reuse the credential the
+    // official CLI already minted rather than driving an OAuth dance of our own.
+    const target = args[1] ?? 'all';
+    const providers: SubProvider[] =
+      target === 'all' ? ['codex', 'grok'] : target === 'codex' || target === 'grok' ? [target] : [];
+    if (!providers.length) {
+      process.stderr.write('usage: shadow login import [codex|grok|all]\n');
+      process.exitCode = 1;
+      return;
+    }
+    for (const p of providers) {
+      const o = importOfficialCredential(p);
+      if (!o.imported) {
+        stdout.write(
+          `${p}: no credential found at ${p === 'codex' ? codexAuthPath() : grokAuthPath()} — ` +
+            `sign in with the official CLI first.\n`,
+        );
+        continue;
+      }
+      stdout.write(
+        `${p}: imported ${o.kind}${o.hasRefresh ? ' (refresh token present)' : ''}` +
+          `${o.expiresAt ? ` — expires ${new Date(o.expiresAt * 1000).toISOString()}` : ''}\n`,
+      );
+    }
+    stdout.write('\nStart Shadow with SHADOW_ALLOW_IMPORT=1 to use it.\n');
+    return;
+  }
+
+  if (provider === 'codex') {
+    // Honest status: Shadow does NOT drive the interactive ChatGPT login. `exchangeCodexCode` and
+    // the localhost redirect are declared, but nothing serves the callback, so printing the URL
+    // alone would promise a flow that cannot complete. The import path reaches the same credential
+    // without impersonating the first-party client, so point there.
+    stdout.write('Codex: Shadow does not run the interactive ChatGPT OAuth exchange.\n\n');
+    stdout.write('Use the credential your official Codex CLI already minted:\n');
+    stdout.write(`  1. sign in with the official CLI (its auth file: ${codexAuthPath()})\n`);
+    stdout.write('  2. shadow login import codex\n');
+    stdout.write('  3. SHADOW_ALLOW_IMPORT=1 shadow --model <a codex/gpt-5 model>\n\n');
+    stdout.write('The subscription token is bound to https://chatgpt.com/backend-api/codex and is\n');
+    stdout.write('never sent anywhere else. It is refreshed automatically when it nears expiry.\n');
+    stdout.write('\nCurrent state:\n');
+    for (const line of subscriptionAuthLines(nowSec)) stdout.write(`  ${line}\n`);
+    return;
+  }
+
   if (provider === 'grok') {
     stdout.write('Grok consumer OAuth is not supported (ToS). Use an xAI API key via `shadow onboard`.\n');
     return;
   }
-  process.stderr.write('usage: shadow login codex|grok\n');
+
+  process.stderr.write('usage: shadow login [status|codex|grok|import [codex|grok|all]]\n');
   process.exit(1);
 }
 
@@ -1151,6 +1249,7 @@ async function main(): Promise<void> {
   }
 
   const log = new Logger(cfg.logLevel);
+  if (flags.reducedMotion) cfg.reducedMotion = true;
 
   // First run with no provider configured → guide the user through setup.
   if (needsOnboarding(cfg)) {
@@ -1166,7 +1265,7 @@ async function main(): Promise<void> {
       stdinIsTTY: !!process.stdin.isTTY,
       stdoutIsTTY: !!process.stdout.isTTY,
       taskMode: !!flags.task,
-      replMode: !!flags.repl,
+      replMode: !!flags.repl || !!flags.screenReader,
     })) {
       process.stderr.write(NO_PROVIDER_HINT + '\n');
       process.exit(1);
@@ -1319,7 +1418,7 @@ async function main(): Promise<void> {
   // (openBrowser fires first) — a TDZ ReferenceError otherwise. Reassignments stay at their
   // original sites (autonomy: raiseAutonomy at the "always" approval; model: onModelSwitch).
   let autonomy: AutonomyLevel = (flags.yolo ?? false) ? 'full' : cfg.autonomy;
-  let activeAgentModel = cfg.model;
+  let activeAgentModel = cfg.model; // re-pointed at the session's WIRE model once built (below)
 
   // --web: mirror this session to a loopback browser console. The bus is already
   // multi-subscriber, so this is additive — the TUI/headless renderer still gets every event
@@ -1412,7 +1511,10 @@ async function main(): Promise<void> {
   // Only emit the structured "ready" line when output is piped/redirected (logs, CI).
   // In an interactive terminal it's just noise above the banner, which already shows this.
   if (!process.stdout.isTTY) {
-    log.info('shadow ready', { provider: cfg.provider, model: cfg.model, autonomy });
+    // Log the WIRE model (what the endpoint is actually asked for), not the preset identity. For an
+  // `autoModel` entry those differ, and a log line naming the stale preset id sends anyone reading
+  // it to debug the wrong model.
+  log.info('shadow ready', { provider: cfg.provider, model: session.wireModel, autonomy });
   }
 
 
@@ -1509,7 +1611,7 @@ async function main(): Promise<void> {
   // Force the plain readline renderer instead of a half-broken TUI; interactive stays true so the
   // user keeps the question-loop REPL rather than being treated like a one-shot pipe.
   const dumbTerm = interactive && isDumbTerm(process.env);
-  const headless = !!flags.task || !!flags.repl || !interactive || dumbTerm;
+  const headless = !!flags.task || !!flags.repl || !!flags.screenReader || !interactive || dumbTerm;
 
   const wakeupHandler = {
     fire: (_task: string, _reason: string) => {},
@@ -1591,7 +1693,15 @@ async function main(): Promise<void> {
     }),
   );
 
+  // Sub-agents and their budgets must use the WIRE model too — an `autoModel` entry's identity and
+  // the id its endpoint actually serves are deliberately different strings.
+  activeAgentModel = session.wireModel;
   let first = context.messages().length === 0;
+  // Session-lifetime read-before-edit tracker: `runTurnBody` builds a NEW AgentLoop for every
+  // message, so a loop-owned tracker forgot every file read one turn ago and refused the next edit
+  // with "read it in this conversation first" — a read the model HAD performed. Same lifetime rule
+  // as the session approval grants the web/TUI layers already share.
+  const sessionReadTracker = createReadTracker();
   const runTurnBody = async (task: string, gate: ApprovalGate, signal: AbortSignal): Promise<void> => {
     currentGate = gate; // so a sub-agent spawned this turn inherits the active gate, not auto-approve
 
@@ -1658,7 +1768,8 @@ async function main(): Promise<void> {
       budget,
       context,
       signal,
-      model: cfg.model,
+      // The wire model (an `autoModel` entry re-reads it from its endpoint), not the entry identity.
+      model: session.wireModel,
       system: fullSystem,
       workspaceRoot,
       additionalRoots,
@@ -1669,6 +1780,7 @@ async function main(): Promise<void> {
       mission,
       streamShell: !headless,
       sessionLog,
+      readTracker: sessionReadTracker,
       continuityState: '',
       resolveFallback: async (entry, fallbackSignal) => {
         fallbackSignal?.throwIfAborted();
@@ -1722,7 +1834,8 @@ async function main(): Promise<void> {
     // F06-09: headless runs keep the old contract — the full toolbox is present before the first
     // turn. Only the interactive TUI paints ahead of the MCP settle.
     if (mcpSettled) await mcpSettled;
-    const detach = attachRenderer(bus, { animate: false });
+    const reader = flags.screenReader ? attachScreenReader(bus, { model: cfg.model }) : null;
+    const detach = reader ? () => reader.dispose() : attachRenderer(bus, { animate: false });
     // Abort controllers are one-shot. Reusing one for the whole REPL meant the first Ctrl-C
     // permanently poisoned every later prompt: each new AgentLoop saw an already-aborted signal
     // and stopped immediately. Keep a fresh controller per turn and point SIGINT at EVERY live
@@ -1769,10 +1882,10 @@ async function main(): Promise<void> {
           // the channel the user can still see (same role as the TERM=dumb note above).
           process.stderr.write('stdin is a terminal but stdout is not — running the plain prompt loop (type a task, or "exit").\n');
         }
-        const rl = createInterface({ input: process.stdin, output: process.stdout });
+        const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: flags.screenReader ? false : undefined });
         const onTurnError = (err: unknown): void => {
           // A failed turn must not tear down the session — report and continue.
-          process.stderr.write(`\n\x1b[31m${(err as Error).message}\x1b[0m\n`);
+          process.stderr.write(flags.screenReader ? `\nERROR: ${(err as Error).message}\n` : `\n\x1b[31m${(err as Error).message}\x1b[0m\n`);
         };
         try {
           // A human is at the keyboard: prompt + real y/n/a approvals. ReplGate
@@ -1783,14 +1896,15 @@ async function main(): Promise<void> {
             : new ReplGate(rl, () => {
                 autonomy = raiseAutonomy(autonomy);
                 return autonomy;
-              });
+              }, { plain: !!flags.screenReader });
           const onClose = new Promise<typeof CLOSED>((res) => rl.once('close', () => res(CLOSED)));
           for (;;) {
-            const raw = await Promise.race([rl.question('\n\x1b[1;32m❯\x1b[0m '), onClose]);
+            const raw = await Promise.race([rl.question(flags.screenReader ? '\nYOU > ' : '\n\x1b[1;32m❯\x1b[0m '), onClose]);
             if (raw === CLOSED) break;
             const task = raw.trim();
             if (task === 'exit' || task === 'quit') break;
             if (!task) continue;
+            if (reader?.command(task)) continue;
             try {
               await runHeadlessTask(task, gate);
             } catch (err) {
@@ -1811,10 +1925,11 @@ async function main(): Promise<void> {
           const task = line.trim();
           if (task === 'exit' || task === 'quit') break;
           if (!task) continue;
+          if (reader?.command(task)) continue;
           try {
             await runHeadlessTask(task, gate);
           } catch (err) {
-            process.stderr.write(`\n\x1b[31m${(err as Error).message}\x1b[0m\n`);
+            process.stderr.write(flags.screenReader ? `\nERROR: ${(err as Error).message}\n` : `\n\x1b[31m${(err as Error).message}\x1b[0m\n`);
           }
         }
       }

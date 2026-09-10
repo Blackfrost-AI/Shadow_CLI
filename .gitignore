@@ -43,3 +43,7 @@ research/
 
 # Local backup bundles (the ONLY off-machine-less backup — see deployment_instructions.md A5).
 *.bundle
+
+# A nested clone of the public worktree kept for reference (see PRODUCT_REVIEW.md). It is a
+# separate git repository — committing it would record a broken gitlink, not its contents.
+overhaul/

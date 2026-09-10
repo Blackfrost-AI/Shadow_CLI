@@ -49,6 +49,7 @@ export function buildTurnDeps(session: WebSession, gate?: ApprovalGate): LoopDep
     // Session-lifetime approval grants (TUI parity): the ACP gate's "Allow for this session"
     // lands on the session's ONE SessionApprovals, so it survives the per-turn AgentLoop.
     approvals: session.approvals,
+    readTracker: session.readTracker,
     budget,
     context: agent.context,
     // The registry sets session.abort before calling us; interrupt aborts the turn through it.

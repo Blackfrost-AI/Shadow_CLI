@@ -11,10 +11,8 @@ import {
 import type { ToolRun } from '../src/tui/rows.js';
 
 // P3-03 (F05-05) — render remount economy.
-// Acceptance: "Ctrl-O at unchanged width reuses wrap work; rows-only resize never wipes;
-// resize-during-stream keeps committed history."
-// Two layers of pin: (a) FUNCTIONAL — the flatten memo itself, imported straight from flatten.ts;
-// (b) STRUCTURAL — the tui.tsx wiring (FlatItem consults the cache; resize never reflows).
+// Cache behavior and call-site coverage. Terminal geometry and history preservation are exercised
+// by tui-terminal-flow.test.ts against a VT buffer, including native resize reflow.
 
 const T: ViewportTheme = {
   fg: '#ffffff', dim: '#b6bcc3', green: '#22c55e', cyan: '#38bdf8',
@@ -134,27 +132,6 @@ test('P3-03: FlatItem consults the epoch-independent cache — no bare flattenIt
   }
 });
 
-test('P3-03: resize never reflows — rows-only never wipes and resize-during-stream keeps committed history', () => {
-  // The old debounced resize→hard-reflow wiring is gone entirely.
-  assert.doesNotMatch(tui, /resizeReflowTimer/, 'the resize reflow debounce timer is removed');
-  assert.doesNotMatch(tui, /didFirstSizeRef/, 'the resize-effect mount guard is removed with it');
-  assert.doesNotMatch(tui, /setTimeout\(\(\) => reflow\(/, 'no delayed reflow of any kind remains');
-  // The deleted effect's deps shape must not reappear — a listener keyed on size state.
-  assert.doesNotMatch(tui, /\[terminalSize\.cols, terminalSize\.rows/, 'no effect re-subscribes on terminal size change');
-  // Reflow is reachable from EXACTLY its 4 user-explicit bindings (Ctrl-O, Alt+O, app:redraw,
-  // Ctrl-T). A 5th call site — e.g. a resize→reflow('soft') regression — fails here even though
-  // it emits no 3J: soft reflow bumps staticEpoch and re-emits committed history mid-stream,
-  // violating criterion 3 while the wipe counter stays 0.
-  assert.equal([...tui.matchAll(/\breflow\(/g)].length, 4, 'reflow has exactly its 4 explicit call sites');
-  // The only resize listener is useTerminalSize feeding setSize — never reflow.
-  const s = tui.indexOf('function useTerminalSize(');
-  assert.ok(s > 0, 'useTerminalSize still exists');
-  const body = tui.slice(s, tui.indexOf('\n}', s));
-  assert.match(body, /stdout\?\.on\?\.\('resize'/, 'resize still tracked for layout state');
-  assert.doesNotMatch(body, /reflow|setStaticEpoch|\\x1b/, 'the resize listener only updates size state');
-  // Hard reflow (the only scrollback wipe) survives in exactly ONE place: explicit app:redraw.
-  const hards = [...tui.matchAll(/reflow\('hard'\)/g)];
-  assert.equal(hards.length, 1, 'reflow(\'hard\') is only reachable as the user-explicit app:redraw');
-  const before = tui.slice(Math.max(0, hards[0]!.index - 400), hards[0]!.index);
-  assert.match(before, /app:redraw/, 'the single hard reflow is the app:redraw binding');
-});
+// Resize correctness is exercised with the production Ink renderer and a VT buffer in
+// tui-terminal-flow.test.ts. Native reflow changes physical cursor rows; source-pattern assertions
+// forbidding a replay allowed ghost composer rules to persist and could not detect that failure.

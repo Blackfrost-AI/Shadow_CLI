@@ -370,7 +370,11 @@ export function vimNormalKey(
     case 'i':
       return ok({ mode: 'insert', count: 0});
     case 'a':
-      return ok({ mode: 'insert', cursor: clamp(cursor + 1), count: 0});
+      // APPEND steps one GRAPHEME, like every other motion in this file: `cursor + 1` is one UTF-16
+      // code unit, so on an emoji (a surrogate PAIR) or a flag/combining cluster the caret landed
+      // INSIDE the cluster and the next keystroke split it — the draft, the painted frame and the
+      // string sent to the provider all carried a lone surrogate afterwards.
+      return ok({ mode: 'insert', cursor: nextGrapheme(input, clamp(cursor)), count: 0});
     case 'I':
       return ok({ mode: 'insert', cursor: ls, count: 0});
     case 'A':

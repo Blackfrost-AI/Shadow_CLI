@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseOpenAISSE } from '../src/provider/openai.js';
+import { eventsFromOpenAICompletion } from '../src/provider/nonStream.js';
 import type { ProviderEvent } from '../src/provider/provider.js';
 
 /**
@@ -93,4 +94,41 @@ test('a stream that legitimately yields nothing is NOT reported as not_sse', asy
   const evs = await collect('data: [DONE]');
   assert.deepEqual(errs(evs), []);
   assert.ok(evs.some((e) => e.type === 'done'));
+});
+
+// ── Non-stream fallback parity with the SSE parser (this path runs whenever a server ignores
+// `stream: true` or the stream fails and the caller retries without it).
+
+test('non-stream: object-typed arguments are serialized, not thrown on', () => {
+  // Passing the object straight to parseToolArgs hit `raw.trim is not a function` — an unhandled
+  // TypeError in the middle of a turn. Ollama-style endpoints send this shape.
+  const events = [...eventsFromOpenAICompletion({
+    choices: [{ message: { role: 'assistant', tool_calls: [{ id: 'c1', type: 'function', function: { name: 'get_weather', arguments: { city: 'Paris' } } }] }, finish_reason: 'tool_calls' }],
+  } as never)];
+  const call = events.find((e) => e.type === 'tool_call') as { call: { name: string; input: unknown } } | undefined;
+  assert.equal(call?.call.input ? JSON.stringify(call.call.input) : '', '{"city":"Paris"}');
+});
+
+test('non-stream: tool_calls + finish_reason "stop" is still a tool_use turn', () => {
+  // The tool_use inference was computed and then IMMEDIATELY overwritten by finish_reason, so a
+  // compat server pairing `tool_calls` with `stop` reported end_turn and the call never ran.
+  const events = [...eventsFromOpenAICompletion({
+    choices: [{ message: { role: 'assistant', content: 'ok', tool_calls: [{ id: 'c2', type: 'function', function: { name: 'read_file', arguments: '{"path":"a"}' } }] }, finish_reason: 'stop' }],
+  } as never)];
+  const done = events.find((e) => e.type === 'done') as { stopReason?: string } | undefined;
+  assert.equal(done?.stopReason, 'tool_use');
+  assert.ok(events.some((e) => e.type === 'tool_call'), 'the call is still emitted');
+});
+
+test('non-stream: a nameless call reports nameless_tool_call (SSE parity)', () => {
+  // Emitting `name: ''` produced a `unknown tool: ` result downstream — a wasted round trip for a
+  // recoverable wire problem the SSE parser already names explicitly.
+  const events = [...eventsFromOpenAICompletion({
+    choices: [{ message: { role: 'assistant', tool_calls: [{ id: 'c3', type: 'function', function: { arguments: '{"a":1}' } }] }, finish_reason: 'tool_calls' }],
+  } as never)];
+  assert.ok(!events.some((e) => e.type === 'tool_call'), 'no nameless call is emitted');
+  assert.ok(
+    events.some((e) => e.type === 'error' && e.code === 'nameless_tool_call'),
+    'the wire problem is reported by name',
+  );
 });

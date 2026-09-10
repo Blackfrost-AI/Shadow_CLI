@@ -192,3 +192,25 @@ test('a completed earlier fence is not mistaken for the truncated envelope opene
   assert.equal(findTextualToolIntentStart(source), prefix.length + 1, 'the prior closing fence remains outside the hidden suffix');
   assert.equal(stripTextualToolIntent(source), prefix, 'sanitizing preserves the complete earlier markdown block');
 });
+
+test('a degenerate repetition reply does not freeze the scan (performance guard)', () => {
+  // A weak/quantized model looping on `call:name{` with unbalanced braces used to cost O(len³) per
+  // turn — the `call:NAME{` loop called balancedObjects() once per match while only reading objs[0].
+  // Measured on the old code: 30 KB took 41 s, 45 KB took 149 s, with no output and no way to
+  // interrupt. The guard below is loose enough not to be flaky and tight enough to catch a return
+  // to the rescanning behaviour.
+  const payload = 'call:read_file{ '.repeat(3000); // ~48 KB, no closing brace anywhere
+  const t0 = Date.now();
+  const r = sniffToolCalls(payload, () => true);
+  const ms = Date.now() - t0;
+  assert.equal(r.calls.length, 0, 'an unclosed call recovers nothing');
+  assert.ok(ms < 5_000, `scan must stay fast on degenerate input (took ${ms}ms)`);
+});
+
+test('a balanced call:NAME{json} payload still recovers every call', () => {
+  // The fast path must not have cost the recovery it exists for.
+  const payload = 'call:read_file{"path":"/x"} '.repeat(2000);
+  const r = sniffToolCalls(payload, () => true);
+  assert.equal(r.calls.length, 2000);
+  assert.equal(r.cleaned.trim(), '', 'every recovered call is stripped from the visible text');
+});

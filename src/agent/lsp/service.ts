@@ -187,8 +187,14 @@ export function createLspService(opts: CreateLspServiceOptions): LspService {
         const uri = pathToFileURL(absPath).href;
         const version = (versions.get(uri) ?? 0) + 1;
         versions.set(uri, version);
-        if (version === 1) conn.notifyOpen(absPath, text, version);
-        else conn.notifyChange(absPath, text, version);
+        // Decision is the CONNECTION's, not this counter's. `versions` lives on the service and
+        // survives a restart, so `version === 1` was true only for the first write of a file EVER:
+        // after the server crashed and `ensureReady` built a fresh connection, the next write sent
+        // didChange for a document the new instance had never seen didOpen — a protocol violation
+        // it ignores, which silently ended diagnostics for that file for the rest of the session
+        // and made every later write wait out the whole diagnostics deadline for nothing.
+        if (conn.hasOpen(absPath)) conn.notifyChange(absPath, text, version);
+        else conn.notifyOpen(absPath, text, version);
         return await conn.awaitDiagnostics(uri, collectOpts?.deadlineMs ?? timeoutMs, collectOpts?.signal);
       } catch {
         return null; // an LSP problem never fails the write

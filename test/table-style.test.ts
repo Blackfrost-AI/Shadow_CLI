@@ -58,7 +58,10 @@ test('large tables fold when foldLargeTables=true', () => {
 
   const folded = flattenItem(item, 80, false, T, false, true);
   const foldText = folded.map((r) => r.spans.map((s) => s.text).join('')).join('\n');
-  assert.match(foldText, /⌄ table \d+×2 · \^O/, 'fold summary when over threshold');
+  // The expansion hint is `/expand <id>`, not Ctrl+O: Ctrl+O opens the ACTIVITY inspector for tool
+  // output, and a table inside an assistant answer is expanded per-answer (`/expand <number>`), so
+  // the old `⌄ table N×M · ^O` advertised a key that no longer expands this.
+  assert.match(foldText, /▸ table \d+×2 · \/expand \d+/, 'fold summary when over threshold');
   assert.ok(!foldText.includes('╭'), 'no full grid when folded');
 
   const open = flattenItem(item, 80, false, T, false, false);

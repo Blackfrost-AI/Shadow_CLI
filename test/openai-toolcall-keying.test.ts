@@ -105,3 +105,40 @@ test('grok reasoning body carries reasoning_effort; plain grok-4 does NOT', () =
   assert.equal(buildOpenAIBody(req('grok-4'), 'fb').reasoning_effort, undefined);
   assert.equal(buildOpenAIBody(req('grok-4'), 'fb').max_tokens, 8192);
 });
+
+// ── Wire-shape tolerance: several OpenAI-compatible endpoints differ from the spec in ways that
+// used to lose a call entirely (Ollama is offered as a first-class provider in the onboarding list).
+
+test('tool-call arguments sent as a JSON OBJECT are recovered, not dropped', async () => {
+  // Ollama (and several compat shims) put an already-decoded object in `function.arguments` instead
+  // of the JSON string the OpenAI wire specifies. The parser only accumulated STRINGS, so the call
+  // came through with `input: {}` — it ran with no arguments at all, and nothing reported why.
+  const calls = await callsFrom([
+    toolChunk({ index: 0, id: 'call_1', type: 'function', function: { name: 'get_weather', arguments: { city: 'Paris', units: 'c' } } }),
+    FINISH,
+  ]);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0]!.input, { city: 'Paris', units: 'c' });
+});
+
+test('a JSON-object argument chunk still reports a partial for the live preview', async () => {
+  const events = await collect(
+    parseOpenAISSE(
+      fromLines([
+        toolChunk({ index: 0, id: 'call_1', type: 'function', function: { name: 'read_file', arguments: { path: 'a.ts' } } }),
+        FINISH,
+      ]),
+    ),
+  );
+  const partials = events.filter((e) => e.type === 'tool_call_partial') as Array<{ jsonDelta?: string }>;
+  assert.ok(partials.length >= 1, 'the object chunk must surface as a delta too');
+  assert.equal(partials[0]!.jsonDelta, '{"path":"a.ts"}');
+});
+
+test('string arguments are untouched by the object path', async () => {
+  const calls = await callsFrom([
+    toolChunk({ index: 0, id: 'call_2', type: 'function', function: { name: 'get_weather', arguments: '{"city":"Paris"}' } }),
+    FINISH,
+  ]);
+  assert.deepEqual(calls[0]!.input, { city: 'Paris' });
+});

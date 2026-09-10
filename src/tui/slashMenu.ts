@@ -60,6 +60,14 @@ export interface ArgContext {
 type ArgProvider = ArgCompletion[] | ((ctx: ArgContext) => ArgCompletion[]);
 
 const SLASH_ARG_COMPLETIONS: Record<string, ArgProvider> = {
+  '/accessibility': [
+    { value: 'motion off', desc: 'Disable spinner animation; keep status updates' },
+    { value: 'motion on', desc: 'Enable spinner animation' },
+  ],
+  '/logo': [
+    { value: 'off', desc: 'Use the compact welcome header' },
+    { value: 'on', desc: 'Show the large welcome wordmark' },
+  ],
   '/help': [
     { value: 'overview', desc: 'Quick start, everyday commands, and essential keys' },
     { value: 'keys', desc: 'Keyboard shortcuts and approval controls' },

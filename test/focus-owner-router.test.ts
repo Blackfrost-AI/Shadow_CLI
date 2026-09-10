@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs';
 import { FOCUS_OWNERS, dispatchKey } from '../src/tui/keys/router.js';
 import { runTransportsAndReserved } from '../src/tui/keys/reserved.js';
 import { dialogOwner } from '../src/tui/keys/dialogOwner.js';
+import { activityOwner } from '../src/tui/keys/activityOwner.js';
 import { pickerOwner } from '../src/tui/keys/pickerOwner.js';
 import { searchOwner } from '../src/tui/keys/searchOwner.js';
 import { vimOwner } from '../src/tui/keys/vimOwner.js';
@@ -86,27 +87,30 @@ test('owner-table snapshot pins the dispatch order explicitly (precedence is DAT
   // The order is asserted LITERAL-BY-LITERAL — never serialized from the table — so any reorder,
   // insertion, or deletion is a loud test failure, and the fix requires a deliberate review of
   // this file (the table can never drift and quietly take its snapshot with it).
-  assert.equal(FOCUS_OWNERS.length, 5, 'exactly five owners');
+  assert.equal(FOCUS_OWNERS.length, 6, 'dialog, activity and the four existing input owners');
   assert.equal(FOCUS_OWNERS[0]!.id, 'dialog');
-  assert.equal(FOCUS_OWNERS[1]!.id, 'picker');
-  assert.equal(FOCUS_OWNERS[2]!.id, 'search');
-  assert.equal(FOCUS_OWNERS[3]!.id, 'vim');
-  assert.equal(FOCUS_OWNERS[4]!.id, 'composer');
+  assert.equal(FOCUS_OWNERS[1]!.id, 'activity');
+  assert.equal(FOCUS_OWNERS[2]!.id, 'picker');
+  assert.equal(FOCUS_OWNERS[3]!.id, 'search');
+  assert.equal(FOCUS_OWNERS[4]!.id, 'vim');
+  assert.equal(FOCUS_OWNERS[5]!.id, 'composer');
   // The table entries are the owner modules themselves (not wrappers or re-instantiations).
   assert.equal(FOCUS_OWNERS[0], dialogOwner);
-  assert.equal(FOCUS_OWNERS[1], pickerOwner);
-  assert.equal(FOCUS_OWNERS[2], searchOwner);
-  assert.equal(FOCUS_OWNERS[3], vimOwner);
-  assert.equal(FOCUS_OWNERS[4], composerOwner);
+  assert.equal(FOCUS_OWNERS[1], activityOwner);
+  assert.equal(FOCUS_OWNERS[2], pickerOwner);
+  assert.equal(FOCUS_OWNERS[3], searchOwner);
+  assert.equal(FOCUS_OWNERS[4], vimOwner);
+  assert.equal(FOCUS_OWNERS[5], composerOwner);
   // And the source table is the same literal order, so a code edit and this pin cannot diverge
   // silently: router.ts must list them in the pinned order, one per line.
   const iDialog = ROUTER.indexOf('dialogOwner,');
+  const iActivity = ROUTER.indexOf('activityOwner,');
   const iPicker = ROUTER.indexOf('pickerOwner,');
   const iSearch = ROUTER.indexOf('searchOwner,');
   const iVim = ROUTER.indexOf('vimOwner,');
   const iComposer = ROUTER.indexOf('composerOwner,');
-  for (const i of [iDialog, iPicker, iSearch, iVim, iComposer]) assert.ok(i >= 0, 'all five owners listed in router.ts');
-  assert.ok(iDialog < iPicker && iPicker < iSearch && iSearch < iVim && iVim < iComposer, 'router.ts lists dialog → picker → search → vim → composer');
+  for (const i of [iDialog, iActivity, iPicker, iSearch, iVim, iComposer]) assert.ok(i >= 0, 'all six owners listed in router.ts');
+  assert.ok(iDialog < iActivity && iActivity < iPicker && iPicker < iSearch && iSearch < iVim && iVim < iComposer, 'router.ts lists dialog → activity → picker → search → vim → composer');
 });
 
 test('dispatch walks the table in order: first active owner wins, false falls through', () => {

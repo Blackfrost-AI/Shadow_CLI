@@ -26,13 +26,25 @@ test('import is gated behind allowImport', () => {
   assert.equal(resolveAuth({ provider: 'openai', subProvider: 'codex', allowImport: false, liveImport: live, nowSec: NOW }), undefined);
 });
 
+// HTTP header names are case-insensitive, so asserting a particular spelling makes this brittle
+// without testing anything real. The backend's contract is the NAME it reads, not its casing.
+const header = (h: Record<string, string> | undefined, name: string): string | undefined => {
+  const want = name.toLowerCase();
+  for (const [k, v] of Object.entries(h ?? {})) if (k.toLowerCase() === want) return v;
+  return undefined;
+};
+
 test('codex subscription import → subscription base + identity headers + expiry', () => {
   const live: ImportedCredential = { provider: 'codex', kind: 'subscription', token: 'at', accountId: 'acc-9', expiresAt: NOW + 3600 };
   const r = resolveAuth({ provider: 'openai', subProvider: 'codex', allowImport: true, liveImport: live, nowSec: NOW });
   assert.equal(r?.bearer, 'at');
   assert.equal(r?.baseUrl, 'https://chatgpt.com/backend-api/codex');
-  assert.equal(r?.extraHeaders?.['ChatGPT-Account-ID'], 'acc-9');
-  assert.equal(r?.extraHeaders?.['OAI-Product-Sku'], 'codex');
+  assert.equal(header(r?.extraHeaders, 'chatgpt-account-id'), 'acc-9');
+  assert.equal(header(r?.extraHeaders, 'oai-product-sku'), 'codex');
+  // The Responses surface the Codex backend serves must be opted into explicitly, and the client
+  // identified — a request carrying the token but neither of these is refused by that host.
+  assert.equal(header(r?.extraHeaders, 'openai-beta'), 'responses=experimental');
+  assert.equal(header(r?.extraHeaders, 'originator'), 'codex_cli_rs');
   assert.equal(r?.expiresAt, NOW + 3600);
   assert.equal(r?.source, 'imported-codex');
 });

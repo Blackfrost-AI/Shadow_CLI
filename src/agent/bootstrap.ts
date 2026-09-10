@@ -1,12 +1,15 @@
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import {
-  resolveApiKey,
   resolveBaseUrl,
   resolveEntryCredential,
+  resolveProviderCredential,
   type ShadowConfig,
   type ModelEntry,
 } from '../config.js';
+import { subProviderFor } from '../auth/spec.js';
+import { ensureFreshSubscriptionCredential } from '../auth/refresh.js';
+import { resolveAutoModel } from '../local/autoEndpoint.js';
 import { vaultExists } from '../auth/vault.js';
 import { vaultUnlocked } from '../state/globalStore.js';
 import { createProvider, entryStreamContract } from '../provider/index.js';
@@ -135,6 +138,13 @@ export interface AgentSession {
   context: Context;
   offline: boolean;
   activeModelEntry: ModelEntry | undefined;
+  /**
+   * The model id that goes ON THE WIRE. Normally the active entry's `model`, but an entry marked
+   * `autoModel` re-reads it from the endpoint, so the entry keeps a stable IDENTITY (used by the
+   * /model picker and by `cfg.models.find(m => m.model === cfg.model)`) while the wire follows
+   * whatever the box is actually serving.
+   */
+  wireModel: string;
   startProvider: string;
   startBaseUrl: string | undefined;
   /** Authoritative sampling classification for the provider created at startup. */
@@ -337,16 +347,64 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
       ) + '\n',
     );
   }
-  const apiKey =
-    activeCred.source === 'provider' ? resolveApiKey(cfg.provider, { model: cfg.model, allowImport }) : activeCred.apiKey;
+  // The base URL the operator configured (flag / config / env / store). Computed BEFORE the
+  // credential because the resolver needs to see it: a subscription token is valid at exactly one
+  // host, and pairing it with a different baseUrl would disclose it. See resolveProviderCredential.
+  const configuredBaseUrl = resolveBaseUrl(cfg.provider, flags.baseUrl ?? cfg.baseUrl);
+  const offline = flags.offline ?? false;
+
+  // Rotate an imported subscription access token BEFORE resolving it, so a session started after
+  // the token aged out still works (these tokens live about an hour, and the refresh path had no
+  // caller at all). Best-effort by design: a failure leaves the stored credential in place and is
+  // reported as a warning rather than blocking boot.
+  if (allowImport) {
+    const subForModel = subProviderFor(cfg.provider, cfg.model);
+    if (subForModel) {
+      const refreshed = await ensureFreshSubscriptionCredential(subForModel, {
+        nowSec: Math.floor(Date.now() / 1000),
+        // Refreshing is egress, so --offline skips it rather than having the broker deny the call.
+        allowNetwork: !offline,
+      });
+      if (refreshed.refreshed) write(lc.gray(`Subscription token for ${subForModel} refreshed.\n`));
+      if (refreshed.error) write(lc.yellow(`⚠ subscription token: ${refreshed.error}\n`));
+    }
+  }
+
+  const providerCred =
+    activeCred.source === 'provider'
+      ? resolveProviderCredential(cfg.provider, { model: cfg.model, allowImport, configuredBaseUrl })
+      : { bearer: activeCred.apiKey, source: 'store' as const };
+  // A subscription credential refused because it belongs elsewhere is the one case where silence
+  // would be actively confusing ("my imported login stopped working"), so it is always announced.
+  if (providerCred.conflict) write(lc.yellow(`⚠ ${providerCred.conflict}\n`));
+
+  const apiKey = providerCred.bearer;
   const authToken = activeCred.authToken;
   registerSecret(apiKey); // mask the resolved key/token in all logs + surfaced errors
   registerSecret(authToken);
-  const resolvedBaseUrl = resolveBaseUrl(cfg.provider, flags.baseUrl ?? cfg.baseUrl);
+  // A subscription credential carries its own endpoint (base URL + identity headers + wire); an
+  // ordinary key leaves the configured base URL in force.
+  let resolvedBaseUrl = providerCred.baseUrl ?? configuredBaseUrl;
+
+  // Auto endpoint (`autoModel`): ask the endpoint what it is serving RIGHT NOW and use that id.
+  // A self-hosted box gets restarted with a different model constantly, and a preset naming one id
+  // breaks the moment that changes; this makes the box's current load the source of truth. The
+  // probe also returns the base URL that actually answered, so a URL written without `/v1` is
+  // corrected instead of being a coin flip. Never fatal: an unreachable box keeps the declared id
+  // and reports a real connection error at request time.
+  const auto = await resolveAutoModel(activeModelEntry);
+  if (auto.error && activeModelEntry?.autoModel) {
+    write(lc.yellow(`⚠ ${auto.error}\n`));
+  }
+  if (auto.baseUrl && auto.baseUrl !== resolvedBaseUrl) resolvedBaseUrl = auto.baseUrl;
+  const wireModel = auto.model ?? cfg.model;
+  if (auto.detected && auto.model !== activeModelEntry?.model) {
+    write(lc.gray(`Endpoint serves ${auto.model}${auto.models.length > 1 ? ` (of ${auto.models.length})` : ''}.\n`));
+  }
   // ── Offline Shadow Mode: hard no-cloud, no-web. Requires a LOCAL model (a gguf
   // preset, or a baseUrl whose host is localhost/LAN). Fail fast + friendly when the
   // active model is a cloud provider — before we spin up anything or touch the network.
-  const offline = flags.offline ?? false;
+  // (`offline` is read above, before the subscription refresh, so the two cannot disagree.)
   // P2-01: arm the egress broker's offline wall (and the dispatcher-layer backstop behind it)
   // BEFORE anything can touch the network — the wall is a hard invariant, not a banner promise.
   setOfflineMode(offline);
@@ -396,7 +454,9 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     // OpenAI-compatible local URL without a managed launcher: ask the running server instead of
     // making every model share an invented window. Explicit preset metadata is the fallback.
     const ctxWindow =
-      (await detectServerContextWindow(resolvedBaseUrl!)) ?? configuredContextWindow(activeModelEntry);
+      auto.contextWindow ??
+      (await detectServerContextWindow(resolvedBaseUrl!)) ??
+      configuredContextWindow(activeModelEntry);
     cfg = {
       ...cfg,
       contextBudget: clampLocalContextBudget(cfg.contextBudget, ctxWindow),
@@ -430,10 +490,15 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     // one shared helper with the TUI rebuild sites so the contract can't drift between them).
     ...entryStreamContract(activeModelEntry ?? undefined, cfg.stream),
     provider: startProvider as 'anthropic' | 'openai' | 'mock',
-    model: cfg.model,
+    model: wireModel,
     apiKey: startApiKey,
     authToken,
     baseUrl: startBaseUrl,
+    // Credential-borne endpoint contract. A local launcher rewrites startBaseUrl, in which case
+    // these no longer describe the endpoint being called — so they are dropped rather than sent
+    // somewhere they were not issued for.
+    extraHeaders: local ? undefined : providerCred.extraHeaders,
+    wire: local ? undefined : providerCred.wire,
     selfHosted: startSelfHosted,
     reasoningRoundtrip: cfg.reasoningRoundtrip,
   });
@@ -578,15 +643,39 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   ): Promise<{ provider: ReturnType<typeof createProvider>; model: string }> => {
     signal?.throwIfAborted();
     let nextProvider = entry.provider;
-    let baseUrl = resolveBaseUrl(entry.provider, entry.baseUrl);
+    const configuredBaseUrl = resolveBaseUrl(entry.provider, entry.baseUrl);
+    let baseUrl = configuredBaseUrl;
     const cred = resolveEntryCredential(entry, { vaultIsLocked: vaultExists() && !vaultUnlocked() });
     if (!cred.ok) {
       throw new Error(
         `fallback "${entry.label}" needs vault slot "${cred.slot}", which is ${cred.reason === 'locked' ? 'locked' : 'empty'}`,
       );
     }
-    let apiKey = cred.apiKey;
-    let hardWindow = configuredContextWindow(entry);
+    // Same credential resolution as boot, including the endpoint binding: a live switch onto a
+    // model that has an imported subscription credential must carry that credential's base URL,
+    // headers and wire, or it would send the token to the previous model's endpoint.
+    if (allowImport) {
+      const subForEntry = subProviderFor(entry.provider, entry.model);
+      if (subForEntry) {
+        await ensureFreshSubscriptionCredential(subForEntry, {
+          nowSec: Math.floor(Date.now() / 1000),
+          allowNetwork: !offline,
+          signal,
+        });
+      }
+    }
+    const entryCred =
+      cred.source === 'provider'
+        ? resolveProviderCredential(entry.provider, { model: entry.model, allowImport, configuredBaseUrl })
+        : { bearer: cred.apiKey, source: 'store' as const };
+    if (entryCred.conflict) write(lc.yellow(`⚠ ${entryCred.conflict}\n`));
+    if (entryCred.baseUrl) baseUrl = entryCred.baseUrl;
+    let apiKey = entryCred.bearer;
+    // Auto endpoint: same contract as boot — the box's current load wins over the preset's id.
+    const auto = await resolveAutoModel(entry);
+    if (auto.baseUrl) baseUrl = auto.baseUrl;
+    const wireModel = auto.model ?? entry.model;
+    let hardWindow = auto.contextWindow ?? configuredContextWindow(entry);
     const local = await opts.launchLocalServer(entry, offline);
     signal?.throwIfAborted();
     if (local) {
@@ -623,14 +712,19 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
       // P1A-04 knobs + P1A-06 capability block (F10-01 shared helper — see entryStreamContract).
       ...entryStreamContract(entry, cfg.stream),
       provider: nextProvider,
-      model: entry.model,
+      model: wireModel,
       apiKey,
       authToken: cred.authToken,
       baseUrl,
+      // A local launcher rewrote baseUrl, so the credential's endpoint contract no longer applies.
+      extraHeaders: local ? undefined : entryCred.extraHeaders,
+      wire: local ? undefined : entryCred.wire,
       selfHosted: entry.selfHosted,
       reasoningRoundtrip: cfg.reasoningRoundtrip,
     });
-    return { provider: next, model: entry.model };
+    // The WIRE model is what callers must propagate to sub-agents and the loop, while
+    // `cfg.model` stays the entry's identity (see AgentSession.wireModel).
+    return { provider: next, model: wireModel };
   };
 
   return {
@@ -652,6 +746,7 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     context,
     offline,
     activeModelEntry,
+    wireModel,
     startProvider,
     startBaseUrl,
     startSelfHosted,

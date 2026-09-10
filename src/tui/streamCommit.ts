@@ -78,8 +78,8 @@ export function extractCompleteBlocks(buf: string): { blocks: string[]; rest: st
  * text — the #1 "cluttered output" complaint.
  * `startPadded` seeds the state from the PREVIOUS delta batch (the caller persists `trailingBlank`
  * across calls in a ref — it covers both a consumed blank AND a committed block at a batch seam).
- * (Only edge case: an inline emphasis span that straddles a hard line break renders literally;
- * vanishingly rare in chat output.)
+ * Prose containing inline Markdown delimiters stays together until its paragraph ends. A newline
+ * is not a safe commit boundary for emphasis, code spans, or link labels spanning source lines.
  */
 export interface CommitUnit {
   text: string;
@@ -112,6 +112,7 @@ export function extractCommittableUnits(
   const n = lines.length;
   const units: CommitUnit[] = [];
   let pending: string[] = []; // an open multi-line construct, held until it completes
+  let pendingProse = false;
   let fenceOpen: { char: '`' | '~'; width: number } | null = null; // the OPENED fence (marker + width) if inside one
   let padNext = startPadded; // gap owed to the next unit (blank line or block boundary behind us)
   // Line-level grouping policy uses the PARSER'S OWN regexes (imported), so what we hold together
@@ -136,6 +137,7 @@ export function extractCommittableUnits(
     // classifies as exactly what the parser sees.
     const held = pending;
     pending = [];
+    pendingProse = false;
     // Split AT MOST ONCE, at the FIRST table start: once a table begins, parseMarkdown consumes
     // every subsequent pipe line as a body row (even separator-looking ones), so splitting again
     // inside the run would fabricate a second table the parser doesn't see.
@@ -185,6 +187,16 @@ export function extractCommittableUnits(
       continue;
     }
     if (grouped(line)) {
+      if (pendingProse) flush();
+      pending.push(line);
+      continue;
+    }
+    const block = isBlockUnit(line);
+    // Conservatively retain the paragraph once inline syntax appears. Parsing a completed LINE
+    // alone cannot tell whether its unmatched delimiter will close on the next source line.
+    if (!block && (pendingProse || /[*_~`[\]]/.test(line))) {
+      if (!pendingProse) flush();
+      pendingProse = true;
       pending.push(line);
       continue;
     }
@@ -287,4 +299,3 @@ export function clampTail(src: string, maxLines: number): string {
   // lines). Re-opening with 3 ticks would let such a line cut the styling short.
   return open ? open.char.repeat(open.width) + open.lang + '\n' + tail.join('\n') : tail.join('\n');
 }
-

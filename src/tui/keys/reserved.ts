@@ -8,6 +8,7 @@
  * DSR-batched-with-text, ^D-in-paste, Ctrl-X arming).
  */
 import { hasSgrMouse } from '../composer.js';
+import { insertChunk, SHIFT_ENTER } from './common.js';
 import type { ContextName } from '../keybindings/types.js';
 import type { InkKey, KeyEnv } from './types.js';
 
@@ -191,6 +192,12 @@ export function runTransportsAndReserved(env: KeyEnv, ch: string, key: InkKey): 
     if (endIdx >= 0) {
       // Whole paste in one chunk — the common case.
       env.insertPastable(after.slice(0, endIdx).replace(/\r\n?/g, '\n'));
+      // …and anything the terminal packed AFTER the end marker. The text BEFORE the start marker is
+      // preserved above, so dropping this side was an asymmetry, not a policy: `\x1b[200~pasted\x1b[201~tail`
+      // inserted "pasted" and silently lost "tail" (the same shape occurs whenever a keystroke is
+      // coalesced with the closing marker). Routed through the composer's own insert path so text
+      // goes in as text and a key sequence glued to it is APPLIED rather than typed.
+      insertChunk(env, after.slice(endIdx + PASTE_END.length), SHIFT_ENTER);
     } else {
       env.pastingRef.current = true;
       env.pasteBufRef.current = after;

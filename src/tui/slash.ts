@@ -15,6 +15,7 @@ import { existsSync, readFileSync, readdirSync, statSync, writeFileSync } from '
 import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import type { Dispatch, SetStateAction } from 'react';
 import type { SessionApprovals } from '../agent/approval.js';
+import type { ReadTracker } from '../tools/readTracker.js';
 import type { Context } from '../agent/context.js';
 import { loadAgentDefs } from '../agent/defs.js';
 import { cycleEffort, effortDescription, effortSymbol, normalizeEffort } from '../agent/effort.js';
@@ -24,7 +25,7 @@ import type { PlanSnapshot } from '../agent/planMode.js';
 import type { MissionSnapshot } from '../agent/mission.js';
 import { missionStatusLines } from './missionHud.js';
 import type { TodoItem } from '../agent/todo.js';
-import { buildCodexAuthUrl, clearSubAuth, getSubAuth, importOfficialCredential, type SubProvider } from '../auth/index.js';
+import { clearSubAuth, importOfficialCredential, subscriptionAuthLines, type SubProvider } from '../auth/index.js';
 import { vaultExists } from '../auth/vault.js';
 import { addModelPreset, defaultModelPatch, findModelPreset, parseModelAddArgs, removeModelPreset, setModelPresetEnabled, splitPresetArgs } from '../config/modelPresets.js';
 import { persistPermissionRules, resolveBaseUrl, resolveEntryCredential, type ModelEntry } from '../config.js';
@@ -130,6 +131,10 @@ export const SLASH_COMMANDS: SlashCommand[] = [
   { name: '/version', desc: 'Show Shadow version' },
   { name: '/color', desc: 'Switch color theme (alias for /theme)', dispatch: '/theme' },
   { name: '/theme', desc: 'Switch color theme (list, preview <name>, or name; no arg cycles)' },
+  { name: '/activity', desc: 'Inspect activity and full output (/activity [group number]); Ctrl+O' },
+  { name: '/expand', desc: 'Expand or fold one answer’s tables (/expand [answer number])' },
+  { name: '/accessibility', desc: 'Accessibility options (/accessibility motion off|on)' },
+  { name: '/logo', desc: 'Show or hide the welcome wordmark (/logo on|off)' },
   { name: '/terminal-setup', desc: 'Make Shift+Enter insert a newline (per-terminal instructions)' },
   { name: '/vim', desc: 'Toggle modal (NORMAL/INSERT) editing in the composer' },
   { name: '/statusline', desc: 'Set a shell command for a custom footer line (/statusline none to clear)' },
@@ -290,7 +295,7 @@ function helpLines(topic: HelpTopic): BannerLine[] {
       { text: 'Navigate', color: C.purple, bold: true },
       { text: '  / opens commands  ·  ↑/↓ select  ·  Tab completes  ·  Esc closes', dimColor: true },
       { text: '  Shift+Tab toggles plan mode  ·  Ctrl+X M model picker  ·  Tab cycles mode', dimColor: true },
-      { text: '  Ctrl+O folds details  ·  Ctrl+T expands tasks  ·  Alt+C copies last answer', dimColor: true },
+      { text: '  Ctrl+O activity  ·  Alt+O latest output  ·  Ctrl+T tasks  ·  Alt+C copy answer', dimColor: true },
       { text: 'While Shadow works', color: C.purple, bold: true },
       { text: '  Keep typing and press Enter to steer the active turn  ·  Esc interrupts', dimColor: true },
       { text: '  State-changing slash commands wait until the current turn ends.', dimColor: true },
@@ -310,6 +315,7 @@ function helpLines(topic: HelpTopic): BannerLine[] {
     { text: '  Model      /model  /local  /provider  /effort', dimColor: true },
     { text: '  Agent      /goal  /autonomy  /permissions  /tasks', dimColor: true },
     { text: '  Workspace  /diff  /files  /branch  /review', dimColor: true },
+    { text: '  Display    /activity  /expand  /accessibility  /theme  /logo', dimColor: true },
     { text: `Keys: Enter send · ${NEWLINE_HINT} newline · Shift+Tab plan mode · Ctrl+X M model · Esc interrupt · Ctrl+C twice to quit`, dimColor: true },
     { text: 'Approvals: y once · n deny · s session · f shell prefix · a raise autonomy', dimColor: true },
     { text: 'More: /help keys for shortcuts · /help all for every command · type / to search', dimColor: true },
@@ -323,6 +329,9 @@ function helpLines(topic: HelpTopic): BannerLine[] {
  * this file needs no React runtime types beyond Dispatch/SetStateAction.
  */
 export interface SlashCtx {
+  openActivity?: (id?: number) => boolean;
+  resetActivity?: () => void;
+  expandAnswer?: (id?: number) => void;
   // ── state setters ──────────────────────────────────────────────────────────
   setLine: (v: string) => void;
   setMenuIndex: Dispatch<SetStateAction<number>>;
@@ -399,6 +408,7 @@ export interface SlashCtx {
   compactAbortRef: { current: AbortController | null };
   sessionLogRef: { current: SessionLog };
   sessionApprovalsRef: { current: SessionApprovals };
+  sessionReadTrackerRef: { current: ReadTracker };
   rewindableTurnsRef: { current: RewindableTurn[] };
   additionalRootsRef: { current: string[] };
   statusLineRef: { current: string };
@@ -438,7 +448,7 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
     costWarnedRef, fileListLoadedRef, missionRef, startTableRef, currentRef,
     selectModelRef, asyncCommandRef, providerRef, activeTargetRef, styleRef,
     autonomyRef, loopRef, effortRef, runningRef, compactingRef, compactAbortRef,
-    sessionLogRef, sessionApprovalsRef, rewindableTurnsRef, additionalRootsRef,
+    sessionLogRef, sessionApprovalsRef, sessionReadTrackerRef, rewindableTurnsRef, additionalRootsRef,
     statusLineRef, vimEnabledRef, vimPendingRef, vimFindRef, vimCountRef, vimRegRef,
     flushQueueRef, runOneRef, repaintFromContextRef, queueDeferred,
     context, opts, bus, subAgents, todoItems,
@@ -455,6 +465,32 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
     return;
   }
   switch (dispatch) {
+    case '/activity':
+    case '/expand': {
+      if (arg && !/^\d+$/.test(arg)) { showToast(`Use ${dispatch} [number].`, 'warn'); break; }
+      const id = arg ? Number(arg) : undefined;
+      if (dispatch === '/expand') ctx.expandAnswer?.(id);
+      else if (ctx.openActivity?.(id) === false) showToast('No matching activity group.', 'warn');
+      break;
+    }
+    case '/accessibility': {
+      if (arg === 'motion off' || arg === 'motion on') {
+        opts.cfg.reducedMotion = arg === 'motion off';
+        saveGlobalConfig({ reducedMotion: opts.cfg.reducedMotion });
+        setThemeTick(n => n + 1);
+        showToast(process.env.SHADOW_REDUCED_MOTION === '1' ? 'Animation off (SHADOW_REDUCED_MOTION=1).' : `Animation ${opts.cfg.reducedMotion ? 'off' : 'on'}.`, 'ok');
+      } else {
+        pushLine({ text: `Animation: ${opts.cfg.reducedMotion || process.env.SHADOW_REDUCED_MOTION === '1' ? 'off' : 'on'}. Use /accessibility motion off|on.\nScreen-reader text mode: start shadow --screen-reader.\nCtrl+O opens activity; arrows navigate; Enter opens; Esc goes back; q returns to your draft.\nThemes: /theme high-contrast, /theme light, /theme mono.`, kind: 'system' });
+      }
+      break;
+    }
+    case '/logo': {
+      if (arg !== 'on' && arg !== 'off') { showToast('Use /logo on|off.', 'warn'); break; }
+      opts.cfg.showLogo = arg === 'on';
+      saveGlobalConfig({ showLogo: opts.cfg.showLogo });
+      showToast(`Welcome logo ${arg}; applies to the next welcome.`, 'ok');
+      break;
+    }
     case '/help': {
       const topic = (arg || 'overview').toLowerCase();
       if (topic !== 'overview' && topic !== 'keys' && topic !== 'all') {
@@ -502,6 +538,7 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
     }
     case '/new':
     case '/clear':
+      ctx.resetActivity?.();
       // isTTY-gated like every sibling escape site (reflow, theme, paste, mouse, startupSequence
       // all are). This one was not, so it leaked 2J/3J into pipes and files — and since several
       // tests drive /clear, `npm test` could wipe the developer's own scrollback.
@@ -662,7 +699,7 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
         }
         const patch = defaultModelPatch(entry);
         opts.cfg.provider = entry.provider;
-        opts.cfg.model = entry.model;
+        opts.cfg.model = entry.model; // the IDENTITY; the wire model is resolved at build
         opts.cfg.baseUrl = entry.baseUrl;
         opts.cfg.selfHosted = entry.selfHosted;
         opts.cfg.lastModel = entry.label;
@@ -844,7 +881,16 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
           text: 'local',
           lines: [
             { text: `Added local model: ${e.label}`, color: C.cyan },
-            { text: e.mlx ? `  ${e.mlx}  ·  mlx` : e.vllm ? `  ${e.vllm}  ·  vllm` : `  ${e.gguf}  ·  ctx ${e.ctx}  ·  gpu-layers ${e.gpuLayers}`, dimColor: true },
+            {
+              text: e.autoModel && e.baseUrl
+                ? `  ${e.baseUrl}  ·  tracks the served model`
+                : e.mlx
+                  ? `  ${e.mlx}  ·  mlx`
+                  : e.vllm
+                    ? `  ${e.vllm}  ·  vllm`
+                    : `  ${e.gguf}  ·  ctx ${e.ctx}  ·  gpu-layers ${e.gpuLayers}`,
+              dimColor: true,
+            },
             { text: `  Switch to it now: /local use ${e.label}`, dimColor: true },
           ],
         });
@@ -877,7 +923,7 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
         break;
       }
       pushLine({
-        text: 'Usage: /local [list | add <path-to.gguf | mlx-folder | mlx-community/model> [--name <n>] [--ctx <n>] [--gpu-layers <n>] | use <name> | remove <name>]',
+        text: 'Usage: /local [list | add <path-to.gguf | mlx-folder | mlx-community/model> [--name <n>] [--ctx <n>] [--gpu-layers <n>] | add --endpoint <http://<host>:<port>/v1> [--name <n>] [--model <id>] | use <name> | remove <name>]',
         dimColor: true,
       });
       break;
@@ -885,7 +931,9 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
     case '/provider': {
       const target = activeTargetRef.current;
       const baseUrl = target.baseUrl;
-      const matches = (m: ModelEntry) => m.provider === currentRef.current.provider && m.model === currentRef.current.model;
+      // Entry IDENTITY (`opts.cfg.model`), not `currentRef.current.model` — the latter is the wire
+      // model, which an autoModel entry re-reads from its endpoint.
+      const matches = (m: ModelEntry) => m.provider === currentRef.current.provider && m.model === opts.cfg.model;
       const entry = opts.cfg.models?.find((m) => matches(m) && m.label === opts.cfg.lastModel)
         ?? opts.cfg.models?.find((m) => matches(m) && resolveBaseUrl(m.provider, m.baseUrl) === baseUrl);
       const credential = resolveEntryCredential(entry ?? { provider: currentRef.current.provider }, { vaultIsLocked: vaultExists() && !vaultUnlocked() });
@@ -1205,6 +1253,7 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
         // A different session is a different grant scope: "approve run_shell for this session"
         // must not silently carry into the one just loaded.
         sessionApprovalsRef.current.clear();
+        sessionReadTrackerRef.current.clear();
         // F08-11: "While you were away" recap — one non-streaming summary of the restored
         // conversation via the CURRENT provider. Opt-in (cfg.resumeRecap), silent on any error
         // or if there's too little to summarize; never blocks the resume itself.
@@ -1357,6 +1406,7 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
         // A different session id is a different grant scope — /resume parity: "approve for
         // this session" must not silently carry into the fork.
         sessionApprovalsRef.current.clear();
+        sessionReadTrackerRef.current.clear();
         // New log path → the /rewind menu must now list the FORK's lineage (not the source's).
         refreshRewindTurns();
         pushLine({
@@ -1725,6 +1775,12 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
         text: 'status',
         lines: [
           { text: `${currentRef.current.provider}/${currentRef.current.model} · ${autonomyRef.current}${opts.bypass ? ' (yolo)' : ''} · style ${styleRef.current}`, color: C.cyan },
+          // An entry that tracks its endpoint shows BOTH ids: the preset it was selected as, and the
+          // model actually on the wire. Without this the two would silently differ and the only
+          // visible id would be the one that is not being requested.
+          ...(opts.cfg.model !== currentRef.current.model
+            ? [{ text: `preset ${opts.cfg.model} · endpoint serves ${currentRef.current.model}`, dimColor: true }]
+            : []),
           // P2-11 — the active named profile is part of the session's identity; show exactly
           // which keys it contributed so a surprise model/effort is never invisible.
           ...(opts.cfg.activeProfile
@@ -1873,14 +1929,17 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
       const parts = arg.split(/\s+/).filter(Boolean);
       const action = parts[0] ?? 'status';
       if (action === 'codex') {
-        const { url } = buildCodexAuthUrl();
+        // Shadow does not serve the OAuth callback, so printing an authorize URL would promise a
+        // flow that cannot complete. The import path reaches the same credential without
+        // impersonating the first-party client, so point there instead.
         pushLine({
           kind: 'system',
           text: 'login',
           lines: [
-            { text: 'Open this URL to sign in with ChatGPT/Codex:', color: C.cyan },
-            { text: url, dimColor: true },
-            { text: 'After authorization, exchange support is still CLI-side work; API keys remain available through `shadow onboard`.', dimColor: true },
+            { text: 'Codex: Shadow does not run the interactive ChatGPT OAuth exchange.', color: C.cyan },
+            { text: 'Import the credential your official Codex CLI already minted:', dimColor: true },
+            { text: '  /login import codex   (then restart with SHADOW_ALLOW_IMPORT=1)', dimColor: true },
+            { text: 'The token is bound to its ChatGPT backend and is never sent elsewhere; it refreshes automatically.', dimColor: true },
           ],
         });
         break;
@@ -1893,33 +1952,42 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
           break;
         }
         const outcomes = providers.map((p) => importOfficialCredential(p));
-        pushLine({
-          kind: 'system',
-          text: 'login',
-          lines: outcomes.map((o) => ({
-            text: o.imported
-              ? `${o.provider}: imported ${o.kind}${o.hasRefresh ? ' with refresh token' : ''}`
-              : `${o.provider}: no official CLI credential found`,
-            color: o.imported ? C.cyan : undefined,
-            dimColor: !o.imported,
-          })),
-        });
+        const lines = outcomes.map((o) => ({
+          text: o.imported
+            ? `${o.provider}: imported ${o.kind}${o.hasRefresh ? ' with refresh token' : ''}`
+            : `${o.provider}: no official CLI credential found`,
+          color: o.imported ? C.cyan : undefined,
+          dimColor: !o.imported,
+        }));
+        // Importing is only half the step: the credential stays inert until the opt-in gate is open,
+        // and a user who has just imported one is exactly the person who needs to be told that.
+        if (outcomes.some((o) => o.imported) && process.env.SHADOW_ALLOW_IMPORT !== '1') {
+          lines.push({
+            text: 'Not in use yet: restart with SHADOW_ALLOW_IMPORT=1 (the ToS acknowledgement for reusing a subscription here).',
+            color: C.yellow,
+            dimColor: false,
+          });
+        }
+        pushLine({ kind: 'system', text: 'login', lines });
         break;
       }
       if (action !== 'status' && action !== 'show') {
         pushLine({ text: 'Usage: /login [status|codex|import codex|grok|all]', dimColor: true });
         break;
       }
-      const codex = getSubAuth('codex');
-      const grok = getSubAuth('grok');
+      const statusLines = subscriptionAuthLines(Math.floor(Date.now() / 1000));
       pushLine({
         kind: 'system',
         text: 'login',
         lines: [
           { text: 'API keys: run `shadow onboard` to save provider credentials.', color: C.cyan },
-          { text: `codex subscription: ${codex ? codex.kind : 'not stored'}`, dimColor: !codex, color: codex ? C.cyan : undefined },
-          { text: `grok subscription: ${grok ? grok.kind : 'not stored'}`, dimColor: !grok, color: grok ? C.cyan : undefined },
-          { text: 'Codex subscription: run `shadow login codex` outside the TUI, then follow the printed URL.', dimColor: true },
+          // One line per fact, straight from the shared descriptor, so this and `shadow login
+          // status` can never disagree about the same store.
+          ...statusLines.map((t) => ({
+            text: t,
+            dimColor: !t.trimStart().startsWith('⚠'),
+            color: t.trimStart().startsWith('⚠') ? C.yellow : undefined,
+          })),
           { text: 'Import official CLI credentials with: /login import codex|grok|all', dimColor: true },
           { text: 'Grok: use an xAI API key through `shadow onboard`; consumer OAuth is not supported.', dimColor: true },
           { text: 'Anthropic: API-key only in Shadow.', dimColor: true },

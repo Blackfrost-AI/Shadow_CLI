@@ -216,6 +216,13 @@ export function createTsserverConnection(spec: LspServerSpec, opts: CreateConnec
       return tracked;
     },
 
+    hasOpen() {
+      // tsserver has no didOpen/didChange split: `notifyChange` re-sends `open` with the full text,
+      // which a freshly spawned instance accepts exactly like the first one (and re-pulls
+      // diagnostics either way), so every instance is always safe to send to.
+      return true;
+    },
+
     notifyOpen(absPath, text) {
       openFile(absPath, text);
     },

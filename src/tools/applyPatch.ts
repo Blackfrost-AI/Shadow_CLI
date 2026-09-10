@@ -367,7 +367,13 @@ export const applyPatch: Tool<ApplyPatchInput, ApplyPatchData> = {
           mkdirSync(dirname(a.abs), { recursive: true });
           atomicWrite(a.abs, a.after);
           undo.push(() => (prior === null ? unlinkSync(a.abs) : atomicWrite(a.abs, prior)));
+          // markRead only records the mtime; markSeen is what authorizes a LATER edit. write_file
+          // and multi_edit both do both, and apply_patch alone skipping markSeen meant its own
+          // output could not be edited or deleted afterwards — the next call was refused with
+          // "read it first" for a file the tool had just created (the in-patch exemption only
+          // covers ops inside the SAME patch).
           ctx.readTracker?.markRead(a.abs);
+          ctx.readTracker?.markSeen(a.abs);
           const d = diffLines(a.before, a.after);
           if (d.length) diff.push({ tag: ' ', text: `--- ${a.rel}` }, ...d);
         } else {
@@ -406,6 +412,7 @@ export const applyPatch: Tool<ApplyPatchInput, ApplyPatchData> = {
       const note = await formatAfterWrite(a.abs, ctx);
       if (note) formatNotes.push(note);
       ctx.readTracker?.markRead(a.abs);
+      ctx.readTracker?.markSeen(a.abs);
     }
     const noteSuffix = formatNotes.length ? `\n${formatNotes.join('\n')}` : '';
 

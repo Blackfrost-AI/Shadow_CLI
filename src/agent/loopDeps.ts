@@ -3,6 +3,7 @@ import type { ShadowConfig } from '../config.js';
 import type { Provider, ToolCall } from '../provider/provider.js';
 import type { ToolRegistry } from '../tools/registry.js';
 import type { ApprovalGate, SessionApprovals } from './approval.js';
+import type { ReadTracker } from '../tools/readTracker.js';
 import type { EventBus } from './events.js';
 import type { Budget } from './budget.js';
 import type { Context } from './context.js';
@@ -50,6 +51,13 @@ export interface LoopDepsInput {
    * MESSAGE must pass one shared instance — grants stored on the loop itself die with it.
    */
   approvals?: SessionApprovals;
+  /**
+   * SESSION-lifetime read-before-edit tracker, for the same reason as `approvals`: a new loop is
+   * built per user message, so a per-loop tracker forgot every file read in an earlier turn and
+   * refused the next edit with "read it in this conversation first" — which the model had, one
+   * message ago. It also silently dropped the stale-file (mtime) protection between turns.
+   */
+  readTracker?: ReadTracker;
   continuityState?: string;
   resolveFallback?: LoopDeps['resolveFallback'];
   /** The previous run's stop reason when the caller tracks it (honest empty-response diagnosis — P1A-08). */
@@ -82,6 +90,7 @@ export function buildLoopDeps(input: LoopDepsInput): LoopDeps {
     streamShell: input.streamShell,
     sessionLog: input.sessionLog,
     approvals: input.approvals,
+    readTracker: input.readTracker,
     continuityState: input.continuityState,
     resolveFallback: input.resolveFallback,
     priorStopReason: input.priorStopReason,

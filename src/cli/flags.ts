@@ -22,6 +22,8 @@ export interface Flags {
   dryRun?: boolean;
   task?: string;
   repl?: boolean;
+  screenReader?: boolean;
+  reducedMotion?: boolean;
   yolo?: boolean;
   offline?: boolean;
   noSandbox?: boolean;
@@ -127,6 +129,14 @@ export function parseArgs(argv: string[]): Flags {
       case '--repl':
         noInlineValue();
         f.repl = true;
+        break;
+      case '--screen-reader':
+        noInlineValue();
+        f.screenReader = true;
+        break;
+      case '--reduced-motion':
+        noInlineValue();
+        f.reducedMotion = true;
         break;
       case '--offline':
         noInlineValue();

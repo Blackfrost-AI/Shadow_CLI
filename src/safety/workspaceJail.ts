@@ -1,5 +1,5 @@
 import { realpathSync, existsSync } from 'node:fs';
-import { resolve, dirname, basename, isAbsolute, relative } from 'node:path';
+import { resolve, join, parse, sep, dirname, isAbsolute, relative } from 'node:path';
 
 /**
  * The filesystem jail. Every path a tool touches is run through `resolveWithin`,
@@ -9,8 +9,9 @@ import { resolve, dirname, basename, isAbsolute, relative } from 'node:path';
  *
  * The first root is the workspace (relative paths resolve against it); any extra
  * roots come from `additionalDirectories` / `--add-dir`, so a user can deliberately
- * grant read/write outside the workspace without disabling the jail. The
- * realpath-the-deepest-existing-ancestor trick defeats a symlink that points out.
+ * grant read/write outside the workspace without disabling the jail. Resolution walks
+ * the path component by component, realpath-ing as it goes (`resolvePhysical`), so a
+ * symlink that points out is caught — including when it is followed by `..`.
  */
 
 /** Is `target` equal to, or nested inside, `root`? (compares post-realpath paths) */
@@ -18,6 +19,47 @@ export function contains(root: string, target: string): boolean {
   if (target === root) return true;
   const rel = relative(root, target);
   return rel.length > 0 && !rel.startsWith('..') && !isAbsolute(rel);
+}
+
+/**
+ * Resolve `requested` against `base` the way the OS does — following symlinks AND resolving `..`
+ * against the PHYSICAL parent — instead of `path.resolve`, which collapses `a/..` lexically.
+ *
+ * POSIX resolves `link/..` by following `link` FIRST, so those two disagree exactly when a
+ * component is a symlink. That made `<ws>/linkout/../outside/secret.txt` read as
+ * `<ws>/outside/secret.txt` (inside) while the shell opened `/elsewhere/outside/secret.txt`.
+ * A symlink can ship inside a cloned repo, so the escape needed no cooperation from the model —
+ * and it also defeated the session/prefix-grant demotion, which shares this resolver.
+ *
+ * Components below the deepest path that exists cannot be symlinks (nothing there exists to link
+ * from), so they are kept literal and appended — which is what `resolve` already did for the
+ * not-yet-created tail this function replaces.
+ */
+function resolvePhysical(base: string, requested: string): string {
+  const from = isAbsolute(requested) ? requested : `${base}${sep}${requested}`;
+  const root = parse(from).root;
+  const parts = from.slice(root.length).split(sep === '\\' ? /[\\/]/ : sep);
+  let current = root;
+  const pending: string[] = [];
+  for (const part of parts) {
+    if (part === '' || part === '.') continue;
+    if (part === '..') {
+      // `..` is the parent of where we PHYSICALLY are, not of the lexical spelling.
+      if (pending.length > 0) pending.pop();
+      else if (current !== root) current = dirname(current);
+      continue;
+    }
+    if (pending.length > 0) {
+      pending.push(part);
+      continue;
+    }
+    try {
+      current = realpathSync(join(current, part));
+    } catch {
+      pending.push(part); // does not exist (or is unreadable) — nothing below can be a symlink
+    }
+  }
+  return pending.length > 0 ? join(current, ...pending) : current;
 }
 
 /**
@@ -51,24 +93,9 @@ export function resolveWithin(roots: string | string[], requested: string): stri
   const reals = list.map((r) => (existsSync(r) ? realpathSync(r) : resolve(r)));
   const primaryReal = reals[0]!;
 
-  const abs = isAbsolute(requested) ? resolve(requested) : resolve(primaryReal, requested);
-
-  // Walk up to the nearest existing ancestor, realpath it, re-append the tail.
-  let existing = abs;
-  const tail: string[] = [];
-  while (!existsSync(existing)) {
-    const parent = dirname(existing);
-    if (parent === existing) break; // reached the filesystem root
-    // basename, NOT slice(parent.length + 1): at the filesystem root `parent` is already "/",
-    // so the +1 ate the first CHARACTER of the segment — "/work/x" walked up to "/work" and
-    // unshifted "ork", producing "/ork/x". Any path whose deepest existing ancestor is "/" was
-    // silently mangled and then rejected as outside the jail. Fails closed, so it read as a
-    // confusing denial rather than a breach — but it made the jail unusable for a workspace at
-    // a top-level directory.
-    tail.unshift(basename(existing));
-    existing = parent;
-  }
-  const real = existsSync(existing) ? resolve(realpathSync(existing), ...tail) : abs;
+  // Physically, not lexically: `resolve()` would collapse `link/..` before the symlink is
+  // followed, which is the opposite of what the OS does (see resolvePhysical).
+  const real = resolvePhysical(primaryReal, requested);
 
   // Containment is decided against the canonical (realpath) roots so a symlink
   // that escapes is still caught. The return value, however, is re-anchored

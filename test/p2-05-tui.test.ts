@@ -174,6 +174,7 @@ test('F05-06: Esc within the 30ms flush window commits the tail exactly once', a
       gate.stall!(); // let the aborted generator complete
       await tick(120); // well past 30ms: a still-armed flush would have re-painted by now
       const frame = strip(lastFrame() ?? '');
+      assert.equal((frame.match(/interrupted/g) ?? []).length, 1, 'Escape and stop acknowledge the interruption once');
       const n = frame.split(TAIL).length - 1;
       assert.equal(n, 1, `the committed tail appears exactly once (got ${n})`);
     } finally {

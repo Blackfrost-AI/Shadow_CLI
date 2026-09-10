@@ -191,6 +191,9 @@ export function makeRunShell(
         const child = spawn(sandbox.argv[0]!, sandbox.argv.slice(1), {
           cwd: ctx.workspaceRoot,
           env: scrubbedEnv(allowlist),
+          // Empty stdin (see the foreground spawn below): a detached background job that reads
+          // stdin would otherwise hold a pipe open for the life of the session.
+          stdio: ['ignore', 'pipe', 'pipe'],
           detached: !IS_WIN,
           windowsHide: true,
         });
@@ -219,6 +222,12 @@ export function makeRunShell(
         const child = spawn(sandbox.argv[0]!, sandbox.argv.slice(1), {
           cwd: ctx.workspaceRoot,
           env: scrubbedEnv(allowlist),
+          // Empty stdin: nothing may wedge waiting for input the agent will never type. Without
+          // this the child inherits an open pipe nobody writes or closes, so `cat`, `read`, a bare
+          // `python`/`node` REPL, `ssh`, `npm login` all block until the timeout (60s by default,
+          // and the reported failure is a misleading "timed out"). The sibling spawn sites in
+          // agent/diagnostics.ts and agent/formatter.ts already do exactly this.
+          stdio: ['ignore', 'pipe', 'pipe'],
           detached: !IS_WIN, // process-group leader so killTree can take the whole tree
           windowsHide: true,
         });

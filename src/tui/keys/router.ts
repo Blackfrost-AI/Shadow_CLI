@@ -2,7 +2,7 @@
  * P3-01 — the focus-owner router (replaces the old 900-line ordered `onKey` if-chain, F03-02).
  *
  * Contract (FRONTIER_LAUNCH_PLAN P3-01):
- *  1. ONE owner per frame claims the keystream: dialog, picker, search, vim, or composer.
+ *  1. ONE owner per frame claims the keystream: dialog, activity, picker, search, vim, or composer.
  *     Reserved chords (Ctrl-C/Ctrl-D exit arming, Ctrl-X editor arming) resolve BEFORE owner
  *     routing; bracketed paste (and mouse/DSR) are transports ABOVE the owners (P1A-14).
  *  2. Precedence is DATA — the FOCUS_OWNERS array below is the single source of truth and its
@@ -16,6 +16,7 @@
  *     acceptance witness.
  */
 import { composerOwner } from './composerOwner.js';
+import { activityOwner } from './activityOwner.js';
 import { dialogOwner } from './dialogOwner.js';
 import { pickerOwner } from './pickerOwner.js';
 import { searchOwner } from './searchOwner.js';
@@ -28,6 +29,7 @@ import type { FocusOwnerHandler, InkKey, KeyEnv } from './types.js';
  *
  *   dialog   — an open approval/question gate owns everything (type-ahead guard re-routes
  *              in-flight typing to the composer; a paste can never decide).
+ *   activity — a snapshot of tool details captures navigation and protects the hidden draft.
  *   picker   — the model picker captures navigation, swallows the rest.
  *   search   — an open Ctrl-R search owns the line; its WAKE chord (Ctrl-R) also resolves at
  *              this slot so it lands ABOVE vim — a focus owner is consulted before a mode.
@@ -37,6 +39,7 @@ import type { FocusOwnerHandler, InkKey, KeyEnv } from './types.js';
  */
 export const FOCUS_OWNERS: readonly FocusOwnerHandler[] = [
   dialogOwner,
+  activityOwner,
   pickerOwner,
   searchOwner,
   vimOwner,

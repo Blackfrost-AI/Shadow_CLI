@@ -81,8 +81,9 @@ test('after a resize DOWN settles, streaming does not flicker (no persistent wip
   bus.emit({ type: 'text', delta: 'streaming answer line one\nline two\nline three' });
   await tick(60);
   stdout.rows = 7; stdout.emit('resize'); // shrink to a small pane mid-stream
-  await tick(80);
-  stdout.writes.length = 0; // ignore the one-frame resize transient; measure STEADY STATE from here
+  await tick(220);
+  assert.equal(wipes(stdout), 1, 'one settled replay restores the transcript; no stale-geometry overflow reset');
+  stdout.writes.length = 0; // measure ordinary streaming after the settled geometry replay
   // more renders at the new size (further streaming + a spinner-like status change)
   bus.emit({ type: 'text', delta: '\nline four\nline five\nline six' });
   await tick(80);

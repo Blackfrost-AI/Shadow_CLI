@@ -99,6 +99,17 @@ export const editFile: Tool<EditFileInput, EditFileData> = {
           `old_string matches ${result.count} times. Add surrounding lines to make it unique, or pass replace_all: true.`,
         );
       }
+      // Named explicitly: a 0-length pattern used to report "old_string matches N times", which
+      // sends the model into an "add more context" loop instead of telling it the real problem.
+      if (result.reason === 'empty') {
+        return fail(
+          'edit_file',
+          'write',
+          Date.now() - start,
+          'empty_old_string',
+          'old_string is empty. It must be the exact text to replace — quote the lines you want to change (with enough surrounding context to be unique).',
+        );
+      }
       const near = nearestMatch(text, input.old_string);
       const tail = near ? `\n\nClosest region of the file — compare it against your old_string:\n${near}` : '';
       if (result.reason === 'ambiguous') {

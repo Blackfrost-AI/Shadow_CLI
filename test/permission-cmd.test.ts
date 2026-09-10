@@ -34,3 +34,15 @@ test('applyPermissionCommand clear wipes rules', () => {
   assert.equal(r.ok, true);
   if (r.ok) assert.equal(r.rules.length, 0);
 });
+test('/permissions add refuses a pattern that is not a valid regex (nothing is stored)', () => {
+  // A stored broken pattern behaved differently from what `/permissions list` showed, so the writer
+  // rejects it at the moment the user can still fix the typo.
+  // The command grammar is whitespace-tokenized, so the pattern must be one token.
+  const r = applyPermissionCommand([], 'add deny run_shell /rm-rf(/'  );
+  assert.equal(r.ok, false);
+  assert.match(r.message, /not a valid regular expression/i);
+  // …and a good one still lands.
+  const ok = applyPermissionCommand([], 'add deny run_shell /rm-rf/');
+  assert.equal(ok.ok, true);
+  assert.equal(ok.rules.length, 1);
+});

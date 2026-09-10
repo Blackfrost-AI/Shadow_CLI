@@ -26,6 +26,17 @@ export const DEFAULT_LOCAL_GPU_LAYERS = 999;
 export { LLAMA_INSTALL_HINT } from '../gguf.js';
 
 /** Sanitize a raw string into a safe, readable preset label (alnum . _ -). */
+/** A readable default label for an endpoint entry: the host, plus the port when it is not the default. */
+function endpointLabel(endpoint: string): string {
+  try {
+    const u = new URL(endpoint);
+    const port = u.port && u.port !== '80' && u.port !== '443' ? `:${u.port}` : '';
+    return `${u.hostname}${port}`;
+  } catch {
+    return endpoint;
+  }
+}
+
 export function sanitizeLocalName(raw: string): string {
   const cleaned = raw
     .trim()
@@ -103,6 +114,15 @@ export interface LocalAddOptions {
   name?: string;
   ctx?: number;
   gpuLayers?: number;
+  /**
+   * `--endpoint <url>`: register an ALREADY-RUNNING OpenAI-compatible server (a DGX Spark, a
+   * workstation, a lab box) instead of a local file to launch. Such an entry runs nothing locally
+   * and is marked `autoModel`, so it tracks whatever that server is serving without a config edit
+   * each time the model changes.
+   */
+  endpoint?: string;
+  /** `--model <id>`: pin a specific id for the endpoint. Omit for auto-detection. */
+  model?: string;
 }
 
 /**
@@ -114,6 +134,8 @@ export function parseLocalAddArgs(tokens: string[]): PresetResult<LocalAddOption
   let name: string | undefined;
   let ctx: number | undefined;
   let gpuLayers: number | undefined;
+  let endpoint: string | undefined;
+  let model: string | undefined;
   for (let i = 0; i < tokens.length; i++) {
     const t = tokens[i]!;
     if (t === '--name') {
@@ -137,19 +159,58 @@ export function parseLocalAddArgs(tokens: string[]): PresetResult<LocalAddOption
       gpuLayers = n;
       continue;
     }
+    // `--endpoint <url>` is the LAN-box form: register a server that is already running rather than
+    // a local file to launch. Accepted as a flag so it can appear anywhere in the argument list.
+    if (t === '--endpoint' || t === '--url') {
+      const v = tokens[++i];
+      if (v === undefined) return { ok: false, message: `Missing value after ${t}.` };
+      endpoint = v;
+      continue;
+    }
+    if (t === '--model') {
+      const v = tokens[++i];
+      if (v === undefined) return { ok: false, message: 'Missing value after --model.' };
+      model = v;
+      continue;
+    }
     if (t.startsWith('--')) return { ok: false, message: `Unknown flag: ${t}` };
+    // A bare http(s) URL in the path slot is the same request spelled the obvious way:
+    // `local add http://10.0.0.31:30000/v1`.
+    if (path === undefined && /^https?:\/\//i.test(t)) {
+      endpoint = t;
+      continue;
+    }
     if (path === undefined) {
       path = t;
       continue;
     }
     return { ok: false, message: `Unexpected argument: ${t}` };
   }
+  if (endpoint !== undefined) {
+    const url = endpoint.trim().replace(/\/+$/, '');
+    try {
+      const u = new URL(url);
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new Error('scheme');
+    } catch {
+      return { ok: false, message: `--endpoint must be an http(s) base URL, got "${endpoint}".` };
+    }
+    return { ok: true, value: defined({ path: '', name, ctx, gpuLayers, endpoint: url, model }) };
+  }
   if (!path)
     return {
       ok: false,
-      message: 'Usage: local add <path-to.gguf> [--name <name>] [--ctx <n>] [--gpu-layers <n>]',
+      message:
+        'Usage: local add <path-to.gguf> [--name <n>] [--ctx <n>] [--gpu-layers <n>]\n' +
+        '       local add --endpoint <http://<host>:<port>/v1> [--name <n>] [--model <id>]',
     };
-  return { ok: true, value: { path, name, ctx, gpuLayers } };
+  return { ok: true, value: defined({ path, name, ctx, gpuLayers, model }) };
+}
+
+/** Drop unset keys so the success shape stays exact — callers deep-compare these options. */
+function defined<T extends object>(o: T): T {
+  const out = {} as Record<string, unknown>;
+  for (const [k, v] of Object.entries(o)) if (v !== undefined) out[k] = v;
+  return out as T;
 }
 
 /**
@@ -158,6 +219,28 @@ export function parseLocalAddArgs(tokens: string[]): PresetResult<LocalAddOption
  * (non-fatal heads-up the caller should surface, e.g. a small --ctx).
  */
 export function buildLocalEntry(opts: LocalAddOptions): PresetResult<ModelEntry> & { note?: string } {
+  // An ENDPOINT entry: a server that is already running elsewhere (a DGX, a workstation, a lab
+  // box). Nothing is launched and no file is validated — the endpoint IS the model source, and
+  // `autoModel` makes the entry follow whatever that server currently serves.
+  if (opts.endpoint) {
+    const label = opts.name?.trim() || endpointLabel(opts.endpoint);
+    return {
+      ok: true,
+      value: {
+        label,
+        provider: 'openai',
+        // The declared id is the FALLBACK for an unreachable box; auto-detection overrides it.
+        model: opts.model?.trim() || 'auto',
+        baseUrl: opts.endpoint,
+        autoModel: true,
+        // A LAN inference box pauses far longer between SSE chunks than a hosted API.
+        idleTimeoutMs: 300_000,
+        firstByteTimeoutMs: 300_000,
+        ...(opts.ctx ? { contextWindow: opts.ctx } : {}),
+      },
+    };
+  }
+
   const raw = opts.path?.trim();
   if (!raw)
     return {
@@ -277,9 +360,14 @@ export function addLocalModel(
   return { ok: true, value: { models: next.value, entry: built.value }, ...(built.note ? { note: built.note } : {}) };
 }
 
-/** Every registered local preset (gguf / mlx / vllm), in config order. */
+/** True for an entry that is served somewhere else and TRACKED rather than launched here. */
+export function isEndpointModel(m: ModelEntry): boolean {
+  return Boolean(m.autoModel && m.baseUrl && !m.gguf && !m.mlx && !m.vllm);
+}
+
+/** Every registered local preset (gguf / mlx / vllm / LAN endpoint), in config order. */
 export function listLocalModels(models: ModelEntry[]): ModelEntry[] {
-  return models.filter((m) => Boolean(m.gguf) || Boolean(m.mlx) || Boolean(m.vllm));
+  return models.filter((m) => Boolean(m.gguf) || Boolean(m.mlx) || Boolean(m.vllm) || isEndpointModel(m));
 }
 
 /** Remove a local preset by name (rejects unknown / non-local names). */
@@ -287,7 +375,7 @@ export function removeLocalModel(models: ModelEntry[], name: string): PresetResu
   if (!name) return { ok: false, message: 'Usage: local remove <name>' };
   const target = models.find((m) => m.label.trim().toLowerCase() === name.trim().toLowerCase());
   if (!target) return { ok: false, message: `No local model named "${name}".` };
-  if (!target.gguf && !target.mlx && !target.vllm)
+  if (!target.gguf && !target.mlx && !target.vllm && !isEndpointModel(target))
     return { ok: false, message: `"${name}" is not a locally-served model; use /model remove.` };
   return removeModelPreset(models, name);
 }
@@ -296,9 +384,16 @@ export function removeLocalModel(models: ModelEntry[], name: string): PresetResu
 export function formatLocalList(models: ModelEntry[]): string[] {
   const locals = listLocalModels(models);
   if (locals.length === 0)
-    return ['No local models registered. Add one with: local add <path-to.gguf | mlx-folder | mlx-community/model>'];
+    return [
+      'No local models registered.',
+      'Add one with: local add <path-to.gguf | mlx-folder | mlx-community/model>',
+      '    or a LAN endpoint: local add --endpoint http://<host>:<port>/v1 [--name <n>]',
+    ];
   return locals.map((m) => {
     const state = m.disabled ? 'disabled' : 'enabled';
+    if (isEndpointModel(m)) {
+      return `${m.label}  ·  ${m.baseUrl}  ·  lan endpoint  ·  auto-detects the served model  ·  ${state}`;
+    }
     if (m.mlx) {
       const target = m.mlx.includes('/') && !m.mlx.startsWith('/') ? m.mlx : basename(m.mlx);
       return `${m.label}  ·  ${target}  ·  mlx  ·  ${state}`;
