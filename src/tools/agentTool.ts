@@ -23,6 +23,57 @@ const inputSchema = z.object({
   run_in_background: z.boolean().optional(),
 });
 
+/**
+ * Ceiling-stopped sub-agents used to deliver NOTHING: `stopReason: 'max_iterations' | 'budget'`
+ * with an empty `finalAnswer` surfaced as "agent stopped by its max_iterations ceiling before
+ * producing an answer" — every partial finding the agent had gathered was silently lost (the
+ * harness bug that stalled two review agents mid-report). Instead, give the stopped agent ONE
+ * closing pass with tools disabled: its context already holds everything it did, so it can
+ * summarize findings. The salvage call goes straight to the provider (no loop, no tools, no
+ * budget) and is best-effort: on any failure we fall back to the honest ceiling message.
+ *
+ * `max_iterations` ONLY — never `budget`. A budget/wall-clock stop is a HARD spend limit; the
+ * P3-09 exhausted-parent contract (test/p3-09-subagent-budget.test.ts) is that no provider call
+ * happens at all once the tree's ceiling is spent, and salvage would violate it. max_iterations
+ * is different: the agent ran (≥1 provider call guaranteed, the cap is ≥1) and simply ran out of
+ * steps — summarizing its existing context is exactly the useful thing to spend one call on.
+ */
+async function salvageFinalAnswer(deps: LoopDeps): Promise<string | null> {
+  try {
+    const messages = deps.context.messages();
+    if (messages.length === 0) return null;
+    deps.context.append({
+      role: 'user',
+      content: [
+        {
+          type: 'text',
+          text:
+            'You stopped because your iteration/budget ceiling was reached. Do NOT start new work and you have no tools. ' +
+            'From everything you have already done in this conversation, output your report or findings now, ' +
+            'clearly labeled as PARTIAL (produced under the ceiling). If you had nothing to report, say so.',
+        },
+      ],
+    });
+    let text = '';
+    for await (const ev of deps.provider.send({
+      model: deps.model,
+      system: deps.system,
+      messages: deps.context.messages(),
+      tools: [],
+      maxOutputTokens: 2048,
+      signal: deps.signal,
+    })) {
+      if (deps.signal.aborted) return null;
+      if (ev.type === 'text') text += ev.delta;
+      if (ev.type === 'done') break;
+    }
+    const report = text.trim();
+    return report || null;
+  } catch {
+    return null; // salvage is best-effort; the ceiling message is the fallback
+  }
+}
+
 export interface AgentToolDeps {
   /** Per-invocation loop deps. MUST carry the session's live gate (not auto-approve) so a
    *  sub-agent is bound by the same permission posture as the main loop. */
@@ -259,6 +310,10 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
             const cancelled = res.stopReason === 'interrupted';
             // P3-09: a ceiling-stopped agent must not masquerade as a completed one — say what stopped it.
             const budgetStopped = res.stopReason === 'budget' || res.stopReason === 'max_iterations';
+            // Ceiling-stop salvage: one tool-less closing pass so partial findings reach the parent
+            // instead of an empty notification (see salvageFinalAnswer). max_iterations only — a
+            // budget/wall-clock stop is a hard spend limit and must not trigger any provider call.
+            const answer = res.stopReason === 'max_iterations' && !cancelled ? (await salvageFinalAnswer(loopDeps)) ?? null : null;
             if (base.hooks?.subagent_stop?.length) {
               runHookPhase('subagent_stop', base.hooks.subagent_stop, { workspaceRoot: subWorkspaceRoot, extra: { agentType, taskId, result: cancelled ? 'bg_cancelled' : 'bg_done' } });
             }
@@ -269,7 +324,7 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
               taskId: taskId!,
               answer: cancelled
                 ? 'agent cancelled by user'
-                : res.finalAnswer || (budgetStopped ? `agent stopped by its ${res.stopReason} ceiling before producing an answer` : ''),
+                : res.finalAnswer || answer || (budgetStopped ? `agent stopped by its ${res.stopReason} ceiling before producing an answer` : ''),
               fromSubagent: agentType,
             });
           } catch (e) {
@@ -327,6 +382,13 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         // Sync target: the IMMEDIATE parent budget — alive for this agent's whole run, and its own
         // finish-time roll-up carries the combined total onward.
         accrue(parentBudget);
+        // P3-09: a ceiling-stopped agent must not masquerade as a completed one — say what stopped it.
+        const budgetStopped = result.stopReason === 'budget' || result.stopReason === 'max_iterations';
+        // Ceiling-stop salvage: one tool-less closing pass so partial findings reach the parent
+        // instead of an empty result (see salvageFinalAnswer). max_iterations only — a budget/
+        // wall-clock stop is a hard spend limit and must not trigger any provider call.
+        const salvage = result.stopReason === 'max_iterations' ? (await salvageFinalAnswer(loopDeps)) ?? null : null;
+        const answer = result.finalAnswer || salvage || '';
         if (base.hooks?.subagent_stop?.length) {
           runHookPhase('subagent_stop', base.hooks.subagent_stop, { workspaceRoot: subWorkspaceRoot, extra: { agentType, result: 'done' } });
         }
@@ -334,17 +396,15 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         // TOTAL spend once — otherwise sub-agent tokens would silently vanish from /cost.
         { const snap = budget.snapshot(Date.now()); base.bus.emit({ type: 'subagent_usage', costUSD: budget.currentCostUSD, subagent: agentType, taskId, inputTokens: snap.inputTokens, outputTokens: snap.outputTokens }); }
         base.bus.emit({ type: 'subagent_end', taskId, ok: true, subagentType: agentType });
-        const data = { answer: result.finalAnswer };
+        const data = { answer };
         if (worktreeCleanupPath) {
           try { removeWorktree(ctx.workspaceRoot, worktreeCleanupPath); } catch {}
         }
-        // P3-09: a ceiling-stopped agent must not masquerade as a completed one — say what stopped it.
-        const budgetStopped = result.stopReason === 'budget' || result.stopReason === 'max_iterations';
         return ok(
           'agent',
           'read',
           Date.now() - start,
-          result.finalAnswer || (budgetStopped ? `Sub-agent stopped by its ${result.stopReason} ceiling before producing an answer.` : 'Sub-agent completed.'),
+          answer || (budgetStopped ? `Sub-agent stopped by its ${result.stopReason} ceiling before producing an answer.` : 'Sub-agent completed.'),
           data,
         );
       } catch (e) {

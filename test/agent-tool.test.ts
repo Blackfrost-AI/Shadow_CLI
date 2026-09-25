@@ -324,3 +324,70 @@ test('listWorktrees exercises real git porcelain output for managed worktrees', 
     rmSync(base, { recursive: true, force: true });
   }
 });
+
+// Regression (harness stall bug): a sub-agent stopped by its max_iterations ceiling must
+// SALVAGE its partial findings via one tool-less closing pass, instead of delivering an
+// empty "stopped by its ceiling" notification.
+test('max_iterations sub-agent salvage pass delivers a PARTIAL report', async () => {
+  const ws = mkdtempSync(join(tmpdir(), 'salvage-'));
+  try {
+    const registry = new ToolRegistry();
+    registerBuiltinTools(registry);
+    let salvageRequested = false;
+    const provider = new MockProvider([
+      // turn 1: burn the iteration cap with a tool call
+      [
+        { type: 'tool_call', call: { id: 'r1', name: 'read_file', input: { path: 'a.txt' } } },
+        { type: 'done', stopReason: 'tool_use' },
+      ],
+      // salvage pass: provider.send() with tools:[] → the closing report
+      (messages) => {
+        salvageRequested = true;
+        void messages;
+        return [
+          { type: 'text', delta: 'PARTIAL: I reviewed budget.ts and approval.ts; both look clean.' },
+          { type: 'usage', inputTokens: 0, outputTokens: 0 },
+          { type: 'done', stopReason: 'end_turn' },
+        ];
+      },
+    ]);
+    const makeLoopDeps = (): LoopDeps => ({
+      provider,
+      registry,
+      gate: new ScriptedApprovalGate([], 'allow'),
+      bus: new EventBus(),
+      budget: new Budget({ maxIterations: 1 }, 'mock', PRICE, Date.now()),
+      context: new Context({ contextBudget: 1_000_000, triggerRatio: 0.75, keepLastTurns: 6 }),
+      signal: new AbortController().signal,
+      model: 'mock',
+      system: 'test',
+      maxOutputTokens: 1024,
+      workspaceRoot: ws,
+      dryRun: false,
+      maxToolResultChars: 16_000,
+      contextBudget: 1_000_000,
+    });
+    const tool = makeAgentTool({
+      makeLoopDeps,
+      getAutonomy: () => 'manual',
+      contextBudget: 1_000_000,
+      triggerRatio: 0.75,
+      keepLastTurns: 6,
+      maxIterations: 1,
+      priceTable: PRICE,
+    });
+    const ctx: ToolContext = { workspaceRoot: ws, signal: new AbortController().signal, log: () => {}, dryRun: false };
+    const res = await tool.run({ prompt: 'review the codebase' }, ctx);
+    assert.equal(salvageRequested, true, 'the salvage pass must run on a ceiling stop');
+    assert.ok(
+      String(res.summary).includes('PARTIAL'),
+      `the ceiling-stopped agent's report must reach the parent, got: ${res.summary}`,
+    );
+    assert.ok(
+      String((res.data as { answer?: string }).answer).includes('PARTIAL'),
+      'the structured answer field must carry the salvage report too',
+    );
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
