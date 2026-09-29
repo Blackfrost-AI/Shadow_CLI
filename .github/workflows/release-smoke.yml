@@ -27,9 +27,11 @@ jobs:
           - runner: windows-2022
             label: Windows PowerShell 5.1
             shell: powershell.exe
+            command_shell: powershell
           - runner: windows-2022
             label: Windows PowerShell 7
             shell: pwsh.exe
+            command_shell: pwsh
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
@@ -44,4 +46,5 @@ jobs:
         with:
           node-version: '22'
       - name: Verify signed binaries and installer safety
+        shell: ${{ matrix.command_shell || 'bash' }}
         run: node scripts/smoke-release.mjs

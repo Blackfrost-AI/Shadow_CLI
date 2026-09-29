@@ -156,7 +156,19 @@ function Verify-Download($binPath, $assetName, $baseUrl) {
       if ($parts.Length -ge 2 -and $parts[1] -eq $assetName) { $expected = $parts[0].ToLower(); break }
     }
     if (-not $expected) { Die "no checksum entry for '$assetName' in the signed SHASUMS256.txt." }
-    $actual = (Get-FileHash -Algorithm SHA256 -Path $binPath).Hash.ToLower()
+    # Use the .NET API directly: PowerShell 5.1 must not depend on Get-FileHash
+    # module discovery or inherit a PowerShell 7 module-path requirement.
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    $stream = $null
+    try {
+      $stream = [IO.File]::OpenRead($binPath)
+      $actual = ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '').ToLowerInvariant()
+    } catch {
+      Die "cannot hash the downloaded binary: $($_.Exception.Message)"
+    } finally {
+      if ($stream) { $stream.Dispose() }
+      $sha.Dispose()
+    }
     if ($actual -ne $expected) { Die "CHECKSUM MISMATCH for $assetName`n       expected (signed): $expected`n       actual (download): $actual`n       aborting (corrupted or tampered)." }
 
     # only reachable once the signature verified (every failure path above aborts)
