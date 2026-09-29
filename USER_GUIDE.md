@@ -20,9 +20,9 @@ instructions, and security model, see the [README](README.md); this guide is the
 
 ```bash
 # macOS / Linux
-curl -fsSL https://shadow.redpillreader.com/install.sh | sh
+curl -fsSL https://blackfrostai.com/shadow/install.sh | sh
 # Windows (PowerShell)
-irm https://shadow.redpillreader.com/install.ps1 | iex
+irm https://blackfrostai.com/shadow/install.ps1 | iex
 
 shadow update        # pull the latest build in place
 shadow --version

@@ -5,7 +5,7 @@ process — everything here runs against this repository alone, with no private 
 
 **Audience:** contributors and anyone building their own artifacts.
 
-**Current release baseline:** `v8.7.0`.
+**Current release baseline:** `v8.7.1`.
 
 > **Maintainer note:** the *official* release pipeline (binary hosting, signing keys) is private
 > and intentionally not part of this repo. This guide covers the parts that are.
@@ -23,7 +23,7 @@ process — everything here runs against this repository alone, with no private 
 ```bash
 git clone https://github.com/Blackfrost-AI/Shadow_CLI.git && cd Shadow_CLI
 npm ci            # reproducible install from package-lock.json
-npm test          # full suite (currently 1,298 tests) — must be 100% green before any release
+npm test          # full suite — must be 100% green before any release
 npm run typecheck:all # strict source + test typecheck
 npm run lint      # style (0 errors)
 ```
@@ -43,7 +43,7 @@ This refuses to proceed if, in shipped code:
 
 - `DEV_UNRESTRICTED` is hard-coded on (the workspace jail + OS sandbox would be silently off),
 - the embedded web UI assets are stale,
-- a checked-in `dist/` differs from a fresh production build (a clean mirror with no `dist/` is
+- a generated `dist/` differs from a fresh production build (a clean mirror with no `dist/` is
   built and validated in the same pass),
 - the test script no longer globs the whole suite with a timeout.
 

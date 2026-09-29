@@ -1,6 +1,6 @@
 {
   "name": "shadow",
-  "version": "8.7.1-dev.0",
+  "version": "8.7.1",
   "description": "Shadow — a high-performance, agentic CLI runtime that lets an LLM operate as a coding/sysadmin agent over a local workspace.",
   "type": "module",
   "private": true,
@@ -31,19 +31,20 @@
     "check:release-gate": "bash scripts/check-release-gate.sh",
     "prepublishOnly": "bash scripts/check-release-gate.sh",
     "prepack": "bash scripts/check-release-gate.sh",
-    "release:dev": "npm version prerelease --preid=dev -m \"release: %s\" && git push --follow-tags",
-    "release:patch": "npm version patch -m \"release: %s\" && git push --follow-tags",
-    "release:minor": "npm version minor -m \"release: %s\" && git push --follow-tags",
+    "release:dev": "npm version prerelease --preid=dev -m \"release: %s\"",
+    "release:patch": "npm version patch -m \"release: %s\"",
+    "release:minor": "npm version minor -m \"release: %s\"",
     "setup:hooks": "git config core.hooksPath .githooks",
     "check:assets": "node scripts/check-webui-assets.mjs",
     "build:webui-vendor": "tsc -p tsconfig.web.json",
-    "prepare": "git config core.hooksPath .githooks || true"
+    "prepare": "git config core.hooksPath .githooks || true",
+    "version": "node scripts/release-version.mjs --sync && git add README.md"
   },
   "license": "MIT",
   "dependencies": {
     "ink": "^5.1.0",
     "react": "^18.3.1",
-    "undici": "^8.10.0",
+    "undici": "^8.11.2",
     "zod": "^3.24.1",
     "zod-to-json-schema": "^3.23.0"
   },

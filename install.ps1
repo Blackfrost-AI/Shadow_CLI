@@ -1,10 +1,10 @@
 # Shadow installer for Windows (PowerShell) — fetches the single self-contained
 # binary (no Node/npm needed to run it).
 #
-#   irm https://shadow.redpillreader.com/install.ps1 | iex
+#   irm https://blackfrostai.com/shadow/install.ps1 | iex
 #
 # Optional environment overrides:
-#   SHADOW_INSTALL_BASE  base URL for binaries  (default: https://shadow.redpillreader.com/bin)
+#   SHADOW_INSTALL_BASE  base URL for binaries  (default: https://storage.googleapis.com/blackfrost-ai-prod-shadow-releases/bin)
 #   SHADOW_INSTALL_DIR   install location       (default: %LOCALAPPDATA%\Programs\shadow)
 #
 # Safe to re-run: it replaces any prior copy and never duplicates your PATH entry.
@@ -167,7 +167,7 @@ function Verify-Download($binPath, $assetName, $baseUrl) {
 }
 
 # ── resolve source URL + install location ─────────────────────────────────────
-$base  = if ($env:SHADOW_INSTALL_BASE) { $env:SHADOW_INSTALL_BASE } else { 'https://shadow.redpillreader.com/bin' }
+$base  = if ($env:SHADOW_INSTALL_BASE) { $env:SHADOW_INSTALL_BASE } else { 'https://storage.googleapis.com/blackfrost-ai-prod-shadow-releases/bin' }
 $asset = 'shadow-windows-x64.exe'   # must match the served file + its SHASUMS256.txt entry
 $url   = "$base/$asset"
 

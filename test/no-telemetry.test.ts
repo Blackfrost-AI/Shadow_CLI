@@ -96,7 +96,7 @@ const HOST_SNAPSHOT = [
   'platform.moonshot.ai', // catalog preset console link
   'platform.openai.com', // catalog preset console link
   'raw.githubusercontent.com', // update channel metadata
-  'shadow.redpillreader.com', // binary release origin (signed manifest)
+  'storage.googleapis.com', // Blackfrost binary release bucket (signed manifest)
   'z.ai', // catalog preset console link
 ];
 

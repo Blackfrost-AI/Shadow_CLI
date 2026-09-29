@@ -1094,6 +1094,11 @@ async function main(): Promise<void> {
     return;
   }
   if (argv[0] === 'update') {
+    if (argv.includes('--offline')) {
+      process.stderr.write('offline mode: updates require network access; no update was attempted.\n');
+      process.exitCode = 1;
+      return;
+    }
     await runUpdate();
     return;
   }

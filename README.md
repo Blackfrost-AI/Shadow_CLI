@@ -6,7 +6,7 @@
 
 > **A true gift of freedom and privacy.**
 > Zero-telemetry · provider-neutral · phone home to no one.
-> Current build: **`v8.7.0`** — credentials and endpoints that describe themselves, on top of a deep-review hardening pass. **Codex/ChatGPT subscription auth works end to end**: import the credential your official Codex CLI already minted (`shadow login import codex`) and Shadow sends it to the ChatGPT backend it belongs to — with the account/product headers and the Responses wire that endpoint requires, never to any other host — and refreshes it automatically before it expires (`shadow login status` shows the state, the endpoint and the opt-in gate). **LAN inference servers now self-describe**: register a box with `shadow local add --endpoint http://<host>:<port>/v1` (or set `autoModel: true` on a preset) and Shadow asks it what it is serving on every start — using that model id and its reported context window — so restarting the box with a different model needs no config edit, while an unreachable box is reported by name and falls back to the declared id. On top of the v8.6.0 line: the web endpoint harness (Endpoints pane, port-resolver doctor, bounded LAN scan, one-click promotion), Models-pane connection editing and Test endpoint/response checks, source-faithful draft copying, and the self-hosting guide; then the v8.5.0 onboarding model discovery and the v8.4.0 UX parity line (first-run auto-onboard, Shift+Tab plan mode, Ctrl+X M model picker, `/export html`, LSP diagnostics after writes, `/goal` mission mode). This release also carries a 26-fix deep review: filesystem-jail and shell-classifier escapes, redaction gaps, cross-turn edit guards, a cubic-time text-recovery scanner that could freeze a session, and coalesced-input handling in the TUI. Paste-safe input since v8.0.2: a pasted line sits in the composer as text; only a typed Enter submits.
+> Current build: **`v8.7.1`** — Blackfrost hosting transition. Windows installs support built-in PowerShell 5.1; PowerShell 7 is optional.
 
 **Shadow is a zero-telemetry, provider-neutral coding agent that runs on your terms.** Point it at any model — Anthropic, any OpenAI-compatible endpoint, Gemini, or a local model on your own box — and it works as a coding / sysadmin agent over your workspace. **No Shadow account, no signup, no phone-home:** the only outbound traffic is the provider *you* chose and the web tools the agent explicitly invokes. Your config stays local and readable (`~/.shadow/config.json`), your keys never leave your machine, and you can switch models mid-session **without losing context**.
 
@@ -16,7 +16,19 @@ Under the hood it's a **tool-calling agentic runtime**: the model reasons, emits
 
 This is **not a chat app** — it is a tool-calling runtime.
 
-## 🔥 What's new in v8.7.0
+## What's new in v8.7.1
+
+- Installers and standalone updates now use Blackfrost's signed release bucket.
+- Existing binary users can run `shadow update` once through the legacy host to receive this transition, then future updates use Blackfrost.
+- Windows PowerShell 5.1 remains supported. Signature checks are mandatory by default; no extra PowerShell installation is required. Standalone self-update verifies and replaces the binary directly without spawning PowerShell.
+- `shadow doctor --privacy` identifies manual release downloads separately from optional version checks.
+- `shadow update --offline` refuses before making a request.
+- Updated compatible dependency versions to resolve the reported Undici and js-yaml advisories.
+- Includes the previously published fix for preserving partial sub-agent findings at the iteration limit.
+
+The product page and installer entrypoints are at [blackfrostai.com/shadow](https://blackfrostai.com/shadow). Source releases and binary releases have separate publication steps.
+
+## Previous highlights: v8.7.0
 
 - **🔑 Subscription auth that carries its own endpoint.** An imported Codex/ChatGPT credential is now used *whole*: the bearer travels with the base URL, the account/product identity headers and the wire it is bound to, instead of being recombined by hand. If a configured `baseUrl` is not the backend that token belongs to, Shadow **refuses** it and says so rather than quietly sending a ChatGPT credential somewhere else. Tokens refresh themselves before they expire (they live about an hour), and `shadow login status` reports the stored credential, its endpoint, its expiry and the opt-in gate — a stored-but-inactive credential used to be indistinguishable from no credential at all. `shadow login import codex` imports; `shadow login codex` explains.
 - **🔌 Inference boxes that describe themselves.** Mark a preset `autoModel` (or run `shadow local add --endpoint http://<host>:<port>/v1`) and Shadow asks the box what it is serving on **every start**, using that model id and the context window the endpoint reports — so restarting a self-hosted box with a different model needs no config edit at all. A base URL written with or without `/v1` self-corrects, and the three failure causes are told apart: unreachable, reachable-with-nothing-loaded, and an unrecognized catalogue. All of them are non-fatal: Shadow names the box, keeps the model id the preset declares, and boots.
@@ -54,25 +66,25 @@ Per-version detail ships with each release.
 
 ## Install
 
-Shadow ships as a single self-contained binary (no Node needed to run it). The installer is served from **this GitHub repo** so its pinned signing key can't be swapped by the download host.
+Shadow ships as a single self-contained binary (no Node needed to run it). The installers are served from **blackfrostai.com/shadow**, with reviewed copies in this repository. They verify the signed manifest using a pinned release key.
 
 ### macOS / Linux
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Blackfrost-AI/Shadow_CLI/main/install.sh | sh
+curl -fsSL https://blackfrostai.com/shadow/install.sh | sh
 ```
 
 ### Windows (PowerShell)
 
 ```powershell
-irm https://raw.githubusercontent.com/Blackfrost-AI/Shadow_CLI/main/install.ps1 | iex
+irm https://blackfrostai.com/shadow/install.ps1 | iex
 ```
 
 The installer detects your platform, downloads the matching binary, **verifies it** (see below), and drops it on your `PATH`. **Update:** `shadow update`. **Uninstall:** delete the binary (`rm "$(command -v shadow)"`).
 
 ### Verifying the download 🔒
 
-Shadow is a security tool, so the installer **fails closed**. It downloads `SHASUMS256.txt` plus an ECDSA‑P256 signature (`SHASUMS256.txt.sig`) made with an **offline** release key, verifies that signature against the public key **pinned in the installer**, and only then checks the binary's SHA‑256 against the signed manifest. A compromised download host can't forge the signature, so a tampered binary is rejected — the install aborts. (Verification uses `openssl` on macOS/Linux; on Windows, PowerShell 7.1+ verifies via `ImportFromPem` and Windows PowerShell 5.1 — stock Windows — verifies via .NET Framework's native ECDSA; runtimes with neither abort.) The release public key is [`public/bin/SHASUMS256.pub`](https://shadow.redpillreader.com/bin/SHASUMS256.pub) and is embedded in `install.sh`/`install.ps1` — read them before piping to a shell.
+Shadow is a security tool, so the installer **fails closed**. It downloads `SHASUMS256.txt` plus an ECDSA‑P256 signature (`SHASUMS256.txt.sig`) made with an **offline** release key, verifies that signature against the public key **pinned in the installer**, and only then checks the binary's SHA‑256 against the signed manifest. A compromised download host can't forge the signature, so a tampered binary is rejected — the install aborts. (Verification uses `openssl` on macOS/Linux; on Windows, PowerShell 7.1+ verifies via `ImportFromPem` and Windows PowerShell 5.1 — stock Windows — verifies via .NET Framework's native ECDSA; runtimes with neither abort.) The release public key is [`public/bin/SHASUMS256.pub`](https://storage.googleapis.com/blackfrost-ai-prod-shadow-releases/bin/SHASUMS256.pub) and is embedded in `install.sh`/`install.ps1` — read them before piping to a shell.
 
 ### Build from source (optional)
 

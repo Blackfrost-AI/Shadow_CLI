@@ -446,7 +446,7 @@ Playwright preset (`network: true, sandbox: false`) runs `npx -y @playwright/mcp
 registry at first connect (skipped under --offline).
 **OPT-IN/USER-INITIATED:** (9) update check (`checkUpdate.ts:84`) — default FALSE, once/day, plain GET
 of public package.json, no params/headers/body, 3s cap, TUI-only. (10) `shadow update` binary
-(`binary.ts:40`) — signed-manifest-first; asset path reveals OS/arch to shadow.redpillreader.com.
+(`binary.ts:40`) — signed-manifest-first; asset path reveals OS/arch to storage.googleapis.com/blackfrost-ai-prod-shadow-releases/bin.
 (11) OAuth scaffold (`oauth.ts:62`) — auth.openai.com, only via explicit `shadow login codex`; token
 exchange unwired. (12) onboarding connection test (`onboard.ts:665`) — user-chosen host via the
 provider stream path, key registered with the redactor BEFORE the test. (13) Context Cooler
@@ -477,3 +477,7 @@ review or delete exports before committing a workspace.
 
 *If you find a gap between this document and the code, that's a bug in one of them — please report
 it. Honesty here is a feature we ship.*
+
+## Hosting transition in 8.7.1
+
+Manual binary updates use the Blackfrost release bucket named above. Signed-manifest-first verification, the pinned ECDSA key, response-size limits, SHA-256 verification, offline enforcement, redirect refusal, and rejection of environment-selected update mirrors are unchanged. This download path is listed by `shadow doctor --privacy`. The installer entrypoints are at `https://blackfrostai.com/shadow`.

@@ -8,7 +8,8 @@
  *
  * The only things that can send traffic in a session are: (a) the model provider, (b) the explicit
  * web_fetch / web_search tools, (c) configured MCP servers — including the npm-registry package resolve
- * an npx-launched one performs on first connect, (d) the opt-in update check, (d2) the opt-in plugin-index
+ * an npx-launched one performs on first connect, (d) the opt-in update check and explicit binary update,
+ * (d2) the opt-in plugin-index
  * lookup (off unless `pluginIndexUrl` is set) plus the user-run `shadow plugin add <git-url>` clone,
  * (e) a configured vision endpoint (describe_media uploads the image bytes there), (f) the one-time
  * HuggingFace weight download when a repo-id model preset is first served, and (g) user-configured
@@ -27,6 +28,7 @@ import { legacyCredentialsExist } from '../state/globalStore.js';
 import { available as keychainAvailable } from '../auth/keychain.js';
 import { detectLspServers } from '../agent/lsp/detect.js';
 import { resolveBaseUrl } from '../config.js';
+import { BINARY_RELEASE_BASE } from '../update/release.js';
 
 const UPDATE_HOST = 'raw.githubusercontent.com';
 const PROVIDER_DEFAULT_BASE: Record<string, string> = {
@@ -233,6 +235,17 @@ export function buildPrivacyReport(cfg: PrivacyConfigView, env: PrivacyEnv): Pri
     note: !updateOn ? 'off (default) — makes zero calls' : offline ? 'suppressed in offline mode' : 'payload-free version GET, at most once/day',
   });
   if (updateOn && !offline) warnings.push(`Opt-in update check will contact ${UPDATE_HOST} at most once a day (no identifiers sent).`);
+
+  // Explicit standalone self-update is separate from the optional daily version check.
+  egress.push({
+    name: 'Binary update',
+    target: BINARY_RELEASE_BASE,
+    active: !offline,
+    scope: 'opt-in',
+    note: offline
+      ? 'blocked in offline mode'
+      : 'only on `shadow update` for a standalone install; signed manifest and platform binary GETs; no background download',
+  });
 
   // (d2) Plugin index (P3-07) — Shadow ships with NO central catalog; this path exists only if the
   // user set `pluginIndexUrl` themselves (global-only key — a project file cannot set it). When a

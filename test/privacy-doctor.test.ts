@@ -58,6 +58,18 @@ test('opt-in update check ON is reported as live egress + a warning', () => {
   assert.ok(r.warnings.some((w) => w.includes('raw.githubusercontent.com')));
 });
 
+test('manual binary downloads disclose the Blackfrost bucket separately from version checks', () => {
+  const report = buildPrivacyReport({ provider: 'openai' }, baseEnv());
+  const binary = find(report, 'Binary update');
+  assert.equal(binary.target, 'https://storage.googleapis.com/blackfrost-ai-prod-shadow-releases/bin');
+  assert.equal(binary.scope, 'opt-in');
+  assert.equal(binary.active, true);
+  assert.match(binary.note ?? '', /only on `shadow update`/);
+  assert.equal(find(report, 'Update check').active, false);
+  const offline = buildPrivacyReport({ provider: 'openai' }, baseEnv({ offline: true }));
+  assert.equal(find(offline, 'Binary update').active, false);
+});
+
 test('an http MCP server is surfaced as an outbound connector + warning; a command server is a local process', () => {
   const cfg: PrivacyConfigView = {
     provider: 'openai',

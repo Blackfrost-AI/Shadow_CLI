@@ -354,7 +354,7 @@ test('max_iterations sub-agent salvage pass delivers a PARTIAL report', async ()
     const makeLoopDeps = (): LoopDeps => ({
       provider,
       registry,
-      gate: new ScriptedApprovalGate([], 'allow'),
+      gate: new ScriptedApprovalGate([], 'approve'),
       bus: new EventBus(),
       budget: new Budget({ maxIterations: 1 }, 'mock', PRICE, Date.now()),
       context: new Context({ contextBudget: 1_000_000, triggerRatio: 0.75, keepLastTurns: 6 }),

@@ -9,8 +9,8 @@ import {
 } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { shadowFetch } from '../safety/egress.js';
+import { BINARY_RELEASE_BASE } from './release.js';
 
-const DEFAULT_RELEASE_BASE = 'https://shadow.redpillreader.com/bin';
 const MAX_BINARY_BYTES = 512 * 1024 * 1024;
 const MAX_METADATA_BYTES = 1024 * 1024;
 
@@ -32,7 +32,7 @@ function releaseAsset(): string {
 function releaseBase(): string {
   // Self-update deliberately ignores installer environment overrides. The signature prevents
   // forged binaries, while a poisoned mirror could still replay an old signed release (rollback).
-  const parsed = new URL(DEFAULT_RELEASE_BASE);
+  const parsed = new URL(BINARY_RELEASE_BASE);
   return parsed.toString().replace(/\/+$/, '');
 }
 

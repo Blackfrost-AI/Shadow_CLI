@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { windowsPowerShell } from '../src/update/winShell.js';
 
-// install.ps1 fails closed below PowerShell 7.1 (ECDSA verification needs .NET 5+), so the
-// Windows self-update must spawn pwsh when it exists instead of the built-in 5.1 powershell.
+// Legacy shell selection prefers pwsh when present. The installer also supports stock
+// PowerShell 5.1, and current standalone self-update does not spawn either shell.
 
 test('prefers pwsh when the PATH probe finds it', () => {
   const probed: string[][] = [];
