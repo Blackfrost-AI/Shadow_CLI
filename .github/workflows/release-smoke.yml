@@ -1,7 +1,8 @@
 name: Signed release smoke
 on:
   push:
-    branches: [release/blackfrost-8.7.1]
+    branches: ['release/**']
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       legacy_bridge:
@@ -27,11 +28,9 @@ jobs:
           - runner: windows-2022
             label: Windows PowerShell 5.1
             shell: powershell.exe
-            command_shell: powershell
           - runner: windows-2022
             label: Windows PowerShell 7
             shell: pwsh.exe
-            command_shell: pwsh
     name: ${{ matrix.label }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
@@ -45,6 +44,10 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
+      - name: Verify stock PowerShell 5.1 installer and signed binary
+        if: matrix.shell == 'powershell.exe'
+        shell: powershell
+        run: node scripts/smoke-release.mjs
       - name: Verify signed binaries and installer safety
-        shell: ${{ matrix.command_shell || 'bash' }}
+        if: matrix.shell != 'powershell.exe'
         run: node scripts/smoke-release.mjs
