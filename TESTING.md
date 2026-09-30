@@ -12,15 +12,23 @@ The normal install is the signed, self-contained binary (no Node runtime require
 curl -fsSL https://raw.githubusercontent.com/Blackfrost-AI/Shadow_CLI/main/install.sh | sh
 ```
 
-For source testing, use **Node ≥ 20** and build the checkout so `dist/` matches the source under test:
+For source testing, use **Node ≥ 22.19.0** and build the checkout so `dist/` matches the source under test:
 
 ```sh
-npm install
+npm ci
 npm run build
 npm link                      # then run: shadow --help
 ```
 
 Windows testers can use the signed PowerShell installer documented in `README.md`.
+
+Ink is the supported default terminal; pi is an opt-in experimental preview. Use the
+[renderer contract](TERMINAL_RENDERERS.md) when checking command/key claims. The signed release
+workflow covers Linux x64/ARM64, macOS Intel/ARM64, and native Windows Server 2022 with both
+PowerShell 5.1 and 7. It exercises installation to a path with spaces, repeat installation,
+offline-update refusal, self-update without PowerShell on PATH, and rejection of invalid
+signatures, altered binaries and missing signatures. These artifact smokes do not imply that
+every interactive terminal/platform combination has been qualified for pi.
 
 ## First run
 
@@ -78,8 +86,8 @@ all three axes below and record any unsupported surface explicitly.
 | Browser control | MCP tool schemas remain provider-neutral | `enable browser` persists the pinned Playwright preset without replacing other MCP entries; tools register as `mcp_playwright_*` after restart; risk remains `exec` | isolated visible Chrome navigates/clicks/reads a deterministic local page; disable key is `playwright`; missing Chrome/npx fails actionably |
 | Self-hosted generation | OpenAI-compatible request shape and tool parsing | local/LAN endpoint, context budget, temperature, cancellation | configured temperature applies only to self-hosted models and is visible in `/config get temperature` |
 | Qwen open weights | native, Hermes/XML, JSON, and DeepSeek-style textual calls; self-hosted Qwen 3.5/3.8 `reasoning_content` survives multi-step tool turns | exact model id, local sampling, context-window clamp, abort-safe fallback | streamed tool scaffolding never appears in scrollback; capability probe completes against the target endpoint |
-| Surface parity | same history and safety invariants in each supported surface | TUI, headless/REPL, web session, editor (ACP) | divergences are named, never implied: live steering is currently TUI-only; web and ACP sessions reject a second prompt while busy; round-table mode asks the user to wait or interrupt; ACP v0 is text-only with no session restore |
-| Editor integration (ACP) | JSON-RPC 2.0 / ACP v1 over stdio; `agent_message_chunk` / `tool_call` / `plan` updates; text-only prompts in v0 | `session/new` only inside allowlisted project dirs (jail re-resolved every turn); tool approval bridged to the editor's `session/request_permission`, fail-closed on any ambiguity; no new egress | `shadow acp --add-project` is repeatable/idempotent; a full prompt round-trip streams chunks + tool updates over a real wire; cancel → `cancelled`; a busy second prompt is rejected; a refusal names the remediation |
+| Surface parity | same history and safety invariants in each supported surface | TUI, headless/REPL, web session, editor (ACP) | divergences are named, never implied: live steering is currently TUI-only; web and ACP sessions reject a second prompt while busy; round-table mode asks the user to wait or interrupt; the ACP adapter accepts text only |
+| Editor integration (ACP) | JSON-RPC 2.0 / ACP v1 over stdio; streamed message/tool/plan updates, persisted session loading, modes, model options and versioned `_shadow/work/*` extension | sessions remain inside allowlisted project dirs (jail re-resolved every turn); editor-mediated approval fails closed; model changes are limited to before the first prompt | add-project is idempotent; prompt/load/close round-trips, cancellation, busy-prompt rejection and explicit Work Center controls are regression-tested |
 | Egress / network posture | every outbound request flows the broker (`shadowFetch`): offline wall → SSRF tier → DNS pin-set → receipt | `--offline` denies below the broker — process-wide undici dispatcher on Node, `globalThis.fetch` wall in the Bun binary; local serves still pass; MCP HTTP honors deadline + caller abort | `shadow egress` prints the disk receipt from a fresh process; `/connections` shows the session aggregate; new hardcoded hosts fail the snapshot guard |
 
 Deterministic coverage belongs in the default suite:

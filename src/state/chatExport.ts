@@ -1,8 +1,9 @@
-import { chmodSync, mkdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { SessionLog } from './session.js';
 import { friendlyDeniedReason } from '../util/deniedReason.js';
 import { resolveWithin } from '../safety/workspaceJail.js';
+import type { ContentBlock, Message } from '../provider/provider.js';
 
 export interface ExportMeta {
   version: string;
@@ -37,6 +38,128 @@ interface SessionEvent {
   subagentType?: string;
   answer?: string;
   fromSubagent?: string;
+}
+
+/** Convert the latest durable Context snapshot into the same compact record vocabulary the
+ * exporters already consume. A resumed log starts with a snapshot rather than replaying all old
+ * bus events, so ignoring this record silently drops the restored conversation. */
+function snapshotEvents(record: Record<string, unknown>): SessionEvent[] {
+  const data = record.data as { messages?: Message[] } | undefined;
+  if (!Array.isArray(data?.messages)) return [];
+  const ts = typeof record.ts === 'string' ? record.ts : undefined;
+  const out: SessionEvent[] = [];
+  const calls = new Map<string, { name: string; input: unknown }>();
+  const textOf = (blocks: ContentBlock[]): string =>
+    blocks
+      .filter((block): block is Extract<ContentBlock, { type: 'text' }> => block.type === 'text')
+      .map((block) => block.text)
+      .filter((text) => text.trim().length > 0)
+      .join('\n');
+
+  for (const message of data.messages) {
+    const blocks = Array.isArray(message.content) ? message.content : [];
+    if (message.role === 'assistant') {
+      const text = textOf(blocks);
+      if (text) out.push({ kind: 'event', type: 'assistant_done', text, ts });
+      for (const block of blocks) {
+        if (block.type === 'tool_use') calls.set(block.id, { name: block.name, input: block.input });
+      }
+      continue;
+    }
+    const results = blocks.filter(
+      (block): block is Extract<ContentBlock, { type: 'tool_result' }> => block.type === 'tool_result',
+    );
+    for (const result of results) {
+      const call = calls.get(result.toolCallId);
+      out.push({
+        kind: 'event',
+        type: 'tool_end',
+        call: { name: call?.name ?? 'tool', input: call?.input },
+        result: { ok: result.ok, summary: result.content },
+        ts,
+      });
+    }
+    // A user-role tool-result turn is protocol plumbing, not a human prompt. Its optional text
+    // blocks are model-facing notes, so do not mislabel them as the user's words in the export.
+    if (message.role === 'user' && results.length === 0) {
+      const text = textOf(blocks);
+      if (text) out.push({ kind: 'user', task: text, ts });
+    }
+  }
+  return out;
+}
+
+/** Replay the journal while honoring explicit resume and rewind lineage markers. Ordinary context
+ * snapshots remain checkpoints, so they cannot erase reasoning, errors, or other audit events. */
+function loadSessionForExport(path: string): unknown[] {
+  let buf: Buffer;
+  try {
+    buf = readFileSync(path);
+  } catch {
+    return [];
+  }
+  const resolvedSnapshots = new Map(
+    SessionLog.loadSnapshotRecords(path).map(({ record, offset }) => [offset, record] as const),
+  );
+  const timeline: unknown[] = [];
+  let current = timeline;
+  const stateAtSnapshot = new Map<number, unknown[]>();
+  let lastSnapshotOffset: number | undefined;
+  let start = 0;
+  for (let index = 0; index <= buf.length; index++) {
+    if (index < buf.length && buf[index] !== 0x0a) continue;
+    const offset = start;
+    const line = buf.subarray(start, index).toString('utf8');
+    start = index + 1;
+    if (!line.trim()) continue;
+    let parsed: SessionEvent & Record<string, unknown>;
+    try {
+      parsed = JSON.parse(line) as SessionEvent & Record<string, unknown>;
+    } catch {
+      continue; // best-effort: a torn line must not prevent export of durable records
+    }
+    if (parsed.kind === 'context_snapshot') {
+      lastSnapshotOffset = offset;
+      stateAtSnapshot.set(offset, [...current]);
+      continue;
+    }
+    if (parsed.kind === 'resumed_from') {
+      // A resume seeds a NEW log from a snapshot. Earlier journal rows in that new log are not
+      // part of the restored lineage; use the snapshot as its only available transcript source.
+      const snapshot = lastSnapshotOffset === undefined ? undefined : resolvedSnapshots.get(lastSnapshotOffset);
+      if (snapshot) {
+        current = snapshotEvents(snapshot);
+        stateAtSnapshot.set(lastSnapshotOffset!, [...current]);
+      }
+      continue;
+    }
+    if (parsed.kind === 'rewound_to') {
+      const source = typeof parsed.sourceSnapshotOffset === 'number' ? parsed.sourceSnapshotOffset : undefined;
+      const durable = typeof parsed.durableSnapshotOffset === 'number' ? parsed.durableSnapshotOffset : undefined;
+      if (source !== undefined) {
+        const prior = stateAtSnapshot.get(source);
+        const snapshot = resolvedSnapshots.get(source);
+        if (prior) current = [...prior];
+        else if (snapshot) current = snapshotEvents(snapshot);
+      }
+      // The durable snapshot was appended BEFORE this marker. Override the state captured when
+      // that line was first encountered so a later rewind can target this lineage correctly.
+      if (durable !== undefined) stateAtSnapshot.set(durable, [...current]);
+      continue;
+    }
+    current.push(parsed);
+  }
+  // Legacy snapshot-only logs predate explicit lineage markers. They have no journal transcript
+  // to preserve, so the newest reconstructed snapshot is still better than an empty export.
+  const hasTranscript = current.some((raw) => {
+    const event = raw as SessionEvent;
+    return event.kind === 'user' || event.kind === 'event';
+  });
+  if (!hasTranscript && lastSnapshotOffset !== undefined) {
+    const snapshot = resolvedSnapshots.get(lastSnapshotOffset);
+    if (snapshot) return snapshotEvents(snapshot);
+  }
+  return current;
 }
 
 /** Display cap for a tool result's summary in exports (envelopes can run to ~maxToolResultChars). */
@@ -392,7 +515,7 @@ export function exportSession(opts: {
   format?: ExportFormat;
   meta: ExportMeta;
 }): { path: string; bytes: number } {
-  const events = SessionLog.load(opts.sessionPath);
+  const events = loadSessionForExport(opts.sessionPath);
   const format: ExportFormat = opts.format ?? 'markdown';
   const body = format === 'html' ? sessionToHtml(events, opts.meta) : sessionToMarkdown(events, opts.meta);
   const stamp = opts.meta.exportedAt.replace(/:/g, '-');

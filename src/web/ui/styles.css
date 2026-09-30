@@ -1212,6 +1212,19 @@ body[data-sb='collapsed'] .sb-foot {
   text-align: right;
   overflow-wrap: anywhere;
 }
+.det-kv .mini {
+  border: 1px solid var(--sw-border-2);
+  border-radius: 6px;
+  background: var(--sw-bg-module);
+  color: var(--sw-t-secondary);
+  font: var(--sw-f-xxxs-strong);
+  padding: 2px 6px;
+  cursor: pointer;
+}
+.det-kv .mini:hover {
+  color: var(--sw-t-primary);
+  border-color: var(--sw-border-4);
+}
 
 /* json tree */
 .json {

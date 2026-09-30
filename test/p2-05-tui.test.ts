@@ -262,7 +262,7 @@ test('F05-07: chart label/value columns pad by display width, truncation never s
 test('F05-07: flatten hanging prefix keeps wrapped rows aligned (display-width measured)', () => {
   const theme: ViewportTheme = {
     fg: '#ffffff', dim: '#888888', green: '#00ff00', cyan: '#00ffff',
-    yellow: '#ffff00', red: '#ff0000', purple: '#ff00ff',
+    yellow: '#ffff00', red: '#ff0000', purple: '#ff00ff', userBg: '#1e3a4d',
   };
   const item: FlattenItem = {
     id: 1,
@@ -270,10 +270,24 @@ test('F05-07: flatten hanging prefix keeps wrapped rows aligned (display-width m
     text: `❯ ${'word '.repeat(40).trim()}`, // wraps several rows at 40 cols
   };
   const lines = flattenItem(item, 40, false, theme);
-  const rows = lines.map((l) => l.spans.map((s) => s.text).join('')).filter((t) => t !== '');
+  const content = lines.filter((l) => l.spans.some((x) => x.text.trim() !== ''));
+  const rows = content.map((l) => l.spans.map((s) => s.text).join('')).filter((t) => t !== '');
   assert.ok(rows.length > 1, 'the prompt wrapped');
-  for (const text of rows) {
-    assert.ok(text.startsWith(String.fromCodePoint(0x258c) + ' '), `every row carries the gutter bar: ${JSON.stringify(text.slice(0, 4))}`);
+  // v9: the user-turn marker is a background BAND (the only filled row in the transcript), not a
+  // per-line ▌ gutter — every wrapped row carries the same 2-col inset + band span, which is
+  // what keeps wrapped rows aligned now.
+  for (let i = 0; i < content.length; i++) {
+    const spans = content[i]!.spans;
+    // The band runs down EVERY wrapped row (the v9 marker replacing the ▌ gutter). Continuation
+    // rows start mid-span after word-wrap, so the check is "row carries band spans", not a
+    // literal inset span — only row 0 of each source line carries the 2-col inset.
+    assert.ok(
+      spans.some((x) => x.bg === theme.userBg),
+      `row ${i} carries the band`,
+    );
+    const text = spans.map((x) => x.text).join('');
+    assert.ok(!text.includes(String.fromCodePoint(0x258c)), 'no legacy gutter glyph');
     assert.ok(displayWidth(text) <= 40, `row fits the budget (${displayWidth(text)} cols)`);
   }
+  assert.ok(content[0]!.spans[0]!.text === '  ', 'the first row carries the 2-col inset');
 });

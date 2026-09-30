@@ -165,7 +165,7 @@ test('@types/react matches the React actually installed', () => {
 });
 
 test('mirror scrub tools are committed privately and excluded from the public mirror', () => {
-  const hasPrivateReleaseRecipe = existsSync(new URL('deployment_instructions.md', root));
+  const hasPrivateReleaseRecipe = existsSync(new URL('docs/internal/deployment_instructions.md', root));
   const hasScrubber = existsSync(new URL('scripts/scrub-mirror.py', root));
   const hasScanner = existsSync(new URL('scripts/scan-mirror.py', root));
   if (!hasPrivateReleaseRecipe) {

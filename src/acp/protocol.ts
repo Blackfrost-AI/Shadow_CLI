@@ -18,8 +18,13 @@ export const M_SESSION_LOAD = 'session/load';
 export const M_SESSION_PROMPT = 'session/prompt';
 /** A NOTIFICATION (no response) — the editor cancels the running turn. */
 export const M_SESSION_CANCEL = 'session/cancel';
+export const M_SESSION_CLOSE = 'session/close';
 export const M_SESSION_SET_MODE = 'session/set_mode';
 export const M_SESSION_SET_MODEL = 'session/set_model';
+export const M_SESSION_SET_CONFIG_OPTION = 'session/set_config_option';
+/** Versioned Shadow extensions; ACP reserves underscore-prefixed methods for extensions. */
+export const M_SHADOW_WORK_LIST = '_shadow/work/list';
+export const M_SHADOW_WORK_CONTROL = '_shadow/work/control';
 
 // --- agent → client ----------------------------------------------------------
 /** Notification carrying one streamed session update (see U_* below). */
@@ -73,7 +78,7 @@ export interface AcpTextBlock {
   text: string;
 }
 
-/** v0 accepts TEXT ONLY; anything else is refused (see promptCapabilities). */
+/** This ACP v1 adapter accepts text only; anything else is refused (see promptCapabilities). */
 export type AcpContentBlock = AcpTextBlock | { type: string; [k: string]: unknown };
 
 export interface SessionNewParams {

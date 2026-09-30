@@ -11,6 +11,11 @@ import type { AgentSession } from '../src/agent/bootstrap.js';
 import type { StopReasonExt } from '../src/agent/events.js';
 import type { ToolResult } from '../src/tools/types.js';
 import type { RequestPermissionResult } from '../src/acp/protocol.js';
+import { SessionLog } from '../src/state/session.js';
+import { Context } from '../src/agent/context.js';
+import { recordWorkCenterSnapshot } from '../src/state/workCenterPersistence.js';
+import { mkdirSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 
 /**
  * The ACP server end-to-end over a REAL RpcPeer wire (fed JSON lines, captured JSON lines), with
@@ -110,15 +115,17 @@ const scripted =
 
 beforeEach(() => __resetRunLock());
 
-test('initialize advertises protocol v1, no auth, text-only prompts, no loadSession', async () => {
+test('initialize advertises protocol v1, durable loading, modes, and the versioned Work Center extension', async () => {
   const h = makeHarness(scripted(() => {}));
   const id = await h.rpc('initialize', { protocolVersion: 1, clientCapabilities: {} });
   await until(() => Boolean(h.responseFor(id)));
   assert.deepEqual(h.responseFor(id)!.result, {
     protocolVersion: 1,
     agentCapabilities: {
-      loadSession: false,
+      loadSession: true,
       promptCapabilities: { image: false, audio: false, embeddedContext: false },
+      sessionCapabilities: { close: {} },
+      _meta: { shadowWorkExtension: 1 },
     },
     authMethods: [],
     agentInfo: { name: 'Shadow CLI', version: '9.9.9-test' },
@@ -134,7 +141,7 @@ test('unknown method → -32601', async () => {
   await h.close();
 });
 
-test('authenticate / session/load / set_mode / set_model → unsupported (-32601) errors', async () => {
+test('authenticate remains unsupported while invalid load/mode/model requests are typed errors', async () => {
   const h = makeHarness(scripted(() => {}));
   const ids: number[] = [];
   ids.push(await h.rpc('authenticate', { methodId: 'x' }));
@@ -142,28 +149,94 @@ test('authenticate / session/load / set_mode / set_model → unsupported (-32601
   ids.push(await h.rpc('session/set_mode', { sessionId: 'x', modeId: 'm' }));
   ids.push(await h.rpc('session/set_model', { sessionId: 'x', modelId: 'm' }));
   await until(() => ids.every((i) => Boolean(h.responseFor(i))));
-  for (const i of ids) {
-    const err = h.responseFor(i)!.error;
-    assert.equal(err.code, -32601);
-    assert.match(err.message, /not supported/);
-  }
+  assert.equal(h.responseFor(ids[0]!)!.error.code, -32601);
+  for (const i of ids.slice(1)) assert.equal(h.responseFor(i)!.error.code, -32602);
   await h.close();
 });
 
-test('session/new against an allowlisted cwd creates an "acp" session with empty modes/models', async () => {
+test('session/new against an allowlisted cwd creates an "acp" session with advertised modes', async () => {
   const h = makeHarness(scripted(() => {}));
   const id = await h.rpc('session/new', { cwd: ALLOWED });
   await until(() => Boolean(h.responseFor(id)));
   const result = h.responseFor(id)!.result;
   assert.equal(typeof result.sessionId, 'string');
-  assert.deepEqual(result.modes, { modes: [] });
-  assert.deepEqual(result.models, { models: [] });
+  assert.equal(result.modes.currentModeId, 'auto-edit');
+  assert.deepEqual(result.modes.availableModes.map((mode: { id: string }) => mode.id), ['manual', 'auto-edit', 'full']);
+  assert.ok(Array.isArray(result.configOptions));
   const session = h.registry.get(result.sessionId);
   assert.ok(session);
   assert.equal(session.origin, 'acp');
   assert.equal(session.title, 'ws');
   assert.equal(session.autonomy(), 'auto-edit');
   await h.close();
+});
+
+test('ACP mode switching and the versioned Work Center extension operate on the same live session', async () => {
+  const h = makeHarness(scripted(() => {}));
+  const newId = await h.rpc('session/new', { cwd: ALLOWED });
+  await until(() => Boolean(h.responseFor(newId)));
+  const sessionId = h.responseFor(newId)!.result.sessionId as string;
+  const session = h.registry.get(sessionId)!;
+  session.bus.emit({ type: 'subagent_start', taskId: 'agent-acp', subagentType: 'review', background: true });
+
+  const listId = await h.rpc('_shadow/work/list', { sessionId });
+  await until(() => Boolean(h.responseFor(listId)));
+  assert.equal(h.responseFor(listId)!.result.version, 1);
+  assert.equal(h.responseFor(listId)!.result.items[0].id, 'agent-acp');
+
+  let cancelled = false;
+  const off = session.bus.on((event) => { if (event.type === 'cancel_subagent') cancelled = true; });
+  const cancelId = await h.rpc('_shadow/work/control', { sessionId, workId: 'agent-acp', action: 'cancel' });
+  await until(() => Boolean(h.responseFor(cancelId)));
+  off();
+  assert.equal(cancelled, true);
+
+  // Confirmation alone must never clone work that is still active: retry is a linked new run
+  // only after the original reaches a terminal state.
+  session.bus.emit({ type: 'subagent_start', taskId: 'agent-running', subagentType: 'review', background: true });
+  session.bus.emit({ type: 'subagent_retryable', taskId: 'agent-running' });
+  const earlyRetryId = await h.rpc('_shadow/work/control', {
+    sessionId,
+    workId: 'agent-running',
+    action: 'retry',
+    confirm: true,
+  });
+  await until(() => Boolean(h.responseFor(earlyRetryId)));
+  assert.equal(h.responseFor(earlyRetryId)!.error.code, -32602);
+
+  const modeId = await h.rpc('session/set_mode', { sessionId, modeId: 'manual' });
+  await until(() => Boolean(h.responseFor(modeId)));
+  assert.equal(session.autonomy(), 'manual');
+  await h.close();
+});
+
+test('session/load restores transcript history and persisted Work Center state without running a model', async () => {
+  mkdirSync(ALLOWED, { recursive: true });
+  const log = SessionLog.open(ALLOWED);
+  const context = new Context({ contextBudget: 10000, triggerRatio: 0.75, keepLastTurns: 2 });
+  context.append({ role: 'user', content: [{ type: 'text', text: 'old question' }] });
+  context.append({ role: 'assistant', content: [{ type: 'text', text: 'old answer' }] });
+  log.recordSnapshot(context, 0);
+  recordWorkCenterSnapshot(log, {
+    version: 1,
+    capturedAt: Date.now(),
+    items: [{ id: 'old-work', type: 'subagent', status: 'completed', description: 'restored work', depth: 0, startedAt: 1, lastActivityAt: 2, activities: [] }],
+  });
+  const storedId = SessionLog.sessionIdFromPath(log.path);
+  const h = makeHarness(scripted(() => { throw new Error('load must not run a model'); }));
+  try {
+    const id = await h.rpc('session/load', { sessionId: storedId, cwd: ALLOWED, mcpServers: [] });
+    await until(() => Boolean(h.responseFor(id)));
+    assert.equal(h.responseFor(id)!.error, undefined);
+    assert.ok(h.updates().some((update) => update.params.update.sessionUpdate === 'user_message_chunk'));
+    assert.ok(h.updates().some((update) => update.params.update.sessionUpdate === 'agent_message_chunk'));
+    const list = await h.rpc('_shadow/work/list', { sessionId: storedId });
+    await until(() => Boolean(h.responseFor(list)));
+    assert.equal(h.responseFor(list)!.result.items[0].id, 'old-work');
+  } finally {
+    await h.close();
+    rmSync(join(ALLOWED, '.shadow'), { recursive: true, force: true });
+  }
 });
 
 test('session/new outside the allowlist is refused with remediation text', async () => {

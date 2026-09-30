@@ -22,6 +22,9 @@ import { spawn, spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import type { Message, Provider, ToolCall, ContentBlock, ImageBlock, Effort } from './provider/provider.js';
 import type { ToolRegistry } from './tools/registry.js';
+import type { BgRegistry } from './tools/bgShell.js';
+import type { WorkCenter } from './app/workCenter.js';
+import type { HistoricalWorkItem } from './state/workCenterPersistence.js';
 import { EventBus, type StopReasonExt } from './agent/events.js';
 import { Budget } from './agent/budget.js';
 import { maybeNotifyUpdate } from './update/checkUpdate.js';
@@ -73,6 +76,7 @@ import { resolve, isAbsolute } from 'node:path';
 import { friendlyDeniedReason } from './util/deniedReason.js';
 import type { VimFind, VimMode } from './tui/vim.js';
 import { runHookPhase } from './hooks/runner.js';
+import { SHADOW_ART as SHADOW_ART_SOURCE } from './tui/wordmark.js';
 
 import { effortOrDefault, effortSymbol } from './agent/effort.js';
 
@@ -319,6 +323,12 @@ export interface TuiOpts {
   version: string;
   styleState?: TuiStyleState;
   todoList?: TodoList;
+  /** Renderer-neutral projection of agents, background shells, and plan items. */
+  workCenter?: WorkCenter;
+  /** Authoritative background-shell registry used by Work Center controls. */
+  bgRegistry?: BgRegistry;
+  /** Read-only cross-session Work Center query. */
+  workHistory?: (session?: string) => HistoricalWorkItem[];
   planMode?: PlanModeState;
   /** Session /goal mission — drives the pinned HUD row and the /goal slash trio. */
   mission?: MissionState;
@@ -347,12 +357,9 @@ export interface TuiOpts {
 // --compile bundler ASCII-escapes the block glyphs to \uXXXX, and String.raw would then keep that
 // escape LITERAL (the binary printed "██…" instead of the wordmark). A plain template
 // evaluates the escapes back to the real characters, so it renders under both Bun and Node.
-const SHADOW_ART = `███████╗██╗  ██╗ █████╗ ██████╗  ██████╗ ██╗    ██╗
-██╔════╝██║  ██║██╔══██╗██╔══██╗██╔═══██╗██║    ██║
-███████╗███████║███████║██║  ██║██║   ██║██║ █╗ ██║
-╚════██║██╔══██║██╔══██║██║  ██║██║   ██║██║███╗██║
-███████║██║  ██║██║  ██║██████╔╝╚██████╔╝╚███╔███╔╝
-╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝  ╚═════╝  ╚══╝╚══╝`.split('\n');
+// The full block-letter logo — one source of truth shared with the pi shell
+// (src/tui/wordmark.ts), which also carries the Bun plain-template-literal constraint.
+const SHADOW_ART = SHADOW_ART_SOURCE;
 
 /**
  * One-time welcome card. On a wide terminal it spans the full width with build
@@ -3844,6 +3851,12 @@ export {
 export { fitHud, type HudFit } from './tui/layout.js';
 
 export function runTui(opts: TuiOpts): Promise<void> {
+  // v9.0: the pi-engine shell (MCODE-class renderer) is reachable behind SHADOW_TUI=pi while
+  // it reaches parity with the 8.x Ink shell. The two own the terminal differently and cannot
+  // share a process. Dynamic import so the default path pays nothing for it.
+  if (process.env.SHADOW_TUI === 'pi') {
+    return import('./app/run.js').then((m) => m.runPiTui(opts));
+  }
   // Launch-time privacy: title → "Shadow" (hide cwd) + wipe scrollback (hide pre-launch shell
   // history from scroll-up). See startupSequence. Title is popped on exit via cleanup.
   const ownsTitle = !!process.stdout.isTTY;

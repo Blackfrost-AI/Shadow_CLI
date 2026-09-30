@@ -2,6 +2,7 @@ import type { ChildProcess } from 'node:child_process';
 import { z } from 'zod';
 import type { Tool, ToolResult } from './types.js';
 import { ok, fail } from './types.js';
+import type { WorkCenter } from '../app/workCenter.js';
 
 const MAX_CAPTURE = 8 * 1024 * 1024;
 const IS_WIN = process.platform === 'win32';
@@ -29,9 +30,16 @@ export interface BgProc {
 export class BgRegistry {
   private readonly procs = new Map<string, BgProc>();
   private seq = 0;
+  private workCenter?: WorkCenter;
+
+  /** Attach a WorkCenter for integrated tracking (optional) */
+  attachWorkCenter(wc: WorkCenter | undefined): void {
+    this.workCenter = wc;
+  }
 
   add(command: string, child: ChildProcess): BgProc {
     const id = `bash_${++this.seq}`;
+    const startedAt = Date.now();
     const proc: BgProc = {
       id,
       command,
@@ -43,24 +51,35 @@ export class BgRegistry {
       exitCode: null,
       signal: null,
       running: true,
-      startedAt: Date.now(),
+      startedAt,
     };
     child.stdout?.on('data', (d: Buffer) => {
-      if (proc.stdout.length < MAX_CAPTURE) proc.stdout += d.toString();
+      const chunk = d.toString();
+      if (proc.stdout.length < MAX_CAPTURE) proc.stdout += chunk;
+      // Track output activity in WorkCenter
+      this.workCenter?.addShellOutput(id, 'stdout', chunk);
     });
     child.stderr?.on('data', (d: Buffer) => {
-      if (proc.stderr.length < MAX_CAPTURE) proc.stderr += d.toString();
+      const chunk = d.toString();
+      if (proc.stderr.length < MAX_CAPTURE) proc.stderr += chunk;
+      this.workCenter?.addShellOutput(id, 'stderr', chunk);
     });
     child.on('close', (code, sig) => {
       proc.running = false;
       proc.exitCode = code;
       proc.signal = sig;
+      // Update WorkCenter status
+      const status = code === 0 ? 'completed' : 'failed';
+      this.workCenter?.updateShellStatus(id, status, code, sig);
     });
     child.on('error', () => {
       proc.running = false;
+      this.workCenter?.updateShellStatus(id, 'failed', null, null);
     });
     this.procs.set(id, proc);
     this.evictFinished();
+    // Register in WorkCenter
+    this.workCenter?.registerShell(id, command, startedAt);
     return proc;
   }
 
@@ -78,15 +97,21 @@ export class BgRegistry {
     return this.procs.get(id);
   }
 
+  /** List all background shells (for /work integration) */
+  list(): BgProc[] {
+    return Array.from(this.procs.values());
+  }
+
   kill(id: string, signal: NodeJS.Signals = 'SIGTERM'): boolean {
     const p = this.procs.get(id);
-    if (!p) return false;
+    if (!p || !p.running) return false;
     try {
       if (!IS_WIN && typeof p.child.pid === 'number') process.kill(-p.child.pid, signal);
       else p.child.kill(signal);
     } catch {
       /* already gone */
     }
+    this.workCenter?.cancelShell(id);
     return true;
   }
 

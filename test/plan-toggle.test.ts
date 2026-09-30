@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { PlanModeState } from '../src/agent/planMode.js';
+import { findTerminalCommand } from '../src/tui/commandCatalog.js';
 import { UNMIGRATED_ACTIONS } from '../src/tui/keybindings/defaultBindings.js';
 
 /**
@@ -12,7 +13,6 @@ import { UNMIGRATED_ACTIONS } from '../src/tui/keybindings/defaultBindings.js';
  */
 const TUI = readFileSync(new URL('../src/tui.tsx', import.meta.url), 'utf8');
 const COMPOSER = readFileSync(new URL('../src/tui/keys/composerOwner.ts', import.meta.url), 'utf8');
-const SLASH = readFileSync(new URL('../src/tui/slash.ts', import.meta.url), 'utf8');
 
 test('chat:cycleMode has a registered handler in the TUI', () => {
   // The default Chat binding 'shift+tab' → 'chat:cycleMode' shipped declared-but-unwired — the
@@ -38,9 +38,11 @@ test('the raw Shift+Tab fallback runs BEFORE the bare-Tab ring', () => {
   assert.ok(fallback < ring, 'the Shift+Tab branch must precede the bare-Tab ring');
 });
 
-test('/plan is advertised, dispatched, and live-safe mid-turn', () => {
-  assert.ok(SLASH.includes("name: '/plan'"), 'advertised in SLASH_COMMANDS');
-  assert.ok(SLASH.includes("case '/plan':"), 'dispatched by runSlash');
+test('/plan is advertised for both renderers and live-safe mid-turn', () => {
+  const plan = findTerminalCommand('/plan');
+  assert.ok(plan, 'advertised in the shared terminal command catalog');
+  assert.equal(plan.renderers.ink.handler, 'plan');
+  assert.equal(plan.renderers.pi.handler, 'plan');
   assert.match(COMPOSER, /SLASH_WHILE_RUNNING = new Set\([^)]*'\/plan'[^)]*\)/, 'runs live while a turn executes');
 });
 

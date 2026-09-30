@@ -15,6 +15,7 @@ import { MockProvider } from '../src/provider/mock.js';
 import type { LoopDeps } from '../src/agent/loop.js';
 import type { ToolContext } from '../src/tools/types.js';
 import type { AutonomyLevel } from '../src/safety/permissions.js';
+import type { CompletionRequest, Provider, ProviderEvent } from '../src/provider/provider.js';
 import { serializeContext, hydrateContext } from '../src/state/snapshot.js';
 import { listWorktrees } from '../src/tools/worktree.js';
 
@@ -146,6 +147,105 @@ test('agent with run_in_background returns taskId immediately (non blocking)', a
     const data = res.data as any;
     assert.ok(data.taskId && data.status === 'started', 'bg agent must return taskId immediately without awaiting full result');
     assert.ok(launched && launched.taskId === data.taskId, 'bg launch must emit bg_agent_launched for main ctx recording');
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+test('background agent pauses at a safe boundary, preserves context, and completes after resume', async () => {
+  const ws = mkdtempSync(join(tmpdir(), 'agent-pause-'));
+  try {
+    writeFileSync(join(ws, 'a.txt'), 'hello');
+    const registry = new ToolRegistry();
+    registerBuiltinTools(registry);
+    let turn = 0;
+    const provider: Provider = {
+      name: 'pause-test',
+      estimateTokens: () => 1,
+      async *send(_req: CompletionRequest): AsyncIterable<ProviderEvent> {
+        turn++;
+        if (turn === 1) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          yield { type: 'tool_call', call: { id: 'read-1', name: 'read_file', input: { path: 'a.txt' } } };
+          yield { type: 'done', stopReason: 'tool_use' };
+        } else {
+          yield { type: 'text', delta: 'finished after resume' };
+          yield { type: 'done', stopReason: 'end_turn' };
+        }
+      },
+    };
+    const bus = new EventBus();
+    const seen: string[] = [];
+    bus.on((event) => seen.push(event.type));
+    const makeLoopDeps = (): LoopDeps => ({
+      provider, registry, gate: new ScriptedApprovalGate([], 'approve'), bus,
+      budget: new Budget({ maxIterations: 5 }, 'mock', PRICE, Date.now()),
+      context: new Context({ contextBudget: 100000, triggerRatio: 0.75, keepLastTurns: 2 }),
+      signal: new AbortController().signal, model: 'mock', system: 'test', maxOutputTokens: 256,
+      workspaceRoot: ws, dryRun: false, maxToolResultChars: 1000, contextBudget: 100000,
+    });
+    const tool = makeAgentTool({ makeLoopDeps, getAutonomy: () => 'full', contextBudget: 100000, triggerRatio: 0.75, keepLastTurns: 2, maxIterations: 5, priceTable: PRICE });
+    const res = await tool.run({ prompt: 'read then finish', run_in_background: true }, { workspaceRoot: ws, signal: new AbortController().signal, log: () => {}, dryRun: false });
+    const taskId = res.data?.taskId;
+    assert.ok(taskId);
+    bus.emit({ type: 'pause_subagent', taskId });
+    const deadline = Date.now() + 1000;
+    while (!seen.includes('subagent_paused') && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.ok(seen.includes('subagent_paused'));
+    assert.equal(turn, 1, 'second provider call waits while paused');
+    bus.emit({ type: 'resume_subagent', taskId });
+    while (!seen.includes('subagent_end') && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.ok(seen.includes('subagent_resumed'));
+    assert.equal(turn, 2);
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+test('confirmed retry creates a linked new run and enforces the retry counter in memory', async () => {
+  const ws = mkdtempSync(join(tmpdir(), 'agent-retry-'));
+  try {
+    const registry = new ToolRegistry();
+    registerBuiltinTools(registry);
+    let builds = 0;
+    const bus = new EventBus();
+    const links: Array<{ taskId: string; retryOf: string; retryCount: number }> = [];
+    const ends: string[] = [];
+    bus.on((event) => {
+      if (event.type === 'subagent_retry_link') links.push(event);
+      if (event.type === 'subagent_end') ends.push(event.taskId);
+    });
+    const makeLoopDeps = (): LoopDeps => {
+      builds++;
+      const failFirst = builds === 1;
+      const provider: Provider = {
+        name: 'retry-test', estimateTokens: () => 1,
+        async *send(): AsyncIterable<ProviderEvent> {
+          if (failFirst) throw new Error('transient');
+          yield { type: 'text', delta: 'recovered' };
+          yield { type: 'done', stopReason: 'end_turn' };
+        },
+      };
+      return {
+        provider, registry, gate: new ScriptedApprovalGate([], 'approve'), bus,
+        budget: new Budget({ maxIterations: 3 }, 'mock', PRICE, Date.now()),
+        context: new Context({ contextBudget: 100000, triggerRatio: 0.75, keepLastTurns: 2 }),
+        signal: new AbortController().signal, model: 'mock', system: 'test', maxOutputTokens: 256,
+        workspaceRoot: ws, dryRun: false, maxToolResultChars: 1000, contextBudget: 100000,
+      };
+    };
+    const tool = makeAgentTool({ makeLoopDeps, getAutonomy: () => 'full', contextBudget: 100000, triggerRatio: 0.75, keepLastTurns: 2, maxIterations: 3, priceTable: PRICE });
+    const first = await tool.run({ prompt: 'retry me', run_in_background: true }, { workspaceRoot: ws, signal: new AbortController().signal, log: () => {}, dryRun: false });
+    const firstId = first.data?.taskId;
+    assert.ok(firstId);
+    const deadline = Date.now() + 2500;
+    while (!ends.includes(firstId) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+    bus.emit({ type: 'retry_subagent', taskId: firstId });
+    while (!links.length && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(links[0]?.retryOf, firstId);
+    assert.equal(links[0]?.retryCount, 1);
+    while (!ends.includes(links[0]!.taskId) && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 5));
+    assert.ok(ends.includes(links[0]!.taskId));
   } finally {
     rmSync(ws, { recursive: true, force: true });
   }

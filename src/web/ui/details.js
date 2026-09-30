@@ -10,6 +10,7 @@
 
 import { el } from './dom.js';
 import { fmtMs, fmtTok, fmtPct } from './util.js';
+import { getJson, postJson } from './api.js';
 
 /** A collapsible section. `open` defaults true unless told otherwise. */
 function section(title, kids, { open = true } = {}) {
@@ -96,6 +97,39 @@ export function createDetails(host, ctx) {
   );
 
   let queued = false;
+  let workSession = '';
+  let workItems = [];
+  let selectedWork = '';
+  let lastWorkFetch = 0;
+  let workFetching = false;
+  let workError = '';
+
+  const loadWork = async (sessionId, force = false) => {
+    if (!sessionId || workFetching || (!force && sessionId === workSession && Date.now() - lastWorkFetch < 500)) return;
+    workFetching = true;
+    try {
+      const data = await getJson(`/api/sessions/${encodeURIComponent(sessionId)}/work`);
+      workSession = sessionId;
+      workItems = Array.isArray(data.items) ? data.items : [];
+      lastWorkFetch = Date.now();
+    } catch {
+      workItems = [];
+    } finally {
+      workFetching = false;
+      refresh();
+    }
+  };
+
+  const control = async (sessionId, item, action) => {
+    try {
+      workError = '';
+      await postJson(`/api/sessions/${encodeURIComponent(sessionId)}/work/${encodeURIComponent(item.id)}/${action}`);
+      await loadWork(sessionId, true);
+    } catch (error) {
+      workError = error instanceof Error ? error.message : String(error);
+      refresh();
+    }
+  };
   const refresh = () => {
     if (queued) return; // trailing coalesce — one rebuild per frame at most
     queued = true;
@@ -108,6 +142,7 @@ export function createDetails(host, ctx) {
   const render = () => {
     const model = ctx.model?.() ?? null;
     const session = ctx.session?.() ?? null;
+    if (session?.id) void loadWork(session.id);
     const snap = model ? model.snapshot() : null;
 
     const kids = [];
@@ -174,6 +209,46 @@ export function createDetails(host, ctx) {
             ),
           ).node,
         );
+      }
+
+      if (workItems.length) {
+        const rows = workItems.map((item) => {
+          const open = selectedWork === item.id;
+          const buttons = [];
+          if (item.type === 'subagent' && item.background && ['queued', 'running', 'paused'].includes(item.status)) {
+            const action = item.status === 'paused' ? 'resume' : 'pause';
+            buttons.push(el('button', { class: 'mini', onClick: (e) => { e.stopPropagation(); void control(session.id, item, action); } }, [action]));
+            buttons.push(el('button', { class: 'mini', onClick: (e) => { e.stopPropagation(); void control(session.id, item, 'cancel'); } }, ['cancel']));
+          }
+          if (item.type === 'bgshell' && item.status === 'running') {
+            buttons.push(el('button', { class: 'mini', onClick: (e) => { e.stopPropagation(); void control(session.id, item, 'kill'); } }, ['kill']));
+          }
+          const summary = el('div', { class: 'det-kv', onClick: () => { selectedWork = open ? '' : item.id; refresh(); }, style: 'cursor:pointer;flex-wrap:wrap;' }, [
+            el('span', { class: 'k' }, [`${item.type} · ${item.id}`]),
+            el('span', { class: 'v' }, [item.status]),
+            ...buttons,
+          ]);
+          if (!open) return summary;
+          return el('div', {}, [
+            summary,
+            el('div', { class: 'json', style: 'padding:8px 12px;' }, [jsonNode({
+              description: item.description,
+              owner: item.owner,
+              depth: item.depth,
+              priority: item.priority,
+              currentActivity: item.currentActivity,
+              toolCalls: item.toolCalls,
+              tools: item.tools,
+              files: item.files,
+              tokens: item.inputTokens != null || item.outputTokens != null ? { input: item.inputTokens, output: item.outputTokens } : undefined,
+              exitReason: item.exitReason,
+              result: item.finalOutput,
+              recentActivity: item.activities?.slice(-10),
+            })]),
+          ]);
+        });
+        if (workError) rows.unshift(el('div', { class: 'det-kv' }, [el('span', { class: 'k' }, ['control failed']), el('span', { class: 'v' }, [workError])]));
+        kids.push(section(`Work Center (${workItems.length})`, rows).node);
       }
 
       // ---- pending approvals ----

@@ -9,6 +9,7 @@ import { redactString } from '../util/redact.js';
 import { stripAnsi } from '../util/lc.js';
 import { createSessionStream, type SessionStream } from './sessionStream.js';
 import { runLock } from './runLock.js';
+import { WorkCenter } from '../app/workCenter.js';
 
 /**
  * The session registry: a Map<id, WebSession>, each with its own EventBus + SSE stream, a
@@ -88,9 +89,13 @@ export interface WebSession {
 
   /** Display-only. NOT authoritative for the jail — resolveJail() re-derives that at build time. */
   readonly displayPath: string;
+  /** Existing transcript to hydrate on first build (ACP session/load only). */
+  readonly resumeSessionPath?: string;
 
   readonly bus: EventBus;
   readonly stream: SessionStream;
+  /** Renderer-neutral live work projection for web/API/ACP inspection and controls. */
+  readonly workCenter: WorkCenter;
 
   status: SessionStatus;
   /** redactString(stripAnsi(msg)), capped at 2 KB. Surfaced by GET /api/sessions. */
@@ -138,6 +143,7 @@ interface WebSessionInternal extends WebSession {
   getAbort?: () => AbortController | null;
   /** Only for browser-created sessions (create()) — swaps the mutable autonomy the getter reads. */
   setAutonomy?: (level: AutonomyLevel) => void;
+  setModel?: (model: string) => void;
 }
 
 export interface SessionSummary {
@@ -162,6 +168,8 @@ export interface CreateSessionSpec {
   autonomy?: AutonomyLevel;
   /** Who is driving the session. Defaults to 'web' (the browser). */
   origin?: 'web' | 'acp';
+  id?: string;
+  resumeSessionPath?: string;
 }
 
 /** Injected so the registry is unit-testable with no credentials, MCP or model server. */
@@ -194,6 +202,8 @@ export interface SessionRegistry {
   decide(id: string, approvalId: string, decision: ApprovalDecision): boolean;
   /** Change a browser-created session's autonomy (the composer's access pill). */
   setAutonomy(id: string, level: AutonomyLevel): boolean;
+  /** Change the configured model before the lazy agent is built. */
+  setModel(id: string, model: string): boolean;
   interrupt(id: string): boolean;
   remove(id: string): Promise<boolean>;
   each(fn: (s: WebSession) => void): void;
@@ -226,7 +236,10 @@ export function createSessionRegistry(deps: { builder: AgentBuilder; runTurn: Tu
     model: () => string;
     autonomy: () => AutonomyLevel;
     getAbort?: () => AbortController | null;
+    resumeSessionPath?: string;
   }): WebSessionInternal {
+    const workCenter = new WorkCenter();
+    workCenter.subscribe(init.bus);
     // Transport-gone path for parked approvals (the deny branch approvalGate.ts documents):
     // when the LAST browser detaches while an ask is pending, arm a grace timer — a tab that
     // comes back within the window (refresh, brief switch) stands it down; anything longer
@@ -266,8 +279,10 @@ export function createSessionRegistry(deps: { builder: AgentBuilder; runTurn: Tu
       createdAt: nowMs(),
       title: init.title,
       displayPath: init.displayPath,
+      resumeSessionPath: init.resumeSessionPath,
       bus: init.bus,
       stream,
+      workCenter,
       status: 'idle',
       lastError: null,
       model: init.model,
@@ -285,6 +300,8 @@ export function createSessionRegistry(deps: { builder: AgentBuilder; runTurn: Tu
       getAbort: init.getAbort,
       async close(): Promise<void> {
         this.status = 'closed';
+        this.bus.emit({ type: 'cancel_subagent', taskId: '*' });
+        this.bus.emit({ type: 'session_closed' });
         if (goneTimer) {
           clearTimeout(goneTimer);
           goneTimer = null;
@@ -314,6 +331,7 @@ export function createSessionRegistry(deps: { builder: AgentBuilder; runTurn: Tu
         }
         this.mcpClients = [];
         this.agent?.bg.killAll();
+        this.workCenter.unsubscribe();
         this.agent?.wakeup.clear();
         this.agent = null;
         this.jail = null;
@@ -465,19 +483,28 @@ export function createSessionRegistry(deps: { builder: AgentBuilder; runTurn: Tu
       // Q1: browser-created sessions default to auto-edit. Mutable via setAutonomy (the
       // composer's access pill) — held in a closure the getter and the setter share.
       let autonomy: AutonomyLevel = spec.autonomy ?? 'auto-edit';
+      let model = spec.model ?? '';
+      const requestedId = spec.id;
+      if (requestedId && (!/^[A-Za-z0-9_.:-]{1,200}$/.test(requestedId) || sessions.has(requestedId))) {
+        throw new Error('invalid or already-active session id');
+      }
       const s = makeSession({
-        id: randomBytes(8).toString('hex'),
+        id: requestedId ?? randomBytes(8).toString('hex'),
         origin: spec.origin ?? 'web',
         title: spec.title ?? 'New session',
         displayPath: spec.projectRoot,
         bus: new EventBus(),
         canPrompt: true,
         canInterrupt: true,
-        model: () => spec.model ?? '',
+        model: () => model,
         autonomy: () => autonomy,
+        resumeSessionPath: spec.resumeSessionPath,
       });
       s.setAutonomy = (level) => {
         autonomy = level;
+      };
+      s.setModel = (next) => {
+        model = next;
       };
       sessions.set(s.id, s);
       return s;
@@ -522,6 +549,13 @@ export function createSessionRegistry(deps: { builder: AgentBuilder; runTurn: Tu
       if (!s || !s.canPrompt || !s.setAutonomy) return false; // mirror/local sessions are read-only
       s.setAutonomy(level);
       s.bus.emit({ type: 'autonomy', level });
+      return true;
+    },
+
+    setModel(id: string, model: string): boolean {
+      const s = sessions.get(id);
+      if (!s || !s.canPrompt || !s.setModel || s.agent || s.building || s.status === 'running' || s.status === 'queued') return false;
+      s.setModel(model);
       return true;
     },
 

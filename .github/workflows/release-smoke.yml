@@ -13,6 +13,7 @@ permissions:
   contents: read
 jobs:
   native:
+    if: github.repository == 'Blackfrost-AI/Shadow_CLI'
     strategy:
       fail-fast: false
       matrix:

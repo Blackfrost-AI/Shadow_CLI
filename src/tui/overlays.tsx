@@ -13,8 +13,9 @@ import type { QuestionSelection } from './questions.js';
 import type { PickerRow } from '../util/modelGroups.js';
 import { displayWidth, takeByWidth, nextCluster } from '../util/width.js';
 import { diffLines, type DiffLine } from '../util/diff.js';
-import { formatDiffStats, stripCtl } from './format.js';
+import { formatDiffStats } from './format.js';
 import { isWriteTool } from './toolDisplay.js';
+import { approvalText } from '../util/approvalText.js';
 
 /** Faint slate panel behind menus/overlays — the OG default. Themes override via `menuBg`;
  *  these remain as the fallback for any palette that predates the field. */
@@ -66,7 +67,7 @@ function previewRows(
   maxRows: number,
 ): { rows: string[]; hidden: number } {
   const rows: string[] = [];
-  let rest = text;
+  let rest = approvalText(text);
   for (let r = 0; r < maxRows && rest !== ''; r++) {
     const width = Math.max(1, r === 0 ? firstWidth : contWidth);
     if (r < maxRows - 1) {
@@ -128,10 +129,9 @@ function defaultRead(path: string): string | null {
   }
 }
 
-/** Single-row hygiene: Ink escapes markup, but stray ESC/\r/\t corrupt the bar-width math
- *  (stripCtl keeps \t and \r, so they are handled here). */
+/** Keep diff indentation while making terminal and direction controls visible. */
 function cleanDiffText(s: string): string {
-  return stripCtl(s).replace(/\r/g, '').replace(/\t/g, '  ');
+  return approvalText(s.replace(/\t/g, '  '));
 }
 
 function fileDiffOf(
@@ -214,7 +214,7 @@ export function buildApprovalDiff(
     const stats = formatDiffStats(built.lines.map((l) => ({ text: `${l.tag} ${l.text}` })));
     const shown = built.lines.slice(0, maxLines).map((l) => ({ tag: l.tag, text: cleanDiffText(l.text) }));
     return {
-      header: stripCtl(built.header).replace(/\s+/g, ' ').trim(), // a hostile path must not add rows
+      header: approvalText(built.header).replace(/\s+/g, ' ').trim(),
       stats,
       lines: shown,
       hidden: built.lines.length - shown.length,
@@ -263,12 +263,12 @@ export function PendingOverlay({
   const titleColor = pending.kind === 'user_question' ? C.cyan : C.yellow;
   const title =
     pending.kind === 'user_question'
-      ? (activeQuestion?.header ? `◆ ${activeQuestion.header}` : '◆ A quick decision')
+      ? (activeQuestion?.header ? `◆ ${approvalText(activeQuestion.header)}` : '◆ A quick decision')
       : pending.kind === 'plan_enter'
         ? 'Enter plan mode?'
         : pending.kind === 'plan_exit'
           ? 'Approve plan?'
-          : `Permission required · ${pending.risk}`;
+          : `Permission required · ${approvalText(pending.risk)}`;
 
   return (
     <Box flexDirection="column" paddingLeft={pageMargin} marginTop={1}>
@@ -361,7 +361,7 @@ export function PendingOverlay({
                 const isCursor = i === cursor;
                 const isRec = i === rec;
                 const mark = activeQuestion.multiSelect ? (selected ? '✓ ' : '  ') : '';
-                const row = `${isCursor ? '❯' : ' '} ${i + 1}. ${mark}${o.label}${isRec ? '  ★ recommended' : ''}${o.description ? `  — ${o.description}` : ''}`;
+                const row = `${isCursor ? '❯' : ' '} ${i + 1}. ${mark}${approvalText(o.label)}${isRec ? '  ★ recommended' : ''}${o.description ? `  — ${approvalText(o.description)}` : ''}`;
                 return (
                   // Keyed by INDEX, not label: a question with two identically-labelled options
                   // (models routinely emit "Yes"/"Yes") produced duplicate React keys, and the two
@@ -384,7 +384,7 @@ export function PendingOverlay({
           );
         })()
       ) : (
-        <Text wrap="truncate" color={C.dim}>{`  Why: ${pending.reason}`}</Text>
+        <Text wrap="truncate" color={C.dim}>{`  Why: ${approvalText(pending.reason)}`}</Text>
       )}
       {pending.kind === 'user_question' && autoAnswerSecs != null ? (
         <Text wrap="truncate" color={C.yellow}>

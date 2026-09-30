@@ -5,7 +5,7 @@ process — everything here runs against this repository alone, with no private 
 
 **Audience:** contributors and anyone building their own artifacts.
 
-**Current release baseline:** `v8.7.1`.
+**Current release baseline:** `v9.0.0`.
 
 > **Maintainer note:** the *official* release pipeline (binary hosting, signing keys) is private
 > and intentionally not part of this repo. This guide covers the parts that are.
@@ -83,7 +83,25 @@ bash scripts/build-binary.sh dist-bin/shadow-windows-x64.exe bun-windows-x64
 4. Build the binaries you intend to distribute and smoke-test `--version` on each.
 5. Commit the release and push.
 
-There's no CI — the gate + staged builds above *are* the pipeline.
+The `Signed release smoke` workflow runs on `release/**` branches and version tags. Maintainers
+upload a complete signed candidate to the existing versioned download channel first. All six
+native jobs must pass before promoting the matching set to the current installer/updater channel.
+Darwin signing precedes checksum generation; manifest signatures use the pinned release key.
+The normal public push hook requires main and its exact `v<package-version>` tag to agree.
+
+Never merge private working history into the public repository. Prepare a reviewed, public-safe
+snapshot on public history, retain rollback artifacts, and verify live signed downloads after
+promotion. The website's version, source provenance and installer copies must match the release.
+
+### Dependency audit note
+
+The 9.0.0 runtime dependency audit has no reported vulnerabilities. The unchanged development
+lockfile has brace-expansion findings below ESLint/typescript-eslint, including
+[nested-brace denial of service](https://github.com/advisories/GHSA-qhr7-859c-m2p7) and
+[quadratic expansion](https://github.com/advisories/GHSA-q2hr-2g5m-vwhr), added to the advisory
+database on September 29. These packages are not runtime imports. Do not feed hostile glob
+patterns to the affected development tooling; full `npm audit` is not clean. Toolchain remediation
+is separate from this release's signed runtime publication.
 
 ---
 
@@ -93,3 +111,5 @@ There's no CI — the gate + staged builds above *are* the pipeline.
 - [USER_GUIDE.md](USER_GUIDE.md) — day-to-day usage
 - [THREAT_MODEL.md](THREAT_MODEL.md) — the security model this release process protects
 - [TESTING.md](TESTING.md) — testing conventions
+- [TERMINAL_RENDERERS.md](TERMINAL_RENDERERS.md) — supported default and preview limits
+- [CHANGELOG.md](CHANGELOG.md) — release notes

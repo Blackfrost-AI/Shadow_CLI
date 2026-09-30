@@ -19,6 +19,9 @@ export interface RewindResult {
    */
   partialFiles: string[];
   turn: number;
+  /** Byte offset of the durable snapshot selected from the journal. Export lineage uses this to
+   * discard only turns after the rewind point while preserving earlier audit events. */
+  snapshotOffset: number;
 }
 
 /** One rewindable snapshot turn for the /rewind picker (F08-07). */
@@ -35,16 +38,18 @@ interface SnapshotRecord {
   turn?: number;
   ts?: string;
   data: ContextSnapshotData;
+  offset: number;
 }
 
 function loadSnapshots(sessionPath: string): SnapshotRecord[] {
   // P2-13: deltas reconstructed to full form in one forward pass (see loadSnapshotRecords).
   const out: SnapshotRecord[] = [];
-  for (const { record: e } of SessionLog.loadSnapshotRecords(sessionPath)) {
+  for (const { record: e, offset } of SessionLog.loadSnapshotRecords(sessionPath)) {
     out.push({
       turn: typeof e.turn === 'number' ? e.turn : out.length,
       ts: typeof e.ts === 'string' ? e.ts : undefined,
       data: e.data as ContextSnapshotData,
+      offset,
     });
   }
   return out;
@@ -164,7 +169,7 @@ export function rewindToTurn(
     }
   }
 
-  return { context, restoredFiles, deletedFiles, partialFiles, turn };
+  return { context, restoredFiles, deletedFiles, partialFiles, turn, snapshotOffset: pick.offset };
 }
 
 /**

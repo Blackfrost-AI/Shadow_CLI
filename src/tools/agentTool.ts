@@ -13,6 +13,7 @@ import { createWorktree, removeWorktree } from './worktree.js';
 import { runHookPhase } from '../hooks/runner.js';
 import { SubagentBus } from '../agent/events.js';
 import { Semaphore } from '../util/semaphore.js';
+import type { EventBus } from '../agent/events.js';
 
 const inputSchema = z.object({
   prompt: z.string().min(1).describe('Task for the sub-agent.'),
@@ -21,7 +22,67 @@ const inputSchema = z.object({
   // Claude parity fields (wired: isolation worktree + run_in_background with task-notification delivery)
   isolation: z.enum(['none', 'worktree']).optional(),
   run_in_background: z.boolean().optional(),
+  priority: z.enum(['low', 'normal', 'high']).optional().describe('Queue priority for background work.'),
 });
+
+class CooperativePauseGate {
+  private paused = false;
+  private announced = false;
+  private readonly waiters = new Set<(durationMs: number) => void>();
+
+  constructor(
+    private readonly onPaused: () => void,
+    private readonly onResumed: () => void,
+  ) {}
+
+  pause(): void {
+    if (this.paused) return;
+    this.paused = true;
+    this.announced = false;
+  }
+
+  resume(): void {
+    if (!this.paused) return;
+    this.paused = false;
+    const hadWaiters = this.waiters.size > 0;
+    for (const finish of [...this.waiters]) finish(0);
+    this.waiters.clear();
+    if (hadWaiters && this.announced) this.onResumed();
+    this.announced = false;
+  }
+
+  wait(signal: AbortSignal): Promise<number> {
+    if (!this.paused || signal.aborted) return Promise.resolve(0);
+    if (!this.announced) {
+      this.announced = true;
+      this.onPaused();
+    }
+    const startedAt = Date.now();
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', onAbort);
+        this.waiters.delete(finish);
+        resolve(Date.now() - startedAt);
+      };
+      const onAbort = (): void => finish();
+      signal.addEventListener('abort', onAbort, { once: true });
+      this.waiters.add(finish);
+    });
+  }
+}
+
+interface RetrySpec {
+  input: z.infer<typeof inputSchema>;
+  workspaceRoot: string;
+  additionalRoots?: string[];
+  dryRun: boolean;
+  maxToolResultChars?: number;
+  retryCount: number;
+  bus: EventBus;
+}
 
 /**
  * Ceiling-stopped sub-agents used to deliver NOTHING: `stopReason: 'max_iterations' | 'budget'`
@@ -109,7 +170,63 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
   // children, so a child only ever queues behind its own SIBLINGS — never its own lineage — and
   // queue waits are abortable like the session gate's.
   const nestedGates = new WeakMap<Budget, Semaphore>();
-  return {
+  const retrySpecs = new Map<string, RetrySpec>();
+  const admissionGates = new Map<string, Semaphore>();
+  const pauseGates = new Map<string, CooperativePauseGate>();
+  const subscribedBuses = new WeakSet<EventBus>();
+  const retryTimers = new Set<ReturnType<typeof setTimeout>>();
+
+  const ensureControlBus = (bus: EventBus): void => {
+    if (subscribedBuses.has(bus)) return;
+    subscribedBuses.add(bus);
+    bus.on((event) => {
+      if (event.type === 'session_closed') {
+        for (const timer of retryTimers) clearTimeout(timer);
+        retryTimers.clear();
+        return;
+      }
+      if (event.type === 'pause_subagent') pauseGates.get(event.taskId)?.pause();
+      if (event.type === 'resume_subagent') pauseGates.get(event.taskId)?.resume();
+      if (event.type === 'set_subagent_priority') admissionGates.get(event.taskId)?.setPriority(event.taskId, event.priority);
+      if (event.type !== 'retry_subagent') return;
+      const spec = retrySpecs.get(event.taskId);
+      if (!spec || spec.retryCount >= 3) {
+        bus.emit({ type: 'finding', severity: 'warn', title: 'Subagent retry rejected', body: spec ? 'Maximum retry count (3) reached.' : 'The retry specification is no longer available.' });
+        return;
+      }
+      const retryCount = spec.retryCount + 1;
+      spec.retryCount = retryCount;
+      bus.emit({ type: 'subagent_retry_count', taskId: event.taskId, retryCount });
+      const delayMs = 2 ** (retryCount - 1) * 1000;
+      const timer = setTimeout(() => {
+        retryTimers.delete(timer);
+        const controller = new AbortController();
+        void tool.run(
+          { ...spec.input, run_in_background: true },
+          {
+            workspaceRoot: spec.workspaceRoot,
+            additionalRoots: spec.additionalRoots,
+            signal: controller.signal,
+            log: () => {},
+            dryRun: spec.dryRun,
+            maxToolResultChars: spec.maxToolResultChars,
+          },
+        ).then((result) => {
+          const newId = result.data?.taskId;
+          if (!result.ok || !newId) {
+            bus.emit({ type: 'finding', severity: 'warn', title: 'Subagent retry failed to start', body: result.summary });
+            return;
+          }
+          const childSpec = retrySpecs.get(newId);
+          if (childSpec) childSpec.retryCount = retryCount;
+          bus.emit({ type: 'subagent_retry_link', taskId: newId, retryOf: event.taskId, retryCount });
+        });
+      }, delayMs);
+      retryTimers.add(timer);
+    });
+  };
+
+  const tool: Tool<z.infer<typeof inputSchema>, { answer?: string; taskId?: string; status?: string }> = {
     name: 'agent',
     description:
       'Launch a sub-agent for complex multi-step work in an isolated context. Returns the sub-agent final answer. ' +
@@ -124,6 +241,7 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         return fail('agent', 'read', Date.now() - start, 'aborted', 'Sub-agent aborted.');
       }
       const base = deps.makeLoopDeps();
+      ensureControlBus(base.bus);
       const agentType = input.subagent_type ?? 'general-purpose';
       const def = resolveAgentDef(agentType, ctx.workspaceRoot);
 
@@ -173,6 +291,18 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
       // can tell a delegated agent's activity from the parent's own instead of clobbering the
       // parent's single live-tool row.
       const taskId = `agent_${Date.now()}_${Math.random().toString(36).slice(2,8)}${isBg ? '' : '_sync'}`;
+      const priority = input.priority ?? 'normal';
+      const parentId = ctx.currentWorkId;
+      const workDepth = parentId ? (ctx.workDepth ?? 0) + 1 : 0;
+      retrySpecs.set(taskId, {
+        input: { ...input },
+        workspaceRoot: ctx.workspaceRoot,
+        additionalRoots: ctx.additionalRoots ? [...ctx.additionalRoots] : undefined,
+        dryRun: ctx.dryRun,
+        maxToolResultChars: ctx.maxToolResultChars,
+        retryCount: 0,
+        bus: base.bus,
+      });
 
       // A sub-agent gets its OWN bus that forwards only a whitelist to the parent. It used to be
       // handed `base.bus`, so its streamed answer, per-turn usage and `stop` were indistinguishable
@@ -183,6 +313,13 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
       // (the turn's signal) can no longer stop it. Give a bg agent its OWN abort, chained under
       // ctx.signal, that a `cancel_subagent` bus request (from /agents kill) can trip.
       const bgAbort = isBg ? new AbortController() : null;
+      const pauseGate = isBg
+        ? new CooperativePauseGate(
+            () => base.bus.emit({ type: 'subagent_paused', taskId }),
+            () => base.bus.emit({ type: 'subagent_resumed', taskId }),
+          )
+        : undefined;
+      if (pauseGate) pauseGates.set(taskId, pauseGate);
       const loopDeps: LoopDeps = {
         ...base,
         bus: subBus,
@@ -195,6 +332,9 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         workspaceRoot: subWorkspaceRoot,
         additionalRoots: base.additionalRoots, // ensure sub-agents inherit jail/sanbox state (full under yolo)
         nestedAgent: true, // F06-10: tools of THIS loop run inside a sub-agent (admission bypass marker)
+        currentWorkId: taskId,
+        workDepth,
+        pauseGate,
         // P3-09 (F04-08): thread the delegation tree's ROOT budget down to the sub-loop so a
         // background agent at ANY depth rolls its spend up into the turn/run budget even after
         // intermediate ancestors have finished (a top-level call's parent budget IS the root).
@@ -277,7 +417,9 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         // the panel after the launching turn ends (F10-02) instead of vanishing with the turn.
         // `queued` only when there IS a gate and no permit — a gateless call (nested with no
         // parent budget) never waits, so it must not announce as queued.
-        base.bus.emit({ type: 'subagent_start', taskId, subagentType: agentType, description: input.description, background: true, queued: gate != null && bgPermit0 == null });
+        base.bus.emit({ type: 'subagent_start', taskId, subagentType: agentType, description: input.description, background: true, queued: gate != null && bgPermit0 == null, parentId, depth: workDepth, priority });
+        base.bus.emit({ type: 'subagent_retryable', taskId });
+        if (gate) admissionGates.set(taskId, gate);
 
         // Listen for a cancel request aimed at THIS agent (taskId or the '*' wildcard). The abort
         // stops the sub-loop at its next boundary; unsubscribed in finally so a completed agent's id
@@ -293,12 +435,12 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
             if (gate && !permit) {
               // loopDeps.signal = turn abort OR /agents-kill cancellation — either one must be able
               // to dequeue an agent that never got a slot (a cancelled turn cannot leak a permit).
-              permit = await gate.acquire(loopDeps.signal);
+              permit = await gate.acquire(loopDeps.signal, { id: taskId, priority });
               // F06-10: queue wait is not loop time — restart the wall-clock budget at admission.
               budget.restartClock(Date.now());
               // admitted — re-announce with queued cleared (nothing has run yet, so re-registration
               // is safe: the HUD counters for this taskId are still zero).
-              base.bus.emit({ type: 'subagent_start', taskId, subagentType: agentType, description: input.description, background: true });
+              base.bus.emit({ type: 'subagent_start', taskId, subagentType: agentType, description: input.description, background: true, parentId, depth: workDepth, priority });
             }
             inheritCeilings(); // P3-09: admission point — parent's remaining ceilings become this agent's
             const res = await loop.run();
@@ -338,6 +480,8 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
           } finally {
             permit?.();
             offCancel();
+            admissionGates.delete(taskId);
+            pauseGates.delete(taskId);
             if (worktreeCleanupPath) {
               try { removeWorktree(ctx.workspaceRoot, worktreeCleanupPath); } catch {}
             }
@@ -357,11 +501,13 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
       const permit0 = gate ? gate.tryAcquire() : null;
       // surface the sub-agent in the TUI HUD immediately (BUG 3). `queued` only when there IS a
       // gate and no permit — a gateless call (nested with no parent budget) never waits.
-      base.bus.emit({ type: 'subagent_start', taskId, subagentType: agentType, description: input.description, background: false, queued: gate != null && permit0 == null });
+      base.bus.emit({ type: 'subagent_start', taskId, subagentType: agentType, description: input.description, background: false, queued: gate != null && permit0 == null, parentId, depth: workDepth, priority });
+      base.bus.emit({ type: 'subagent_retryable', taskId });
+      if (gate) admissionGates.set(taskId, gate);
       let permit = permit0;
       if (gate && !permit) {
         try {
-          permit = await gate.acquire(loopDeps.signal);
+          permit = await gate.acquire(loopDeps.signal, { id: taskId, priority });
           // F06-10: queue wait is not loop time — restart the wall-clock budget at admission.
           budget.restartClock(Date.now());
         } catch {
@@ -373,7 +519,7 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
           }
           return fail('agent', 'read', Date.now() - start, 'aborted', 'Sub-agent aborted while queued.');
         }
-        base.bus.emit({ type: 'subagent_start', taskId, subagentType: agentType, description: input.description, background: false });
+        base.bus.emit({ type: 'subagent_start', taskId, subagentType: agentType, description: input.description, background: false, parentId, depth: workDepth, priority });
       }
       try {
         inheritCeilings(); // P3-09: admission point — parent's remaining ceilings become this agent's
@@ -418,8 +564,10 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         }
         return fail('agent', 'read', Date.now() - start, 'agent_failed', (e as Error).message);
       } finally {
+        admissionGates.delete(taskId);
         permit?.(); // released back to whichever gate admitted this agent; null = gateless bypass
       }
     },
   };
+  return tool;
 }

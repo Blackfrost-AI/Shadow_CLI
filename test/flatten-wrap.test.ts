@@ -7,6 +7,7 @@ import type { ViewportTheme } from '../src/tui/flatten.js';
 const T: ViewportTheme = {
   fg: '#ffffff', dim: '#b6bcc3', green: '#22c55e', cyan: '#38bdf8',
   yellow: '#eab308', red: '#ef4444', purple: '#a78bfa',
+  userBg: '#1e3a4d',
 };
 
 const text = (rows: { text: string }[][]) => rows.map((r) => r.map((s) => s.text).join(''));
@@ -75,21 +76,24 @@ test('assistant Markdown has no per-block speaker header and continuations align
   assert.deepEqual(cont.map(r => r.spans.map(s => s.text).join('')), ['  continued paragraph']);
 });
 
-test('user prompt: ▌ bar on EVERY line, bright body (fg), leading blank', () => {
-  // The ▌ bar runs down every row of the user turn (a SHAPE cue — survives mono/grayscale and
-  // any color-vision deficiency), tinted theme.user (falls back to green). The first-line-only
-  // ❯ left rows 2+ of a multi-line prompt indistinguishable from answer prose. Body is theme.fg —
-  // the same readable tier as answer prose, not dim meta. A leading blank always opens the turn
-  // (new question = air), even if tight is set.
+test('user prompt: background band on EVERY line, bright body (fg), leading blank', () => {
+  // The user turn is the only FILLED row in the transcript (v9): it replaced a per-line ▌ gutter,
+  // which repeated a glyph down every wrapped row in the same column as answer text. Body is
+  // theme.fg — the same readable tier as answer prose. A leading blank always opens the turn.
   const md = 'a prompt long enough to wrap at this narrow measure\n1. a typed list line';
   const rows = flattenItem({ id: 3, kind: 'user', text: `❯ ${md}`, color: T.green, bold: true, tight: true }, 30, false, T);
   assert.equal(rows[0]!.spans.every((s) => s.text === ''), true, 'user turns always lead with a blank (tight ignored)');
   const nonBlank = rows.filter((r) => r.spans.some((s) => s.text.trim() !== ''));
-  assert.ok(nonBlank.every((r) => r.spans[0]!.text === '▌ '), '▌ bar on every content row — wraps and typed lines alike');
-  assert.ok(nonBlank.every((r) => r.spans[0]!.color === T.green), 'bar takes theme.user (falls back to green)');
-  const body = nonBlank.flatMap((r) => r.spans.slice(1));
-  assert.ok(body.every((s) => s.color === T.fg), 'body is the bright fg tier, not dim meta');
-  assert.ok(body.every((s) => !s.bold), 'no bold body — the bar is the marker');
+  assert.ok(
+    nonBlank.every((r) => r.spans.some((s) => s.bg === T.userBg)),
+    'every content row carries the band — wraps and typed lines alike',
+  );
+  assert.ok(
+    !nonBlank.some((r) => r.spans.some((s) => s.text.includes('▌'))),
+    'the per-line gutter is gone',
+  );
+  const body = nonBlank.flatMap((r) => r.spans).filter((s) => s.text.trim() !== '');
+  assert.ok(body.every((s) => !s.bold), 'no bold body — the band is the marker');
   const joined = nonBlank.map((r) => r.spans.map((s) => s.text).join('')).join('\n');
   assert.match(joined, /1\. a typed list line/, 'typed text is verbatim — no markdown rewrite');
   assert.ok(!joined.includes('❯'), 'the baked-in ❯ fallback marker is stripped from styled output');

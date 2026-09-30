@@ -4,8 +4,10 @@ import { redactString } from '../util/redact.js';
 import { stripAnsi } from '../util/lc.js';
 import type { ShadowConfig } from '../config.js';
 import type { Flags } from '../cli/flags.js';
+import { defaultModelPatch } from '../config/modelPresets.js';
 import { resolveJail } from './projects.js';
 import { SessionStartupError, type AgentBuilder, type WebSession } from './registry.js';
+import { readLatestWorkCenterSnapshot, recordWorkCenterSnapshot } from '../state/workCenterPersistence.js';
 
 /**
  * The real `AgentBuilder` for browser sessions — the ONLY web file that imports bootstrap.ts.
@@ -25,9 +27,18 @@ export function makeAgentBuilder(deps: { bootConfig: ShadowConfig; installDir: s
     // frozen, realpath-pinned jail that must reach buildLoopDeps (never session.displayPath).
     const jail = resolveJail(session.displayPath);
 
-    const chosenModel = session.model() || deps.bootConfig.model;
-    // Boot snapshot for everything except the model choice. NEVER a fresh loadConfig here.
-    const cfg: ShadowConfig = { ...deps.bootConfig, model: chosenModel };
+    const selector = session.model();
+    // ACP exposes stable preset labels, while the older web create API may still provide a raw
+    // model id. Resolve against the boot snapshot only: a config edit after server start must not
+    // smuggle a new endpoint or credential into a lazily-built session. Passing lastPicked keeps
+    // duplicate wire ids on different endpoints unambiguous all the way through bootstrap.
+    const selectedEntry = selector
+      ? deps.bootConfig.models.find((entry) => entry.label === selector)
+        ?? deps.bootConfig.models.find((entry) => entry.model === selector)
+      : undefined;
+    const cfg: ShadowConfig = selectedEntry
+      ? { ...deps.bootConfig, ...defaultModelPatch(selectedEntry) }
+      : { ...deps.bootConfig, model: selector || deps.bootConfig.model };
 
     // Route startup notices onto THIS session's bus (the stream redacts at the wire).
     const notice = (s: string): void => {
@@ -58,6 +69,8 @@ export function makeAgentBuilder(deps: { bootConfig: ShadowConfig; installDir: s
       write: notice,
       fail,
       sessionId: session.id,
+      lastPicked: selectedEntry,
+      resumeSessionPath: session.resumeSessionPath,
       // Non-interactive local-model launch: no brew/TTY prompt behind a browser. A throw
       // propagates out as a startup failure (see the §5 caveat: a throw AFTER the server starts
       // leaves a gguf server in the module map that this session's close() can't reach — the
@@ -84,19 +97,40 @@ export function makeAgentBuilder(deps: { bootConfig: ShadowConfig; installDir: s
     // ever reaches /events. No explicit detach needed — the todoList dies with the agent and the
     // bus dies with the session, so the listener's references drop with them on close().
     agent.todoList.onUpdate((items) => session.bus.emit({ type: 'todo', items }));
+    if (session.resumeSessionPath) session.workCenter?.restore(readLatestWorkCenterSnapshot(session.resumeSessionPath));
+    session.workCenter?.syncTodos(agent.todoList.snapshot());
+    if (session.workCenter) agent.bg.attachWorkCenter(session.workCenter);
 
     // Durable web transcript: the same bus→recordEvent contract the TUI/REPL wire at boot
     // (index.ts, tui.tsx). recordEvent drops per-token deltas (SKIP_EVENT_TYPES) and chains
     // snapshots, so the log stays compact; the in-memory SSE ring remains the browser's replay
     // source — this is the on-disk record, wired once per built session. Detached on close()
     // (registry) so a closed session writes nothing more.
-    session.detachLog = session.bus.on((e) => {
+    const detachEvents = session.bus.on((e) => {
       try {
         agent.sessionLog.recordEvent(e);
       } catch {
         /* a logging failure must never break the bus */
       }
     });
+    let snapshotTimer: ReturnType<typeof setTimeout> | undefined;
+    let latestSnapshot = session.workCenter?.snapshot();
+    const detachWork = session.workCenter?.onUpdate((snapshot) => {
+      latestSnapshot = snapshot;
+      if (snapshotTimer) return;
+      snapshotTimer = setTimeout(() => {
+        snapshotTimer = undefined;
+        if (latestSnapshot) recordWorkCenterSnapshot(agent.sessionLog, latestSnapshot);
+      }, 250);
+    }) ?? (() => {});
+    session.detachLog = () => {
+      detachEvents();
+      detachWork();
+      if (snapshotTimer) clearTimeout(snapshotTimer);
+    };
+    if (session.resumeSessionPath && latestSnapshot) {
+      recordWorkCenterSnapshot(agent.sessionLog, latestSnapshot);
+    }
 
     return { agent, mcp, jail };
   };

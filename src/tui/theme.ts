@@ -40,6 +40,9 @@ export const THEMES = {
     yellow: '#f5b62e', // amber
     purple: '#b9a3ff', // violet, brightened
     user: '#22d38f',
+    // The band behind a user turn — the only filled row in the transcript. Desaturated blue:
+    // reads as "yours" on a dark terminal without fighting the code chip or the menu fill.
+    userBg: '#1e3a4d',
     accent: '#d97757', // warm turn-bullet orange
     codeBg: '#2d333b',
     bg: null,
@@ -236,6 +239,9 @@ export const THEMES = {
     codeBg: '#141414', // barely-lifted charcoal: a code chip reads as a panel, not a hole
     bg: '#000000',
     menuBg: '#101010',
+    // This theme asserts pure black, so the menuBg fallback would be invisible — band gets
+    // its own tinted blue.
+    userBg: '#16242e',
     menuSelBg: '#2b2b2b',
   },
 } as const;
@@ -296,6 +302,11 @@ export interface Palette {
   bg: string | null;
   menuBg: string;
   menuSelBg: string;
+  /**
+   * Background band behind a user turn — the only filled row in the transcript. Optional: a
+   * theme that omits it falls back to `menuBg`, which every theme already defines.
+   */
+  userBg?: string;
 }
 
 export const C: Palette = { ...THEMES.og };
@@ -310,6 +321,10 @@ export function normalizeThemeName(name: string | undefined): CanonicalThemeName
 /** Swap the active palette in place. Caller must trigger a re-render to repaint. */
 export function applyTheme(name: ThemeName | string): void {
   const theme = normalizeThemeName(name) ?? 'og';
+  // Reset BEFORE assigning: Object.assign only copies keys the new theme DEFINES, so a theme
+  // that omits an optional token silently inherits the previous theme's value — `light` was
+  // painted with `og`'s user band and paletteSnapshot() then reported a palette not in use.
+  for (const key of Object.keys(C)) delete (C as unknown as Record<string, unknown>)[key];
   Object.assign(C, THEMES[theme]);
 }
 

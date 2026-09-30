@@ -57,6 +57,8 @@ import {
 import { attachBgAgentDelivery } from './agent/busListeners.js';
 import { exportSessionFile } from './state/chatExport.js';
 import { EventBus } from './agent/events.js';
+import { WorkCenter } from './app/workCenter.js';
+import { queryWorkHistory, readLatestWorkCenterSnapshot, recordWorkCenterSnapshot } from './state/workCenterPersistence.js';
 import { Budget } from './agent/budget.js';
 import { Context } from './agent/context.js';
 import { AgentLoop } from './agent/loop.js';
@@ -1399,6 +1401,28 @@ async function main(): Promise<void> {
   const sessionLogBox = { current: sessionLog };
 
   const bus = new EventBus();
+  const workCenter = new WorkCenter();
+  workCenter.subscribe(bus);
+  workCenter.restore(readLatestWorkCenterSnapshot(resumeSessionPath ?? sessionLog.path));
+  workCenter.syncTodos(todoList.snapshot());
+  bg.attachWorkCenter(workCenter);
+  // Coalesce bursts (streaming shell output/tool events) into bounded durable snapshots.
+  const workSnapshotWrites = new Map<SessionLog, { snapshot: ReturnType<WorkCenter['snapshot']>; timer?: ReturnType<typeof setTimeout> }>();
+  workCenter.onUpdate((snapshot) => {
+    const target = sessionLogBox.current;
+    const state = workSnapshotWrites.get(target) ?? { snapshot };
+    state.snapshot = snapshot;
+    workSnapshotWrites.set(target, state);
+    if (state.timer) return;
+    state.timer = setTimeout(() => {
+      state.timer = undefined;
+      recordWorkCenterSnapshot(target, state.snapshot);
+      workSnapshotWrites.delete(target);
+    }, 250);
+  });
+  // A resumed run writes into a fresh SessionLog. Seed its sidecar immediately so an otherwise
+  // idle resume still carries the completed Work Center history into the new lineage.
+  if (resumeSessionPath) recordWorkCenterSnapshot(sessionLog, workCenter.snapshot());
   // recordEvent drops the per-token stream deltas (text/thinking/shell_output) that used to
   // trigger a redact+stringify+write on EVERY token; the committed assistant_done/reasoning_done
   // events carry the same text for resume/replay (P1B-06).
@@ -1994,6 +2018,9 @@ async function main(): Promise<void> {
       version: VERSION,
       styleState,
       todoList,
+      workCenter,
+      bgRegistry: bg,
+      workHistory: (sessionId) => queryWorkHistory(workspaceRoot, sessionId),
       planMode,
       mission,
       // bg sub-agent results: the TUI drains these into its NEXT user turn (8.4 fix —

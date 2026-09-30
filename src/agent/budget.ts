@@ -70,6 +70,11 @@ export class Budget {
     this.startMs = now;
   }
 
+  /** Exclude an operator-requested cooperative pause from the wall-clock ceiling. */
+  suspendClock(durationMs: number): void {
+    if (Number.isFinite(durationMs) && durationMs > 0) this.startMs += durationMs;
+  }
+
   /**
    * Re-price against the model actually in use (D5).
    *

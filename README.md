@@ -6,7 +6,7 @@
 
 > **A true gift of freedom and privacy.**
 > Zero-telemetry · provider-neutral · phone home to no one.
-> Current build: **`v8.7.1`** — Blackfrost hosting transition. Windows installs support built-in PowerShell 5.1; PowerShell 7 is optional.
+> Current build: **`v9.0.0`** — Work Center and operator control. Ink remains the supported default terminal; pi is an opt-in preview.
 
 **Shadow is a zero-telemetry, provider-neutral coding agent that runs on your terms.** Point it at any model — Anthropic, any OpenAI-compatible endpoint, Gemini, or a local model on your own box — and it works as a coding / sysadmin agent over your workspace. **No Shadow account, no signup, no phone-home:** the only outbound traffic is the provider *you* chose and the web tools the agent explicitly invokes. Your config stays local and readable (`~/.shadow/config.json`), your keys never leave your machine, and you can switch models mid-session **without losing context**.
 
@@ -16,7 +16,18 @@ Under the hood it's a **tool-calling agentic runtime**: the model reasons, emits
 
 This is **not a chat app** — it is a tool-calling runtime.
 
-## What's new in v8.7.1
+## What's new in v9.0.0
+
+- **Work Center:** `/work` lists agents, background shells and plan items with status, ownership, elapsed time and bounded activity history. Inspect details, filter by type/status/tool/file, and view persisted cross-session history without restarting old work.
+- **Explicit controls:** pause/resume background agents at safe boundaries, adjust queued priority, cancel active background agents, stop owned shells, and request a linked retry with explicit confirmation. Historical work remains read-only.
+- **Shared state:** terminal, web companion and the versioned ACP Work Center extension use the same work state and control boundaries.
+- **Full SHADOW wordmark:** the two-tone 51-column mark is restored; medium-width layouts stack the full mark before falling back to a compact header.
+- **Renderer contract:** Ink remains the supported default. `SHADOW_TUI=pi shadow` selects the experimental preview. Its daily commands and session transitions are covered by regression tests; `/vim`, `/table`, `/statusline`, custom commands and custom key mappings remain Ink-only. See [Terminal renderers](TERMINAL_RENDERERS.md).
+- Approval previews make terminal and invisible controls visible without altering the original tool inputs. Session resume, rewind, fork and exports preserve the documented context and ownership boundaries.
+
+See the [release notes](CHANGELOG.md) and [Work Center guide](USER_GUIDE.md#work-center).
+
+## Previous transition: v8.7.1
 
 - Installers and standalone updates now use Blackfrost's signed release bucket.
 - Existing binary users can run `shadow update` once through the legacy host to receive this transition, then future updates use Blackfrost.
@@ -43,7 +54,7 @@ Earlier highlights:
 - **v8.0–8.3 — the web console era:** `shadow web` (sessions sidebar, streaming transcript, approval dock, inspector), toasts + context gauge, stream resilience, self-documenting config + instruction-file autopilot.
 - **🎭 Collaboration Mode — a live model round-table.** `/table gpt glm` seats 2–4 models in **one shared conversation**; you hold the baton and route each turn with `@handle`. Compare reasoning side by side, or let a strong model check a fast one.
 - **📊 Charts, tables & a genuinely beautiful TUI.** Fenced `chart` blocks render as real unicode **bar / line / sparkline** graphs; GFM tables get rounded grids with ledger-aligned numbers; markdown, code, and diffs are calm and readable.
-- **♿ Accessibility, first-class.** A `colorblind` (Okabe–Ito) palette and a `high-contrast` (WCAG-AAA) theme; your prompts carry a `▌` bar and failed tools a `✗` glyph, so meaning never rides on color alone.
+- **♿ Accessibility, first-class.** A `colorblind` (Okabe–Ito) palette and a `high-contrast` theme; user prompts have a filled background band and failed tools a `✗` marker.
 - **📋 Copy & paste that just works.** Multi-line paste is atomic (embedded newlines never fire a stray send), `Ctrl-V` pastes from the system clipboard, `Alt-C` copies the last answer, `/copy code` grabs the last code block.
 - **⌨ A slash menu that anticipates you.** Fuzzy matching (`/thm` → `/theme`), inline argument completion (`/theme ␣` lists every theme with a `✓ current` marker), and did-you-mean on typos.
 - **🖥 Three local backends, auto-served.** `.gguf` (llama.cpp), **MLX** (Apple Silicon — text *and* multimodal via mlx-vlm), and **vLLM** (Linux + CUDA) — point an entry at a model and Shadow launches the server for you.
@@ -262,12 +273,13 @@ typing (`/cl` → `/clear`), `↑`/`↓` to select, `Tab` to autocomplete, `Ente
 | `/rewind` | rewind to a turn index (e.g. `/rewind 2`) |
 | `/init` | scaffold `SHADOW.md` in the workspace |
 | `/agents` | list agent definitions |
+| `/work` | inspect work, filter current/history items, and use explicit background controls |
 | `/memory` | show project memory facts |
 | `/permissions` | list or edit permission rules |
 | `/doctor` | diagnose environment, credentials, and guardrails |
 | `/quit` | exit Shadow |
 
-While the agent is running, informational commands (`/help`, `/cost`, `/usage`, `/context`, `/fast`) work without interrupting the turn.
+While the agent is running, informational commands (`/help`, `/cost`, `/usage`, `/context`, `/fast`, `/work`) work without interrupting the turn. Renderer-specific commands and keys are documented in [Terminal renderers](TERMINAL_RENDERERS.md).
 
 ## Configuration
 

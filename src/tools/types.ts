@@ -60,6 +60,10 @@ export interface ToolContext {
   /** F06-10: true when this tool runs inside a sub-agent loop. A nested `agent` call uses it
    *  to bypass the session admission gate — queuing behind its own parent's permit deadlocks. */
   nestedAgent?: boolean;
+  /** Work Center lineage for nested delegation. Undefined for the lead loop. */
+  currentWorkId?: string;
+  /** Zero-based depth of currentWorkId in the delegation tree. */
+  workDepth?: number;
   /** P3-09 (F04-08): the Budget of the loop that is running THIS tool call — the immediate parent
    *  of any sub-agent the call spawns. The `agent` tool reads its remaining ceilings into the
    *  sub-agent at admission and rolls the sub-agent's final spend back up into it, so the parent's

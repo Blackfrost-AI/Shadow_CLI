@@ -75,6 +75,7 @@ export function renderBrand(b: BrandInfo, theme: ViewportTheme, cols: number): S
       const line: StyledSpan[] = [];
       const hasArt = i < art.length;
       if (hasArt) {
+        // Bright upper face + quiet lower face restores the dimensional wordmark treatment.
         const t = art.length > 1 ? i / (art.length - 1) : 0;
         line.push({ text: art[i]!.padEnd(artW), color: t < 0.5 ? theme.cyan : theme.dim, bold: t < 0.5 });
       } else {
@@ -253,15 +254,22 @@ export function renderToolStack(run: ToolRun, theme: ViewportTheme): StyledSpan[
     { text: `${TOOL_DOT} `, color: run.failCount > 0 ? theme.red : theme.green },
     { text: headline, color: theme.bright ?? theme.fg, bold: true },
   ];
+  // Short hint: the counts are the informative part of a collapsed run, and this row has to
+  // survive an 80-column terminal beside the counts, elapsed time and both expand hints.
   if (run.hint && run.collapsed) {
-    spans.push({ text: ` · ${displayToolArg(run.hint, 40)}`, color: theme.dim });
+    spans.push({ text: ` · ${displayToolArg(run.hint, 28)}`, color: theme.dim });
   }
+  // A collapsed run is ONE row, so a failure inside it has to be unmissable — this is the only
+  // signal that something in the group did not work. Yellow and bold, not dim: on an otherwise
+  // entirely quiet row a dim marker reads as decoration and gets skimmed past.
   if (run.failCount > 0) {
-    spans.push({ text: ` · ✗${run.failCount}`, color: theme.dim });
+    spans.push({ text: ` · ✗${run.failCount} failed`, color: theme.yellow, bold: true });
   }
   const e = elapsed(run.totalMs);
   if (e) spans.push({ text: e, color: theme.dim });
-  if (run.collapsed) spans.push({ text: ' · ⌄ ^O', color: theme.dim }); // expand hint
+  // Expand in place (^O) or open the sub-window (/activity). Both paths are named on the row,
+  // because a collapsed run that does not say how to get back into it is just a hidden one.
+  if (run.collapsed) spans.push({ text: ' · ⌄ ^O · /activity', color: theme.dim });
   return spans;
 }
 

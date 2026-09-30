@@ -307,6 +307,11 @@ web tools + a sensitive workspace remains a risk combination you are choosing.
 
 ## Everyday use
 
+Ink is the supported default terminal for v9. `SHADOW_TUI=pi shadow` selects the experimental
+preview; unset `SHADOW_TUI` or set it to `ink` to return to the default. The commands and keys below
+describe Ink unless otherwise noted. See [Terminal renderers](TERMINAL_RENDERERS.md) for pi's
+explicit command/key limits.
+
 - **`/help`** lists every slash command; **`/model`**, **`/effort`**, **`/theme`**, **`/context`**,
   **`/copy`**, **`/export`**, **`/resume`**, **`/fork`**, **`/mcp`** are the common ones.
 - **Branch a session with `/fork`**: copies the transcript so far into a new session id and switches
@@ -338,12 +343,47 @@ web tools + a sensitive workspace remains a risk combination you are choosing.
   copies the last answer, **`/copy code`** just its last fenced code block. Huge pastes condense to a
   `[Pasted text #N]` chip and expand again on send.
 - **Accessibility**: `/theme colorblind` switches to an Okabe–Ito palette (safe under deuteranopia,
-  protanopia, and tritanopia); `/theme high-contrast` is a WCAG-AAA loud mode. Your turns carry a `▌`
-  bar on every line and failed tools a `✗` — state never rides on color alone.
+  protanopia, and tritanopia); `/theme high-contrast` is a louder mode. Your turns have a filled
+  background band, and failed tools carry a `✗` marker.
 - **Tables & charts**: GFM tables render as rounded grids with numeric columns right-aligned; a fenced
   ` ```chart ` block (`label: value` lines, `type: bar|line|spark`) renders as a real unicode chart.
 - **Ctrl-C twice** quits; **Esc** interrupts the current turn.
 - Pipe a one-shot task non-interactively: `shadow --task "summarize README.md"` (scriptable, plain output).
+
+### Work Center
+
+`/work` gives one view of agents, background shells and plan items. It reports state, ownership,
+elapsed time, recent activity and results; the terminal, web companion and ACP extension share
+the same work state. Inspect without launching anything:
+
+```text
+/work
+/work show <id>
+/work --type subagent,bgshell --status running,paused
+/work --tool <name>
+/work --file <path>
+/work --all-sessions
+/work --session <session-id>
+/work show <session-suffix>::<id>
+```
+
+Cross-session history is read-only. It does not grant authority to resume or repeat old work.
+Current-session background controls are explicit:
+
+```text
+/work pause <agent-id>
+/work resume <agent-id>
+/work priority <queued-agent-id> high
+/work cancel <background-agent-id>
+/work kill <running-shell-id>
+/work retry <agent-id> --confirm
+```
+
+Pause takes effect at the next safe model/tool boundary. Priority accepts `low`, `normal` or `high`
+only while queued. Foreground agents are inspect-only. Retry creates a linked new background run,
+may repeat external effects, requires confirmation and an in-memory retry specification, and is
+limited to three retries. Persisted historical items cannot be retried. Web/ACP controls apply
+the same restrictions.
 
 ---
 

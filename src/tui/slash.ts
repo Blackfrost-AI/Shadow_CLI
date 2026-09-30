@@ -49,6 +49,7 @@ import { ProjectMemory } from '../state/memory.js';
 import { listResumableSessions, resumeSession } from '../state/resume.js';
 import { rewindToTurn, type RewindableTurn } from '../state/rewind.js';
 import { SessionLog } from '../state/session.js';
+import { readLatestWorkCenterSnapshot, recordWorkCenterSnapshot } from '../state/workCenterPersistence.js';
 import { customStyleNames, type OutputStyle } from '../styles.js';
 import { imageMediaType, MAX_IMAGE_BYTES } from '../util/image.js';
 import { firstSelectableRow, modelEntries, modelRows } from '../util/modelGroups.js';
@@ -66,6 +67,10 @@ import { NEWLINE_HINT } from './platform.js';
 import type { VimFind, VimMode } from './vim.js';
 import type { BannerLine, TranscriptBase } from './rows.js';
 import type { TuiOpts } from '../tui.js';
+import { commandHandler, findTerminalCommand, terminalCommandsFor } from './commandCatalog.js';
+import { SAFE_CONFIG_KEYS, formatTemperature, parseSafeConfig } from '../config/safeInteractiveConfig.js';
+import { executeWorkCommand } from './workCommand.js';
+export { parseSafeConfig } from '../config/safeInteractiveConfig.js';
 
 export interface SlashCommand {
   name: string;
@@ -79,76 +84,19 @@ export interface SlashCommand {
   mention?: { start: number; path: string };
 }
 
-export const SLASH_COMMANDS: SlashCommand[] = [
-  { name: '/help', desc: 'Show keybindings and commands' },
-  { name: '/keybindings', desc: 'Show / customize keybindings (/keybindings init writes a starter config)' },
-  { name: '/clear', desc: 'Clear the screen and reset the conversation' },
-  { name: '/new', desc: 'Start a fresh conversation (alias for /clear)' },
-  { name: '/goal', desc: 'Start a mission: plan → tasks → verify (/goal = status, /goal clear = end)' },
-  { name: '/model', desc: 'Switch, list, add, remove, enable, disable, or test (capability check) model presets' },
-  { name: '/table', desc: 'Collaboration Mode (experimental): /table <model> <model> — a live round-table; @handle to route, /table done to end' },
-  { name: '/provider', desc: 'Show active provider, endpoint, auth status, and model presets' },
-  { name: '/local', desc: 'Add / test / switch a local model (.gguf or MLX)' },
-  { name: '/onboard', desc: 'Show provider setup guidance' },
-  { name: '/style', desc: 'Cycle output style' },
-  { name: '/output-style', desc: 'Cycle output style (alias for /style)', dispatch: '/style' },
-  { name: '/autonomy', desc: 'Cycle autonomy: manual → auto-read → auto-edit → full' },
-  { name: '/plan', desc: 'Toggle plan mode (reads free, writes held): /plan [on|off|status]' },
-  { name: '/compact', desc: 'Summarize earlier turns to free up context' },
-  { name: '/summary', desc: 'Summarize earlier turns to free up context (alias for /compact)', dispatch: '/compact' },
-  { name: '/fast', desc: 'Toggle Anthropic fast mode (lower latency, no extended thinking)' },
-  { name: '/effort', desc: 'Set or cycle reasoning effort: low | medium | high | xhigh | max' },
-  { name: '/cost', desc: 'Show session token usage and cost' },
-  { name: '/usage', desc: 'Alias for /cost' },
-  { name: '/stats', desc: 'Show session token usage and cost (alias for /cost)', dispatch: '/cost' },
-  { name: '/context', desc: 'Show context-window usage' },
-  { name: '/connections', desc: 'Show the egress receipt: every host Shadow reached this session, why, allowed/denied' },
-  { name: '/export', desc: 'Export session to markdown or HTML ("html" first arg, optional path)' },
-  { name: '/copy', desc: 'Copy the last answer to the clipboard (/copy code → last code block); Alt+C' },
-  { name: '/session', desc: 'Show current session id, log path, and message count' },
-  { name: '/sessions', desc: 'List resumable sessions in this workspace (/resume <id> to load one)' },
-  { name: '/resume', desc: 'Resume a prior session (opens a picker; or /resume <id|path>)' },
-  { name: '/rewind', desc: 'Rewind to a turn (picker shows each turn’s prompt; or /rewind <n> [--code-only|--chat-only])' },
-  { name: '/fork', desc: 'Fork this session: copy the transcript to a new session id and switch to it' },
-  { name: '/init', desc: 'Scaffold SHADOW.md in the workspace' },
-  { name: '/agents', desc: 'List running agents + definitions; /agents kill <id|all> cancels a background agent' },
-  { name: '/skills', desc: 'List discovered repo skills' },
-  { name: '/workflows', desc: 'List workflow files' },
-  { name: '/plugins', desc: 'List installed plugins; /plugins enable|disable <name>' },
-  { name: '/mcp', desc: 'List, inspect, enable, or disable MCP servers' },
-  { name: '/memory', desc: 'Show project memory facts' },
-  { name: '/tasks', desc: 'Show or clear the live task list (/tasks clear)' },
-  { name: '/permissions', desc: 'List or edit permission rules' },
-  { name: '/doctor', desc: 'Diagnose environment, credentials, and guardrails' },
-  { name: '/status', desc: 'Show session status (model, autonomy, context, goal)' },
-  { name: '/diff', desc: 'Show the working-tree git diff (--stat)' },
-  { name: '/files', desc: 'Show changed files from git status' },
-  { name: '/branch', desc: 'Show current git branch and status summary' },
-  { name: '/config', desc: 'Show or set safe config values (secrets hidden)' },
-  { name: '/hooks', desc: 'Show configured lifecycle hooks' },
-  { name: '/login', desc: 'Show/import supported auth credentials' },
-  { name: '/logout', desc: 'Clear supported subscription credentials' },
-  { name: '/version', desc: 'Show Shadow version' },
-  { name: '/color', desc: 'Switch color theme (alias for /theme)', dispatch: '/theme' },
-  { name: '/theme', desc: 'Switch color theme (list, preview <name>, or name; no arg cycles)' },
-  { name: '/activity', desc: 'Inspect activity and full output (/activity [group number]); Ctrl+O' },
-  { name: '/expand', desc: 'Expand or fold one answer’s tables (/expand [answer number])' },
-  { name: '/accessibility', desc: 'Accessibility options (/accessibility motion off|on)' },
-  { name: '/logo', desc: 'Show or hide the welcome wordmark (/logo on|off)' },
-  { name: '/terminal-setup', desc: 'Make Shift+Enter insert a newline (per-terminal instructions)' },
-  { name: '/vim', desc: 'Toggle modal (NORMAL/INSERT) editing in the composer' },
-  { name: '/statusline', desc: 'Set a shell command for a custom footer line (/statusline none to clear)' },
-  { name: '/add-dir', desc: 'Grant an extra directory to file tools for this session' },
-  { name: '/image', desc: 'Attach an image file to your next message (/image clear to drop)' },
-  { name: '/review', desc: 'Review the current uncommitted changes' },
-  { name: '/quit', desc: 'Exit Shadow' },
-  { name: '/exit', desc: 'Exit Shadow (alias for /quit)' },
-];
+export const SLASH_COMMANDS: SlashCommand[] = terminalCommandsFor('ink').map(({ name, desc, dispatch }) => ({
+  name,
+  desc,
+  ...(dispatch ? { dispatch } : {}),
+}));
 export const SLASH_NAME_WIDTH = Math.max(...SLASH_COMMANDS.map((c) => c.name.length)) + 1;
 
 const AUTONOMY_LEVELS: AutonomyLevel[] = ['manual', 'auto-read', 'auto-edit', 'full'];
 
 export function slashDispatchName(cmd: SlashCommand): string {
+  const builtin = findTerminalCommand(cmd.name);
+  const handler = builtin ? commandHandler(builtin, 'ink') : undefined;
+  if (handler) return `/${handler}`;
   return cmd.dispatch ?? cmd.name;
 }
 
@@ -156,72 +104,8 @@ export function findSlashCommand(name: string, extra: SlashCommand[] = []): Slas
   return SLASH_COMMANDS.find((c) => c.name === name) ?? extra.find((c) => c.name === name);
 }
 
-const SAFE_CONFIG_KEYS = [
-  'temperature',
-  'fastMode',
-  'effort',
-  'cacheTtl',
-  'maxIterations',
-  'maxOutputTokens',
-  'autoClassifier',
-  'parallelTools',
-  'costWarnUSD',
-] as const;
-type SafeConfigKey = (typeof SAFE_CONFIG_KEYS)[number];
-
-function parseBool(value: string): boolean | null {
-  const v = value.toLowerCase();
-  if (['on', 'true', 'yes', '1'].includes(v)) return true;
-  if (['off', 'false', 'no', '0'].includes(v)) return false;
-  return null;
-}
-
-export function parseSafeConfig(key: string, raw: string): { ok: true; key: SafeConfigKey; value: unknown } | { ok: false; message: string } {
-  if (!(SAFE_CONFIG_KEYS as readonly string[]).includes(key)) {
-    return { ok: false, message: `Config key "${key}" is not editable here. Editable: ${SAFE_CONFIG_KEYS.join(', ')}` };
-  }
-  const safeKey = key as SafeConfigKey;
-  if (safeKey === 'fastMode' || safeKey === 'autoClassifier' || safeKey === 'parallelTools') {
-    const value = parseBool(raw);
-    return value === null ? { ok: false, message: `Use on/off for ${safeKey}.` } : { ok: true, key: safeKey, value };
-  }
-  if (safeKey === 'effort') {
-    const allowed = ['low', 'medium', 'high', 'xhigh', 'max'];
-    return allowed.includes(raw) ? { ok: true, key: safeKey, value: raw } : { ok: false, message: `effort must be one of: ${allowed.join(', ')}` };
-  }
-  if (safeKey === 'cacheTtl') {
-    return raw === '5m' || raw === '1h' ? { ok: true, key: safeKey, value: raw } : { ok: false, message: 'cacheTtl must be 5m or 1h.' };
-  }
-  if (safeKey === 'costWarnUSD') {
-    const value = Number(raw);
-    return Number.isFinite(value) && value > 0
-      ? { ok: true, key: safeKey, value }
-      : { ok: false, message: 'costWarnUSD must be a positive number (e.g. 5).' };
-  }
-  if (safeKey === 'temperature') {
-    const value = Number(raw);
-    return Number.isFinite(value) && value >= 0 && value <= 2
-      ? { ok: true, key: safeKey, value }
-      : { ok: false, message: 'temperature must be a number from 0 to 2 (default 1.0).' };
-  }
-  if (safeKey === 'maxOutputTokens') {
-    const value = Number(raw);
-    return Number.isInteger(value) && value >= 256
-      ? { ok: true, key: safeKey, value }
-      : { ok: false, message: 'maxOutputTokens must be an integer ≥ 256 (e.g. 65536).' };
-  }
-  const value = Number(raw);
-  if (!Number.isInteger(value) || value < 0) return { ok: false, message: `${safeKey} must be a non-negative integer.` };
-  return { ok: true, key: safeKey, value };
-}
-
 function parseSubProvider(value: string | undefined): SubProvider | null {
   return value === 'codex' || value === 'grok' ? value : null;
-}
-
-/** Keep the documented default visibly `1.0` while preserving useful fractional precision. */
-function formatTemperature(value: number): string {
-  return Number.isInteger(value) ? value.toFixed(1) : String(value);
 }
 
 function modelPresetLines(entries: ModelEntry[], current: { provider: string; model: string }): string[] {
@@ -556,6 +440,7 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
       setStaticEpoch((n) => n + 1); // remount <Static> so it forgets the wiped scrollback items
       setTodoItems([]); // clear the task list (was persisting stale tasks after /clear)
       opts.todoList?.write([]); // clear the backing source so the agent starts fresh
+      opts.workCenter?.clear();
       attachmentsRef.current = []; // drop any queued image attachments
       setAttachCount(0);
       pastesRef.current = []; // F02-06: the draft is gone, so its parked paste contents are too
@@ -570,6 +455,10 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
       prevTurnOutTokRef.current = 0;
       sessionTurnsRef.current = 0;
       costWarnedRef.current = false;
+      // A cleared conversation starts a new grant/evidence scope. Keeping either would let a
+      // prior approval or read silently authorize work in the fresh context.
+      sessionApprovalsRef.current.clear();
+      sessionReadTrackerRef.current.clear();
       setStatus('0 tokens');
       loadCustomCommands(); // F10-07: pick up any commands added since launch
       fileListLoadedRef.current = false; // F08-04: re-walk for @-mentions on next use
@@ -698,13 +587,10 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
           break;
         }
         const patch = defaultModelPatch(entry);
-        opts.cfg.provider = entry.provider;
-        opts.cfg.model = entry.model; // the IDENTITY; the wire model is resolved at build
-        opts.cfg.baseUrl = entry.baseUrl;
-        opts.cfg.selfHosted = entry.selfHosted;
-        opts.cfg.lastModel = entry.label;
         saveGlobalConfig(patch);
-        pushLine({ text: `Default model saved: ${entry.label}`, color: C.cyan });
+        // Saving a default is a next-launch config change. `/model use` owns the live switch so
+        // the provider, endpoint, context policy, and status surfaces always move atomically.
+        pushLine({ text: `Default model saved for next launch: ${entry.label}`, color: C.cyan });
         break;
       }
       if (action === 'use' || action === 'switch') {
@@ -1229,6 +1115,7 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
           keepLastTurns: opts.cfg.keepLastTurns,
         });
         context.loadState(resumed.exportState());
+        opts.workCenter?.restore(readLatestWorkCenterSnapshot(pick.path));
         firstRef.current = context.messages().length === 0;
         // Repaint BEFORE the confirmation line, so the notice sits at the bottom of the
         // conversation it is describing rather than above a stale one.
@@ -1329,7 +1216,7 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
         break;
       }
       try {
-        const { context: rewound, restoredFiles, deletedFiles, partialFiles, turn } = rewindToTurn(
+        const { context: rewound, restoredFiles, deletedFiles, partialFiles, turn, snapshotOffset } = rewindToTurn(
           sessionLogRef.current.path,
           turnIndex,
           opts.workspaceRoot,
@@ -1342,11 +1229,28 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
         );
         if (rewound) {
           context.loadState(rewound.exportState());
+          // Chat rewind can remove the read that justified a later edit. Drop all read evidence
+          // so the next mutation must establish it again in the surviving conversation.
+          sessionReadTrackerRef.current.clear();
           // F08-07: make the REWOUND state durable — append a snapshot for the rewound turn so
           // a later /resume resurrects the post-rewind conversation instead of the pre-rewind
           // one (rewindToTurn's pick is latest-append-wins). This also makes the rewind itself
           // a rewind target. --code-only leaves the conversation untouched → no snapshot.
-          sessionLogRef.current?.recordSnapshot(rewound, turn);
+          const liveLog = sessionLogRef.current;
+          try {
+            const durableSnapshotOffset = statSync(liveLog.path).size;
+            liveLog.recordSnapshot(rewound, turn);
+            if (statSync(liveLog.path).size > durableSnapshotOffset) {
+              liveLog.record({
+                kind: 'rewound_to',
+                turn,
+                sourceSnapshotOffset: snapshotOffset,
+                durableSnapshotOffset,
+              });
+            }
+          } catch {
+            /* rewind succeeded; a log write failure is already tracked by SessionLog */
+          }
           firstRef.current = context.messages().length === 0;
           repaintFromContextRef.current?.();
           refreshRewindTurns(); // the appended snapshot changed the turn's backing state
@@ -1403,6 +1307,7 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
         const sourceId = SessionLog.sessionIdFromPath(source.path);
         const { log, forkId } = forkSession(source, opts.workspaceRoot);
         sessionLogRef.current = log;
+        if (opts.workCenter) recordWorkCenterSnapshot(log, opts.workCenter.snapshot());
         // A different session id is a different grant scope — /resume parity: "approve for
         // this session" must not silently carry into the fork.
         sessionApprovalsRef.current.clear();
@@ -1494,6 +1399,28 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
         lines.push({ text: `  ${d.name.padEnd(14)} ${d.description}${d.builtin ? ' (built-in)' : ''}`, dimColor: true });
       }
       pushLine({ kind: 'system', text: 'agents', lines });
+      break;
+    }
+    case '/work': {
+      if (!opts.workCenter || !opts.bgRegistry) {
+        pushLine({ text: 'Work Center is unavailable in this session.', color: C.red });
+        break;
+      }
+      const result = executeWorkCommand(arg, {
+        workCenter: opts.workCenter,
+        bus,
+        bgRegistry: opts.bgRegistry,
+        workHistory: opts.workHistory,
+      });
+      if (result.error) {
+        pushLine({ text: result.error, color: C.red });
+      } else {
+        pushLine({
+          kind: 'system',
+          text: 'work',
+          lines: result.lines.map((text) => ({ text, dimColor: true })),
+        });
+      }
       break;
     }
     case '/skills': {

@@ -163,9 +163,15 @@ export interface ViewportTheme {
   /** Bright white for BOLD text only. Body text uses the softer `fg`, so bold visibly pops —
    *  truecolor #ffffff body rendered heavy/bloomy in Terminal.app and blended with bold. */
   bright?: string;
-  /** The ▌ gutter bar on every line of a user turn. Optional — falls back to `green`. Paired with
-   *  `accent` per-theme so user vs assistant stays distinguishable under color-vision deficiency. */
+  /** The tint of a user turn's text. Optional — falls back to `green`. */
   user?: string;
+  /**
+   * The BACKGROUND BAND behind a user turn. The user's own words are the only thing in the
+   * transcript that gets a filled row, which is what makes "mine" versus "the model's" readable
+   * at a glance without a per-line gutter glyph. Optional — falls back to the theme's `menuBg`,
+   * which every theme already defines as its subtle fill tone.
+   */
+  userBg?: string;
   /** The ⏺ assistant-turn bullet. Optional — falls back to the reference client's warm orange. */
   accent?: string;
 }
@@ -844,28 +850,28 @@ export function flattenItem(
     return out;
   }
 
-  // ── user prompt (▌ bar gutter + bright body) ──
-  // Hierarchy: a ▌ bar runs down EVERY line of the user turn — the first-line-only ❯ left
-  // multi-line prompts indistinguishable from answer prose from row 2 on, which is exactly the
-  // "user entry and answers blend together" failure. The bar is a SHAPE cue (WCAG 1.4.1: works
-  // in mono/grayscale and under any color-vision deficiency), tinted theme.user so sighted users
-  // get the color reinforcement too. Body is theme.fg — the same readable tier as answers, NOT
-  // dim meta. Text is verbatim (no markdown pass); the bar repeats on soft-wrapped rows.
+  // ── user prompt (a full-width background band, no gutter glyph) ──
+  // The user's turn is the only FILLED row in the transcript. A per-line ▌ gutter was doing this
+  // job before, but a glyph repeated down every wrapped row is visual noise sitting in the same
+  // column as the answer text, and the model's own prose had nothing marking it at all — so the
+  // eye had to read the marker to know whose words it was looking at. A background band is read
+  // pre-attentively: the shape of the paragraph tells you before you read a word. Body is
+  // theme.fg — the same readable tier as answers. Text is verbatim (no markdown pass).
+  //
+  // The band's inset lives here (two columns of leading space inside the fill) and the fill
+  // itself is applied by the cell, which is the only layer that knows the terminal width.
   if (item.kind === 'user' && !item.lines) {
-    // Both push sites bake '❯ ' into `text` (it must survive in the plain-text fallback);
-    // strip it here so the styled gutter below is the only marker.
-    const userC = theme.user ?? theme.green;
     const raw = item.text.startsWith('❯ ') ? item.text.slice(2) : item.text;
     raw.split('\n').forEach((ln, i) => {
-      out.push(
-        ...wrapHanging(
-          `${kp}u${i}`,
-          [{ text: '▌ ', color: userC, bold: true }],
-          [{ text: '▌ ', color: userC, bold: true }],
-          [{ text: ln, color: theme.fg }],
-          cols,
-        ),
-      );
+      const spans: StyledSpan[] = [
+        { text: '  ', bg: theme.userBg },
+        { text: ln || ' ', color: theme.fg, bg: theme.userBg },
+      ];
+      const inner = Math.max(4, cols - 2);
+      const rows = wrapLine(`${kp}u${i}`, spans, inner);
+      // A blank line still occupies a row: .split('\n') must not lose the user's blank lines, and
+      // an empty wrap result would drop the row from the band entirely.
+      out.push(...(rows.length ? rows : [{ key: `${kp}u${i}.0`, spans }]));
     });
     return out;
   }

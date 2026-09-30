@@ -5,6 +5,7 @@ import { render } from 'ink-testing-library';
 import { readFileSync } from 'node:fs';
 import { TuiApp, type TuiOpts } from '../src/tui.js';
 import { EventBus } from '../src/agent/events.js';
+import { findTerminalCommand } from '../src/tui/commandCatalog.js';
 
 /**
  * A3 — the composer advertised "Shift+Enter newline" for the whole 3.x line, and it never worked.
@@ -95,8 +96,11 @@ test('the hint text no longer advertises a binding that does not work', () => {
 });
 
 test('/terminal-setup exists and covers the terminals that need it', () => {
-  const src = readFileSync(new URL('../src/tui/slash.ts', import.meta.url), 'utf8'); // P3-02: command table + handler live in slash.ts
-  assert.match(src, /\{ name: '\/terminal-setup'/, 'the command is listed');
+  const command = findTerminalCommand('/terminal-setup');
+  assert.ok(command, 'the command is listed in the shared terminal catalog');
+  assert.equal(command.renderers.ink.handler, 'terminal-setup');
+  assert.equal(command.renderers.pi.handler, 'terminal-setup');
+  const src = readFileSync(new URL('../src/tui/slash.ts', import.meta.url), 'utf8');
   const body = src.slice(src.indexOf("case '/terminal-setup'"), src.indexOf("case '/vim'"));
   assert.match(body, /iTerm/, 'iTerm2 instructions');
   assert.match(body, /vscode/, 'VS Code instructions');

@@ -31,7 +31,7 @@ export function formatWebBoot(server: Pick<WebServerHandle, 'port' | 'url'>): st
 /**
  * `shadow web` — start the loopback UI and block until interrupted.
  *
- * The web UI is the credential "single writer" (see WEBUI_RESEARCH/00-PLAN.md phase 2), so the
+ * The web UI is the credential "single writer" (see docs/archive/research/WEBUI_RESEARCH/00-PLAN.md phase 2), so the
  * vault is unlocked at startup exactly as a normal agent run does — via `ensureVaultReady`
  * (keychain → env → prompt → migrate). Without this, saving a model with a key from the
  * browser would have nowhere to seal it. A locked vault that can't be opened does not abort

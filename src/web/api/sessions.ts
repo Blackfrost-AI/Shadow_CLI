@@ -63,6 +63,41 @@ export function registerSessionsRoutes(route: RouteFn, ctx: ApiContext): void {
     return { status: 200, body: { interrupted: ctx.registry.interrupt(id) } };
   });
 
+  route('GET', /^\/api\/sessions\/([^/]+)\/work$/, (_req, _res, m) => {
+    const session = ctx.registry.get(m[1]!);
+    if (!session) return { status: 404, body: { error: 'unknown session' } };
+    return { status: 200, body: { items: session.workCenter.list(), capturedAt: Date.now() } };
+  });
+
+  route('GET', /^\/api\/sessions\/([^/]+)\/work\/([^/]+)$/, (_req, _res, m) => {
+    const session = ctx.registry.get(m[1]!);
+    if (!session) return { status: 404, body: { error: 'unknown session' } };
+    const item = session.workCenter.get(m[2]!);
+    return item ? { status: 200, body: { item } } : { status: 404, body: { error: 'unknown work item' } };
+  });
+
+  route('POST', /^\/api\/sessions\/([^/]+)\/work\/([^/]+)\/(cancel|kill|pause|resume)$/, (_req, _res, m) => {
+    const session = ctx.registry.get(m[1]!);
+    if (!session) return { status: 404, body: { error: 'unknown session' } };
+    const item = session.workCenter.get(m[2]!);
+    if (!item) return { status: 404, body: { error: 'unknown work item' } };
+    const action = m[3]!;
+    if (action === 'kill') {
+      if (item.type !== 'bgshell' || item.status !== 'running') return { status: 409, body: { error: 'item is not a running background shell' } };
+      return session.agent?.bg.kill(item.id)
+        ? { status: 200, body: { accepted: true } }
+        : { status: 409, body: { error: 'shell is unavailable' } };
+    }
+    if (item.type !== 'subagent' || !item.background) return { status: 409, body: { error: 'item is not a controllable background subagent' } };
+    if (action === 'cancel' && !['queued', 'running', 'paused'].includes(item.status)) return { status: 409, body: { error: `cannot cancel ${item.status} subagent` } };
+    if (action === 'pause' && !['queued', 'running'].includes(item.status)) return { status: 409, body: { error: `cannot pause ${item.status} subagent` } };
+    if (action === 'resume' && item.status !== 'paused' && item.currentActivity !== 'pause requested') return { status: 409, body: { error: 'subagent is not paused' } };
+    if (action === 'cancel') session.bus.emit({ type: 'cancel_subagent', taskId: item.id });
+    if (action === 'pause') session.bus.emit({ type: 'pause_subagent', taskId: item.id });
+    if (action === 'resume') session.bus.emit({ type: 'resume_subagent', taskId: item.id });
+    return { status: 200, body: { accepted: true } };
+  });
+
   // E2 — close a session: aborts any in-flight turn, stops its MCP stdio children and frees the
   // replay ring. registry.remove() existed but had ZERO production callers, so every
   // "+ new session" was permanent: contexts, child processes and 2 MB rings accumulated for the

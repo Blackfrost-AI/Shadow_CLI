@@ -1,6 +1,7 @@
 /** Pure terminal layout math for the Shadow TUI — no React/Ink imports. */
 
 import { formatContextGauge } from './gauge.js';
+import { SHADOW_ART_WIDTH } from './wordmark.js';
 
 export interface ChromeConfig {
   statusRows?: number;
@@ -24,8 +25,8 @@ export interface TerminalLayout {
   sidePanelCols: number;
 }
 
-/** Width of the figlet SHADOW wordmark (longest line). Keep in sync with SHADOW_ART in tui.tsx. */
-export const SHADOW_LOGO_WIDTH = 50;
+/** Width of the full SHADOW wordmark (longest line), derived from its single source of truth. */
+export const SHADOW_LOGO_WIDTH = SHADOW_ART_WIDTH;
 
 const LOGO_MIN_COLS = 90; // legacy wide threshold for computeLayout.wideBanner
 

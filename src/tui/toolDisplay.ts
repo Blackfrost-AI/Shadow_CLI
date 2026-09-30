@@ -17,7 +17,33 @@ const COLLAPSIBLE = new Set([
 ]);
 
 /** Kind of collapsible activity for Claude-style "Read 3 files, Grep 2 patterns" lines. */
-export type CollapseKind = 'read' | 'search' | 'list' | 'view' | 'other';
+export type CollapseKind = 'read' | 'search' | 'list' | 'view' | 'command' | 'edit' | 'other';
+
+/**
+ * Classify a tool for the collapsed-run summary.
+ *
+ * A DISPLAY classifier, deliberately not the safety classifier. The v9 transcript folds every
+ * consecutive tool call into one row and the summary has to say what is inside that row — a
+ * mutation is called out by count (`Edited 2 files`) rather than hidden. Whether a call is
+ * permitted is decided by the permission gate before it runs; it never depended on how the
+ * transcript draws it.
+ */
+export function groupKind(name: string): CollapseKind {
+  switch (name) {
+    case 'run_shell':
+    case 'run_shell_bg':
+    case 'bash_output':
+    case 'kill_shell':
+      return 'command';
+    case 'write_file':
+    case 'edit_file':
+    case 'multi_edit':
+    case 'apply_patch':
+      return 'edit';
+    default:
+      return collapseKind(name);
+  }
+}
 
 /** True when this tool should fold into a consecutive read/search group. */
 export function isCollapsibleTool(name: string): boolean {
@@ -139,6 +165,11 @@ export function collapseNoun(kind: CollapseKind, count: number): string {
       return count === 1 ? 'path' : 'paths';
     case 'view':
       return count === 1 ? 'image' : 'images';
+    case 'command':
+      return `command${count === 1 ? '' : 's'}`;
+    case 'edit':
+      // "Edited 2 files", not "Edited 2 edits" — an edit is always an edit to a file.
+      return `file${count === 1 ? '' : 's'}`;
     default:
       return count === 1 ? 'call' : 'calls';
   }
@@ -155,6 +186,10 @@ export function collapseVerb(kind: CollapseKind): string {
       return 'Glob';
     case 'view':
       return 'Viewed';
+    case 'command':
+      return 'Ran';
+    case 'edit':
+      return 'Edited';
     default:
       return 'Ran';
   }
@@ -171,6 +206,10 @@ export function collapseVerbLive(kind: CollapseKind): string {
       return 'Listing';
     case 'view':
       return 'Viewing';
+    case 'command':
+      return 'Running';
+    case 'edit':
+      return 'Editing';
     default:
       return 'Running';
   }
@@ -185,7 +224,7 @@ export function formatReconSummary(
   opts: { live?: boolean; fallbackLen?: number } = {},
 ): string {
   const parts: string[] = [];
-  const order: CollapseKind[] = ['read', 'search', 'list', 'view', 'other'];
+  const order: CollapseKind[] = ['command', 'edit', 'read', 'search', 'list', 'view', 'other'];
   for (const k of order) {
     const n = kinds[k] ?? 0;
     if (n > 0) {

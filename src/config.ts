@@ -325,7 +325,9 @@ const ConfigSchema = z.object({
   parallelTools: z.boolean().default(true),
   lastStyle: z.enum(outputStyles).default('proactive'),
   reducedMotion: z.boolean().default(false),
-  showLogo: z.boolean().default(false),
+  // The logo is the brand — on by default (a false default here is why the welcome art
+  // mysteriously vanished for the founder; unset configs silently opted them out).
+  showLogo: z.boolean().default(true),
   lastTheme: z
     .enum(['og', 'shadow', 'dark', 'light', 'matrix', 'mono', 'pipboy', 'cyberpunk', 'coder-chick', 'colorblind', 'high-contrast'])
     .default('og'),
@@ -411,7 +413,7 @@ const ConfigSchema = z.object({
   // can't detect by name) don't burn the whole budget on hidden thinking and hit the cap before
   // answering. Local servers just cap generation; a cloud model with a smaller hard limit gets a
   // 400 that the stream layer catches and shrinks-and-retries (see looksLikeTokenOverflow).
-  // Override per-machine in ~/.shadow/config.json or with --max-output-tokens (see USER_GUIDE.md).
+  // Override per-machine in ~/.shadow/config.json or with --max-output-tokens (see docs/USER_GUIDE.md).
   maxOutputTokens: z.number().int().positive().default(65536),
   // Sampling temperature for self-hosted OpenAI-compatible endpoints only. Provider adapters
   // enforce the trust boundary at send time, so this is never forwarded to Anthropic or an

@@ -42,6 +42,7 @@ import { sniffToolCalls, stripTextualToolIntent } from '../provider/textToolCall
 import { normalizeForeignTool } from '../tools/foreignAdapter.js';
 import { extractPatchBlock } from '../provider/applyPatch.js';
 import { scrubControlTokens, scrubForDisplay, sanitizeTerminalEscapes } from '../util/scrub.js';
+import { approvalText } from '../util/approvalText.js';
 import { envelopeSafeSlice } from '../safety/envelope.js';
 import { hasKnownReasoningMarker } from '../provider/openai.js';
 import { DEFAULT_EFFORT, effortDirective } from './effort.js';
@@ -101,6 +102,11 @@ export interface LoopDeps {
   /** F06-10: true when this loop IS a sub-agent. Stamped onto every ToolContext so a nested
    *  `agent` call can bypass the admission gate (deadlock guard — see makeAgentTool). */
   nestedAgent?: boolean;
+  /** Work Center lineage for a sub-agent loop. */
+  currentWorkId?: string;
+  workDepth?: number;
+  /** Cooperative background-agent pause gate; waits only at safe model/tool boundaries. */
+  pauseGate?: { wait(signal: AbortSignal): Promise<number> };
   /** P3-09 (F04-08): the turn/run budget at the ROOT of this loop's delegation tree. Unset for a
    *  top-level loop (it IS the root — its own budget is stamped). Threaded down to every sub-loop
    *  and re-stamped onto every ToolContext so a background sub-agent at any depth can roll its
@@ -435,6 +441,12 @@ export class AgentLoop {
 
     for (;;) {
       if (this.deps.signal.aborted || this.steerRequested) return this.stop('interrupted', finalAnswer);
+
+      if (this.deps.pauseGate) {
+        const pausedMs = await this.deps.pauseGate.wait(this.deps.signal);
+        budget.suspendClock(pausedMs);
+        if (this.deps.signal.aborted) return this.stop('interrupted', finalAnswer);
+      }
 
       const stop = budget.check(this.now());
       if (stop) return this.stop(stop, finalAnswer);
@@ -1316,6 +1328,10 @@ export class AgentLoop {
   /** Gate, validate, and run one tool call; return its result block. */
   private async executeCall(call: ToolCall): Promise<{ block: ContentBlock; isFatal: boolean; images?: ImageBlock[] }> {
     const { registry, bus } = this.deps;
+    if (this.deps.pauseGate) {
+      const pausedMs = await this.deps.pauseGate.wait(this.deps.signal);
+      this.deps.budget.suspendClock(pausedMs);
+    }
     if (this.preExecutionCancelled()) return this.cancelledCall(call);
     const normalized = normalizeForeignTool({ name: call.name, input: call.input });
     call.name = normalized.name;
@@ -1689,6 +1705,8 @@ export class AgentLoop {
       workspaceRoot: this.deps.workspaceRoot,
       additionalRoots: this.deps.additionalRoots,
       nestedAgent: this.deps.nestedAgent === true,
+      currentWorkId: this.deps.currentWorkId,
+      workDepth: this.deps.workDepth,
       // P3-09 (F04-08): the running loop's OWN budget is the immediate parent of any sub-agent
       // this call spawns — the top loop stamps the turn/run budget, a sub-agent loop stamps its
       // own budget, so nested delegation chains accrual upward one level at a time.
@@ -2327,6 +2345,10 @@ const OPERATIVE_KEYS = [
 ] as const;
 
 export function previewOf(call: ToolCall): string {
+  return approvalText(rawPreviewOf(call));
+}
+
+function rawPreviewOf(call: ToolCall): string {
   const input = call.input as Record<string, unknown> | undefined;
   if (input && typeof input === 'object') {
     const desc = typeof input.description === 'string' && input.description.trim() ? input.description.trim() : '';
@@ -2357,7 +2379,7 @@ export function previewOf(call: ToolCall): string {
  * visible and marked.
  */
 function collapseForPreview(s: string): string {
-  return s.replace(/\s+/g, ' ').trim();
+  return approvalText(s).replace(/\s+/g, ' ').trim();
 }
 
 /**

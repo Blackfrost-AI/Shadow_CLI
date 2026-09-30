@@ -100,3 +100,189 @@ test('exportSession writes markdown file under workspace exports/', () => {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('exportSession uses the latest context snapshot as a resumed transcript baseline', () => {
+  const root = mkdtempSync(join(tmpdir(), 'shadow-export-snapshot-'));
+  try {
+    const sessionDir = join(root, '.shadow', 'sessions');
+    mkdirSync(sessionDir, { recursive: true });
+    const sessionPath = join(sessionDir, 'resumed.jsonl');
+    const snapshot = {
+      ts: '2026-06-21T11:00:00.000Z',
+      kind: 'context_snapshot',
+      format: 'full',
+      turn: 0,
+      data: {
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'restored prompt' }] },
+          { role: 'assistant', content: [{ type: 'text', text: 'restored answer' }] },
+        ],
+        pinnedPrefix: 1,
+        lastActualTokens: 0,
+      },
+    };
+    writeFileSync(
+      sessionPath,
+      [
+        JSON.stringify({ kind: 'user', task: 'discarded pre-snapshot duplicate' }),
+        JSON.stringify(snapshot),
+        JSON.stringify({ kind: 'resumed_from', sessionId: 'source-session', path: '/source.jsonl' }),
+        JSON.stringify({ kind: 'user', task: 'new prompt' }),
+        JSON.stringify({ kind: 'event', type: 'assistant_done', text: 'new answer' }),
+      ].join('\n') + '\n',
+    );
+
+    const mdPath = exportSession({
+      sessionPath,
+      workspaceRoot: root,
+      outPath: 'snapshot.md',
+      meta: { ...META, workspaceRoot: root, sessionPath },
+    }).path;
+    const htmlPath = exportSession({
+      sessionPath,
+      workspaceRoot: root,
+      outPath: 'snapshot.html',
+      format: 'html',
+      meta: { ...META, workspaceRoot: root, sessionPath },
+    }).path;
+    for (const body of [readFileSync(mdPath, 'utf8'), readFileSync(htmlPath, 'utf8')]) {
+      assert.match(body, /restored prompt/);
+      assert.match(body, /restored answer/);
+      assert.match(body, /new prompt/);
+      assert.match(body, /new answer/);
+      assert.doesNotMatch(body, /discarded pre-snapshot duplicate/);
+      assert.equal(body.match(/restored answer/g)?.length, 1, 'snapshot history is not duplicated');
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('normal checkpoints do not erase reasoning, errors, or other pre-snapshot audit events', () => {
+  const root = mkdtempSync(join(tmpdir(), 'shadow-export-audit-'));
+  try {
+    const sessionDir = join(root, '.shadow', 'sessions');
+    mkdirSync(sessionDir, { recursive: true });
+    const sessionPath = join(sessionDir, 'normal.jsonl');
+    writeFileSync(
+      sessionPath,
+      [
+        JSON.stringify({ kind: 'user', task: 'investigate' }),
+        JSON.stringify({ kind: 'event', type: 'reasoning_done', text: 'audit reasoning' }),
+        JSON.stringify({ kind: 'event', type: 'assistant_done', text: 'audit answer' }),
+        JSON.stringify({ kind: 'event', type: 'error', message: 'audit error' }),
+        JSON.stringify({
+          kind: 'context_snapshot',
+          format: 'full',
+          turn: 0,
+          data: {
+            messages: [
+              { role: 'user', content: [{ type: 'text', text: 'investigate' }] },
+              { role: 'assistant', content: [{ type: 'text', text: 'audit answer' }] },
+            ],
+            pinnedPrefix: 1,
+            lastActualTokens: 0,
+          },
+        }),
+      ].join('\n') + '\n',
+    );
+
+    const path = exportSession({
+      sessionPath,
+      workspaceRoot: root,
+      outPath: 'normal.md',
+      meta: { ...META, workspaceRoot: root, sessionPath },
+    }).path;
+    const body = readFileSync(path, 'utf8');
+    assert.match(body, /audit reasoning/);
+    assert.match(body, /audit answer/);
+    assert.match(body, /audit error/);
+    assert.equal(body.match(/audit answer/g)?.length, 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('rewind lineage drops only the undone suffix and preserves earlier audit events', () => {
+  const root = mkdtempSync(join(tmpdir(), 'shadow-export-rewind-'));
+  try {
+    const sessionDir = join(root, '.shadow', 'sessions');
+    mkdirSync(sessionDir, { recursive: true });
+    const sessionPath = join(sessionDir, 'rewound.jsonl');
+    const lines: string[] = [];
+    let bytes = 0;
+    const add = (record: unknown): number => {
+      const offset = bytes;
+      const line = JSON.stringify(record) + '\n';
+      lines.push(line);
+      bytes += Buffer.byteLength(line);
+      return offset;
+    };
+    add({ kind: 'user', task: 'kept prompt' });
+    add({ kind: 'event', type: 'reasoning_done', text: 'kept reasoning' });
+    add({ kind: 'event', type: 'assistant_done', text: 'kept answer' });
+    const sourceSnapshotOffset = add({
+      kind: 'context_snapshot',
+      format: 'full',
+      turn: 0,
+      data: {
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'kept prompt' }] },
+          { role: 'assistant', content: [{ type: 'text', text: 'kept answer' }] },
+        ],
+        pinnedPrefix: 1,
+        lastActualTokens: 0,
+      },
+    });
+    add({ kind: 'user', task: 'undone prompt' });
+    add({ kind: 'event', type: 'assistant_done', text: 'undone answer' });
+    add({
+      kind: 'context_snapshot',
+      format: 'full',
+      turn: 1,
+      data: {
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'kept prompt' }] },
+          { role: 'assistant', content: [{ type: 'text', text: 'kept answer' }] },
+          { role: 'user', content: [{ type: 'text', text: 'undone prompt' }] },
+          { role: 'assistant', content: [{ type: 'text', text: 'undone answer' }] },
+        ],
+        pinnedPrefix: 1,
+        lastActualTokens: 0,
+      },
+    });
+    const durableSnapshotOffset = add({
+      kind: 'context_snapshot',
+      format: 'full',
+      turn: 0,
+      data: {
+        messages: [
+          { role: 'user', content: [{ type: 'text', text: 'kept prompt' }] },
+          { role: 'assistant', content: [{ type: 'text', text: 'kept answer' }] },
+        ],
+        pinnedPrefix: 1,
+        lastActualTokens: 0,
+      },
+    });
+    add({ kind: 'rewound_to', turn: 0, sourceSnapshotOffset, durableSnapshotOffset });
+    add({ kind: 'user', task: 'replacement prompt' });
+    add({ kind: 'event', type: 'assistant_done', text: 'replacement answer' });
+    writeFileSync(sessionPath, lines.join(''));
+
+    const path = exportSession({
+      sessionPath,
+      workspaceRoot: root,
+      outPath: 'rewound.md',
+      meta: { ...META, workspaceRoot: root, sessionPath },
+    }).path;
+    const body = readFileSync(path, 'utf8');
+    assert.match(body, /kept prompt/);
+    assert.match(body, /kept reasoning/);
+    assert.match(body, /kept answer/);
+    assert.match(body, /replacement prompt/);
+    assert.match(body, /replacement answer/);
+    assert.doesNotMatch(body, /undone prompt|undone answer/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

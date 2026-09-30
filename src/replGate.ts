@@ -2,6 +2,7 @@ import type { Interface as ReadlineInterface } from 'node:readline/promises';
 import type { AutonomyLevel } from './safety/permissions.js';
 import type { ApprovalDecision, ApprovalGate, ApprovalRequest, UserQuestion } from './agent/approval.js';
 import { sanitizeTerminalEscapes } from './util/scrub.js';
+import { approvalText } from './util/approvalText.js';
 
 /**
  * Which input the headless loop consumes when no `--task` was given: the prompt-loop
@@ -41,7 +42,7 @@ export class ReplGate implements ApprovalGate {
     }
 
     this.write(
-      `\n\x1b[1;33m${promptLabel(req.kind)}\x1b[0m ${req.preview}\n  [${req.risk}] ${req.reason}\n`,
+      `\n\x1b[1;33m${promptLabel(req.kind)}\x1b[0m ${approvalText(req.preview)}\n  [${approvalText(req.risk)}] ${approvalText(req.reason)}\n`,
     );
     // F07-09: an acknowledge-only dialog offers NO approve/deny verbs — the call is already
     // hard-blocked by the loop. We wait for one keystroke so the human SEES what was attempted,
@@ -65,10 +66,10 @@ export class ReplGate implements ApprovalGate {
   private async askQuestions(questions: UserQuestion[]): Promise<ApprovalDecision> {
     const answers: Array<{ question: string; selected: string[] }> = [];
     for (const q of questions) {
-      this.write(`\n\x1b[1;36m${q.header ? `${q.header}: ` : ''}${q.question}\x1b[0m\n`);
+      this.write(`\n\x1b[1;36m${q.header ? `${approvalText(q.header)}: ` : ''}${approvalText(q.question)}\x1b[0m\n`);
       q.options.forEach((o, i) => {
-        const desc = o.description ? ` — ${o.description}` : '';
-        this.write(`  ${i + 1}. ${o.label}${desc}\n`);
+        const desc = o.description ? ` — ${approvalText(o.description)}` : '';
+        this.write(`  ${i + 1}. ${approvalText(o.label)}${desc}\n`);
       });
       const raw = (await this.rl.question(q.multiSelect ? 'Enter numbers (comma-separated) or empty to skip: ' : 'Enter number [1]: ')).trim();
       if (!raw) {

@@ -9,7 +9,13 @@
  */
 export class Semaphore {
   private slots: number;
-  private readonly queue: Array<() => void> = [];
+  private readonly queue: Array<{
+    wake: () => void;
+    id?: string;
+    priority: 'low' | 'normal' | 'high';
+    seq: number;
+  }> = [];
+  private sequence = 0;
 
   constructor(permits: number) {
     this.slots = Math.max(1, Math.floor(permits));
@@ -30,7 +36,10 @@ export class Semaphore {
   /** Take a permit, queueing behind earlier callers when none is free. Resolves with a
    *  once-only releaser; rejects if `signal` aborts while still queued (an already-granted
    *  permit cannot be revoked — the caller proceeds and releases normally). */
-  acquire(signal?: AbortSignal): Promise<() => void> {
+  acquire(
+    signal?: AbortSignal,
+    options?: { id?: string; priority?: 'low' | 'normal' | 'high' },
+  ): Promise<() => void> {
     const immediate = this.tryAcquire();
     if (immediate) return Promise.resolve(immediate);
     return new Promise<() => void>((resolve, reject) => {
@@ -45,13 +54,33 @@ export class Semaphore {
       const onAbort = (): void => {
         if (settled) return;
         settled = true;
-        const i = this.queue.indexOf(wake);
+        const i = this.queue.findIndex((waiter) => waiter.wake === wake);
         if (i !== -1) this.queue.splice(i, 1);
         reject(new Error('aborted while queued'));
       };
       signal?.addEventListener('abort', onAbort, { once: true });
-      this.queue.push(wake);
+      this.queue.push({
+        wake,
+        id: options?.id,
+        priority: options?.priority ?? 'normal',
+        seq: this.sequence++,
+      });
+      this.sortQueue();
     });
+  }
+
+  /** Reorder an already queued waiter. Running holders are intentionally unaffected. */
+  setPriority(id: string, priority: 'low' | 'normal' | 'high'): boolean {
+    const waiter = this.queue.find((entry) => entry.id === id);
+    if (!waiter) return false;
+    waiter.priority = priority;
+    this.sortQueue();
+    return true;
+  }
+
+  private sortQueue(): void {
+    const rank = { high: 2, normal: 1, low: 0 } as const;
+    this.queue.sort((a, b) => rank[b.priority] - rank[a.priority] || a.seq - b.seq);
   }
 
   private grant(): () => void {
@@ -70,7 +99,7 @@ export class Semaphore {
     // so `slots` is decremented before the loop re-checks it.
     while (this.queue.length > 0 && this.slots > 0) {
       const next = this.queue.shift()!;
-      next();
+      next.wake();
     }
   }
 }

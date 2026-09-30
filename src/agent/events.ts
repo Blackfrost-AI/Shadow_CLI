@@ -11,6 +11,7 @@ import type { ApprovalKind, UserQuestion } from './approval.js';
  * the loop itself never imports any UI code — this seam keeps it headless/testable.
  */
 export type LoopEvent =
+  | { type: 'session_closed' }
   | { type: 'mode'; mode: 'thinking' | 'acting' | 'idle' }
   // The user's own turn. Emitted by the SUBMIT sites (tui.tsx, index.ts), not by the loop —
   // the loop receives a Message, not a keystroke, and by then the text is already history.
@@ -73,12 +74,31 @@ export type LoopEvent =
   // F06-10: the session concurrency semaphore can delay a sub-agent's admission. A delayed agent
   // is announced with `queued: true`, then RE-announced with `queued: false` once a slot frees —
   // re-registration is safe because nothing has run yet (counters are still zero at admission).
-  | { type: 'subagent_start'; taskId: string; subagentType: string; description?: string; background?: boolean; queued?: boolean }
+  | {
+      type: 'subagent_start';
+      taskId: string;
+      subagentType: string;
+      description?: string;
+      background?: boolean;
+      queued?: boolean;
+      parentId?: string;
+      depth?: number;
+      priority?: 'low' | 'normal' | 'high';
+    }
   | { type: 'subagent_end'; taskId: string; ok: boolean; subagentType?: string }
   // A REQUEST (UI → running bg agent) to cancel a background sub-agent by taskId, or all when
   // taskId is '*'. Emitted on the parent bus; the bg `agent` tool run listens for its own taskId and
   // aborts its sub-loop. Completes the F10-02 story: bg agents were visible but uncancellable.
   | { type: 'cancel_subagent'; taskId: string }
+  | { type: 'pause_subagent'; taskId: string }
+  | { type: 'resume_subagent'; taskId: string }
+  | { type: 'subagent_paused'; taskId: string }
+  | { type: 'subagent_resumed'; taskId: string }
+  | { type: 'set_subagent_priority'; taskId: string; priority: 'low' | 'normal' | 'high' }
+  | { type: 'retry_subagent'; taskId: string }
+  | { type: 'subagent_retryable'; taskId: string }
+  | { type: 'subagent_retry_link'; taskId: string; retryOf: string; retryCount: number }
+  | { type: 'subagent_retry_count'; taskId: string; retryCount: number }
   // --- approvals over HTTP (the web console's decision channel) -----------------------
   // A gated action announces itself as `approval_request` and is PARKED on the session
   // (registry.pendingApprovals) until the browser answers via
