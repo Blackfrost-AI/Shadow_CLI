@@ -380,7 +380,7 @@ Current-session background controls are explicit:
 ```
 
 Pause takes effect at the next safe model/tool boundary. Priority accepts `low`, `normal` or `high`
-only while queued. Foreground agents are inspect-only. Retry creates a linked new background run,
+only while queued. Active foreground agents are inspect-only. Retry creates a linked new background run,
 may repeat external effects, requires confirmation and an in-memory retry specification, and is
 limited to three retries. Persisted historical items cannot be retried. Web/ACP controls apply
 the same restrictions.
@@ -605,13 +605,18 @@ permission before running tools — all inside the editor.
 - **Delegation.** When Shadow spins up sub-agents, their events are tagged `[subagent <id>]` so you
   can see delegated work in the stream.
 
-### v0 limitations (by design)
+### ACP v1 support and limits
+
+- **Persisted sessions and controls.** `session/load` restores a session within an allowlisted
+  project. Modes are editor-selectable; model presets can change only before the first prompt.
+  `session/close` closes an active session. The versioned `_shadow/work/list` and
+  `_shadow/work/control` extensions expose Work Center state and explicit controls.
 
 - **Text-only prompts.** Images and other non-text blocks aren't accepted yet — the editor sends
   text, Shadow replies with text.
-- **No session restore, mode, or model switching.** `session/load`, `session/set_mode`, and
-  `session/set_model` return a clear "not supported" error rather than silently doing nothing.
-  Each new editor session starts fresh.
+- **Credential and workspace boundaries.** The adapter uses Shadow's configured credentials rather
+  than editor-supplied authentication; client-supplied MCP servers and additional directories are
+  refused. Persisted history does not restore old approval authority.
 - **Shell output is delivered when the command finishes,** not streamed live. Long-running commands
   report their result in the final tool-call update.
 - **Unsaved editor buffers.** Shadow reads files from disk. If you have unsaved changes in an editor

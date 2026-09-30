@@ -5,7 +5,7 @@
 - Added Work Center across terminal, web and a versioned ACP extension: agents, background shells,
   plan items, bounded activity, ownership, elapsed time, filters and read-only persisted history.
 - Added safe-boundary background pause/resume, queued priority, explicit cancellation/owned-shell
-  termination and confirmed linked retries. Foreground and historical work remain inspect-only.
+  termination and confirmed linked retries. Active foreground and historical work remain inspect-only.
 - Restored the full two-tone SHADOW wordmark with responsive stacked and compact layouts.
 - Kept Ink as the supported default terminal and pi as an opt-in experimental preview. Unified
   command claims and dispatch, corrected session transitions and documented the remaining Ink-only
