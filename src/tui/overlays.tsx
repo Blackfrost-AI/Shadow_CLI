@@ -1,3 +1,4 @@
+import { GLYPHS } from './glyphs.js';
 /**
  * Borderless overlay panels for the Shadow TUI (question / permission / plan / model picker).
  * Same visual family as the slash menu: shaded bars, no boxes. One border in the app is the composer.
@@ -361,7 +362,7 @@ export function PendingOverlay({
                 const isCursor = i === cursor;
                 const isRec = i === rec;
                 const mark = activeQuestion.multiSelect ? (selected ? '✓ ' : '  ') : '';
-                const row = `${isCursor ? '❯' : ' '} ${i + 1}. ${mark}${approvalText(o.label)}${isRec ? '  ★ recommended' : ''}${o.description ? `  — ${approvalText(o.description)}` : ''}`;
+                const row = `${isCursor ? `${GLYPHS.prompt}` : ' '} ${i + 1}. ${mark}${approvalText(o.label)}${isRec ? '  ★ recommended' : ''}${o.description ? `  — ${approvalText(o.description)}` : ''}`;
                 return (
                   // Keyed by INDEX, not label: a question with two identically-labelled options
                   // (models routinely emit "Yes"/"Yes") produced duplicate React keys, and the two
@@ -501,7 +502,7 @@ export function ModelPickerOverlay({
           // The ● marker on the ACTIVE model stays green regardless of the cursor row — it is the
           // "this one is in use" signal, not a selection highlight.
           <Text key={`m${i}`} wrap="truncate" bold={cur}>
-            <Text backgroundColor={bg} color={cur ? C.green : C.dim}>{cur ? '❯ ' : '  '}</Text>
+            <Text backgroundColor={bg} color={cur ? C.green : C.dim}>{cur ? `${GLYPHS.promptPrefix}` : '  '}</Text>
             <Text backgroundColor={bg} color={C.green}>{active ? '● ' : '  '}</Text>
             <Text backgroundColor={bg} color={cur ? C.fg : C.dim}>{body}</Text>
           </Text>

@@ -24,7 +24,7 @@ eval/drive-*.log
 eval/models-*.json
 eval/RESULTS-*.md
 eval/FINDINGS-*.md
-research/
+/research/
 
 # other tools' session scratch
 .zcode/
@@ -41,9 +41,9 @@ research/
 *.pfx
 .shadow-signing/
 
-# Local backup bundles (the ONLY off-machine-less backup — see deployment_instructions.md A5).
+# Local backup bundles.
 *.bundle
 
-# A nested clone of the public worktree kept for reference (see PRODUCT_REVIEW.md). It is a
-# separate git repository — committing it would record a broken gitlink, not its contents.
-overhaul/
+# Evaluation endpoint definitions are machine-specific; only the template is shared.
+eval/models.*.json
+!eval/models.example.json

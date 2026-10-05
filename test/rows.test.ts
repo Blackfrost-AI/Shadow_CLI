@@ -1,7 +1,17 @@
+import { GLYPHS } from '../src/tui/glyphs.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { renderBrand, renderToolResult, renderToolChild, renderReasoning, renderToolStack } from '../src/tui/rows.js';
+import {
+  SHADOW_COMPACT_MARK,
+  SHADOW_COMPACT_NAME,
+  SHADOW_LOGOTYPE,
+  SHADOW_ICON_ART,
+} from '../src/tui/brand.js';
 import type { ViewportTheme } from '../src/tui/flatten.js';
+
+/** The icon's horizontal arm — a long ─ run that only the ART draws, never the compact mark. */
+const ICON_ARM = SHADOW_ICON_ART[7]!;
 
 // The v2 palette (matches PIN_THEME): dim is the EXPLICIT ADA gray, never a faint attribute.
 const T: ViewportTheme = {
@@ -25,16 +35,19 @@ function assertNoFaint(rows: { text: string; dim?: boolean; color?: string }[][]
   }
 }
 
-test('renderBrand: ✦ sparkle mark, bright name, dim meta — no bordered card', () => {
+test('renderBrand: flake-core mark, bright name, dim meta — no bordered card', () => {
   const rows = renderBrand(
     { version: '1.0.0', providerModel: 'openai/LUMIX-35B', workspace: '~/app', help: '/help', yolo: false },
     T,
     80,
   );
   assert.equal(rows.length, 2, 'compact form (no art) → two rows when not yolo');
-  assert.equal(rows[0]![0]!.text, '✦ ');
+  // The compact symbol and name must come from the shared brand module.
+  assert.equal(rows[0]![0]!.text, `${SHADOW_COMPACT_MARK} `);
+  assert.equal(SHADOW_COMPACT_MARK, '✻', 'the compact mark is the flake core');
   assert.equal(rows[0]![0]!.color, T.cyan);
-  assert.equal(rows[0]![1]!.text, 'shadow');
+  assert.equal(rows[0]![1]!.text, SHADOW_COMPACT_NAME);
+  assert.equal(SHADOW_COMPACT_NAME, 'shadow');
   assert.equal(rows[0]![1]!.bold, true);
   assert.ok(rows[0]![2]!.text.includes('v1.0.0') && rows[0]![2]!.color === T.dim, 'version in dim gray');
   assert.ok(rows[1]![0]!.text.includes('openai/LUMIX-35B') && rows[1]![0]!.text.includes('~/app'));
@@ -68,10 +81,53 @@ test('renderBrand: two-column — wordmark left, meta right-aligned to the width
   assert.equal(metaLeft(0), 60 - Math.max(...['✦ v1.0.0', 'openai/LUMIX-35B', '~/app', '/help · /model', '⚠ yolo — all permission checks disabled'].map((s) => s.length)), 'meta hugs the right edge');
 });
 
-test('renderBrand: narrow terminal falls back to the compact ✦ form', () => {
+test('renderBrand: narrow terminal falls back to the compact ✻ form', () => {
   const art = ['████████████████████████████████████████████████████']; // 52 wide
   const rows = renderBrand({ version: '1', providerModel: 'p/m', workspace: '/w', help: '/h', art }, T, 20);
-  assert.equal(rows[0]![1]!.text, 'shadow', 'compact form under a narrow width');
+  assert.equal(rows[0]![1]!.text, SHADOW_COMPACT_NAME, 'compact form under a narrow width');
+  assert.equal(rows[0]![0]!.text, `${SHADOW_COMPACT_MARK} `, 'the flake core leads the compact form');
+});
+
+test('renderBrand: a mid-width terminal degrades to the ICON, not straight to compact', () => {
+  // The hole this closes: pre-v10 had two tiers, so a terminal too narrow for the
+  // full logotype but easily wide enough for the 25-col icon still fell all the
+  // way down to the one-line `✻ shadow` form. The icon tier has to be reachable
+  // THROUGH the shared renderer, or it is decoration rather than behaviour — which
+  // is exactly what the first draft of src/tui/brand.ts shipped (a pickBrandTier
+  // ladder with zero callers).
+  const brand = {
+    version: '10.0.0',
+    providerModel: 'p/m',
+    workspace: '/w',
+    help: '/h',
+    art: SHADOW_LOGOTYPE,
+  };
+  const at = (cols: number) => renderBrand({ ...brand } as never, T as never, cols);
+
+  // 32 cols: the logotype (51) cannot fit even stacked, but the icon (25) can.
+  const mid = at(32);
+  assert.ok(
+    mid.some((r) => r.some((s) => s.text.includes(ICON_ARM))),
+    'a 32-column terminal must still draw the snowflake icon, not the compact mark',
+  );
+  assert.ok(
+    !mid.some((r) => r.some((s) => s.text === SHADOW_COMPACT_NAME)),
+    'the icon tier must not ALSO emit the compact name form',
+  );
+
+  // 20 cols: neither art tier fits → the compact one-liner.
+  const narrow = at(20);
+  assert.ok(
+    narrow.some((r) => r.some((s) => s.text === SHADOW_COMPACT_NAME)),
+    'a 20-column terminal falls back to the compact mark',
+  );
+
+  // Wide: the logotype survives intact rather than being degraded to the icon.
+  const wide = at(120);
+  assert.ok(
+    wide.some((r) => r.some((s) => s.text.includes(SHADOW_LOGOTYPE[0]!))),
+    'a wide terminal draws the full logotype',
+  );
 });
 
 test('renderToolResult: status is spelled out, display name bold, args in parens, dim tail', () => {
@@ -149,7 +205,7 @@ test('renderToolResult: subagent (agent tool) renders as ▸ type · description
   assert.ok(generic.some((s) => s.text === '(do thing)'), 'generic form keeps args in parens');
 });
 
-test('renderToolStack: collapsed run = ⏺ Read N files, Grep M patterns · hint · ⌄ ^O', () => {
+test(`renderToolStack: collapsed run = ${GLYPHS.tool} Read N files, Grep M patterns · hint · ⌄ ^O`, () => {
   const r = renderToolStack(
     {
       pos: 0,
@@ -164,7 +220,7 @@ test('renderToolStack: collapsed run = ⏺ Read N files, Grep M patterns · hint
     T,
   );
   const text = r.map((s) => s.text).join('');
-  assert.equal(r[0]!.text, '⏺ ', 'status dot');
+  assert.equal(r[0]!.text, `${GLYPHS.tool} `, 'status dot');
   assert.equal(r[0]!.color, T.red, 'red as soon as one call failed');
   assert.ok(text.includes('Read 3 files'), 'read tally with noun');
   assert.ok(text.includes('Grep 2 patterns'), 'search tally with noun');

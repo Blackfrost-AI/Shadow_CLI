@@ -1,3 +1,5 @@
+import { GLYPHS } from './tui/glyphs.js';
+import { terminalRenderer } from './tui/renderer.js';
 import React, { useState, useEffect, useLayoutEffect, useRef, useCallback } from 'react';
 import { render, Box, Text, Static, useApp, useInput, useStdin, useStdout } from 'ink';
 import { itemIsCollapsible } from './tui/flatten.js';
@@ -76,7 +78,7 @@ import { resolve, isAbsolute } from 'node:path';
 import { friendlyDeniedReason } from './util/deniedReason.js';
 import type { VimFind, VimMode } from './tui/vim.js';
 import { runHookPhase } from './hooks/runner.js';
-import { SHADOW_ART as SHADOW_ART_SOURCE } from './tui/wordmark.js';
+import { SHADOW_LOGOTYPE } from './tui/brand.js';
 
 import { effortOrDefault, effortSymbol } from './agent/effort.js';
 
@@ -201,17 +203,12 @@ export function runStatusLine(cmd: string, ctx: StatusLineCtx, cb: (line: string
   }
 }
 
-// ── the reference client visual vocabulary (parity with the reference) ───────────────────────
-// The Shadow spinner: a circle spinning between LIGHT and DARK — the half-disc rotates through
-// four phases (founder pick, 2026-07-11; replaced the sparkle pulse). Reads as an eclipse: on
-// brand for a client named Shadow, and it's the ◐ "working" glyph the redesign spec already used.
+// ── shared Snowfall activity ───────────────────────────────────────────────
+// Shared crystal frames keep activity consistent with the Snowfall assistant and tool marks.
 // IS_DARWIN moved to ./tui/platform.js (shared with slash help lines) — imported below.
-const SPINNER = ['◐', '◓', '◑', '◒']; // light/dark halves chase around the circle
-// The signature left-gutter dot on assistant turns; color (not shape) carries tool state.
-// The spinner glyph + live-region ⏺ accent — reads the THEME token so the streaming
-// preview matches the committed transcript under /theme (incl. colorblind/high-contrast).
-// (Historically Claude's warm brand orange, now og's `accent` value.)
-const CLAUDE_ORANGE = '#d97757'; // fallback only — prefer C.accent at render time
+const SPINNER = GLYPHS.spinner;
+// The spinner reads C.accent at render time so the live preview follows the selected
+// theme, including the Frost ice accent in og and the accessible palettes.
 // The activity label shown beside the spinner while a turn runs. One brand-consistent word
 // ('Shadowing…') instead of a rotating grab-bag of generic verbs. A CUSTOM per-action label (a tool
 // or the app setting a contextual verb) can override it in future; there is no such source today.
@@ -353,13 +350,8 @@ export interface TuiOpts {
   setAbortGetter?: (fn: () => AbortController | null) => void;
 }
 
-// Big "SHADOW" wordmark (figlet "big"). MUST be a PLAIN template literal, NOT String.raw: Bun's
-// --compile bundler ASCII-escapes the block glyphs to \uXXXX, and String.raw would then keep that
-// escape LITERAL (the binary printed "██…" instead of the wordmark). A plain template
-// evaluates the escapes back to the real characters, so it renders under both Bun and Node.
-// The full block-letter logo — one source of truth shared with the pi shell
-// (src/tui/wordmark.ts), which also carries the Bun plain-template-literal constraint.
-const SHADOW_ART = SHADOW_ART_SOURCE;
+// The session-opening retro banner comes from src/tui/brand.ts, shared with pi and onboarding.
+// That module also owns the icon and compact fallbacks, so the renderers use the same artwork.
 
 /**
  * One-time welcome card. On a wide terminal it spans the full width with build
@@ -403,8 +395,8 @@ const SYNTH_RETURN_KEY = { return: true, name: 'return', sequence: '\r' } as unk
 
 // focus-owner router (src/tui/keys/reserved.ts + composerOwner.ts, P3-01). DSR_REPLY stays —
 // the raw click tap still parses the cursor-position report itself.
-/** Collaboration Mode: the baton is always this warm orange (Shadow's brand ⏺ color) — never a seat color. */
-const BATON_ORANGE = '#d97757';
+/** Collaboration Mode: a distinct deep-blue baton mark; its label uses readable theme text. */
+const BATON_BLUE = '#2563eb';
 
 
 /** Legacy/restored tool bodies stay compact; current tool output lives in activity details. */
@@ -1362,7 +1354,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       tools += m.content.filter((b) => b.type === 'tool_use').length;
       if (!text) continue;
       if (m.role === 'user') {
-        pushLine({ kind: 'user', text: `❯ ${text}`, color: C.green, bold: true, meta: 'you' });
+        pushLine({ kind: 'user', text: `${GLYPHS.promptPrefix}${text}`, color: C.green, bold: true, meta: 'you' });
       } else if (m.role === 'assistant') {
         const display = sanitizeAssistantText(text);
         if (display.trim()) pushLine({ kind: 'assistant', text: display, color: C.fg, meta: 'assistant', speaker: { handle: 'SHADOW', model: 'restored history', color: C.accent } });
@@ -1538,7 +1530,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         workspace: opts.workspaceRoot,
         help: '/help · /model · Shift+Tab mode',
         yolo: opts.bypass,
-        art: opts.cfg.showLogo ? SHADOW_ART : undefined,
+        art: opts.cfg.showLogo ? SHADOW_LOGOTYPE : undefined,
       },
     });
   }, [opts, pushLine]);
@@ -2170,7 +2162,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         }
         answerRunRef.current = []; // new (injected) turn → fresh repeat detector
         repeatPosRef.current = 0;
-        pushLine({ kind: 'user', text: `❯ ${line}`, color: C.green, bold: true, meta: 'wakeup' });
+        pushLine({ kind: 'user', text: `${GLYPHS.promptPrefix}${line}`, color: C.green, bold: true, meta: 'wakeup' });
         runOneRef.current?.(line);
       };
     }
@@ -2890,7 +2882,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       repeatPosRef.current = 0;
       const nImg = attachmentsRef.current.length;
       const userText = task || `📎 ${nImg} image${nImg === 1 ? '' : 's'}`;
-      pushLine({ kind: 'user', text: `❯ ${userText}`, color: C.green, bold: true, meta: 'you' });
+      pushLine({ kind: 'user', text: `${GLYPHS.promptPrefix}${userText}`, color: C.green, bold: true, meta: 'you' });
       // F08-04: the echo above shows what the user typed (`@path` visible); the MODEL gets the
       // referenced files inlined so it doesn't need a read_file round-trip. Unresolved @tokens stay
       // literal text.
@@ -2999,12 +2991,19 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       const nextTable = { seats };
       tableRef.current = nextTable; // queue flushing reads the ref before React's state commit
       setTable(nextTable);
+      const batonLabel = `round-table · ${seats.length} seats · you hold the baton`;
       pushLine({
         kind: 'system',
         text: 'table-open',
         lines: [
-          { text: `◆ round-table · ${seats.length} seats · you hold the baton`, color: BATON_ORANGE, bold: true },
-          ...seats.map((s) => ({ text: `  ⏺ @${s.handle}  ${s.provider}/${s.model}`, color: s.color })),
+          {
+            text: `◆ ${batonLabel}`,
+            bold: true,
+            // The blue clears the 3:1 mark floor on sampled backgrounds, not the 4.5:1
+            // text floor. Keep it on the diamond; the words inherit the readable palette.
+            spans: [{ text: '◆ ', color: BATON_BLUE }, { text: batonLabel }],
+          },
+          ...seats.map((s) => ({ text: `  ${GLYPHS.tool} @${s.handle}  ${s.provider}/${s.model}`, color: s.color })),
           { text: `  @${seats[0]!.handle} <question> to route · /pass @handle forwards · /table done ends`, dimColor: true },
         ],
       });
@@ -3039,7 +3038,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           break;
         case 'route': {
           const seat = t.seats.find((s) => s.handle === cmd.handle)!;
-          pushLine({ kind: 'user', text: `❯ @${seat.handle} ${cmd.question || '(your take?)'}`, color: C.green, bold: true, meta: 'you' });
+          pushLine({ kind: 'user', text: `${GLYPHS.promptPrefix}@${seat.handle} ${cmd.question || '(your take?)'}`, color: C.green, bold: true, meta: 'you' });
           void routeToSeat(seat, cmd.question || 'Please weigh in on the discussion above.');
           break;
         }
@@ -3638,7 +3637,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             // the input on every idle screen. One (marginTop) is the breathing room; two is a gap.
             <Box paddingLeft={PAGE_MARGIN}>
               <Text wrap="truncate">
-                <Text color={C.accent ?? CLAUDE_ORANGE}>{spinner}</Text>
+                <Text color={C.accent}>{spinner}</Text>
                 <Text> {statusVerb}</Text>
                 <Text color={C.dim}>{`${statusPrefix}${runningStrip || statusSafetyMarkers.length ? ' · ' : ''}`}</Text>
                 <ChromeMarkers
@@ -3785,7 +3784,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
                   // wrap="truncate": a long row must never wrap to a 2nd line — it eats the frame budget.
                   return (
                     <Text key={c.name} wrap="truncate">
-                      <Text backgroundColor={bg} color={cur ? C.green : C.dim} bold={cur}>{cur ? '❯ ' : '  '}</Text>
+                      <Text backgroundColor={bg} color={cur ? C.green : C.dim} bold={cur}>{cur ? `${GLYPHS.promptPrefix}` : '  '}</Text>
                       <Text backgroundColor={bg} color={C.fg} bold={cur}>{`${namePart} `}</Text>
                       <Text backgroundColor={bg} color={cur ? C.fg : C.dim}>{desc}</Text>
                       {pad ? <Text backgroundColor={bg}>{pad}</Text> : null}
@@ -3851,10 +3850,8 @@ export {
 export { fitHud, type HudFit } from './tui/layout.js';
 
 export function runTui(opts: TuiOpts): Promise<void> {
-  // v9.0: the pi-engine shell (MCODE-class renderer) is reachable behind SHADOW_TUI=pi while
-  // it reaches parity with the 8.x Ink shell. The two own the terminal differently and cannot
-  // share a process. Dynamic import so the default path pays nothing for it.
-  if (process.env.SHADOW_TUI === 'pi') {
+  // v10: pi owns the fullscreen Snowfall layout. Ink remains an explicit compatibility path.
+  if (terminalRenderer() === 'pi') {
     return import('./app/run.js').then((m) => m.runPiTui(opts));
   }
   // Launch-time privacy: title → "Shadow" (hide cwd) + wipe scrollback (hide pre-launch shell

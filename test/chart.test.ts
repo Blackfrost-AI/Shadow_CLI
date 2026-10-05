@@ -1,3 +1,4 @@
+import { GLYPHS } from '../src/tui/glyphs.js';
 /**
  * Terminal chart renderer — parse + geometry goldens.
  *
@@ -59,8 +60,8 @@ test('bar geometry: max value fills the bar column, non-zero values never render
   const tiny = lines.find((l) => l.includes('tiny'))!;
   const zero = lines.find((l) => l.includes('zero'))!;
   assert.ok((big.match(/█/g) ?? []).length >= 40, 'max value fills the available bar width');
-  assert.match(tiny, /[▏▎▍▌▋▊▉█]/, 'a 0.1% value still shows a sliver — nothing lies as zero');
-  assert.ok(!/[▏▎▍▌▋▊▉█]/.test(zero), 'a true zero draws no bar');
+  assert.match(tiny, new RegExp(`[▏▎▍${GLYPHS.halfBlock}▋▊▉█]`, ""), 'a 0.1% value still shows a sliver — nothing lies as zero');
+  assert.ok(!new RegExp(`[▏▎▍${GLYPHS.halfBlock}▋▊▉█]`, "").test(zero), 'a true zero draws no bar');
   for (const l of lines) assert.ok(l.length <= 60, `row fits the measure: ${l.length}`);
   // Values RIGHT-align on a shared edge (ledger style): the last digit of every value
   // lands in the same column, regardless of bar length.

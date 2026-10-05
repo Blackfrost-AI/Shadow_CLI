@@ -12,17 +12,20 @@
 // construction rather than by convention.
 
 import type { Component } from '@earendil-works/pi-tui';
-import { visibleWidth, truncateToWidth } from '@earendil-works/pi-tui';
+import { Image, visibleWidth, truncateToWidth } from '@earendil-works/pi-tui';
 
 import { flattenItem, type FlattenItem, type ViewportLine } from '../tui/flatten.js';
 import type { BrandInfo, ToolRun } from '../tui/rows.js';
 import { renderBrand } from '../tui/rows.js';
 import { groupKind, type CollapseKind } from '../tui/toolDisplay.js';
 import { clampTail } from '../tui/streamCommit.js';
-import { PIN_THEME, RESET, bgAnsi, lineToAnsi } from './ansi.js';
+import { PIN_THEME, RESET, bgAnsi, lineToAnsi, style } from './ansi.js';
+import { SPACING } from '../tui/glyphs.js';
+import { approvalText } from '../util/approvalText.js';
+import { formatBytes, fullscreenImageProtocol } from '../util/termImage.js';
 
 /** Left/right page margin — floats transcript content off the terminal edges. */
-export const PAGE_MARGIN = 4;
+export const PAGE_MARGIN = SPACING.page;
 /** Cap prose so lines don't run edge-to-edge on wide terminals (matches the Ink path). */
 export const PROSE_MAX_COLS = 100;
 
@@ -42,7 +45,7 @@ export function fitLines(lines: string[], width: number): string[] {
 
 /** Inner content width for a terminal column count. */
 export function contentWidth(cols: number, kind: string): number {
-  const inner = Math.max(20, cols - PAGE_MARGIN * 2);
+  const inner = Math.max(1, cols - PAGE_MARGIN * 2);
   return kind === 'banner' ? inner : Math.min(inner, PROSE_MAX_COLS);
 }
 
@@ -73,6 +76,7 @@ export class FlatCell implements Component {
   private toolRun: ToolRun | undefined;
   private foldTables: boolean;
   private sig: string;
+  private image: Image | undefined;
 
   constructor(
     private item: FlattenItem,
@@ -86,6 +90,13 @@ export class FlatCell implements Component {
     this.toolRun = toolRun;
     this.foldTables = foldTables;
     this.sig = runSig(toolRun);
+    // Graphics protocols embed the payload verbatim. Only base64 may cross that boundary;
+    // a tool-supplied escape must never terminate the image and become a terminal command.
+    if (item.image && fullscreenImageProtocol(item.image.mediaType) && item.image.bytes.length <= 1_400_000 && /^[A-Za-z0-9+/]+={0,2}$/.test(item.image.bytes)) {
+      this.image = new Image(item.image.bytes, item.image.mediaType, { fallbackColor: style.dim }, {
+        maxWidthCells: 72, maxHeightCells: 20, filename: approvalText(item.image.alt ?? 'image'),
+      });
+    }
   }
 
   /**
@@ -118,6 +129,7 @@ export class FlatCell implements Component {
   invalidate(): void {
     this.cachedWidth = -1;
     this.cachedLines = null;
+    this.image?.invalidate();
   }
 
   render(width: number): string[] {
@@ -125,6 +137,15 @@ export class FlatCell implements Component {
       return this.cachedLines;
     }
     const w = contentWidth(width, this.item.kind);
+    if (this.item.kind === 'image' && this.item.image) {
+      const im = this.item.image;
+      const label = `[image] ${approvalText(im.alt || 'image')} · ${approvalText(im.mediaType.replace(/^image\//, ''))} ${formatBytes(Buffer.byteLength(im.bytes, 'base64'))}`;
+      const source = im.source ? `  ${approvalText(im.source)}` : '  Use /image <path> to attach a local image.';
+      const lines = ['', style.dim(truncateToWidth(label, width)), style.dim(truncateToWidth(source, width)), ...(this.image?.render(width) ?? [])];
+      this.cachedWidth = width;
+      this.cachedLines = lines;
+      return lines;
+    }
     this.lines = flattenItem(this.item, w, this.collapsed, PIN_THEME, this.continuation, this.foldTables, this.toolRun);
     const isUser = this.item.kind === 'user';
     const band = isUser ? PIN_THEME.userBg : undefined;
@@ -147,6 +168,10 @@ export class FlatCell implements Component {
     });
     this.cachedWidth = width;
     this.cachedLines = fitLines(out, width);
+    if (isUser) {
+      const first = this.cachedLines.findIndex((line) => visibleWidth(line) > 0);
+      if (first >= 0) this.cachedLines[first] = '\x1b]133;A\x07' + this.cachedLines[first];
+    }
     return this.cachedLines;
   }
 }

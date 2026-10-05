@@ -1,3 +1,4 @@
+import { GLYPHS } from '../src/tui/glyphs.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseMarkdown } from '../src/util/markdown.js';
@@ -36,7 +37,7 @@ test('table borders are dim; header cells bold; body cells fg', () => {
   const item = { id: 1, kind: 'assistant' as const, text: md };
   const rows = flattenItem(item, 80, false, T, false, false);
   const joined = rows.map((r) => r.spans.map((s) => s.text).join(''));
-  assert.ok(joined.some((l) => l.includes('╭')), 'grid renders (under ⏺ gutter)');
+  assert.ok(joined.some((l) => l.includes('╭')), `grid renders (under ${GLYPHS.tool} gutter)`);
   // Top border line: the ╭…╮ segment(s) are dim (gutter may be orange ⏺ / indent)
   const top = rows.find((r) => r.spans.some((s) => s.text.includes('╭')));
   assert.ok(top);

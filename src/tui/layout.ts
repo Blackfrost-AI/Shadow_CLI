@@ -1,7 +1,7 @@
 /** Pure terminal layout math for the Shadow TUI — no React/Ink imports. */
 
+import { SHADOW_LOGOTYPE_WIDTH } from './brand.js';
 import { formatContextGauge } from './gauge.js';
-import { SHADOW_ART_WIDTH } from './wordmark.js';
 
 export interface ChromeConfig {
   statusRows?: number;
@@ -25,8 +25,19 @@ export interface TerminalLayout {
   sidePanelCols: number;
 }
 
-/** Width of the full SHADOW wordmark (longest line), derived from its single source of truth. */
-export const SHADOW_LOGO_WIDTH = SHADOW_ART_WIDTH;
+/**
+ * Width of the SHADOW wordmark (longest line), for reserving layout beside it.
+ *
+ * DERIVED from the brand art, never pinned to a literal. It used to be
+ * `= 50`, a number that matched the figlet block-letter art in onboard.ts while
+ * this comment pointed at the snowflake in wordmark.ts — two marks, one stale
+ * constant. fitsWideBanner() then over-reserved by 25 columns and suppressed the
+ * side-by-side banner on terminals that could perfectly well have held it.
+ *
+ * Re-exported under the old name so existing callers and tests keep working;
+ * new code should import SHADOW_LOGOTYPE_WIDTH from src/tui/brand.js directly.
+ */
+export const SHADOW_LOGO_WIDTH: number = SHADOW_LOGOTYPE_WIDTH;
 
 const LOGO_MIN_COLS = 90; // legacy wide threshold for computeLayout.wideBanner
 

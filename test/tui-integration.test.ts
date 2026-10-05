@@ -1,3 +1,4 @@
+import { GLYPHS } from '../src/tui/glyphs.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import React from 'react';
@@ -60,11 +61,11 @@ test('composer accepts the letter o (not stolen by reasoning toggle)', async () 
 
   const { stdin, frames, unmount } = render(React.createElement(TuiApp, { opts }));
   const seen = () => frames.join('\n');
-  await waitFor(() => /❯/.test(seen()), 1500);
+  await waitFor(() => new RegExp(`${GLYPHS.prompt}`, "").test(seen()), 1500);
   await new Promise((r) => setTimeout(r, 80));
 
   stdin.write('hello');
-  await waitFor(() => /❯ hello/.test(seen()), 1500);
+  await waitFor(() => new RegExp(`${GLYPHS.promptPrefix}hello`, "").test(seen()), 1500);
   unmount();
 });
 
@@ -90,18 +91,18 @@ test('typing a task + Enter runs the loop and commits the mock reply', async () 
 
   const { stdin, frames, unmount } = render(React.createElement(TuiApp, { opts }));
   const seen = () => frames.join('\n');
-  await waitFor(() => /❯/.test(seen()), 1500); // composer mounted
+  await waitFor(() => new RegExp(`${GLYPHS.prompt}`, "").test(seen()), 1500); // composer mounted
   await new Promise((r) => setTimeout(r, 80)); // let Ink wire useInput before synthetic typing
 
   stdin.write('ping'); // type the task
-  await waitFor(() => /❯ ping/.test(seen()), 1500);
+  await waitFor(() => new RegExp(`${GLYPHS.promptPrefix}ping`, "").test(seen()), 1500);
   stdin.write('\r'); // Enter → submit
 
-  await waitFor(() => /❯ ping/.test(seen()), 1500); // user line committed
+  await waitFor(() => new RegExp(`${GLYPHS.promptPrefix}ping`, "").test(seen()), 1500); // user line committed
   await waitFor(() => /Shadow \(mock\): I received "ping"/.test(seen()), 1500); // loop ran, reply committed
 
   const out = seen();
-  assert.match(out, /❯ ping/, 'the submitted task is committed to scrollback');
+  assert.match(out, new RegExp(`${GLYPHS.promptPrefix}ping`, ""), 'the submitted task is committed to scrollback');
   assert.match(out, /Shadow \(mock\): I received "ping"/, 'the mock loop reply is committed');
   // Turns now render as plain scrolling text (Claude-Code style): the old per-message
   // bordered card — with its "you"/"assistant" header label — is gone.
@@ -236,7 +237,7 @@ test('type-ahead: a pending message interrupts model streaming and steers the ne
   assert.deepEqual(prompts, ['first', 'second'], 'the steering message becomes the next provider turn');
   assert.doesNotMatch(seen(), /stale first completion/, 'the obsolete completion never reaches the transcript');
   assert.match(seen(), /↪ pending message — steering at the next safe boundary/);
-  assert.match(seen(), /❯ second/, 'the steering message commits its user line like an idle send');
+  assert.match(seen(), new RegExp(`${GLYPHS.promptPrefix}second`, ""), 'the steering message commits its user line like an idle send');
 
   const messages = context.messages();
   assert.equal(messages[0]?.role, 'user');
@@ -482,7 +483,7 @@ test('Enter on a typed follow-up denies an approval dialog and steers instead of
   stdin.write('\r');
   await new Promise((resolve) => setTimeout(resolve, 40));
   stdin.write('change course');
-  await waitFor(() => /❯ change course/.test(seen()));
+  await waitFor(() => new RegExp(`${GLYPHS.promptPrefix}change course`, "").test(seen()));
   await waitFor(() => /dangerous_write/.test(seen()), 2000);
   stdin.write('\r');
   await waitFor(() => /follow-up:change course/.test(seen()), 2000);
@@ -644,7 +645,7 @@ test('backslash + Enter inserts a newline instead of submitting', async () => {
 
   const { stdin, frames, unmount } = render(React.createElement(TuiApp, { opts }));
   const seen = () => frames.join('\n');
-  await waitFor(() => /❯/.test(seen()), 1500);
+  await waitFor(() => new RegExp(`${GLYPHS.prompt}`, "").test(seen()), 1500);
   await new Promise((r) => setTimeout(r, 80));
 
   stdin.write('one\\'); // type "one\"
@@ -712,10 +713,10 @@ test('ask_user_question overlay collects multiple TUI answers', async () => {
 
   const { stdin, frames, unmount } = render(React.createElement(TuiApp, { opts }));
   const seen = () => frames.join('\n');
-  await waitFor(() => /❯/.test(seen()), 1500);
+  await waitFor(() => new RegExp(`${GLYPHS.prompt}`, "").test(seen()), 1500);
   await new Promise((r) => setTimeout(r, 80));
   stdin.write('choose');
-  await waitFor(() => /❯ choose/.test(seen()), 1500);
+  await waitFor(() => new RegExp(`${GLYPHS.promptPrefix}choose`, "").test(seen()), 1500);
   stdin.write('\r');
   await waitFor(() => /First target\?/.test(seen()), 1500);
   stdin.write('2');
@@ -776,7 +777,7 @@ test('TUI user_prompt_submit hook denial prevents a model turn', async () => {
 
     const { stdin, frames, unmount } = render(React.createElement(TuiApp, { opts }));
     const seen = () => frames.join('\n');
-    await waitFor(() => /❯/.test(seen()), 1500);
+    await waitFor(() => new RegExp(`${GLYPHS.prompt}`, "").test(seen()), 1500);
     await new Promise((r) => setTimeout(r, 80));
     stdin.write('blocked');
     await new Promise((r) => setTimeout(r, 20));
@@ -835,7 +836,7 @@ test('Esc interrupts a running turn (and the session survives)', async () => {
   const frame = lastFrame() ?? '';
   assert.match(frame, /interrupted/, 'Esc reports the interrupt');
   assert.doesNotMatch(frame, /Esc stop/, 'the running turn stopped');
-  assert.match(frame, /❯/, 'composer still present — the session survived');
+  assert.match(frame, new RegExp(`${GLYPHS.prompt}`, ""), 'composer still present — the session survived');
   unmount();
 });
 
@@ -846,6 +847,6 @@ test('a single Ctrl-C does NOT quit; it warns first (no accidental session loss)
   await new Promise((r) => setTimeout(r, 80));
   const frame = lastFrame() ?? '';
   assert.match(frame, /press Ctrl-C again to quit/, 'first Ctrl-C warns instead of quitting');
-  assert.match(frame, /❯/, 'app still mounted after one Ctrl-C');
+  assert.match(frame, new RegExp(`${GLYPHS.prompt}`, ""), 'app still mounted after one Ctrl-C');
   unmount();
 });

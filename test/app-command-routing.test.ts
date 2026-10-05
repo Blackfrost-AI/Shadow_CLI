@@ -274,9 +274,9 @@ test('pi keybindings are renderer-specific and unsupported commands explain the 
   const text = h.text();
   assert.match(text, /pi keybindings/i);
   assert.match(text, /Shift\+Tab\s+toggle plan mode/);
-  assert.match(text, /~\/\.shadow\/keybindings\.json applies only to Ink in v9/);
+  assert.match(text, /~\/\.shadow\/keybindings\.json is Ink-only/);
   for (const name of ['/vim', '/table', '/statusline']) {
-    assert.match(text, new RegExp(`${name} is unavailable in the pi preview`));
+    assert.match(text, new RegExp(`${name} is unavailable in Snowfall`));
   }
   assert.doesNotMatch(text, /Unknown command/);
 

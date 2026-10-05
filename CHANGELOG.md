@@ -1,5 +1,21 @@
 # Shadow release notes
 
+## 10.0.0 — 2026-10-04
+
+- Made Snowfall the default interactive terminal, with a full-width conversation, pinned composer,
+  compact status bar, and the original thick cyan SHADOW banner.
+- Added full-screen transcript navigation, search, selection/copy, folded details, responsive
+  layouts and restoration to normal terminal scrollback on exit.
+- Completed shared commands, custom commands, permission/question dialogs, queued follow-ups,
+  external-editor access, accessible themes and supported terminal image placements.
+- Preserved v9 Work Center tracking, persisted history and controls across terminal, web and ACP.
+- Retained the Ink compatibility renderer for Vim, round-table, custom status lines and key maps.
+- Preserved headless, REPL, web and editor entrypoints and the signed Blackfrost update channel.
+- Updated development-only brace-expansion dependencies; runtime and full dependency audits are clean.
+- Fixed Node 22 / Undici 8 dispatcher compatibility and bundled the complete Undici implementation
+  in standalone binaries built with Bun 1.4.2.
+
+
 ## 9.0.0 — 2026-09-30
 
 - Added Work Center across terminal, web and a versioned ACP extension: agents, background shells,

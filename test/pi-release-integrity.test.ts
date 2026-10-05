@@ -243,6 +243,7 @@ test('pi Esc interrupts a running turn even when the composer holds an unsent dr
         listener = next;
       },
       requestRender() {},
+      hasOverlay: () => false,
     },
   });
 

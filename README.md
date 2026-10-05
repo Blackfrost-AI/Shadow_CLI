@@ -6,9 +6,9 @@
 
 > **A true gift of freedom and privacy.**
 > Zero-telemetry · provider-neutral · phone home to no one.
-> Current build: **`v9.0.0`** — Work Center and operator control. Ink remains the supported default terminal; pi is an opt-in preview.
+> Current build: **`v10.0.0`** — Snowfall. Full-screen terminal, full-width conversation, compact status bar and the classic block-letter SHADOW banner.
 
-**Shadow is a zero-telemetry, provider-neutral coding agent that runs on your terms.** Point it at any model — Anthropic, any OpenAI-compatible endpoint, Gemini, or a local model on your own box — and it works as a coding / sysadmin agent over your workspace. **No Shadow account, no signup, no phone-home:** the only outbound traffic is the provider *you* chose and the web tools the agent explicitly invokes. Your config stays local and readable (`~/.shadow/config.json`), your keys never leave your machine, and you can switch models mid-session **without losing context**.
+**Shadow is a zero-telemetry, provider-neutral coding agent that runs on your terms.** Point it at any model — Anthropic, any OpenAI-compatible endpoint, Gemini, or a local model on your own box — and it works as a coding / sysadmin agent over your workspace. **No Shadow account, no signup, no phone-home:** network access follows your provider, tool and update choices. Your config stays local and readable (`~/.shadow/config.json`), credentials are sent to their configured services, and you can switch models mid-session **without losing context**.
 
 We're not competing for "coding-tool" mindshare — we're handing you back control: local-first autonomy, real guardrails, and full ownership of your workspace and your data.
 
@@ -16,13 +16,23 @@ Under the hood it's a **tool-calling agentic runtime**: the model reasons, emits
 
 This is **not a chat app** — it is a tool-calling runtime.
 
-## What's new in v9.0.0
+## What's new in v10.0.0 — Snowfall
+
+- **Snowfall is now the default terminal:** a full-width conversation, pinned composer and compact footer keep your work centered. The original thick SHADOW wordmark returns in cyan with responsive fallbacks for narrow terminals.
+- **A navigable transcript:** page and wheel scrolling, prompt jumps, text selection, search, folded tool details and scrollback restoration on normal exit.
+- **Everyday controls:** queued follow-ups, permission dialogs, custom slash commands, external-editor access and accessible themes share the existing agent runtime.
+- **Work Center stays available:** v9 agent, shell and task tracking, persisted history, and explicit controls continue across terminal, web and ACP.
+- **Compatibility:** `SHADOW_TUI=ink shadow` retains Vim mode, round-table mode, custom status lines and configurable key mappings. Headless, REPL, web and editor integrations keep their existing entrypoints.
+
+See the [terminal contract](TERMINAL_RENDERERS.md), [release verification](docs/V10_VERIFICATION.md), and [release notes](CHANGELOG.md).
+
+## Previous highlights: v9.0.0
 
 - **Work Center:** `/work` lists agents, background shells and plan items with status, ownership, elapsed time and bounded activity history. Inspect details, filter by type/status/tool/file, and view persisted cross-session history without restarting old work.
 - **Explicit controls:** pause/resume background agents at safe boundaries, adjust queued priority, cancel active background agents, stop owned shells, and request a linked retry with explicit confirmation. Historical work remains read-only.
 - **Shared state:** terminal, web companion and the versioned ACP Work Center extension use the same work state and control boundaries.
 - **Full SHADOW wordmark:** the two-tone 51-column mark is restored; medium-width layouts stack the full mark before falling back to a compact header.
-- **Renderer contract:** Ink remains the supported default. `SHADOW_TUI=pi shadow` selects the experimental preview. Its daily commands and session transitions are covered by regression tests; `/vim`, `/table`, `/statusline`, custom commands and custom key mappings remain Ink-only. See [Terminal renderers](TERMINAL_RENDERERS.md).
+- **Renderer contract:** In v9, Ink was the supported default and `SHADOW_TUI=pi shadow` selected the experimental preview. Its daily commands and session transitions are covered by regression tests; `/vim`, `/table`, `/statusline`, custom commands and custom key mappings remain Ink-only. See [Terminal renderers](TERMINAL_RENDERERS.md).
 - Approval previews make terminal and invisible controls visible without altering the original tool inputs. Session resume, rewind, fork and exports preserve the documented context and ownership boundaries.
 
 See the [release notes](CHANGELOG.md) and [Work Center guide](USER_GUIDE.md#work-center).

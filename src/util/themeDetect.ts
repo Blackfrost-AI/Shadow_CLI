@@ -136,7 +136,8 @@ export function queryTerminalBackground(opts: TermBgQueryOpts = {}): Promise<Ter
       if (buf.length > 512) finish(null);
     };
     const timer = setTimeout(() => finish(null), timeoutMs);
-    timer.unref?.();
+    // Startup awaits this bounded query. Keep its deadline alive even if stdin closes,
+    // so the promise settles and raw-mode restoration is not abandoned with the event loop.
     try {
       setRaw(true);
       stdin.resume?.();

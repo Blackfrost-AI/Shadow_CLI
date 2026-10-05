@@ -27,6 +27,13 @@ if ! command -v "$BUN" >/dev/null 2>&1; then
     echo "error: bun not found. Install with: curl -fsSL https://bun.sh/install | bash" >&2; exit 1; }
 fi
 
+# Undici 8 needs this Node API. Bun 1.3.x silently substituted a non-pinning Undici
+# shim; the explicit package entry now needs a compatible runtime (verified: 1.4.2).
+if ! "$BUN" -e 'if (typeof require("node:worker_threads").markAsUncloneable !== "function") process.exit(1)' >/dev/null 2>&1; then
+  echo "error: this Bun lacks markAsUncloneable required by Undici 8. Use Bun 1.4.2 or set BUN to a compatible executable." >&2
+  exit 1
+fi
+
 VERSION="$(node -p "require('./package.json').version")"
 OUT="${1:-dist-bin/shadow}"
 TARGET="${2:-}"
@@ -65,7 +72,11 @@ echo "→ compiling v$VERSION ${TARGET:+($TARGET) }→ $OUT"
 chmod +x "$OUT" 2>/dev/null || true
 SIZE="$(du -h "$OUT" 2>/dev/null | cut -f1)"
 if [ -z "$TARGET" ]; then
-  echo "✓ built $OUT ($SIZE) — $("$OUT" --version 2>/dev/null || echo 'run failed')"
+  if ! SHADOW_BINARY_VERSION="$("$OUT" --version)"; then
+    echo "build-binary: compiled executable failed its --version smoke" >&2
+    exit 1
+  fi
+  echo "✓ built $OUT ($SIZE) — $SHADOW_BINARY_VERSION"
 else
   echo "✓ built $OUT ($SIZE) for $TARGET (cross-compiled; not run on host)"
 fi

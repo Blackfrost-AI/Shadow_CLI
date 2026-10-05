@@ -1,3 +1,4 @@
+import { PROMPT_WIDTH } from './glyphs.js';
 // Pure composer-input helpers, split out of tui.tsx so they can be unit-tested without booting Ink.
 import { existsSync } from 'node:fs';
 import { displayWidth, nextCluster } from '../util/width.js';
@@ -87,7 +88,7 @@ export function dropConsumedPastes<T extends { id: number }>(pastes: T[], submit
 /** Max visual rows the composer shows before scrolling the window around the caret. */
 export const COMPOSER_MAX_VISIBLE_ROWS = 8;
 /** Prefix width of the `❯ ` gutter on the first visual line (continuation lines indent 2). */
-export const COMPOSER_GUTTER = 2;
+export const COMPOSER_GUTTER = PROMPT_WIDTH;
 
 export interface ComposerLayout {
   /** Soft-wrapped visual lines (hard `\n` always breaks). */

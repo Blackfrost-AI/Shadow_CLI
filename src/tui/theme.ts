@@ -29,6 +29,27 @@
 // `user` vs `accent` are chosen per-theme to stay distinguishable under color-vision
 // deficiency — and the cue is never color-alone: user turns carry the ▌ bar SHAPE.
 export const THEMES = {
+  snowfall: {
+    fg: '#f2f7fc',
+    body: '#d4dde7',
+    bright: '#ffffff',
+    dim: '#9cadc1',
+    cyan: '#70cfff',
+    green: '#79dfb0',
+    red: '#ff8585',
+    yellow: '#f0ca74',
+    purple: '#c5adff',
+    user: '#82d5d1',
+    accent: '#c3e5ff',
+    codeBg: '#182534',
+    bg: '#0b121b',
+    menuBg: '#122031',
+    menuSelBg: '#233e54',
+    userBg: '#142b37',
+    border: '#7893ad',
+    panel: '#111f2b',
+    selection: '#234157',
+  },
   og: {
     fg: '#ffffff', // white — high contrast
     body: '#c9d2da', // transcript prose — soft, readable tier under bright
@@ -43,7 +64,7 @@ export const THEMES = {
     // The band behind a user turn — the only filled row in the transcript. Desaturated blue:
     // reads as "yours" on a dark terminal without fighting the code chip or the menu fill.
     userBg: '#1e3a4d',
-    accent: '#d97757', // warm turn-bullet orange
+    accent: '#c3e5ff', // pale ice — the Frost identity's turn accent
     codeBg: '#2d333b',
     bg: null,
     menuBg: '#1b2331',
@@ -61,7 +82,7 @@ export const THEMES = {
     yellow: '#f5b62e',
     purple: '#b9a3ff',
     user: '#22d38f',
-    accent: '#d97757',
+    accent: '#c3e5ff',
     codeBg: '#2d333b',
     bg: null,
     menuBg: '#1b2331',
@@ -246,10 +267,11 @@ export const THEMES = {
   },
 } as const;
 export type ThemeName = keyof typeof THEMES;
-export const THEME_NAMES = ['og', 'shadow', 'pipboy', 'cyberpunk', 'coder-chick', 'matrix', 'mono', 'light', 'colorblind', 'high-contrast'] as const;
+export const THEME_NAMES = ['snowfall', 'og', 'shadow', 'pipboy', 'cyberpunk', 'coder-chick', 'matrix', 'mono', 'light', 'colorblind', 'high-contrast'] as const;
 export type CanonicalThemeName = (typeof THEME_NAMES)[number];
 
 export const THEME_DESCRIPTIONS: Record<CanonicalThemeName, string> = {
+  snowfall: 'Cold midnight, pale ice and crystal marks. The Shadow v10 default.',
   og: 'Original Shadow palette: calm dark terminal with cyan/violet accents.',
   shadow: 'True black. Sets the terminal background itself for a focused session; colorblind-safe accents.',
   pipboy: 'Soft green phosphor with amber warnings; retro but low-glare.',
@@ -307,9 +329,13 @@ export interface Palette {
    * theme that omits it falls back to `menuBg`, which every theme already defines.
    */
   userBg?: string;
+  /** Optional chrome roles; existing themes fall back to dim/menuBg/menuSelBg. */
+  border?: string;
+  panel?: string;
+  selection?: string;
 }
 
-export const C: Palette = { ...THEMES.og };
+export const C: Palette = { ...THEMES.snowfall };
 
 export function normalizeThemeName(name: string | undefined): CanonicalThemeName | null {
   if (!name) return null;
@@ -320,7 +346,7 @@ export function normalizeThemeName(name: string | undefined): CanonicalThemeName
 
 /** Swap the active palette in place. Caller must trigger a re-render to repaint. */
 export function applyTheme(name: ThemeName | string): void {
-  const theme = normalizeThemeName(name) ?? 'og';
+  const theme = normalizeThemeName(name) ?? 'snowfall';
   // Reset BEFORE assigning: Object.assign only copies keys the new theme DEFINES, so a theme
   // that omits an optional token silently inherits the previous theme's value — `light` was
   // painted with `og`'s user band and paletteSnapshot() then reported a palette not in use.
@@ -354,6 +380,6 @@ export function backgroundSequence(bg: string | null, isTTY: boolean, env: NodeJ
 
 /** The background the named theme asserts (null = inherit the terminal's own). */
 export function themeBackground(name: string | undefined): string | null {
-  const theme = normalizeThemeName(name) ?? 'og';
+  const theme = normalizeThemeName(name) ?? 'snowfall';
   return THEMES[theme].bg;
 }

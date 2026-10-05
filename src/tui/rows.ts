@@ -1,3 +1,4 @@
+import { GLYPHS } from './glyphs.js';
 // src/tui/rows.ts — Shadow TUI v2 visual language: PURE transcript-row renderers.
 //
 // These build the redesigned transcript rows (brand mark, tool results, reasoning) as StyledSpan
@@ -11,6 +12,7 @@
 
 import type { StyledSpan, ViewportTheme } from './flatten.js';
 import type { SpeakerTag } from './roundTable.js';
+import { SHADOW_COMPACT_MARK, SHADOW_COMPACT_NAME, degradeArt } from './brand.js';
 import { displayWidth } from '../util/width.js';
 import {
   displayToolArg,
@@ -34,22 +36,33 @@ export interface BrandInfo {
   help: string;
   /** Bypass/YOLO active → a bright warning row. */
   yolo?: boolean;
-  /** ASCII wordmark lines. Rendered borderless when it fits `cols`; else the compact ✦ form. */
+  /** Brand art lines (see src/tui/brand.ts). Rendered borderless when it fits `cols`; else the compact ✻ form. */
   art?: string[];
 }
 
 /**
- * The brand mark that opens a session. When the terminal is wide enough, the SHADOW wordmark is
- * rendered BORDERLESS (the box is what broke on every renderer swap) in a two-tone cyan for depth,
- * followed by a ✦ meta line; on a narrow terminal it degrades to the compact ✦ name form. Either
+ * The brand mark that opens a session. When the terminal is wide enough, the SHADOW logotype is
+ * rendered borderless in cyan, followed by a ✦ meta line; on a narrow terminal it degrades
+ * through the icon to the compact ✻ name form. Either
  * way it scrolls off into history like any other transcript block. A yellow YOLO row when active.
+ *
+ * The caller hands over its PREFERRED art on `b.art` (normally the 51-col retro banner) and this
+ * function degrades it against `cols`: logotype → icon → compact. That ladder lives in
+ * src/tui/brand.ts (`degradeArt`) and is applied HERE rather than in each renderer, because the
+ * shared layer is what both the Ink and pi shells draw through — putting it in either shell would
+ * have left the other one two-tiered, which is how the pre-v10 brand diverged.
+ *
+ * Everything else is measured with displayWidth, so a 51-column logotype, a 25-column icon or
+ * nothing at all all lay out correctly without this function knowing which it got.
  */
 export function renderBrand(b: BrandInfo, theme: ViewportTheme, cols: number): StyledSpan[][] {
   const rows: StyledSpan[][] = [];
   // Measure in DISPLAY COLUMNS (.length miscounts CJK/emoji meta — a wide model name made the
   // right-aligned meta block overflow the terminal edge).
   const width = (spans: StyledSpan[]): number => spans.reduce((n, s) => n + displayWidth(s.text), 0);
-  const art = b.art ?? [];
+  // Degrade BEFORE measuring: the tier that survives decides artW, which decides
+  // side-by-side vs stacked vs compact below.
+  const art = degradeArt(b.art ?? [], cols);
   const artW = art.length ? Math.max(...art.map((l) => displayWidth(l))) : 0;
 
   // The meta block: version, model, workspace, hints, and (when active) the YOLO warning.
@@ -75,9 +88,9 @@ export function renderBrand(b: BrandInfo, theme: ViewportTheme, cols: number): S
       const line: StyledSpan[] = [];
       const hasArt = i < art.length;
       if (hasArt) {
-        // Bright upper face + quiet lower face restores the dimensional wordmark treatment.
-        const t = art.length > 1 ? i / (art.length - 1) : 0;
-        line.push({ text: art[i]!.padEnd(artW), color: t < 0.5 ? theme.cyan : theme.dim, bold: t < 0.5 });
+        // Keep a uniform accent across both the solid-block banner and the narrow icon.
+        void i;
+        line.push({ text: art[i]!.padEnd(artW), color: theme.cyan, bold: true });
       } else {
         line.push({ text: ' '.repeat(artW) });
       }
@@ -90,8 +103,8 @@ export function renderBrand(b: BrandInfo, theme: ViewportTheme, cols: number): S
   // Stacked: wordmark fits width but not beside the meta → wordmark, then meta below.
   if (art.length && artW + 2 <= cols) {
     art.forEach((l, i) => {
-      const t = art.length > 1 ? i / (art.length - 1) : 0;
-      rows.push([{ text: l, color: t < 0.5 ? theme.cyan : theme.dim, bold: t < 0.5 }]);
+      void i;
+      rows.push([{ text: l, color: theme.cyan, bold: true }]);
     });
     rows.push([{ text: '' }]);
     rows.push(...meta.map((spans, i) => (i === 0 ? spans : [{ text: '  ' }, ...spans])));
@@ -101,9 +114,11 @@ export function renderBrand(b: BrandInfo, theme: ViewportTheme, cols: number): S
   // Compact: too narrow for the wordmark at all → the ✦ name form. The meta joins onto ONE line
   // only when it fits; otherwise each segment gets its own row — word-wrap would split the
   // workspace PATH mid-token ("…/shad / ow-cli"), the ugliest possible header.
+  //
+  // The compact mark and name come from the same brand module as the full banner.
   rows.push([
-    { text: '✦ ', color: theme.cyan, bold: true },
-    { text: 'shadow', color: theme.fg, bold: true },
+    { text: `${SHADOW_COMPACT_MARK} `, color: theme.cyan, bold: true },
+    { text: SHADOW_COMPACT_NAME, color: theme.fg, bold: true },
     { text: `  v${b.version}`, color: theme.dim },
   ]);
   const joined = `  ${b.providerModel}${SEP}${b.workspace}${SEP}${b.help}`;
@@ -202,7 +217,7 @@ function shortSummary(summary: string, arg: string | undefined, max = 90): strin
  * `renderToolStack`), so this row is what EDITS, failures and one-off actions leave behind.
  */
 /** The signature bullet the grouped-run header and the banner use (⏺ on macOS, ● elsewhere). */
-const TOOL_DOT = process.platform === 'darwin' ? '⏺' : '●';
+const TOOL_DOT = GLYPHS.tool;
 
 export function renderToolResult(t: ToolInfo, theme: ViewportTheme): StyledSpan[] {
   // BOTH outcomes are written out — `✓ DONE ` / `✗ FAILED ` — because a green dot and a red dot are
@@ -319,6 +334,8 @@ export function renderReasoning(
 // importing the TUI component module.
 export interface BannerLine {
   text: string;
+  /** Styled runs for system/banner rows. `text` remains the plain-text representation. */
+  spans?: StyledSpan[];
   color?: string;
   dimColor?: boolean;
   bold?: boolean;

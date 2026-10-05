@@ -64,6 +64,30 @@ function summaryFor(host: string) {
   return egressSummary().find((r) => r.host === host);
 }
 
+test('per-request agents bridge legacy fetch handlers without losing pinning or the offline wall', async () => {
+  const srv = await startLocalServer();
+  const agent = new EgressAgent({ pinTo: ['127.0.0.1'], validatedHost: 'legacy-fetch.invalid' });
+  const request = () => new Promise<string>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    // Exercise Node 22's handler protocol even when this test runs on newer Node.
+    agent.dispatch({ origin: `http://legacy-fetch.invalid:${srv.port}`, path: '/legacy', method: 'GET' }, {
+      onConnect() {},
+      onHeaders(status: number) { assert.equal(status, 200); return true; },
+      onData(chunk: Buffer) { chunks.push(chunk); return true; },
+      onComplete() { resolve(Buffer.concat(chunks).toString()); },
+      onError: reject,
+    } as never);
+  });
+  try {
+    assert.equal(await request(), 'ok:/legacy', 'the unresolvable hostname uses the validated IP');
+    setOfflineMode(true);
+    await assert.rejects(request, /offline mode.*blocked at the dispatcher/);
+  } finally {
+    setOfflineMode(false);
+    await agent.close();
+  }
+});
+
 // ── Offline wall ──────────────────────────────────────────────────────────────
 
 test('offline mode: shadowFetch denies non-local egress with a readable error and records the deny', async () => {
@@ -443,6 +467,9 @@ test('the ESLint guard also catches the sneaky shapes (alias, bracket, dynamic i
     "const f = fetch;\nvoid f;\n", // aliasing fetch away
     "const g = globalThis['fetch'];\nvoid g;\n", // bracket access
     "const u = await import('undici');\nvoid u;\n", // dynamic import
+    "import { fetch } from 'undici/index.js';\nvoid fetch;\n", // package entry
+    "const u = await import('undici/index.js');\nvoid u;\n",
+    "const u = require('undici/index.js');\nvoid u;\n",
   ];
   for (const code of sneaky) {
     const out = await eslint.lintText(code, { filePath: fp });

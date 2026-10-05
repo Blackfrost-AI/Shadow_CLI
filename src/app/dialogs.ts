@@ -1,3 +1,4 @@
+import { BORDER, GLYPHS, SPACING } from '../tui/glyphs.js';
 // src/app/dialogs.ts — the approval and question overlays.
 //
 // This is the safety surface: everything an autonomous agent is allowed to do to the user's
@@ -14,7 +15,7 @@
 //     key can only mean what the visible legend says it means.
 
 import type { Component } from '@earendil-works/pi-tui';
-import { visibleWidth, truncateToWidth } from '@earendil-works/pi-tui';
+import { visibleWidth, truncateToWidth, isKeyRelease, matchesKey } from '@earendil-works/pi-tui';
 
 import type { ApprovalDecision, ApprovalRequest, UserQuestion } from '../agent/approval.js';
 import type { AutonomyLevel } from '../safety/permissions.js';
@@ -27,10 +28,10 @@ import { approvalText } from '../util/approvalText.js';
 
 /** Faint slate panel behind menus/overlays — themes override via `menuBg`. */
 function menuBg(): string {
-  return C.menuBg;
+  return C.panel ?? C.menuBg;
 }
 function menuSelBg(): string {
-  return C.menuSelBg;
+  return C.selection ?? C.menuSelBg;
 }
 
 /** The dialog's fixed bar width: never edge-to-edge, never wider than a comfortable measure. */
@@ -42,7 +43,8 @@ export function barWidth(cols: number, pageMargin: number): number {
 function fill(text: string, width: number, bg: string): string {
   const clipped = visibleWidth(text) > width ? truncateToWidth(text, width, '…') : text;
   const pad = Math.max(0, width - visibleWidth(clipped));
-  return `\x1b[48;2;${hex(bg)}m` + clipped + ' '.repeat(pad) + '\x1b[0m';
+  const background = `\x1b[48;2;${hex(bg)}m`;
+  return background + clipped.replaceAll('\x1b[0m', '\x1b[0m' + background) + ' '.repeat(pad) + '\x1b[0m';
 }
 
 function hex(h: string): string {
@@ -170,6 +172,7 @@ export class PendingDialog implements Component {
   // ── input ──────────────────────────────────────────────────────────────────
 
   handleInput(data: string): void {
+    if (isKeyRelease(data)) return;
     if (this.done) return;
     if (this.req.kind === 'user_question' && this.questions.length) {
       this.handleQuestionKey(data);
@@ -187,7 +190,7 @@ export class PendingDialog implements Component {
   private handlePermissionKey(data: string): void {
     const k = data.toLowerCase();
     // Esc denies: the safe default when the user backs out.
-    if (data === '\x1b' || k === 'n') return this.finish('deny');
+    if (matchesKey(data, 'escape') || k === 'n') return this.finish('deny');
     if (k === 'y') return this.finish('approve');
     if (this.req.kind === 'permission') {
       if (k === 's') return this.finish({ approveForSession: true });
@@ -224,10 +227,10 @@ export class PendingDialog implements Component {
     };
 
     // Arrow keys arrive as CSI sequences; accept both the raw and the normalised forms.
-    if (data === '\x1b[A' || data === 'k') return move(-1);
-    if (data === '\x1b[B' || data === 'j') return move(1);
-    if (data === '\x1b[C' || data === '\x1b[D') {
-      const delta = data === '\x1b[C' ? 1 : -1;
+    if (matchesKey(data, 'up') || data === 'k') return move(-1);
+    if (matchesKey(data, 'down') || data === 'j') return move(1);
+    if (matchesKey(data, 'right') || matchesKey(data, 'left')) {
+      const delta = matchesKey(data, 'right') ? 1 : -1;
       const next = this.questionIndex + delta;
       if (next >= 0 && next < this.questions.length) {
         this.questionIndex = next;
@@ -247,7 +250,7 @@ export class PendingDialog implements Component {
       this.host.repaint();
       return;
     }
-    if (data === '\r' || data === '\n') {
+    if (matchesKey(data, 'enter')) {
       // Single-select: committing the cursor row. Multi-select: commit what is checked, and never
       // commit an empty list — an unchecked Enter used to answer a question with no answer.
       if (!multi) {
@@ -297,7 +300,7 @@ export class PendingDialog implements Component {
 
   render(width: number): string[] {
     const { rows: termRows } = this.getSize();
-    const pageMargin = Math.min(4, Math.max(0, Math.floor(width / 8)));
+    const pageMargin = Math.min(SPACING.page, Math.max(0, Math.floor(width / 8)));
     const BAR = Math.min(barWidth(width, pageMargin), Math.max(20, width - pageMargin * 2));
     const pad = ' '.repeat(pageMargin);
     const bg = menuBg();
@@ -309,15 +312,15 @@ export class PendingDialog implements Component {
     const isQ = this.req.kind === 'user_question';
     const title = isQ
       ? this.activeQuestion?.header
-        ? `◆ ${approvalText(this.activeQuestion.header)}`
-        : '◆ A quick decision'
+        ? `${GLYPHS.tool} ${approvalText(this.activeQuestion.header)}`
+        : `${GLYPHS.tool} A quick decision`
       : this.req.kind === 'plan_enter'
         ? 'Enter plan mode?'
         : this.req.kind === 'plan_exit'
           ? 'Approve plan?'
           : 'Permission required';
     const titleColor = isQ ? C.cyan : C.yellow;
-    out.push(pad + fill(`\x1b[1m\x1b[38;2;${hex(titleColor)}m ${title}`, BAR, bg));
+    out.push(pad + fill(`\x1b[1m\x1b[38;2;${hex(titleColor)}m${BORDER.topLeft}${BORDER.horizontal} ${title}`, BAR, bg));
 
     // body
     const label = isQ
@@ -369,7 +372,7 @@ export class PendingDialog implements Component {
         const selected = sel.includes(o.label);
         const mark = q.multiSelect ? (selected ? '✓ ' : '  ') : '';
         const color = selected ? C.green : isCursor ? C.fg : C.dim;
-        let line = `${isCursor ? '❯' : ' '} ${i + 1}. ${mark}${approvalText(o.label)}`;
+        let line = `${isCursor ? `${GLYPHS.prompt}` : ' '} ${i + 1}. ${mark}${approvalText(o.label)}`;
         if (i === rec) line += `  ★ recommended`;
         if (o.description) line += `  — ${approvalText(o.description)}`;
         const styled = `\x1b[38;2;${hex(color)}m${isCursor ? '\x1b[1m' : ''}${line}`;
@@ -382,7 +385,7 @@ export class PendingDialog implements Component {
       out.push(pad + style.dim(`  [${approvalText(this.req.risk)}] ${approvalText(this.req.reason)}`));
     }
 
-    out.push(pad + this.legend());
+    out.push(pad + style.fg(C.border ?? C.dim, BORDER.bottomLeft + BORDER.horizontal + ' ') + this.legend());
     return fitLines(out, width);
   }
 

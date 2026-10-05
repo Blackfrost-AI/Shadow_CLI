@@ -1,3 +1,4 @@
+import { GLYPHS, stripPrompt } from './glyphs.js';
 // src/tui/flatten.ts — Flatten Shadow's TranscriptItems into styled display lines.
 //
 // Each TranscriptItem is rendered to an array of ViewportLines (1 terminal row each), preserving
@@ -17,7 +18,7 @@ import type { ChartSpan } from '../util/chart.js';
 import { hyperlink, supportsHyperlinks } from '../util/hyperlinks.js';
 import { inlineImageEsc, formatBytes, supportsInlineImages } from '../util/termImage.js';
 import { renderBrand, renderToolResult, renderToolChild, renderReasoning, renderToolStack } from './rows.js';
-import type { BrandInfo, ToolInfo, ToolRun } from './rows.js';
+import type { BannerLine, BrandInfo, ToolInfo, ToolRun } from './rows.js';
 import { collapseKind, isCollapsibleTool, type CollapseKind } from './toolDisplay.js';
 import { displayWidth, takeByWidth, nextCluster, stripInvisible } from '../util/width.js';
 
@@ -72,7 +73,7 @@ function appendToolBody(
     const PREVIEW = 2;
     const teaser = body.slice(0, PREVIEW);
     teaser.forEach((l, i) => {
-      const gutter: StyledSpan = i === 0 ? { text: '  ⎿ ', color: theme.dim } : { text: '    ' };
+      const gutter: StyledSpan = i === 0 ? { text: `${GLYPHS.resultPrefix}`, color: theme.dim } : { text: '    ' };
       out.push({
         key: `${kp}tp${i}`,
         spans: truncateSpans(
@@ -108,7 +109,7 @@ function appendToolBody(
       key: `${kp}cap`,
       spans: truncateSpans(
         [
-          { text: '  ⎿ ', color: theme.dim },
+          { text: `${GLYPHS.resultPrefix}`, color: theme.dim },
           { text: `… +${hidden} earlier ${hidden === 1 ? 'line' : 'lines'} elided`, color: theme.dim },
         ],
         cols,
@@ -116,7 +117,7 @@ function appendToolBody(
     });
   }
   shown.forEach((l, i) => {
-    const gutter: StyledSpan = i === 0 && !over ? { text: '  ⎿ ', color: theme.dim } : { text: '    ' };
+    const gutter: StyledSpan = i === 0 && !over ? { text: `${GLYPHS.resultPrefix}`, color: theme.dim } : { text: '    ' };
     out.push({
       key: `${kp}l${i}`,
       spans: truncateSpans(
@@ -172,7 +173,7 @@ export interface ViewportTheme {
    * which every theme already defines as its subtle fill tone.
    */
   userBg?: string;
-  /** The ⏺ assistant-turn bullet. Optional — falls back to the reference client's warm orange. */
+  /** Theme accent for assistant attribution; optional for renderers without an accent role. */
   accent?: string;
 }
 
@@ -696,7 +697,7 @@ export interface FlattenItem {
   tight?: boolean;
   title?: string;
   severity?: string;
-  lines?: { text: string; color?: string; dimColor?: boolean; bold?: boolean }[];
+  lines?: BannerLine[];
   /** v2 structured payloads (pinned/cell path). When present, the row renderer owns all styling
    *  and `text`/`lines` are the plain fallback used only by the stock Ink components. */
   brand?: BrandInfo;
@@ -861,10 +862,10 @@ export function flattenItem(
   // The band's inset lives here (two columns of leading space inside the fill) and the fill
   // itself is applied by the cell, which is the only layer that knows the terminal width.
   if (item.kind === 'user' && !item.lines) {
-    const raw = item.text.startsWith('❯ ') ? item.text.slice(2) : item.text;
+    const raw = stripPrompt(item.text);
     raw.split('\n').forEach((ln, i) => {
       const spans: StyledSpan[] = [
-        { text: '  ', bg: theme.userBg },
+        { text: i === 0 ? `${GLYPHS.user} ` : '  ', color: theme.user, bg: theme.userBg },
         { text: ln || ' ', color: theme.fg, bg: theme.userBg },
       ];
       const inner = Math.max(4, cols - 2);
@@ -899,8 +900,10 @@ export function flattenItem(
         ], cols),
       });
     }
-    bodyLines.forEach((ln) => {
-      const gutter: StyledSpan = { text: '  ' };
+    bodyLines.forEach((ln, index) => {
+      const gutter: StyledSpan = !continuation && index === 0 && (!spk || spk.handle === 'SHADOW')
+        ? { text: `${GLYPHS.assistant} `, color: theme.accent ?? theme.cyan }
+        : { text: '  ' };
       out.push({ key: ln.key, spans: [gutter, ...ln.spans] });
     });
     return out;
@@ -917,7 +920,10 @@ export function flattenItem(
   }
 
   body.forEach((l, i) => {
-    out.push(...wrapLine(`${kp}l${i}`, [{ text: l.text ?? '', color: l.color ?? color, dim: l.dimColor, bold: l.bold }], cols));
+    const spans = l.spans
+      ? l.spans.map((span) => ({ color: l.color ?? color ?? theme.fg, dim: l.dimColor, bold: l.bold, ...span }))
+      : [{ text: l.text ?? '', color: l.color ?? color, dim: l.dimColor, bold: l.bold }];
+    out.push(...wrapLine(`${kp}l${i}`, spans, cols));
   });
   return out;
 }

@@ -21,6 +21,12 @@ import type {
 } from '@earendil-works/pi-tui';
 
 import { fuzzyRank } from '../util/fuzzy.js';
+import { approvalText } from '../util/approvalText.js';
+
+function displayItems(items: AutocompleteItem[]): AutocompleteItem[] {
+  return items.map((item) => ({ ...item, label: approvalText(item.label ?? item.value),
+    description: item.description === undefined ? undefined : approvalText(item.description) }));
+}
 
 /** Directories never worth completing into: noise, or huge, or both. */
 const SKIP_DIRS = new Set([
@@ -211,7 +217,7 @@ export class ShadowAutocompleteProvider implements AutocompleteProvider {
         description: p.endsWith('/') ? 'directory' : undefined,
       }));
       if (!items.length) return null;
-      return { items, prefix: `@${query}` };
+      return { items: displayItems(items), prefix: `@${query}` };
     }
 
     // ── 2. /command name (no space yet) ──
@@ -227,7 +233,7 @@ export class ShadowAutocompleteProvider implements AutocompleteProvider {
         description: s.item.desc,
       }));
       if (!items.length) return null;
-      return { items, prefix: `/${q}` };
+      return { items: displayItems(items), prefix: `/${q}` };
     }
 
     // ── 3. /command <argument> ──
@@ -238,7 +244,7 @@ export class ShadowAutocompleteProvider implements AutocompleteProvider {
       const cmd = this.commands.find((c) => c.name === name);
       if (cmd?.args) {
         const items = cmd.args(argPrefix);
-        if (items.length) return { items, prefix: argPrefix };
+        if (items.length) return { items: displayItems(items), prefix: argPrefix };
       }
       return null;
     }
@@ -254,7 +260,7 @@ export class ShadowAutocompleteProvider implements AutocompleteProvider {
           value: p,
           label: p.endsWith('/') ? `📁 ${p}` : p,
         }));
-        if (items.length) return { items, prefix: query };
+        if (items.length) return { items: displayItems(items), prefix: query };
       }
     }
 

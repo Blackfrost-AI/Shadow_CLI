@@ -329,8 +329,8 @@ const ConfigSchema = z.object({
   // mysteriously vanished for the founder; unset configs silently opted them out).
   showLogo: z.boolean().default(true),
   lastTheme: z
-    .enum(['og', 'shadow', 'dark', 'light', 'matrix', 'mono', 'pipboy', 'cyberpunk', 'coder-chick', 'colorblind', 'high-contrast'])
-    .default('og'),
+    .enum(['snowfall', 'og', 'shadow', 'dark', 'light', 'matrix', 'mono', 'pipboy', 'cyberpunk', 'coder-chick', 'colorblind', 'high-contrast'])
+    .default('snowfall'),
   statusLine: z.string().optional(), // shell command whose stdout renders in the footer (/statusline)
   vimMode: z.boolean().default(false), // modal (NORMAL/INSERT) editing in the composer (/vim)
   // Click-to-place-caret. OFF, and off is the only sane default: enabling mouse reporting takes

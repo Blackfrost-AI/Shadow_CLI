@@ -1,18 +1,16 @@
+import { GLYPHS } from '../tui/glyphs.js';
 // src/app/app.ts — the pi-tui shell.
 //
 // What this file is: the terminal-owning half of Shadow. It subscribes to the loop's EventBus,
 // keeps the transcript, drives the composer, and answers permission gates. The agent, the tools,
 // the permission model, the run lock and the session log are all unchanged and untouched.
 //
-// What changed and why: Ink owned the cursor through React. `render(<Static>)` re-emitted the
-// whole transcript on every epoch bump, the live frame had to stay strictly below terminal height
-// or Ink issued clearTerminal and destroyed scrollback, and every commit was three un-merged
-// writes. All of that is gone. pi-tui's main-screen renderer diffs row strings, never rewrites
-// above the viewport, and wraps every frame in DEC 2026 — so resize, streaming and fold toggling
-// stop being terminal-state events, and native scrollback is the transcript's home as intended.
+// Snowfall owns an alternate-screen viewport. The complete document lives in a ScrollView,
+// while a vertical stack pins the composer and status beneath the full-width conversation.
+// The shared row layer continues to serve Ink, exports, and the fullscreen transcript.
 
-import { Container, Editor, ProcessTerminal, TuiMainScreen } from '@earendil-works/pi-tui';
-import type { Component, EditorTheme, OverlayHandle, SelectListTheme, TUI } from '@earendil-works/pi-tui';
+import { Container, ProcessTerminal, TuiAltScreen, matchesKey, isKeyRelease } from '@earendil-works/pi-tui';
+import type { EditorTheme, OverlayHandle, SelectListTheme, Terminal } from '@earendil-works/pi-tui';
 import { truncateToWidth, visibleWidth } from '@earendil-works/pi-tui';
 
 import { AgentLoop } from '../agent/loop.js';
@@ -38,12 +36,16 @@ import {
 } from '../config/modelPresets.js';
 import { SAFE_CONFIG_KEYS, formatTemperature, parseSafeConfig } from '../config/safeInteractiveConfig.js';
 import { approvalText } from '../util/approvalText.js';
-import { C, THEME_DESCRIPTIONS, THEME_NAMES, applyTheme, normalizeThemeName } from '../tui/theme.js';
+import { C, THEME_DESCRIPTIONS, THEME_NAMES, applyTheme, normalizeThemeName, backgroundSequence, themeBackground } from '../tui/theme.js';
 import type { CanonicalThemeName } from '../tui/theme.js';
 import { customStyleNames, type OutputStyle } from '../agent/styles.js';
 import type { TodoItem } from '../agent/todo.js';
 import { writeFileSync, statSync, readFileSync, existsSync, readdirSync } from 'node:fs';
 import { isAbsolute, join, resolve, basename, dirname } from 'node:path';
+import { homedir } from 'node:os';
+import { discoverCustomCommands, expandCommandBody } from '../tui/customCommands.js';
+import { PI_KEYS } from './keymap.js';
+import { ChoicePicker } from './picker.js';
 import { loadAgentDefs } from '../agent/defs.js';
 import { cycleEffort, effortDescription, effortSymbol, normalizeEffort } from '../agent/effort.js';
 import type { Effort } from '../provider/provider.js';
@@ -80,14 +82,14 @@ import type { FlattenItem } from '../tui/flatten.js';
 import type { ContentBlock, Message } from '../provider/provider.js';
 
 import { RESET, fgAnsi, style } from './ansi.js';
-import { BrandSplash, clampStreamTail, FlatCell, PAGE_MARGIN, StreamCell, computeToolRuns } from './cells.js';
+import { BrandSplash, FlatCell, StreamCell, computeToolRuns } from './cells.js';
 import { ActivityPanel, capBody, type ToolDetail } from './activity.js';
-import { SHADOW_ART } from '../tui/wordmark.js';
+import { SHADOW_LOGOTYPE } from '../tui/brand.js';
 import { missionHudLine, missionStatusLines } from '../tui/missionHud.js';
 import type { MissionSnapshot } from '../agent/mission.js';
 import { PendingDialog, dialogArmMs } from './dialogs.js';
 import { ModelSwitcher } from './modelSwitch.js';
-import { SubAgentsCell } from './subagents.js';
+import { SnowfallEditor, snowfallLayout, type SnowfallState } from './snowfall.js';
 import { emitNotification } from '../util/notify.js';
 import type { SubAgentView } from '../tui/subagentPanel.js';
 import { modelRows, type PickerRow } from '../util/modelGroups.js';
@@ -115,20 +117,18 @@ import { isSecretKey, maskSecret, redactConfig } from '../util/redact.js';
 import { sandboxConfinement, sandboxToolAvailable } from '../safety/sandbox.js';
 import { vaultExists } from '../auth/vault.js';
 
-const SPINNER = ['◐', '◓', '◑', '◒'];
-
 /** Keys that mean "stop the running turn", in the encodings terminals actually send. */
 function isEscape(data: string): boolean {
-  return data === '\x1b';
+  return matchesKey(data, 'escape');
 }
 function isCtrlC(data: string): boolean {
-  return data === '\x03';
+  return matchesKey(data, 'ctrl+c');
 }
 function isCtrlO(data: string): boolean {
-  return data === '\x0f';
+  return matchesKey(data, 'ctrl+o');
 }
 function isCtrlT(data: string): boolean {
-  return data === '\x14';
+  return matchesKey(data, 'ctrl+t');
 }
 
 // ── status line ──────────────────────────────────────────────────────────────
@@ -150,72 +150,6 @@ interface HudState {
   planMode: boolean;
 }
 
-/**
- * The one always-present row while working, plus the pinned task row. Both are cheap components
- * reading a shared state object — the engine re-renders the live region constantly, so nothing
- * here allocates per frame beyond the string it returns.
- */
-class StatusLine implements Component {
-  constructor(
-    private s: HudState,
-    private tick: () => number,
-  ) {}
-
-  invalidate(): void {}
-
-  render(width: number): string[] {
-    const out: string[] = [];
-    const s = this.s;
-    const goalRow = s.missionLine || (s.goal ? `◎ goal ${oneLine(s.goal, width - 16)}` : '');
-    if (goalRow) out.push(fit(PAGE_MARGIN, style.dim(goalRow), width));
-    if (s.running) {
-      const secs = Math.max(0, Math.round((Date.now() - s.startedAt) / 1000));
-      const frame = SPINNER[this.tick() % SPINNER.length]!;
-      const parts = [`${style.yellow(frame)} ${style.dim('working')}`, style.dim(`${secs}s`)];
-      if (s.toolLine) parts.push(style.cyan(oneLine(s.toolLine, Math.max(12, width - 40))));
-      if (s.queued > 0) parts.push(style.dim(`${s.queued} queued`));
-      parts.push(style.dim('esc interrupt'));
-      out.push(fit(PAGE_MARGIN, parts.join(style.dim(' · ')), width));
-    }
-    // Pinned task row: one line, always — the full list is /tasks.
-    const done = s.todos.filter((t) => t.status === 'completed').length;
-    const active = s.todos.find((t) => t.status === 'in_progress') ?? s.todos.find((t) => t.status === 'pending');
-    if (s.todos.length && s.running) {
-      const label = active ? oneLine(active.subject, Math.max(10, width - 28)) : 'all tasks done';
-      out.push(fit(PAGE_MARGIN, `${style.green('▸')} ${style.dim(`${done}/${s.todos.length}`)} ${style.dim(label)} ${style.dim('· ^T')}`, width));
-    }
-    return out;
-  }
-}
-
-/** The idle hint row under the composer: model · mode · context · cost. */
-class HintLine implements Component {
-  constructor(private s: HudState) {}
-  invalidate(): void {}
-  render(width: number): string[] {
-    const s = this.s;
-    if (s.running) return [];
-    const mode = s.planMode ? style.yellow('plan') : style.dim(s.autonomy);
-    const parts = [style.dim(s.providerModel), mode];
-    if (s.mcpConnecting) parts.push(style.dim('mcp: connecting…'));
-    else if (s.mcpFailed) parts.push(style.yellow('mcp: some servers failed'));
-    if (s.contextPct > 0) {
-      const pct = Math.round(s.contextPct * 100);
-      const color = pct > 85 ? style.red : pct > 70 ? style.yellow : style.dim;
-      parts.push(color(`ctx ${pct}%`));
-    }
-    if (s.costUSD > 0) parts.push(style.dim(`$${s.costUSD.toFixed(4)}`));
-    parts.push(style.dim('/help'));
-    return [fit(PAGE_MARGIN, parts.join(style.dim(' · ')), width)];
-  }
-}
-
-function fit(pad: number, text: string, width: number): string {
-  const p = ' '.repeat(Math.min(pad, Math.max(0, width - 1)));
-  const room = Math.max(1, width - p.length);
-  return p + (visibleWidth(text) > room ? truncateToWidth(text, room, '…') : text);
-}
-
 function oneLine(s: string, max: number): string {
   const flat = s.replace(/\s+/g, ' ').trim();
   return visibleWidth(flat) > max ? truncateToWidth(flat, Math.max(4, max), '…') : flat;
@@ -234,6 +168,7 @@ class PiGate implements ApprovalGate {
   show: (req: ApprovalRequest | null) => void = () => {};
 
   request(req: ApprovalRequest): Promise<ApprovalDecision> {
+    if (req.signal?.aborted) return Promise.resolve('deny');
     return new Promise<ApprovalDecision>((resolve) => {
       const entry = { req, resolve };
       this.queue.push(entry);
@@ -253,25 +188,32 @@ class PiGate implements ApprovalGate {
     const i = this.queue.findIndex((e) => e === entry);
     if (i < 0) return;
     const wasHead = i === 0;
-    this.queue.splice(i, 1);
+    const removed = this.queue.splice(i, 1)[0];
+    removed?.resolve('deny');
     if (wasHead) this.show(this.queue[0]?.req ?? null);
   }
 
   get awaiting(): boolean {
     return this.queue.length > 0;
   }
+
+  cancel(): void {
+    const pending = this.queue.splice(0);
+    this.show(null);
+    for (const entry of pending) entry.resolve('deny');
+  }
 }
 
 // ── the app ──────────────────────────────────────────────────────────────────
 
 export class ShadowApp {
-  private terminal = new ProcessTerminal();
-  private tui: TuiMainScreen;
-  private editor: Editor;
+  private terminal: Terminal;
+  private tui: TuiAltScreen;
+  private editor: SnowfallEditor;
   private transcript = new Container();
   /** Slot for the wordmark splash: mounted only while the transcript is empty. */
   private splashSlot = new Container();
-  private hud = new Container();
+  private document = new Container();
 
   private items: FlattenItem[] = [];
   private cellById = new Map<number | string, FlatCell>();
@@ -331,7 +273,6 @@ export class ShadowApp {
   private subAgents = new Map<string, SubAgentView>();
   /** Mission-mode snapshot (P1.3) — replaces the raw goal row when a mission is active. */
   private mission: MissionSnapshot | null;
-  private subAgentsCell: SubAgentsCell;
 
   private gate = new PiGate();
   private approvals = new SessionApprovals();
@@ -357,14 +298,15 @@ export class ShadowApp {
   /** Read/edit evidence spans turns and is cleared only at conversation/session boundaries. */
   private readonly readTracker = createReadTracker();
   private style: OutputStyle = 'proactive';
-  private themeName: CanonicalThemeName = 'og';
+  private themeName: CanonicalThemeName = 'snowfall';
   private resolveExit!: () => void;
   private exiting = false;
   private rewindableTurns = 0;
-  private statusLine: StatusLine;
-  private hintLine: HintLine;
 
-  constructor(private opts: TuiOpts) {
+  constructor(private opts: TuiOpts, terminal: Terminal = new ProcessTerminal()) {
+    this.terminal = terminal;
+    this.themeName = normalizeThemeName(opts.cfg.lastTheme) ?? 'snowfall';
+    applyTheme(this.themeName);
     this.autonomy = opts.autonomy;
     this.current = { provider: String(opts.provider.name ?? ''), model: opts.cfg.model ?? '' };
     this.provider = opts.provider;
@@ -414,32 +356,13 @@ export class ShadowApp {
         app.activeTarget = target;
       },
     });
-    this.tui = new TuiMainScreen(this.terminal, false);
-    this.editor = new Editor(this.tui as unknown as TUI, editorTheme(), {
-      paddingX: PAGE_MARGIN,
-      autocompleteMaxVisible: 8,
+    this.tui = new TuiAltScreen(this.terminal, false, undefined, {
+      searchMatchStyle: (text) => '\x1b[4m' + style.cyan(text),
+      searchCurrentMatchStyle: (text) => '\x1b[1;7m' + text + RESET,
+      searchNavigationButtonStyle: (text) => style.fg(C.accent, text),
+      scrollToEndIndicator: () => style.fg(C.accent, ' ↓ Latest · End '),
     });
-    this.statusLine = new StatusLine(
-      {
-        running: this.running,
-        startedAt: this.runStart,
-        toolLine: this.toolLine,
-        queued: this.queued.length,
-        todos: this.todos,
-        autonomy: this.autonomy,
-        providerModel: `${this.current.provider}/${this.current.model}`,
-        contextPct: this.contextPct,
-        costUSD: this.costUSD,
-        goal: this.goal,
-        missionLine: '',
-        mcpConnecting: false,
-        mcpFailed: false,
-        planMode: this.planMode,
-      },
-      () => this.tick,
-    );
-    this.subAgentsCell = new SubAgentsCell(() => [...this.subAgents.values()], () => this.terminal.rows);
-    this.hintLine = new HintLine(this.hudState());
+    this.editor = new SnowfallEditor(this.tui, editorTheme(), () => this.snowfallState(), () => this.terminal.rows);
   }
 
   /** All writers follow the shared holder after /fork; standalone mounts use opts.sessionLog. */
@@ -491,17 +414,21 @@ export class ShadowApp {
     return s;
   }
 
+  private snowfallState(): SnowfallState {
+    return {
+      ...this.hudState(), version: this.opts.version, workspace: shortPath(this.opts.workspaceRoot),
+      tick: this.tick, reducedMotion: !!this.opts.cfg.reducedMotion, bypass: !!this.opts.bypass,
+      agents: [...this.subAgents.values()],
+    };
+  }
+
   // ── lifecycle ────────────────────────────────────────────────────────────
 
   async run(): Promise<void> {
-    this.tui.addChild(this.transcript);
-    this.tui.addChild(this.splashSlot);
-    this.tui.addChild(this.streamCell);
-    this.hud.addChild(this.subAgentsCell);
-    this.hud.addChild(this.statusLine);
-    this.tui.addChild(this.hud);
-    this.tui.addChild(this.editor);
-    this.tui.addChild(this.hintLine);
+    this.document.addChild(this.transcript);
+    this.document.addChild(this.splashSlot);
+    this.document.addChild(this.streamCell);
+    this.tui.setLayoutRoot(snowfallLayout(this.document, this.editor, () => this.snowfallState()).root);
 
     this.editor.onSubmit = (text: string) => this.submit(text);
     this.editor.onChange = () => {
@@ -566,20 +493,30 @@ export class ShadowApp {
     if (this.ticker) clearInterval(this.ticker);
   }
 
-  private exit(): void {
+  /** Stop is idempotent; also used by the signal/fatal-exit lifecycle owner. */
+  stop(): void {
     if (this.exiting) return;
     this.exiting = true;
     // Ink-unmount parity: abandon any in-flight turn (its loop can no longer render) and
     // release the process-wide run lock so an exiting shell can never starve the web mirror.
     this.controller?.abort();
+    this.compactController?.abort();
+    this.gate.cancel();
+    if (this.flushTimer) clearTimeout(this.flushTimer);
+    if (this.ticker) clearInterval(this.ticker);
+    if (this.pendingStream !== null) this.streamCell.setText(this.pendingStream, this.answerOpen);
     runLock.releaseFor(CLI_HOLDER);
     try {
+      // Restore the complete conversation to the main buffer, without composer/status chrome.
+      this.tui.setLayoutRoot(this.document);
       this.tui.stop();
     } catch {
       /* the terminal may already be gone */
     }
     this.resolveExit?.();
   }
+
+  private exit(): void { this.stop(); }
 
   /** Brand information for the splash and the committed record. */
   private brandInfo(): {
@@ -590,7 +527,7 @@ export class ShadowApp {
     yolo?: boolean;
   } {
     return {
-      version: `${this.opts.version} · pi preview`,
+      version: `${this.opts.version} · Snowfall`,
       providerModel: `${this.current.provider}/${this.current.model}`,
       workspace: this.opts.workspaceRoot,
       help: '/help · /model · Shift+Tab mode · @ file',
@@ -601,11 +538,14 @@ export class ShadowApp {
   /**
    * Mount the wordmark splash. It lives in the LIVE frame, so every resize re-renders it at the
    * new width and the art reflows cleanly — the reason it is not committed to scrollback, where
-   * the terminal would re-wrap 51 fixed columns into garbage.
+   * the terminal would re-wrap fixed columns into garbage.
+   *
+   * The original solid-block banner comes from the shared brand module. Narrow screens
+   * fall back to the icon or compact mark, and the splash unmounts on the first turn.
    */
   private showSplash(): void {
     this.splashSlot.clear();
-    this.splashSlot.addChild(new BrandSplash(this.brandInfo(), SHADOW_ART));
+    if (this.opts.cfg.showLogo !== false) this.splashSlot.addChild(new BrandSplash(this.brandInfo(), SHADOW_LOGOTYPE));
     this.tui.requestRender();
   }
 
@@ -641,6 +581,7 @@ export class ShadowApp {
   }
 
   private commit(item: FlattenItem): void {
+    if (this.exiting) return;
     this.items.push(item);
     // The splash is the empty state — the moment real content lands, it goes.
     if (item.kind !== 'banner') this.hideSplash();
@@ -692,10 +633,9 @@ export class ShadowApp {
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null;
       if (this.pendingStream !== null) {
-        // Table-aware clamp: a plain last-N-lines clamp cuts a streaming table below its
-        // header, and headerless pipe rows don't parse as a table — the preview would flicker
-        // into raw pipes until the block commits.
-        this.streamCell.setText(clampStreamTail(this.pendingStream), this.answerOpen);
+        // Keep the complete live block; ScrollView owns clipping and table headers remain
+        // available while an unfinished table streams beyond the viewport.
+        this.streamCell.setText(this.pendingStream, this.answerOpen);
         this.pendingStream = null;
         this.tui.requestRender();
       }
@@ -746,6 +686,7 @@ export class ShadowApp {
   // ── bus ──────────────────────────────────────────────────────────────────
 
   private onBusEvent(e: Record<string, unknown>): void {
+    if (this.exiting) return;
     const type = String(e.type ?? '');
     const sub = e.subagent as string | undefined;
     switch (type) {
@@ -792,9 +733,12 @@ export class ShadowApp {
           break;
         }
         const call = e.call as { name: string; input?: unknown };
-        const result = e.result as { ok: boolean; summary?: string } | undefined;
+        const result = e.result as { ok: boolean; summary?: string; images?: { mediaType: string; data: string }[] } | undefined;
         this.toolLine = null;
         this.pushTool(call, result);
+        for (const image of result?.images ?? []) {
+          this.pushLine({ kind: 'image', text: '', image: { bytes: image.data, mediaType: image.mediaType, alt: previewOf(call.input) || call.name, source: previewOf(call.input) } });
+        }
         break;
       }
       case 'tool_denied': {
@@ -1012,6 +956,7 @@ export class ShadowApp {
 
   private installInputHandling(): void {
     this.tui.addInputListener((data: string) => {
+      if (isKeyRelease(data)) return undefined;
       // 1. Ctrl+C is a RESERVED chord: it must be reachable even while a dialog owns the
       //    keyboard. pi-tui dispatches input listeners before the focused component, and this
       //    listener returns consume:true for every key under a dialog — so if this check sat
@@ -1050,7 +995,7 @@ export class ShadowApp {
       //    Type-ahead aimed at the composer is still in flight when a gate opens mid-sentence;
       //    routing it here is how "also fix the failing test" once approved `rm -rf` on the `f`
       //    key. Inside the arming window the key goes where it was aimed.
-      if (this.dialog && !this.dialog.isDone) {
+      if (this.dialog && !this.dialog.isDone && this.dialogHandle?.isFocused()) {
         if (Date.now() - this.dialog.shownAt < dialogArmMs()) {
           this.editor.handleInput(data);
           return { consume: true };
@@ -1060,17 +1005,20 @@ export class ShadowApp {
         return { consume: true };
       }
 
+      // Search and pickers own input while focused; their keys must not become app actions.
+      if (this.tui.hasOverlay()) return undefined;
+
       // 2.5 Ctrl-G opens the draft in $VISUAL/$EDITOR (F08-10). Idle-only: spawnSync blocks the
       //     whole event loop, so this must never run mid-turn. The TUI stops (raw mode off, the
       //     editor owns the tty) and restarts after; the engine's start() repaints the frame.
-      if (data === '\x07' && !this.running && !this.compacting) {
+      if (matchesKey(data, 'ctrl+g') && !this.running && !this.compacting) {
         this.openExternalEditor();
         return { consume: true };
       }
 
       // Shift+Tab is the key form of /plan. pi-tui does not translate it for the editor, so the
       // shell owns CSI Z before focus dispatch.
-      if (data === '\x1b[Z') {
+      if (matchesKey(data, 'shift+tab')) {
         this.runSlash('/plan');
         return { consume: true };
       }
@@ -1102,8 +1050,8 @@ export class ShadowApp {
 
       // 6. Enter while a turn runs: the draft is a follow-up. Queue it rather than dropping the
       //    keystroke into a loop that cannot read it yet.
-      if ((data === '\r' || data === '\n') && (this.running || this.compacting || this.modelChecking || this.switcher.isSwitching) && this.editor.getText().trim()) {
-        const q = this.editor.getText().trim();
+      if (matchesKey(data, 'enter') && !matchesKey(data, 'ctrl+j') && (this.running || this.compacting || this.modelChecking || this.switcher.isSwitching) && this.editor.getText().trim()) {
+        const q = this.editor.getExpandedText().trim();
         this.editor.setText('');
         this.queue(q);
         return { consume: true };
@@ -1162,6 +1110,7 @@ export class ShadowApp {
   }
 
   private flushQueue(): void {
+    if (this.exiting) return;
     if (this.running || this.compacting || this.modelChecking || this.switcher.isSwitching) return;
     while (this.queued.length) {
       const next = this.queued.shift()!.trim();
@@ -1177,6 +1126,7 @@ export class ShadowApp {
   }
 
   private startTurn(task: string): void {
+    if (this.exiting) return;
     if (this.running || this.compacting || this.modelChecking || this.switcher.isSwitching) {
       this.queue(task);
       return;
@@ -1184,7 +1134,7 @@ export class ShadowApp {
     // The splash has served its purpose; record the session's start in scrollback instead, then
     // the turn itself. Order matters: the compact brand line is the durable record.
     this.commitBrandLine();
-    this.pushLine({ kind: 'user', text: `❯ ${task}`, color: C.green, bold: true, meta: 'you' });
+    this.pushLine({ kind: 'user', text: `${GLYPHS.promptPrefix}${task}`, color: C.green, bold: true, meta: 'you' });
     void this.runTurn(task);
   }
 
@@ -1324,7 +1274,7 @@ export class ShadowApp {
     this.controller = null;
     this.toolLine = null;
     const secs = Math.max(0, Math.round((Date.now() - this.runStart) / 1000));
-    if (secs >= 1) this.pushLine({ text: `⏺ done · ${Math.round(secs)}s`, dimColor: true });
+    if (secs >= 1) this.pushLine({ text: `${GLYPHS.tool} done · ${Math.round(secs)}s`, dimColor: true });
     this.stopTicker();
     this.hudRef = this.hudState();
     this.tui.requestRender();
@@ -1336,7 +1286,7 @@ export class ShadowApp {
     this.ticker = setInterval(() => {
       this.tick++;
       this.tui.requestRender();
-    }, 120);
+    }, this.opts.cfg.reducedMotion ? 1000 : 160);
   }
 
   private stopTicker(): void {
@@ -1357,7 +1307,7 @@ export class ShadowApp {
         decide: (d) => {
           this.closeDialog();
           this.gate.respond(d);
-          this.tui.setFocus(this.editor);
+          if (!this.gate.awaiting) this.tui.setFocus(this.editor);
           this.tui.requestRender();
         },
         onQuestionIndexChange: () => {},
@@ -1431,7 +1381,7 @@ export class ShadowApp {
       tools += m.content.filter((b) => b.type === 'tool_use').length;
       if (!text) continue;
       if (m.role === 'user') {
-        this.pushLine({ kind: 'user', text: `❯ ${text}`, color: C.green, bold: true, meta: 'you' });
+        this.pushLine({ kind: 'user', text: `${GLYPHS.promptPrefix}${text}`, color: C.green, bold: true, meta: 'you' });
       } else if (m.role === 'assistant') {
         const display = sanitizeAssistantText(text);
         if (display.trim()) {
@@ -1531,35 +1481,13 @@ export class ShadowApp {
   }
 
   private openResumePicker(sessions: ResumableSession[]): void {
-    const render = (): Component => {
-      const MAX = Math.max(3, Math.min(12, this.terminal.rows - 8));
-      const lines: string[] = [` ${style.bold(style.cyan(' Resume a session'))}`];
-      sessions.slice(0, MAX).forEach((x, i) => {
-        lines.push(` ${style.dim(String(i + 1))}  ${style.fg(C.body, truncateToWidth(approvalText(x.id), 28))} ${style.dim(truncateToWidth(approvalText(x.ts), 20))}`);
-      });
-      if (sessions.length > MAX) lines.push(` ${style.dim(`… ${sessions.length - MAX} more — /resume <id>`)}`);
-      lines.push(` ${style.dim('number + Enter · Esc cancel · /resume <id|path> direct')}`);
-      return {
-        render: (width: number) => lines.map((l) => (visibleWidth(l) > width ? truncateToWidth(l, width, '…') : l)),
-        invalidate: () => {},
-        handleInput: (data: string) => {
-          if (data === '') {
-            this.closePicker();
-            return;
-          }
-          if (data === '\r' || data === '\n') return; // no cursor concept — use a number
-          if (/^[1-9]$/.test(data)) {
-            const pick = sessions[Number(data) - 1];
-            if (pick) {
-              this.closePicker();
-              this.applyResume(pick);
-            }
-          }
-        },
-      };
-    };
+    const picker = new ChoicePicker({
+      title: 'Resume a session', items: sessions, label: (session) => `${session.id} · ${session.ts}`,
+      choose: (session) => { this.closePicker(); this.applyResume(session); },
+      close: () => this.closePicker(), repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
+    });
     this.pickerHandle?.hide();
-    this.pickerHandle = this.tui.showOverlay(render(), { anchor: 'center', width: 70 });
+    this.pickerHandle = this.tui.showOverlay(picker, { anchor: 'center', width: 76 });
     this.tui.requestRender();
   }
 
@@ -1610,35 +1538,14 @@ export class ShadowApp {
   }
 
   private openRewindPicker(turns: RewindableTurn[], scope: 'code' | 'chat' | undefined): void {
-    const ordered = [...turns].sort((a, b) => b.turn - a.turn); // newest first
-    const render = (): Component => {
-      const MAX = Math.max(3, Math.min(12, this.terminal.rows - 8));
-      const lines: string[] = [` ${style.bold(style.cyan(' Rewind to a turn'))}`];
-      ordered.slice(0, MAX).forEach((t, i) => {
-        lines.push(` ${style.dim(String(i + 1))}  ${style.dim(`turn ${t.turn}`)}  ${style.fg(C.body, truncateToWidth(approvalText(t.label), 48))}`);
-      });
-      if (ordered.length > MAX) lines.push(` ${style.dim(`… ${ordered.length - MAX} older — /rewind <n>`)}`);
-      lines.push(` ${style.dim('number + Enter · Esc cancel · scope: ' + (scope ?? 'code+chat'))}`);
-      return {
-        render: (width: number) => lines.map((l) => (visibleWidth(l) > width ? truncateToWidth(l, width, '…') : l)),
-        invalidate: () => {},
-        handleInput: (data: string) => {
-          if (data === '\x1b') {
-            this.closePicker();
-            return;
-          }
-          if (/^[1-9]$/.test(data)) {
-            const pick = ordered[Number(data) - 1];
-            if (pick) {
-              this.closePicker();
-              this.applyRewind(pick.turn, scope);
-            }
-          }
-        },
-      };
-    };
+    const picker = new ChoicePicker({
+      title: `Rewind · ${scope ?? 'code+chat'}`, items: [...turns].sort((a, b) => b.turn - a.turn),
+      label: (turn) => `turn ${turn.turn} · ${turn.label}`,
+      choose: (turn) => { this.closePicker(); this.applyRewind(turn.turn, scope); },
+      close: () => this.closePicker(), repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
+    });
     this.pickerHandle?.hide();
-    this.pickerHandle = this.tui.showOverlay(render(), { anchor: 'center', width: 70 });
+    this.pickerHandle = this.tui.showOverlay(picker, { anchor: 'center', width: 76 });
     this.tui.requestRender();
   }
 
@@ -1737,7 +1644,7 @@ export class ShadowApp {
     const editor = resolveEditor();
     const session = openEditorFile(this.editor.getText());
     try {
-      this.tui.stop();
+      this.tui.stop({ preserveScreen: true });
       const r = spawnSync(`${editor} "${session.file}"`, { stdio: 'inherit', shell: true });
       if (r.error) {
         this.pushLine({ kind: 'error', text: `  Couldn't launch "${editor}": ${r.error.message}. Set $EDITOR.`, color: C.red });
@@ -1811,8 +1718,13 @@ export class ShadowApp {
 
   // ── commands ─────────────────────────────────────────────────────────────
 
+  private discoverCommands() {
+    return discoverCustomCommands(this.opts.workspaceRoot, homedir())
+      .filter((command) => !findTerminalCommand(`/${command.name}`));
+  }
+
   private commandSpecs(): SlashCommandSpec[] {
-    return SLASH.map((c) => ({
+    return [...SLASH, ...this.discoverCommands().map((c) => ({ name: `/${c.name}`, desc: approvalText(c.description) }))].map((c: SlashSpec) => ({
       name: c.name,
       desc: c.desc,
       args:
@@ -1831,13 +1743,20 @@ export class ShadowApp {
     const arg = rest.join(' ').trim();
     const command = findTerminalCommand(typedName ?? '');
     if (!command) {
+      const custom = this.discoverCommands().find((c) => `/${c.name.toLowerCase()}` === typedName?.toLowerCase());
+      if (custom) {
+        const prompt = expandCommandBody(custom.body, raw.trim().slice((typedName ?? '').length).trim());
+        if (this.running || this.compacting || this.modelChecking || this.switcher.isSwitching) this.queue(prompt);
+        else this.startTurn(prompt);
+        return;
+      }
       this.pushLine({ kind: 'error', text: `  Unknown command: ${typedName} — type / for the list.`, color: C.red });
       return;
     }
     const handler = commandHandler(command, 'pi');
     if (!handler) {
       this.pushLine({
-        text: `  ${command.name} is unavailable in the pi preview: ${command.renderers.pi.unavailable ?? 'use the Ink renderer.'}`,
+        text: `  ${command.name} is unavailable in Snowfall: ${command.renderers.pi.unavailable ?? 'Use SHADOW_TUI=ink shadow.'}`,
         color: C.yellow,
       });
       return;
@@ -1891,19 +1810,11 @@ export class ShadowApp {
           text: '',
           lines: [
             { text: 'Commands', bold: true },
-            ...SLASH.map((c) => ({ text: `  ${c.name.padEnd(14)} ${c.desc}`, dimColor: true as boolean })),
+            ...this.commandSpecs().map((c) => ({ text: `  ${c.name.padEnd(14)} ${c.desc}`, dimColor: true as boolean })),
             { text: '', dimColor: true },
             { text: 'Keys', bold: true },
-            { text: '  Enter                send (queues a follow-up while the agent works)', dimColor: true },
-            { text: '  @path                reference a file — completion as you type', dimColor: true },
-            { text: '  Esc                  interrupt the running turn', dimColor: true },
-            { text: '  Ctrl-O               expand/collapse tool output and reasoning', dimColor: true },
-            { text: '  /activity            open the activity sub-window (every call + output)', dimColor: true },
-            { text: '  Ctrl-T               full task list', dimColor: true },
-            { text: '  Ctrl-C               clear the draft, twice to exit', dimColor: true },
-            { text: '  Shift+Tab            toggle plan mode', dimColor: true },
-            { text: '  Ctrl-G               edit the draft in $VISUAL/$EDITOR while idle', dimColor: true },
-            { text: '  ↑/↓                  composer history', dimColor: true },
+            ...PI_KEYS.map(({ key, action }) => ({ text: `  ${key.padEnd(20)} ${action}`, dimColor: true })),
+
           ],
         });
         return;
@@ -2029,7 +1940,7 @@ export class ShadowApp {
               ? [{ text: approvalText(`mission    ${this.mission.mission} (${this.mission.phase})`), color: C.purple }]
               : [{ text: approvalText(`goal       ${this.goal ?? '(none)'}`) }]),
             { text: `plan mode  ${this.planMode ? 'on' : 'off'}` },
-            { text: `renderer   pi preview`, color: C.yellow },
+            { text: `renderer   Snowfall (pi fullscreen)`, color: C.cyan },
             { text: approvalText(`workspace  ${this.opts.workspaceRoot}`), dimColor: true },
             { text: `sandbox    ${sandboxConfinement(this.opts.cfg.sandbox)}`, dimColor: true },
           ],
@@ -2054,7 +1965,7 @@ export class ShadowApp {
         void this.compactContext(this.compactController);
         return;
       case '/version':
-        this.pushLine({ text: `  shadow ${this.opts.version} · pi preview`, dimColor: true });
+        this.pushLine({ text: `  shadow ${this.opts.version} · Snowfall`, dimColor: true });
         return;
       case '/diff':
       case '/files':
@@ -2269,7 +2180,9 @@ export class ShadowApp {
             this.pushLine({ kind: 'error', text: `  Image is too large: ${arg} (${(info.size / 1024 / 1024).toFixed(1)} MiB; max 20 MiB).`, color: C.red });
             return;
           }
-          this.imageAttachments.push({ mediaType, data: readFileSync(absImg).toString('base64') });
+          const data = readFileSync(absImg).toString('base64');
+          this.imageAttachments.push({ mediaType, data });
+          this.pushLine({ kind: 'image', text: '', image: { bytes: data, mediaType, alt: basename(absImg), source: absImg } });
           this.pushLine({ text: `  Attached ${basename(absImg)} (${mediaType}) — sends with your next message.`, color: C.cyan });
         } catch (e) {
           this.pushLine({ kind: 'error', text: `  Could not read ${arg}: ${(e as Error).message}`, color: C.red });
@@ -3018,7 +2931,7 @@ export class ShadowApp {
   private showPiKeybindings(arg: string): void {
     if (arg && arg !== 'show' && arg !== 'list') {
       this.pushLine({
-        text: '  Pi uses fixed preview bindings in v9; custom key maps and /keybindings init are available in Ink.',
+        text: '  Snowfall uses fixed bindings. Custom key maps and /keybindings init: SHADOW_TUI=ink shadow.',
         color: C.yellow,
       });
       return;
@@ -3027,37 +2940,30 @@ export class ShadowApp {
       kind: 'system',
       text: 'pi keybindings',
       lines: [
-        { text: '  Enter       send; queues a follow-up while busy', dimColor: true },
-        { text: '  Shift+Tab   toggle plan mode', dimColor: true },
-        { text: '  Esc         interrupt a turn or cancel compaction', dimColor: true },
-        { text: '  Ctrl-G      edit the draft in $VISUAL/$EDITOR while idle', dimColor: true },
-        { text: '  Ctrl-O      expand or collapse output', dimColor: true },
-        { text: '  Ctrl-T      show tasks', dimColor: true },
-        { text: '  Ctrl-C      clear the draft; twice on an empty draft exits', dimColor: true },
-        { text: '  Up/Down     composer history', dimColor: true },
-        { text: '~/.shadow/keybindings.json applies only to Ink in v9.', color: C.yellow },
+        ...PI_KEYS.map(({ key, action }) => ({ text: `  ${key.padEnd(20)} ${action}`, dimColor: true })),
+        { text: '~/.shadow/keybindings.json is Ink-only. Use SHADOW_TUI=ink shadow for custom maps.', color: C.yellow },
       ],
     });
   }
 
   private doTheme(arg: string): void {
-    if (!arg) {
-      const next = THEME_NAMES[(THEME_NAMES.indexOf(this.themeName) + 1) % THEME_NAMES.length]!;
-      applyTheme(next);
-      this.themeName = next;
-      this.invalidateAll();
-      this.pushLine({ text: `  theme: ${next}`, dimColor: true });
-      return;
-    }
-    const name = normalizeThemeName(arg);
+    const name = arg ? normalizeThemeName(arg) : THEME_NAMES[(THEME_NAMES.indexOf(this.themeName) + 1) % THEME_NAMES.length];
     if (!name) {
       this.pushLine({ kind: 'error', text: `  unknown theme: ${arg} — ${THEME_NAMES.join(', ')}`, color: C.red });
       return;
     }
+    try {
+      saveGlobalConfig({ lastTheme: name });
+    } catch (error) {
+      this.pushLine({ kind: 'error', text: `  Theme save failed: ${approvalText((error as Error).message)}`, color: C.red });
+      return;
+    }
     applyTheme(name);
     this.themeName = name;
+    this.opts.cfg.lastTheme = name;
+    this.terminal.write(backgroundSequence(themeBackground(name), !!process.stdout.isTTY));
     this.invalidateAll();
-    this.pushLine({ text: `  theme: ${name}`, dimColor: true });
+    this.tui.flash(`Theme: ${name}`);
   }
 
   private invalidateAll(): void {
@@ -3280,8 +3186,8 @@ export class ShadowApp {
   }
 
   /**
-   * The model picker: a pi-tui overlay running the SAME grouped rows (provider headers, active
-   * dot, order) as the Ink picker. Esc cancels; Enter switches and closes.
+   * The model picker uses the shared model catalog order and names each entry's provider.
+   * Esc cancels; arrows or a number select; Enter switches and closes.
    */
   private openPicker(): void {
     if (this.pickerHandle) return;
@@ -3296,54 +3202,14 @@ export class ShadowApp {
     const activeEntry = entries.find(
       (entry) => entry.provider === this.current.provider && entry.model === this.opts.cfg.model,
     );
-    let cursor = Math.max(0, entries.findIndex((e) => e === activeEntry));
-    const render = (): Component => {
-      const lines: string[] = [];
-      lines.push(` ${style.bold(style.cyan(' Select a model'))}`);
-      const MAX = Math.max(3, Math.min(12, this.terminal.rows - 8));
-      const start = Math.min(Math.max(0, cursor - MAX + 1), Math.max(0, entries.length - MAX));
-      let idx = -1;
-      for (const row of rows) {
-        if (row.kind === 'header') {
-          lines.push(` ${style.bold(style.yellow(row.label))}`);
-          continue;
-        }
-        idx++;
-        if (idx < start || idx >= start + MAX) continue;
-        const e = row.entry;
-        const cur = idx === cursor;
-        const active = activeEntry !== undefined && e.provider === activeEntry.provider && e.model === activeEntry.model && e.label === activeEntry.label;
-        const body = `${e.label}  (${e.provider}/${e.model})`;
-        const line =
-          (cur ? style.green('❯ ') : '  ') +
-          (active ? style.green('● ') : '  ') +
-          (cur ? style.bold(body) : style.dim(body));
-        lines.push(line);
-      }
-      if (start > 0) lines.push(` ${style.dim(`↑ ${start} more`)}`);
-      if (start + MAX < entries.length) lines.push(` ${style.dim(`↓ ${entries.length - start - MAX} more`)}`);
-      lines.push(` ${style.dim('↑/↓ select · Enter switch · Esc cancel')}`);
-      return {
-        render: (width: number) => lines.map((l) => (visibleWidth(l) > width ? truncateToWidth(l, width, '…') : l)),
-        invalidate: () => {},
-        handleInput: (data: string) => {
-          const selectable = entries.length;
-          if (data === '\x1b[A' || data === 'k') cursor = (cursor - 1 + selectable) % selectable;
-          else if (data === '\x1b[B' || data === 'j') cursor = (cursor + 1) % selectable;
-          else if (data === '\x1b') {
-            this.closePicker();
-            return;
-          } else if (data === '\r' || data === '\n') {
-            this.closePicker();
-            this.selectModel(entries[cursor]!);
-            return;
-          } else return;
-          this.tui.requestRender();
-        },
-      };
-    };
-    const overlay = render();
-    this.pickerHandle = this.tui.showOverlay(overlay, { anchor: 'center', width: 64 });
+    const picker = new ChoicePicker({
+      title: 'Select a model', items: entries,
+      selected: Math.max(0, entries.findIndex((entry) => entry === activeEntry)),
+      label: (entry) => `${entry === activeEntry ? '● ' : ''}${entry.label} (${entry.provider}/${entry.model})`,
+      choose: (entry) => { this.closePicker(); this.selectModel(entry); },
+      close: () => this.closePicker(), repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
+    });
+    this.pickerHandle = this.tui.showOverlay(picker, { anchor: 'center', width: 70 });
     this.tui.requestRender();
   }
 
@@ -3399,7 +3265,6 @@ const SLASH: SlashSpec[] = terminalCommandsFor('pi').map(({ name, desc }) => ({
     ? {
         args: (p: string) =>
           THEME_NAMES.filter((theme) => theme.startsWith(p))
-            .slice(0, 10)
             .map((theme) => ({ value: theme, label: theme, description: THEME_DESCRIPTIONS[theme] })),
       }
     : name === '/autonomy'
@@ -3427,7 +3292,7 @@ function selectListTheme(): SelectListTheme {
 function editorTheme(): EditorTheme {
   return {
     // Dim border, bright accent when the composer holds a draft — the one border in the app.
-    borderColor: (s: string) => fgAnsi(C.dim) + s + RESET,
+    borderColor: (s: string) => fgAnsi(C.border ?? C.dim) + s + RESET,
     selectList: selectListTheme(),
   };
 }

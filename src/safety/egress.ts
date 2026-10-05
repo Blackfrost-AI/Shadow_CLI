@@ -31,7 +31,9 @@
  * keep working unchanged, while production traffic still flows through the pinned/enforcing
  * dispatcher passed per-request.
  */
-import { Agent, fetch as undiciFetch, setGlobalDispatcher, type Dispatcher } from 'undici';
+// The explicit package entry prevents Bun from substituting its built-in `undici` shim,
+// whose Agent does not implement the dispatcher/pinning contract used below.
+import { Agent, Dispatcher1Wrapper, fetch as undiciFetch, setGlobalDispatcher, type Dispatcher } from 'undici/index.js';
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import { appendFile, mkdir, rename, stat } from 'node:fs/promises';
@@ -422,6 +424,11 @@ export interface EgressAgentOptions {
  * hard invariant, not a per-caller convention.
  */
 export class EgressAgent extends Agent {
+  // Node 22's built-in fetch still supplies v1 handlers. Undici bridges its global
+  // dispatcher automatically, but an explicit per-request dispatcher bypasses that
+  // bridge. Use the public adapter here too, preserving pinning and the offline wall.
+  private readonly legacyDispatcher = new Dispatcher1Wrapper(this);
+
   constructor(private readonly egressOpts: EgressAgentOptions = {}) {
     super({
       ...(egressOpts.pinTo && egressOpts.pinTo.length
@@ -434,6 +441,9 @@ export class EgressAgent extends Agent {
   }
 
   override dispatch(opts: Dispatcher.DispatchOptions, handler: Dispatcher.DispatchHandler): boolean {
+    if (typeof handler.onRequestStart !== 'function') {
+      return this.legacyDispatcher.dispatch(opts, handler);
+    }
     const host = hostFromOrigin(opts.origin ? String(opts.origin) : undefined);
     if (offlineModeOn && host && !isLocalHost(host)) {
       recordEgress(host, 'dispatch', 'denied');

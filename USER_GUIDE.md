@@ -307,10 +307,16 @@ web tools + a sensitive workspace remains a risk combination you are choosing.
 
 ## Everyday use
 
-Ink is the supported default terminal for v9. `SHADOW_TUI=pi shadow` selects the experimental
-preview; unset `SHADOW_TUI` or set it to `ink` to return to the default. The commands and keys below
-describe Ink unless otherwise noted. See [Terminal renderers](TERMINAL_RENDERERS.md) for pi's
-explicit command/key limits.
+Snowfall is the default terminal in v10: a full-width scrollable conversation, pinned composer,
+compact footer and retro SHADOW banner. Unset `SHADOW_TUI` or set it to `pi` to use Snowfall.
+`SHADOW_TUI=ink shadow` selects the compatibility renderer for Vim mode, round-table mode,
+custom status lines and custom key mappings. See [Terminal renderers](TERMINAL_RENDERERS.md)
+for the complete command and key inventory.
+
+In Snowfall, **Ctrl+G** opens your external editor while idle; **Ctrl+T** shows tasks;
+**Ctrl+Shift+F** searches the transcript if your terminal forwards that chord; **Home/End**
+go to the first/latest output. Drag to select and copy text. Press Enter while busy to queue
+a follow-up. The normal terminal paste command inserts a draft without submitting it.
 
 - **`/help`** lists every slash command; **`/model`**, **`/effort`**, **`/theme`**, **`/context`**,
   **`/copy`**, **`/export`**, **`/resume`**, **`/fork`**, **`/mcp`** are the common ones.
@@ -323,7 +329,7 @@ explicit command/key limits.
   (files untouched), **`--code-only`** restores only the files (conversation untouched). After a
   rewind the composer is prefilled with the first undone prompt, so you can rephrase and resubmit.
   `/resume` loads a prior session from its last snapshot.
-- **Vim editing (`/vim`)**: the composer gets a vim NORMAL/INSERT model — **Esc** enters NORMAL;
+- **Vim editing (`/vim`, Ink only)**: the composer gets a vim NORMAL/INSERT model — **Esc** enters NORMAL;
   `i` `a` `I` `A` (and `o`/`O`, which open a new line) enter INSERT. Motions: `h l 0 $ w b e j k`
   plus in-line finds `f`/`F`/`t`/`T` — repeat the last find with `;`, reverse it with `,`. Edits:
   `x s d c y D C` with the usual operator+motion combos (`dw`, `c$`, `yy`, `d2w`, `2dd`…), paste
@@ -339,8 +345,8 @@ explicit command/key limits.
 - **Ctrl-O** expands a collapsed reasoning / tool-output block; **PageUp/PageDown** scroll the
   transcript. Mouse input is opt-in with `"mouse": true` or `SHADOW_MOUSE=1`.
 - **Copy & paste**: paste multi-line text straight into the composer (it inserts atomically — newlines
-  never fire a send); **Ctrl-V** pastes from the system clipboard explicitly; **Alt-C** (or `/copy`)
-  copies the last answer, **`/copy code`** just its last fenced code block. Huge pastes condense to a
+  never fire a send); **`/copy`** copies the last answer, **`/copy code`** just its last fenced
+  code block. Ink additionally supports **Ctrl-V** clipboard paste and **Alt-C** answer copy. Huge pastes condense to a
   `[Pasted text #N]` chip and expand again on send.
 - **Accessibility**: `/theme colorblind` switches to an Okabe–Ito palette (safe under deuteranopia,
   protanopia, and tritanopia); `/theme high-contrast` is a louder mode. Your turns have a filled

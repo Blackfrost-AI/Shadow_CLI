@@ -1,3 +1,4 @@
+import { GLYPHS } from '../src/tui/glyphs.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import React from 'react';
@@ -71,7 +72,7 @@ test('/config set temperature persists and the very next turn uses the new value
   const { stdin, frames, unmount } = render(React.createElement(TuiApp, { opts }));
   const output = () => frames.join('\n');
   try {
-    await waitFor(() => /❯/.test(output()));
+    await waitFor(() => new RegExp(`${GLYPHS.prompt}`, "").test(output()));
     // Let Ink finish wiring useInput after the first paint before synthetic typing begins.
     await new Promise((resolve) => setTimeout(resolve, 80));
 

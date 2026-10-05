@@ -5,7 +5,7 @@ process — everything here runs against this repository alone, with no private 
 
 **Audience:** contributors and anyone building their own artifacts.
 
-**Current release baseline:** `v9.0.0`.
+**Current release baseline:** `v10.0.0`.
 
 > **Maintainer note:** the *official* release pipeline (binary hosting, signing keys) is private
 > and intentionally not part of this repo. This guide covers the parts that are.
@@ -15,7 +15,7 @@ process — everything here runs against this repository alone, with no private 
 ## Prerequisites
 
 - **Node.js ≥ 22.19** (matches `engines.node` in `package.json`)
-- **[Bun](https://bun.sh)** — only needed for the single-file binary (`scripts/build-binary.sh`)
+- **[Bun](https://bun.sh) 1.4.2** — verified for this release; only needed for the single-file binary (`scripts/build-binary.sh`)
 - **git**
 
 ## 1. Install + verify the toolchain
@@ -93,15 +93,12 @@ Never merge private working history into the public repository. Prepare a review
 snapshot on public history, retain rollback artifacts, and verify live signed downloads after
 promotion. The website's version, source provenance and installer copies must match the release.
 
-### Dependency audit note
+### Dependency audit
 
-The 9.0.0 runtime dependency audit has no reported vulnerabilities. The unchanged development
-lockfile has brace-expansion findings below ESLint/typescript-eslint, including
-[nested-brace denial of service](https://github.com/advisories/GHSA-qhr7-859c-m2p7) and
-[quadratic expansion](https://github.com/advisories/GHSA-q2hr-2g5m-vwhr), added to the advisory
-database on September 29. These packages are not runtime imports. Do not feed hostile glob
-patterns to the affected development tooling; full `npm audit` is not clean. Toolchain remediation
-is separate from this release's signed runtime publication.
+Run `npm audit --omit=dev` for shipped dependencies and `npm audit` for the complete toolchain.
+Both audits reported zero vulnerabilities for the v10.0.0 lockfile on 2026-10-04, after updating
+the development-only brace-expansion packages to 1.1.21 and 5.0.12. Recheck at build time because
+the advisory database changes.
 
 ---
 

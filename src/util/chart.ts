@@ -1,3 +1,4 @@
+import { GLYPHS } from '../tui/glyphs.js';
 /**
  * Terminal charts — pure renderers for fenced ```chart blocks in answers.
  *
@@ -148,7 +149,7 @@ export function parseChartSpec(src: string): ChartSpec | null {
 
 // ── shared bits ───────────────────────────────────────────────────────────────
 
-const EIGHTHS = ['', '▏', '▎', '▍', '▌', '▋', '▊', '▉'] as const;
+const EIGHTHS = ['', '▏', '▎', '▍', `${GLYPHS.halfBlock}`, '▋', '▊', '▉'] as const;
 const SPARKS = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'] as const;
 
 /** Compact axis number: 1234 → 1.2k, 2500000 → 2.5M, 0.5 → 0.5. */

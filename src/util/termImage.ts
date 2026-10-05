@@ -27,6 +27,16 @@ export interface ImageTermOpts {
   isTTY?: boolean;
 }
 
+/** Fullscreen uses pi's managed Kitty placements (crop/delete on scroll). iTerm2's protocol
+ * cannot reliably erase a partially scrolled image; keep a durable file/description there.
+ * PNG is the wire format supported by Kitty's direct encoded-image transmission. */
+export function fullscreenImageProtocol(mediaType: string, opts: ImageTermOpts = {}): 'kitty' | null {
+  if (mediaType !== 'image/png' || !supportsInlineImages(opts)) return null;
+  const env = opts.env ?? process.env;
+  const terminal = `${env.TERM_PROGRAM ?? ''} ${env.TERM ?? ''}`.toLowerCase();
+  return /kitty|ghostty|wezterm/.test(terminal) || env.KITTY_WINDOW_ID || env.WEZTERM_PANE || env.GHOSTTY_RESOURCES_DIR ? 'kitty' : null;
+}
+
 /** True if stdout is a TTY on a terminal known to render inline images. Conservative — unknown
  *  terminals get the save+open fallback, never raw escape codes (mirrors supportsHyperlinks). */
 export function supportsInlineImages(opts: ImageTermOpts = {}): boolean {

@@ -95,6 +95,10 @@ export default tseslint.config(
                 'Route egress through shadowFetch() in src/safety/egress.ts — the offline wall, SSRF policy, DNS pinning and the receipt live there.',
             },
           ],
+          patterns: [{
+            group: ['undici/*'],
+            message: 'Route egress through shadowFetch() in src/safety/egress.ts; package subpaths must not bypass the broker.',
+          }],
         },
       ],
       'no-restricted-syntax': [
@@ -128,12 +132,12 @@ export default tseslint.config(
         },
         {
           // Dynamic import('undici')
-          selector: "ImportExpression[source.value='undici']",
+          selector: "ImportExpression[source.value=/^undici\\b/]",
           message: 'Direct undici use is banned outside the egress broker — use shadowFetch() from src/safety/egress.ts.',
         },
         {
           // require('undici')
-          selector: "CallExpression[callee.name='require'][arguments.0.value='undici']",
+          selector: "CallExpression[callee.name='require'][arguments.0.value=/^undici\\b/]",
           message: 'Direct undici use is banned outside the egress broker — use shadowFetch() from src/safety/egress.ts.',
         },
       ],

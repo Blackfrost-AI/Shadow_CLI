@@ -18,6 +18,7 @@ import { defaultModelPatch } from '../config/modelPresets.js';
 import type { ModelEntry } from '../config.js';
 import { looksAnthropicDistilled, toAnthropicBaseUrl } from '../util/transport.js';
 import { normalizeBaseUrl } from '../config.js';
+import { SHADOW_LOGOTYPE, SHADOW_COMPACT, degradeArt } from '../tui/brand.js';
 import type { Message } from '../provider/provider.js';
 import { registerSecret, redactString } from '../util/redact.js';
 import { persistOnboardTarget, type OnboardTargetInput } from './persistTarget.js';
@@ -34,14 +35,7 @@ const c = {
 };
 
 // ── Centered banner / box layout ─────────────────────────────────────────────
-const SHADOW_ART = [
-  '███████╗██╗  ██╗ █████╗ ██████╗  ██████╗ ██╗    ██╗',
-  '██╔════╝██║  ██║██╔══██╗██╔══██╗██╔═══██╗██║    ██║',
-  '███████╗███████║███████║██║  ██║██║   ██║██║ █╗ ██║',
-  '╚════██║██╔══██║██╔══██║██║  ██║██║   ██║██║███╗██║',
-  '███████║██║  ██║██║  ██║██████╔╝╚██████╔╝╚███╔███╔╝',
-  '╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝  ╚═════╝  ╚══╝╚══╝ ',
-];
+// Use the same retro banner and narrow-screen fallbacks as both interactive shells.
 
 // Compatibility disclaimer.
 const DISCLAIMER = [
@@ -73,8 +67,8 @@ function boxed(lines: string[]): string[] {
   ];
 }
 
-function writeCentered(lines: string[]): void {
-  for (const l of centerBlock(lines)) stdout.write(l + '\n');
+function writeCentered(lines: string[], width = cols()): void {
+  for (const l of centerBlock(lines, width)) stdout.write(l + '\n');
 }
 
 // ── Context Cooler (optional, opt-in MCP server) ─────────────────────────────
@@ -256,7 +250,9 @@ export async function runOnboard(): Promise<boolean> {
 
     const showBanner = () => {
       stdout.write('\n');
-      writeCentered(SHADOW_ART.map((l) => c.cyan(l)));
+      const width = Math.min(stdout.columns || 80, cols());
+      const art = degradeArt(SHADOW_LOGOTYPE, width);
+      writeCentered((art.length ? art : [SHADOW_COMPACT]).map((l) => c.cyan(l)), width);
       stdout.write('\n');
       writeCentered(boxed(DISCLAIMER).map((l) => c.gray(l)));
       stdout.write('\n');

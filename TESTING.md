@@ -22,13 +22,15 @@ npm link                      # then run: shadow --help
 
 Windows testers can use the signed PowerShell installer documented in `README.md`.
 
-Ink is the supported default terminal; pi is an opt-in experimental preview. Use the
+Snowfall is the default terminal in v10; `SHADOW_TUI=ink shadow` selects the compatibility renderer. Use the
 [renderer contract](TERMINAL_RENDERERS.md) when checking command/key claims. The signed release
 workflow covers Linux x64/ARM64, macOS Intel/ARM64, and native Windows Server 2022 with both
 PowerShell 5.1 and 7. It exercises installation to a path with spaces, repeat installation,
 offline-update refusal, self-update without PowerShell on PATH, and rejection of invalid
 signatures, altered binaries and missing signatures. These artifact smokes do not imply that
-every interactive terminal/platform combination has been qualified for pi.
+every interactive terminal/platform combination has been qualified. The separate Snowfall workflow
+runs source checks on Linux, macOS and Windows with Node 22.19.0 and 26.5.0, plus POSIX PTY
+lifecycle checks. See [release verification](docs/V10_VERIFICATION.md).
 
 ## First run
 
@@ -62,7 +64,7 @@ Responses). Cloud frontier models and local Ollama endpoints both work.
 - `run_shell`: confirm the sandbox engages; try writing **outside** the workspace and confirm
   the jail blocks it (it should, unless `--yolo`/full-auto).
 - Plan mode (`--plan-mode`), the todo list, sub-agents (`agent` tool), `web_search`/`web_fetch`.
-- TUI slash commands: `/help`, `/model`, `/diff`, `/status`, `/theme`, `/vim`, `/image`, …
+- TUI slash commands: `/help`, `/model`, `/diff`, `/status`, `/theme`, `/work`, `/image`, … (`/vim` uses the Ink fallback)
 - Multimodal: `/image <path>` to attach an image; or ask the model to call `view_image <path>`
   to load one itself (vision-capable models only).
 - Live steering: start a deliberately long answer, type a correction, and press Enter. Model

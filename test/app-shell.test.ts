@@ -1,3 +1,4 @@
+import { GLYPHS } from '../src/tui/glyphs.js';
 // Regression net for the pi-tui shell (src/app/).
 //
 // These lock the two properties the new renderer exists to guarantee, plus the completion
@@ -20,7 +21,7 @@ import { ShadowAutocompleteProvider } from '../src/app/autocomplete.js';
 import { spanToAnsi, PIN_THEME } from '../src/app/ansi.js';
 import { ActivityPanel, capBody, type ToolDetail } from '../src/app/activity.js';
 import { SHADOW_ART } from '../src/tui/wordmark.js';
-import { renderBrand, renderToolStack } from '../src/tui/rows.js';
+import { renderToolStack } from '../src/tui/rows.js';
 import { applyTheme, paletteSnapshot, THEME_NAMES } from '../src/tui/theme.js';
 import { flattenItem } from '../src/tui/flatten.js';
 import type { FlattenItem } from '../src/tui/flatten.js';
@@ -230,55 +231,64 @@ function splashLines(width: number): string[] {
   return splash.render(width);
 }
 
-test('SHADOW_ART holds the full block wordmark as real glyphs, not escaped \\uXXXX text', () => {
-  // This is the bug that made the wordmark vanish from the compiled binary: Bun ASCII-escapes the
-  // block glyphs to \u2588 in the bundle, and String.raw would keep the escape literal.
+/**
+ * The icon's horizontal arm — a long ─ run that ONLY the art ever draws.
+ *
+ * `✻` can no longer identify rendered art: v10's compact fallback mark is
+ * `✻ shadow`, so a narrow terminal that correctly fell back would otherwise look
+ * like it drew the flake. Probing a distinctive art row instead makes "did the
+ * art render?" answerable independently of which glyphs the tiers share.
+ */
+const ART_ARM = SHADOW_ART[7]!;
+const artRendered = (lines: string[]): boolean => lines.some((l) => l.includes(ART_ARM));
+
+test('SHADOW_ART holds real snowflake glyphs, not escaped \\uXXXX text', () => {
+  // This is the bug class that made the wordmark vanish from the compiled binary: Bun
+  // ASCII-escapes the box glyphs to \uXXXX in the bundle, and anything that keeps the escape
+  // LITERAL prints "u2588u2588…" instead of the art. The source must stay a plain template.
   const joined = SHADOW_ART.join('\n');
-  assert.ok(joined.includes('█'), 'the art must contain real U+2588 block glyphs');
-  assert.ok(!joined.includes('u2588'), 'the art must not contain a literal \\u2588 escape');
-  assert.equal(SHADOW_ART.length, 6, 'the full wordmark is six rows tall');
-  assert.equal(Math.max(...SHADOW_ART.map((line) => visibleWidth(line))), 51, 'the full-width mark is retained');
+  assert.ok(joined.includes('✻'), 'the snowflake center must be a real glyph');
+  assert.ok(joined.includes('│') && joined.includes('╲') && joined.includes('╱'), 'six arms present');
+  assert.ok(!joined.includes('u2588') && !joined.includes('u273b'), 'no literal \\uXXXX escapes');
+  assert.ok(!joined.includes('❄'), 'no emoji-variant glyphs — some terminals render them double-width');
+  assert.equal(SHADOW_ART.length, 15, 'the snowflake is fifteen rows tall');
 });
 
-test('the full wordmark renders side-by-side when there is room beside the meta block', () => {
+test('the snowflake renders side-by-side when there is room beside the meta block', () => {
   const lines = splashLines(120);
-  const artRow = lines.find((l) => l.includes(SHADOW_ART[0]!));
-  assert.ok(artRow, 'expected the full wordmark at 120 columns');
-  assert.ok(artRow.includes(BRAND.version), 'meta sits beside the wordmark side-by-side');
+  const artRow = lines.find((l) => l.includes(ART_ARM));
+  assert.ok(artRow, 'expected the snowflake at 120 columns');
+  // The meta block is identified by the VERSION string — art tips are also ✦, so the star is not
+  // a meta marker. Meta overlays the TOP art rows (0..3), so check the tips row, not the ✻ center.
+  const tipsRow = lines.find((l) => l.includes(SHADOW_ART[0]!));
+  assert.ok(tipsRow && tipsRow.includes(BRAND.version), 'meta sits beside the flake side-by-side');
 });
 
-test('the wordmark keeps its two-tone depth treatment', () => {
-  const rows = renderBrand({ ...BRAND, art: SHADOW_ART }, PIN_THEME, 120);
-  assert.equal(rows[0]?.[0]?.color, PIN_THEME.cyan);
-  assert.equal(rows[0]?.[0]?.bold, true);
-  assert.equal(rows.at(-1)?.[0]?.color, PIN_THEME.dim);
-  assert.notEqual(rows.at(-1)?.[0]?.bold, true);
-});
-
-test('the full wordmark stacks instead of shrinking when the terminal is moderately narrow', () => {
+test('the snowflake stacks below the meta block when the terminal is narrow', () => {
   const lines = splashLines(70);
-  // The exact founder regression: 70 columns has room for the 51-column art, just not for the
-  // side-by-side meta block. Keep the full art and stack; do not fall back to compact "shadow".
+  // Stacked: every art row renders on its own line, none sharing the row with the meta block
+  // (identified by the version string — art tips are also ✦).
   for (const artLine of SHADOW_ART) {
     const row = lines.find((l) => l.includes(artLine));
     assert.ok(row, `art row missing at 70 columns: ${artLine.slice(0, 24)}…`);
     assert.ok(!row.includes(BRAND.version), 'a stacked art row must not also carry the meta block');
   }
+  assert.ok(artRendered(lines), 'the flake arm is present when stacked');
 });
 
 test('the splash degrades to the compact name form on a very narrow terminal', () => {
-  const lines = splashLines(40);
-  assert.ok(
-    !lines.some((l) => l.includes('█')),
-    'the 51-column wordmark cannot render in 40 columns and must fall back',
-  );
+  // 25-col flake + 2-col gutter = 27: it stacks at 40 columns but cannot render at all at 24.
+  const lines = splashLines(24);
+  assert.ok(!artRendered(lines), 'the flake cannot render in 24 columns and must fall back');
+  assert.ok(lines.some((l) => l.includes('✻')), 'the compact flake-core mark renders instead');
   assert.ok(lines.some((l) => l.includes('shadow')), 'the compact form names the binary');
 });
 
-test('the wordmark stacks when the meta would not fit beside it', () => {
+test('the flake stacks (no side-by-side) when the meta would not fit beside it', () => {
+  // 25-col art + 4 gap + ~45 meta ≈ 74: at 70 columns the stacked branch wins.
   const lines = splashLines(70);
-  const top = lines.find((l) => l.includes(SHADOW_ART[0]!));
-  assert.ok(top && !top.includes(BRAND.version), 'stacked at 70: art rows carry no meta');
+  const tips = lines.find((l) => l.includes(SHADOW_ART[0]!));
+  assert.ok(tips && !tips.includes(BRAND.version), 'stacked at 70: art rows carry no meta');
 });
 
 test('every splash row fits its width — including at widths too narrow for the art', () => {
@@ -294,7 +304,12 @@ test('every splash row fits its width — including at widths too narrow for the
 
 test('the splash re-renders on resize rather than caching a stale width', () => {
   // The art lives in the LIVE frame precisely so a resize reflows it. A width-keyed cache that
-  // did not invalidate would leave the 120-column layout on a 70-column terminal.
+  // did not invalidate would leave the 120-column layout on a 70-column terminal. The probe is the
+  // TIPS row (art row 0, the ✦ triplet): the meta block overlays the top art rows, so that row
+  // carries the version side-by-side at 120 and nothing but art at 70. The reflow is therefore
+  // visible in the row itself, which is why it is the probe rather than the ✻ arm row — the arm is
+  // identical in both layouts, and at a width that falls back to the compact form ✻ also appears in
+  // `✻ shadow`, so it cannot distinguish "art rendered" from "correctly fell back".
   const splash = new BrandSplash(BRAND as never, SHADOW_ART);
   const wide = splash.render(120).find((l) => l.includes(SHADOW_ART[0]!))!;
   splash.invalidate();
@@ -487,7 +502,7 @@ function bandedCols(line: string): number {
 }
 
 test('a user turn is drawn as a full-width background band', () => {
-  const item = { id: 1, kind: 'user', text: '❯ hello there, this is my message' } as FlattenItem;
+  const item = { id: 1, kind: 'user', text: `${GLYPHS.promptPrefix}hello there, this is my message` } as FlattenItem;
   const lines = new FlatCell(item as never, false).render(80);
   const bandRows = lines.filter((l) => bandedCols(l) > 0);
   assert.ok(bandRows.length >= 1, 'the user turn must carry a background band');
@@ -498,7 +513,7 @@ test('a user turn is drawn as a full-width background band', () => {
 });
 
 test('the band runs down EVERY wrapped row of a long user turn', () => {
-  const item = { id: 1, kind: 'user', text: `❯ ${'word '.repeat(60)}` } as FlattenItem;
+  const item = { id: 1, kind: 'user', text: `${GLYPHS.promptPrefix}${'word '.repeat(60)}` } as FlattenItem;
   const lines = new FlatCell(item as never, false).render(60);
   const bandRows = lines.filter((l) => bandedCols(l) > 0);
   assert.ok(bandRows.length >= 4, `expected the band on every wrapped row, got ${bandRows.length}`);
@@ -515,7 +530,7 @@ test('an assistant turn carries NO background — only the user is highlighted',
 test('the blank separator above a user turn is outside the band', () => {
   // The item's leading gap row belongs to the same item but must not be filled — that edge is
   // what makes the band read as a block rather than bleeding into the row above it.
-  const item = { id: 1, kind: 'user', text: '❯ hi' } as FlattenItem;
+  const item = { id: 1, kind: 'user', text: `${GLYPHS.promptPrefix}hi` } as FlattenItem;
   const lines = new FlatCell(item as never, false).render(80);
   assert.equal(bandedCols(lines[0]!), 0, 'the leading separator row must not be banded');
   assert.ok(lines.slice(1).some((l) => bandedCols(l) > 0), 'the message row must be banded');
@@ -525,7 +540,7 @@ test('the user band uses the theme color, and every theme resolves one', () => {
   for (const name of THEME_NAMES) {
     applyTheme(name);
     assert.ok(PIN_THEME.userBg, `theme ${name} must resolve a user band color`);
-    const item = { id: 1, kind: 'user', text: '❯ x' } as FlattenItem;
+    const item = { id: 1, kind: 'user', text: `${GLYPHS.promptPrefix}x` } as FlattenItem;
     const row = new FlatCell(item as never, false).render(40).find((l) => bandedCols(l) > 0);
     assert.ok(row, `theme ${name} rendered no band`);
   }

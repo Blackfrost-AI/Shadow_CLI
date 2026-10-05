@@ -42,10 +42,11 @@ test('every theme defines every palette field', () => {
   applyTheme('og');
 });
 
-test('only the shadow theme asserts a terminal background', () => {
+test('Shadow and Snowfall assert their backgrounds; other themes inherit the terminal', () => {
   for (const name of THEME_NAMES) {
     const bg = themeBackground(name);
     if (name === 'shadow') assert.equal(bg, '#000000');
+    else if (name === 'snowfall') assert.equal(bg, '#0b121b');
     else assert.equal(bg, null, `${name} must leave the user's own background alone`);
   }
 });
@@ -101,6 +102,6 @@ test('themeBackground resolves aliases and unknown names', () => {
     assert.equal(themeBackground(alias), '#000000', `${alias} should alias to shadow`);
   }
   assert.equal(themeBackground('dark'), null, 'dark aliases to og, which asserts nothing');
-  assert.equal(themeBackground('nonsense'), null, 'an unknown name falls back to og');
-  assert.equal(themeBackground(undefined), null);
+  assert.equal(themeBackground('nonsense'), '#0b121b', 'an unknown name falls back to Snowfall');
+  assert.equal(themeBackground(undefined), '#0b121b');
 });

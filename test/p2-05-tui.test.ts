@@ -1,3 +1,4 @@
+import { GLYPHS } from '../src/tui/glyphs.js';
 /**
  * P2-05 TUI correctness batch — regression pins.
  *
@@ -267,7 +268,7 @@ test('F05-07: flatten hanging prefix keeps wrapped rows aligned (display-width m
   const item: FlattenItem = {
     id: 1,
     kind: 'user',
-    text: `❯ ${'word '.repeat(40).trim()}`, // wraps several rows at 40 cols
+    text: `${GLYPHS.promptPrefix}${'word '.repeat(40).trim()}`, // wraps several rows at 40 cols
   };
   const lines = flattenItem(item, 40, false, theme);
   const content = lines.filter((l) => l.spans.some((x) => x.text.trim() !== ''));
@@ -289,5 +290,5 @@ test('F05-07: flatten hanging prefix keeps wrapped rows aligned (display-width m
     assert.ok(!text.includes(String.fromCodePoint(0x258c)), 'no legacy gutter glyph');
     assert.ok(displayWidth(text) <= 40, `row fits the budget (${displayWidth(text)} cols)`);
   }
-  assert.ok(content[0]!.spans[0]!.text === '  ', 'the first row carries the 2-col inset');
+  assert.ok(rows[0]!.startsWith(`${GLYPHS.user} `), 'the first row carries the 2-col user marker');
 });

@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { GLYPHS } from './tui/glyphs.js';
 import { readFileSync, existsSync, unlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { resolve, parse, join } from 'node:path';
@@ -1928,7 +1929,7 @@ async function main(): Promise<void> {
               }, { plain: !!flags.screenReader });
           const onClose = new Promise<typeof CLOSED>((res) => rl.once('close', () => res(CLOSED)));
           for (;;) {
-            const raw = await Promise.race([rl.question(flags.screenReader ? '\nYOU > ' : '\n\x1b[1;32m❯\x1b[0m '), onClose]);
+            const raw = await Promise.race([rl.question(flags.screenReader ? '\nYOU > ' : `\n\x1b[1;32m${GLYPHS.prompt}\x1b[0m `), onClose]);
             if (raw === CLOSED) break;
             const task = raw.trim();
             if (task === 'exit' || task === 'quit') break;

@@ -1,3 +1,4 @@
+import { EFFORT_GLYPHS } from '../tui/glyphs.js';
 /**
  * Reasoning-effort model for the Shadow harness.
  *
@@ -27,14 +28,8 @@ export const EFFORT_LEVELS: readonly Effort[] = ['low', 'medium', 'high', 'xhigh
 
 export const DEFAULT_EFFORT: Effort = 'high';
 
-/** Unicode depth glyph (matches the reference client's EffortIndicator vocabulary). */
-const SYMBOLS: Record<Effort, string> = {
-  low: '◯',
-  medium: '◐',
-  high: '◑',
-  xhigh: '◕',
-  max: '⬤',
-};
+/** Crystal depth marks; the accompanying word always names the effort. */
+const SYMBOLS: Record<Effort, string> = EFFORT_GLYPHS;
 
 export function effortSymbol(level: Effort): string {
   return SYMBOLS[level] ?? SYMBOLS.high;

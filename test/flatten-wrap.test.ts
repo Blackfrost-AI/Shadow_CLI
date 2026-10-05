@@ -1,3 +1,4 @@
+import { GLYPHS } from '../src/tui/glyphs.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { wrapSpansWord, truncateSpans, flattenItem, TOOL_BODY_EXPAND_CAP, itemIsCollapsible, computeToolRuns } from '../src/tui/flatten.js';
@@ -71,7 +72,7 @@ test('wide table vertical fallback wraps instead of terminal hard-wrapping mid-w
 test('assistant Markdown has no per-block speaker header and continuations align', () => {
   const nonBlank = (rows: { spans: { text: string }[] }[]) => rows.filter((r) => r.spans.some((s) => s.text.trim() !== ''));
   const first = nonBlank(flattenItem({ id: 1, kind: 'assistant', text: 'first line second line', speaker: { handle: 'SHADOW', model: 'fixture', color: T.cyan } }, 20, false, T));
-  assert.deepEqual(first.map(r => r.spans.map(s => s.text).join('')), ['  first line second', '  line']);
+  assert.deepEqual(first.map(r => r.spans.map(s => s.text).join('')), [`${GLYPHS.assistant} first line second`, '  line']);
   const cont = nonBlank(flattenItem({ id: 2, kind: 'assistant', text: 'continued paragraph' }, 60, false, T, true));
   assert.deepEqual(cont.map(r => r.spans.map(s => s.text).join('')), ['  continued paragraph']);
 });
@@ -81,7 +82,7 @@ test('user prompt: background band on EVERY line, bright body (fg), leading blan
   // which repeated a glyph down every wrapped row in the same column as answer text. Body is
   // theme.fg — the same readable tier as answer prose. A leading blank always opens the turn.
   const md = 'a prompt long enough to wrap at this narrow measure\n1. a typed list line';
-  const rows = flattenItem({ id: 3, kind: 'user', text: `❯ ${md}`, color: T.green, bold: true, tight: true }, 30, false, T);
+  const rows = flattenItem({ id: 3, kind: 'user', text: `${GLYPHS.promptPrefix}${md}`, color: T.green, bold: true, tight: true }, 30, false, T);
   assert.equal(rows[0]!.spans.every((s) => s.text === ''), true, 'user turns always lead with a blank (tight ignored)');
   const nonBlank = rows.filter((r) => r.spans.some((s) => s.text.trim() !== ''));
   assert.ok(
@@ -89,18 +90,18 @@ test('user prompt: background band on EVERY line, bright body (fg), leading blan
     'every content row carries the band — wraps and typed lines alike',
   );
   assert.ok(
-    !nonBlank.some((r) => r.spans.some((s) => s.text.includes('▌'))),
+    !nonBlank.some((r) => r.spans.some((s) => s.text.includes(`${GLYPHS.halfBlock}`))),
     'the per-line gutter is gone',
   );
   const body = nonBlank.flatMap((r) => r.spans).filter((s) => s.text.trim() !== '');
   assert.ok(body.every((s) => !s.bold), 'no bold body — the band is the marker');
   const joined = nonBlank.map((r) => r.spans.map((s) => s.text).join('')).join('\n');
   assert.match(joined, /1\. a typed list line/, 'typed text is verbatim — no markdown rewrite');
-  assert.ok(!joined.includes('❯'), 'the baked-in ❯ fallback marker is stripped from styled output');
+  assert.ok(!joined.includes(`${GLYPHS.prompt}`), `the baked-in ${GLYPHS.promptPrefix}fallback marker is stripped from styled output`);
   for (const r of rows) assert.ok(r.spans.map((s) => s.text).join('').length <= 30, 'fits the measure');
 });
 
-test('tool output child: collapsed = one-row ⌄ fold; expanded = ⎿ body (no 10-line preview)', () => {
+test(`tool output child: collapsed = one-row ⌄ fold; expanded = ${GLYPHS.result} body (no 10-line preview)`, () => {
   const lines = Array.from({ length: 15 }, (_, i) => ({ text: `line ${i + 1}`, color: T.dim }));
   const item = { id: 7, kind: 'tool' as const, text: '', meta: 'output', lines };
 
@@ -116,7 +117,7 @@ test('tool output child: collapsed = one-row ⌄ fold; expanded = ⎿ body (no 1
   // Expanded (Ctrl-O) → full body under ⎿, no fold glyph.
   const expanded = flattenItem(item, 80, false, T);
   const expandedText = join(expanded);
-  assert.equal(expanded[0]!.spans[0]!.text, '  ⎿ ', 'branch glyph opens the child');
+  assert.equal(expanded[0]!.spans[0]!.text, `${GLYPHS.resultPrefix}`, 'branch glyph opens the child');
   assert.equal(expanded[1]!.spans[0]!.text, '    ', 'subsequent lines align under the branch');
   assert.ok(expandedText.some((r) => r.includes('line 15')), 'expanded shows every line');
   assert.ok(!expandedText.some((r) => r.includes('· ^O')), 'no fold hint when fully expanded');
@@ -131,7 +132,7 @@ test('tool output child: short body (≤3 lines) stays inline even when collapse
   const item = { id: 8, kind: 'tool' as const, text: '', meta: 'output', lines };
   const rows = flattenItem(item, 80, true, T);
   assert.equal(rows.length, 3, '≤3 lines never fold');
-  assert.equal(rows[0]!.spans[0]!.text, '  ⎿ ');
+  assert.equal(rows[0]!.spans[0]!.text, `${GLYPHS.resultPrefix}`);
   assert.ok(!rows.some((r) => r.spans.map((s) => s.text).join('').includes('⌄')));
 });
 
@@ -159,7 +160,7 @@ test('collapsed long DIFF shows a 2-line teaser then fold for the rest', () => {
   assert.ok(!text.includes('+ added 2'), 'third line stays under the fold');
 });
 
-test('tool header + nested body: one ⏺ row + fold child when collapsed', () => {
+test(`tool header + nested body: one ${GLYPHS.tool} row + fold child when collapsed`, () => {
   const item = {
     id: 9,
     kind: 'tool' as const,
@@ -262,7 +263,7 @@ test('nested list items keep their depth indent AND wrap with a hanging indent u
   // Body indent is 2 (the ⏺ gutter). Top-level marker at col 2; its wrapped row aligns under the TEXT.
   const top = lines.find((l) => l.includes('top level'))!;
   const topCont = lines[lines.indexOf(top) + 1]!;
-  assert.match(top, /^ {2}• top level/, 'marker on the first row');
+  assert.match(top, new RegExp(`^${GLYPHS.assistant} • top level`), 'marker on the first row');
   assert.match(topCont, /^ {4}\S/, 'continuation aligns under the text (hanging indent), not the margin');
   const nested = lines.find((l) => l.includes('nested item'))!;
   assert.match(nested, /^ {2} {2}◦ nested item/, 'nested bullet keeps its 2-space depth indent + ◦ glyph');
@@ -305,14 +306,14 @@ test('collaboration speaker: colored ◆ handle header once per turn, body inden
   const first = flattenItem({ id: 1, kind: 'assistant', text: 'the KV cache is the OOM', speaker: spk } as never, 60, false, T, false);
   const headRow = first.find((r) => r.spans.map((s) => s.text).join('').includes('◆'))!;
   const head = headRow.spans.map((s) => s.text).join('');
-  assert.match(head, /◆ grok/, 'header shows the ⏺ + handle');
+  assert.match(head, /◆ grok/, `header shows the ${GLYPHS.tool} + handle`);
   assert.match(head, /openai\/grok-4/, 'header shows the model');
   assert.equal(headRow.spans[0]!.color, '#38dbf5', 'header is painted the seat color, not orange');
   // No orange assistant bullet anywhere in a speaker turn (the header is the only bullet).
-  assert.ok(!first.slice(1).some((r) => (r.spans[0]?.color) === '#d97757'), 'body has no orange ⏺');
+  assert.ok(!first.slice(1).some((r) => (r.spans[0]?.color) === '#d97757'), `body has no orange ${GLYPHS.tool}`);
   // A continuation block (same turn) draws neither a second header nor a bullet — just indent.
   const cont = flattenItem({ id: 2, kind: 'assistant', text: 'add -ctk q8_0', speaker: spk } as never, 60, false, T, true);
-  assert.ok(!cont.some((r) => r.spans.map((s) => s.text).join('').includes('◆')), 'continuation has no ⏺ header');
+  assert.ok(!cont.some((r) => r.spans.map((s) => s.text).join('').includes('◆')), `continuation has no ${GLYPHS.tool} header`);
 });
 
 test('computeToolRuns: only collapsible tools stack; edits/shell break the group', () => {

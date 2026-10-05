@@ -1,3 +1,4 @@
+import { GLYPHS } from './glyphs.js';
 // src/tui/chrome.tsx — the transcript chrome components (extracted from tui.tsx, plan 2.4):
 // the pinned agent-state block, the status strip, composer, and the committed FlatItem renderer.
 import React from 'react';
@@ -235,7 +236,7 @@ export function Composer({
       >
         {empty ? (
           <Text wrap="truncate">
-            <Text color={C.dim}>{'❯ '}</Text>
+            <Text color={C.dim}>{`${GLYPHS.promptPrefix}`}</Text>
             <Text inverse> </Text>
             {/* The full placeholder is 58 cols + gutter + caret = 61; below ~69 terminal cols it
                 wrapped to a SECOND row — an idle composer 4 rows tall where every height budget
@@ -248,7 +249,7 @@ export function Composer({
         ) : (
           win.lines.map((line, ri) => {
             const gutter = ri === 0
-              ? win.offset > 0 ? '↑ ' : '❯ '
+              ? win.offset > 0 ? '↑ ' : `${GLYPHS.promptPrefix}`
               : ri === win.lines.length - 1 && win.offset + win.lines.length < win.totalRows ? '↓ ' : '  ';
             const onCaretRow = ri === win.caretRow;
             if (!onCaretRow) {

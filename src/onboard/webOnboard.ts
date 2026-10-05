@@ -183,7 +183,7 @@ export function page(token: string, hasVault = false): string {
   return `<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1"><title>Shadow — secure setup</title>
 <style>
- :root{--bg:#0d1117;--panel:#161b22;--fg:#e6edf3;--dim:#8b949e;--accent:#d97757;--cyan:#38dbf5;--line:#30363d}
+ :root{--bg:#0d1117;--panel:#161b22;--fg:#e6edf3;--dim:#8b949e;--accent:#c3e5ff;--cyan:#38dbf5;--line:#30363d}
  *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;padding:24px}
  .card{width:100%;max-width:440px;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:28px}
  h1{margin:0 0 4px;font-size:20px}h1 span{color:var(--accent)}

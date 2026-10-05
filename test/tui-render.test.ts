@@ -1,3 +1,4 @@
+import { GLYPHS } from '../src/tui/glyphs.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import React from 'react';
@@ -38,7 +39,7 @@ test('TuiApp renders without throwing (regression guard for the Box/Text import 
   // Footer status line is always in the live frame when idle.
   assert.match(frame, /mock\/claude-opus-4-8/, 'shows provider/model');
   assert.match(frame, /mode: auto-edit/, 'shows the autonomy level');
-  assert.match(frame, /❯/, 'renders the composer prompt');
+  assert.match(frame, new RegExp(`${GLYPHS.prompt}`, ""), 'renders the composer prompt');
   unmount();
 });
 

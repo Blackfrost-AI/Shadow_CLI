@@ -1,6 +1,6 @@
 {
   "name": "shadow",
-  "version": "9.0.0",
+  "version": "10.0.0",
   "description": "Shadow — a high-performance, agentic CLI runtime that lets an LLM operate as a coding/sysadmin agent over a local workspace.",
   "type": "module",
   "private": true,
@@ -27,6 +27,8 @@
     "lint": "eslint .",
     "format": "prettier --write .",
     "test": "node --import tsx/esm --test --test-timeout=60000 \"test/**/*.test.ts\" \"test/**/*.test.tsx\"",
+    "test:terminal": "node --import tsx/esm --test --test-timeout=60000 \"test/snowfall-*.test.ts\"",
+    "preview:snowfall": "tsx scripts/snapshot-snowfall.ts",
     "verify:plan": "bash scripts/verify-plan.sh",
     "check:release-gate": "bash scripts/check-release-gate.sh",
     "prepublishOnly": "bash scripts/check-release-gate.sh",

@@ -1,3 +1,4 @@
+import { GLYPHS } from '../src/tui/glyphs.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import React from 'react';
@@ -58,7 +59,7 @@ async function mount(
     await new Promise((r) => setTimeout(r, FLUSH_MS));
 
     const plain = (lastFrame() ?? '').replace(/\x1b\[[0-9;]*m/g, '');
-    const row = plain.split('\n').find((r) => r.trimStart().startsWith('❯ '));
+    const row = plain.split('\n').find((r) => r.trimStart().startsWith(`${GLYPHS.promptPrefix}`));
     if (!row) return '';
     const body = row.trimStart().slice(2).replace(/\s+$/, '');
     return body.includes('Send a message…') ? '' : body;
@@ -310,7 +311,7 @@ test('Ctrl+D on an EMPTY composer warns first (two-stage arm) and any other key 
   send('\x04'); // Ctrl+D once, idle + empty
   await new Promise((r) => setTimeout(r, FLUSH_MS));
   assert.match(lastFrame() ?? '', /press Ctrl\+D again to quit/, 'the first ^D arms instead of quitting');
-  assert.match(lastFrame() ?? '', /❯/, 'the app is still mounted after one ^D');
+  assert.match(lastFrame() ?? '', new RegExp(`${GLYPHS.prompt}`, ""), 'the app is still mounted after one ^D');
   // Any other key disarms the latch, so a later ^D starts over instead of quitting.
   send('x');
   assert.equal(await draft(), 'x');
@@ -318,7 +319,7 @@ test('Ctrl+D on an EMPTY composer warns first (two-stage arm) and any other key 
   assert.equal(await draft(), '');
   send('\x04');
   await new Promise((r) => setTimeout(r, FLUSH_MS));
-  assert.match(lastFrame() ?? '', /❯/, 'still mounted: the intervening key disarmed the first press');
+  assert.match(lastFrame() ?? '', new RegExp(`${GLYPHS.prompt}`, ""), 'still mounted: the intervening key disarmed the first press');
 });
 
 test('Ctrl+D on a NON-EMPTY draft keeps its forward-delete meaning (never arms exit)', async (t) => {
