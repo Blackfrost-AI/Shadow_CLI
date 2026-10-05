@@ -19,7 +19,7 @@ const pkg = JSON.parse(read('package.json')) as {
 test('npm run lint can actually exit 0', () => {
   // It could not before: 49 no-undef errors for browser globals in src/web/ui/*.js meant lint was
   // permanently red, so nobody ran it, so 5 REAL errors sat hidden behind the noise.
-  const out = execFileSync('npx', ['eslint', '.', '-f', 'json'], {
+  const out = execFileSync(process.execPath, [fileURLToPath(new URL('../node_modules/eslint/bin/eslint.js', import.meta.url)), '.', '-f', 'json'], {
     cwd: rootPath,
     encoding: 'utf8',
     maxBuffer: 32 * 1024 * 1024,

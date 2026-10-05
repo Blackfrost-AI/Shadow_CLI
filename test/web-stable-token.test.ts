@@ -223,7 +223,7 @@ test('runWeb prints the join line end to end', async () => {
       // queue phase), and runWeb's once('SIGINT') is the only handler, so nothing else reacts.
       if (!interrupted && output.includes('Ctrl-C to stop')) {
         interrupted = true;
-        setImmediate(() => process.kill(process.pid, 'SIGINT'));
+        setImmediate(() => process.emit('SIGINT'));
       }
     },
     open: false,

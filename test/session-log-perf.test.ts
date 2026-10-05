@@ -93,7 +93,7 @@ test('persistent-fd writes are synchronous, ordered, and 0600', () => {
     const events = SessionLog.load(log.path) as Array<Record<string, unknown>>;
     assert.equal(events.length, 3);
     assert.deepEqual(events.map((e) => e.text as string), ['a', 'b', 'c']);
-    assert.equal(statSync(log.path).mode & 0o777, 0o600, 'file forced to 0600');
+    if (process.platform !== 'win32') assert.equal(statSync(log.path).mode & 0o777, 0o600, 'file forced to 0600');
     assert.equal(log.lastError, undefined);
   } finally {
     rmSync(root, { recursive: true, force: true });

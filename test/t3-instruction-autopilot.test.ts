@@ -67,7 +67,7 @@ test('seed NEVER overwrites an existing SHADOW.md', () => {
   assert.equal(readFileSync(join(dir, 'SHADOW.md'), 'utf8'), 'PRECIOUS');
 });
 
-test('seed reports an error (never throws) when the dir is unwritable', () => {
+test('seed reports an error (never throws) when the dir is unwritable', { skip: process.platform === 'win32' ? 'POSIX permission bits are not Windows ACLs' : false }, () => {
   const dir = tmp();
   chmodSync(dir, 0o500); // read+execute, no write
   const res = seedInstructionFile(dir);

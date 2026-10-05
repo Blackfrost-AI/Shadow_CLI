@@ -92,7 +92,7 @@ test('durable writes replace a 0600 sidecar instead of appending repeated full s
     const sidecar = `${log.path}.work.json`;
     assert.equal(readLatestWorkCenterSnapshot(log.path)?.items[0]?.id, 'latest-19');
     assert.ok(statSync(sidecar).size < 10_000);
-    assert.equal(statSync(sidecar).mode & 0o777, 0o600);
+    if (process.platform !== 'win32') assert.equal(statSync(sidecar).mode & 0o777, 0o600);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

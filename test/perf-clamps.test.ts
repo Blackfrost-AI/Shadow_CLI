@@ -51,7 +51,7 @@ test('F06-05: files over 10MB are refused by STAT — never read into memory', a
     assert.equal(res.error?.code, 'file_too_large');
     assert.match(res.summary, /grep|run_shell/i, 'the refusal must point at an extraction path');
   } finally {
-    rmSync(ws, { recursive: true, force: true });
+    rmSync(ws, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -68,7 +68,7 @@ test('F06-05: only the requested line window is retained; totalLines stays exact
     assert.equal(d.totalLines, 2000, 'totalLines counts the whole file, not the window');
     assert.equal(d.content, lines.slice(99, 104).join('\n'), 'exactly the window, nothing more');
   } finally {
-    rmSync(ws, { recursive: true, force: true });
+    rmSync(ws, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -84,7 +84,7 @@ test('F06-05: multi-chunk files stream together intact (lines spanning chunk bou
     assert.equal(d.totalLines, 5000);
     assert.equal(d.content, lines.join('\n'));
   } finally {
-    rmSync(ws, { recursive: true, force: true });
+    rmSync(ws, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -96,7 +96,7 @@ test('F06-05: a NUL in the first 8KB marks the file binary and refuses it', asyn
     assert.equal(res.ok, false);
     assert.equal(res.error?.code, 'binary');
   } finally {
-    rmSync(ws, { recursive: true, force: true });
+    rmSync(ws, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -110,7 +110,7 @@ test('F06-05: an empty file reads as 0 lines, not an error', async () => {
     assert.equal(d.content, '');
     assert.equal(d.totalLines, 0);
   } finally {
-    rmSync(ws, { recursive: true, force: true });
+    rmSync(ws, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -243,7 +243,7 @@ test('F06-09: session_start hooks fire detached — first paint is not gated on 
     const ms = Date.now() - t0;
     assert.ok(ms < 500, `detached hook returned in ${ms}ms — must not block first paint behind a 1s init script`);
   } finally {
-    rmSync(ws, { recursive: true, force: true });
+    rmSync(ws, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -421,7 +421,7 @@ test('F06-10: agent tool queues excess sub-agents and admits them only on releas
     assert.equal(ends.length, 2, 'exactly one end per agent');
     assert.ok(ends.every((e) => e.ok === true));
   } finally {
-    rmSync(ws, { recursive: true, force: true });
+    rmSync(ws, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -560,7 +560,7 @@ test('F06-10: a nested agent call bypasses admission — it cannot deadlock behi
     const resB = await runB;
     assert.ok(resB.ok);
   } finally {
-    rmSync(ws, { recursive: true, force: true });
+    rmSync(ws, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -611,6 +611,6 @@ test('F06-09: a hook that slams stdin or fails to spawn cannot crash the session
     await new Promise((r) => setTimeout(r, 200));
     assert.ok(true, 'neither hook failure mode crashed the session');
   } finally {
-    rmSync(ws, { recursive: true, force: true });
+    rmSync(ws, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });

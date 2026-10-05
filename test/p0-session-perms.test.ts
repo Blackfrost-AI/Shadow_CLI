@@ -12,7 +12,7 @@ import { SessionLog } from '../src/state/session.js';
  * The sessions directory is 0700, the log file is 0600, and `.shadow/.gitignore`
  * ignores everything.
  */
-test('session log dir is 0700 and log file is 0600', () => {
+test('session log dir is 0700 and log file is 0600', { skip: process.platform === 'win32' ? 'POSIX permission bits are not Windows ACLs' : false }, () => {
   const ws = mkdtempSync(join(tmpdir(), 'p0-session-'));
   try {
     const log = SessionLog.open(ws);

@@ -117,7 +117,7 @@ test('a pre-migration backup of config.json is left behind', () => {
   const bak = join(SHADOW, 'config.json.pre-credref.bak');
   assert.ok(existsSync(bak), 'backup exists — the scrub is irreversible without it');
   assert.ok(readFileSync(bak, 'utf8').includes(S_ZAI), 'backup holds the pre-scrub content');
-  assert.equal(statSync(bak).mode & 0o777, 0o600, 'backup is owner-only');
+  if (process.platform !== 'win32') assert.equal(statSync(bak).mode & 0o777, 0o600, 'backup is owner-only');
 });
 
 test('migration is idempotent — a second run moves nothing and keeps slot ids stable', () => {

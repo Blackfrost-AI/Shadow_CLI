@@ -48,7 +48,7 @@ function cleanup(root: string): void {
 
 // --- runner semantics ---
 
-test('mapped extension runs the command and folds a red verdict into the tool result', async () => {
+test('mapped extension runs the command and folds a red verdict into the tool result', { skip: process.platform === 'win32' ? 'fixture uses POSIX shell commands' : false }, async () => {
   const root = ws();
   try {
     const note = await runDiagnostics({
@@ -132,7 +132,7 @@ test('map keys are normalized: case and one leading dot are irrelevant', async (
   }
 });
 
-test('{file} is substituted with the workspace-relative path, shell-quoted', async () => {
+test('{file} is substituted with the workspace-relative path, shell-quoted', { skip: process.platform === 'win32' ? 'Windows file interpolation deliberately fails closed' : false }, async () => {
   const root = ws();
   try {
     const note = await runDiagnostics({
@@ -202,7 +202,7 @@ test('a diagnostic that hangs is killed at the timeout and reported', async () =
   }
 });
 
-test('a SIGTERM-immune diagnostic still dies — the cap escalates to SIGKILL', async () => {
+test('a SIGTERM-immune diagnostic still dies — the cap escalates to SIGKILL', { skip: process.platform === 'win32' ? 'requires POSIX signal semantics' : false }, async () => {
   const root = ws();
   const started = Date.now();
   try {
@@ -240,7 +240,7 @@ test('a fast command with a daemonized grandchild holding stdout resolves prompt
   }
 });
 
-test('an external signal death is reported honestly — never as a timeout', async () => {
+test('an external signal death is reported honestly — never as a timeout', { skip: process.platform === 'win32' ? 'requires POSIX signal semantics' : false }, async () => {
   const root = ws();
   try {
     const note = await runDiagnostics({

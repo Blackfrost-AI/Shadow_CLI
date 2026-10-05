@@ -11,6 +11,8 @@
 - Preserved v9 Work Center tracking, persisted history and controls across terminal, web and ACP.
 - Retained the Ink compatibility renderer for Vim, round-table, custom status lines and key maps.
 - Preserved headless, REPL, web and editor entrypoints and the signed Blackfrost update channel.
+- Retried transient Windows config replacement failures without deleting the previous complete file.
+- Made source test fixtures portable and independent of a developer’s installed MLX packages.
 - Updated development-only brace-expansion dependencies; runtime and full dependency audits are clean.
 - Fixed Node 22 / Undici 8 dispatcher compatibility and bundled the complete Undici implementation
   in standalone binaries built with Bun 1.4.2.

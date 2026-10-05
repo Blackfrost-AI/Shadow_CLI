@@ -424,7 +424,7 @@ export class WorkCenter {
     for (const todo of todos) {
       const id = `plan_${todo.id}`;
       staleIds.delete(id);
-      
+
       const existing = this.items.get(id);
       if (existing) {
         existing.description = redactString(todo.subject).slice(0, MAX_DETAIL_CHARS);

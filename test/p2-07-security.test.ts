@@ -51,7 +51,7 @@ test('F07-10: rule-allow still vouches for ORDINARY commands', async () => {
 // ── F07-05: prefix-grant scoping — unit (bashReadOnly) ──────────────────────────────────────
 import { commandReadsOutsideRoots, isBashReadOnly } from '../src/safety/bashReadOnly.js';
 
-test('F07-05: commandReadsOutsideRoots scopes viewers + search commands like the fast path', () => {
+test('F07-05: commandReadsOutsideRoots scopes viewers + search commands like the fast path', { skip: process.platform === 'win32' ? 'fixture uses POSIX shell paths' : false }, () => {
   // The root must EXIST: resolveWithin realpaths existing roots (macOS /tmp → /private/tmp),
   // and a missing root resolves differently than its realpath — same trap as production roots.
   const ws = mkdtempSync(join(tmpdir(), 'f0705-unit-'));
@@ -74,7 +74,7 @@ test('F07-05: commandReadsOutsideRoots scopes viewers + search commands like the
   }
 });
 
-test('BYPASS: a session grant does not vouch for non-viewer segments that name outside paths', () => {
+test('BYPASS: a session grant does not vouch for non-viewer segments that name outside paths', { skip: process.platform === 'win32' ? 'fixture uses POSIX shell paths' : false }, () => {
   // The operand scans above only understand commands whose operands are files BY DEFINITION
   // (cat/head/grep/find). Every other way of naming a file simply contributed nothing, so one `(s)`
   // grant on ANY gated command auto-ran them: `bash -c 'cat ~/.aws/credentials'`, `cp ~/.ssh/id_rsa

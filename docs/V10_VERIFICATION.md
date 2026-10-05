@@ -11,6 +11,9 @@ Use Node for tests; Bun's test runner does not preserve the suite's HOME isolati
 
 The [Snowfall verification workflow](https://github.com/Blackfrost-AI/Shadow_CLI/actions/workflows/snowfall.yml)
 runs source and terminal checks on Linux, macOS and Windows with Node 22.19.0 and 26.5.0.
+Tests that require POSIX permission bits, executable shebang fixtures or POSIX signal semantics
+are explicitly skipped on Windows with their reason. Portable tests and native signed Windows
+installer checks still run; the suite is not replaced by a reduced Windows test list.
 Linux and macOS also exercise the terminal lifecycle through a native PTY. Deterministic frame
 fixtures cover layout widths, themes, dialogs and transcript behavior.
 

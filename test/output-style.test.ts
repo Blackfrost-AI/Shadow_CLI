@@ -54,7 +54,7 @@ test('--style persists the selected lastStyle in the global config', () => {
       ['--import', 'tsx/esm', entry, '--provider', 'mock', '--model', 'mock', '--style', 'procedural', '--task', 'hi', '--workspace', workspace, '--log-level', 'silent'],
       {
         cwd: process.cwd(),
-        env: { ...process.env, HOME: home },
+        env: { ...process.env, HOME: home, USERPROFILE: home },
         encoding: 'utf8',
       },
     );

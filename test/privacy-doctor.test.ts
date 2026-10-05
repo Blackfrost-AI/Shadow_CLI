@@ -48,7 +48,9 @@ test('offline mode flips every outbound path to inactive and drops the provider 
   };
   const r = buildPrivacyReport(cfg, baseEnv({ offline: true }));
   for (const e of r.egress) assert.equal(e.active, false, `${e.name} is inactive offline`);
-  assert.equal(r.warnings.length, 0, 'no "leaves this machine" warnings when nothing can leave');
+  // Host confinement warnings remain truthful even when brokered egress is offline.
+  assert.deepEqual(r.warnings.filter((warning) => !warning.startsWith('run_shell runs UNCONFINED')), [],
+    'offline mode removes egress warnings without hiding host confinement');
 });
 
 test('opt-in update check ON is reported as live egress + a warning', () => {

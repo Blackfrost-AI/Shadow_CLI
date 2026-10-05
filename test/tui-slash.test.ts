@@ -787,7 +787,7 @@ test('runStatusLine returns the first stdout line, exposes SHADOW_* env, and fai
 test('F07-03: runStatusLine runs with cwd = HOME, not ctx.cwd (no workspace bait resolution)', async () => {
   // A relative script path inside a statusLine command must resolve against HOME, never the workspace.
   // This guarantees a hostile cloned repo's relative file can never be executed by the statusLine.
-  const pwd = await statusLineOnce('pwd', slCtx); // slCtx.cwd is '/tmp' (a workspace stand-in)
+  const pwd = await statusLineOnce('node -p "process.cwd()"', slCtx); // slCtx.cwd is '/tmp' (a workspace stand-in)
   assert.notEqual(pwd, slCtx.cwd, 'statusLine cwd is NOT the workspace');
   assert.equal(pwd, homedir(), 'statusLine cwd is pinned to HOME');
   // The workspace is still reachable explicitly via $SHADOW_CWD.

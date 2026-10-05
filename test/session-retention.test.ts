@@ -224,7 +224,7 @@ test('a hostile session filename cannot walk the checkpoint move out of its tree
   }
 });
 
-test('checkpoint trees are written PRIVATE: 0700 dirs, 0600 payloads and index (S4)', () => {
+test('checkpoint trees are written PRIVATE: 0700 dirs, 0600 payloads and index (S4)', { skip: process.platform === 'win32' ? 'POSIX permission bits are not Windows ACLs' : false }, () => {
   const ws = tmpWs();
   try {
     const abs = saveCheckpoint(ws, 'sess-perms', 3, 'src/a.ts', 'pre-turn file body');

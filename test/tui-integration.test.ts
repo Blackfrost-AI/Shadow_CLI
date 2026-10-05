@@ -1,4 +1,5 @@
 import { GLYPHS } from '../src/tui/glyphs.js';
+import { shellFixture } from './helpers/shellFixture.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import React from 'react';
@@ -745,7 +746,7 @@ test('TUI user_prompt_submit hook denial prevents a model turn', async () => {
     const cfg = loadConfig(ws, {
       provider: 'mock',
       model: 'm',
-      hooks: { user_prompt_submit: [deny] },
+      hooks: { user_prompt_submit: [shellFixture(deny)] },
     });
     let calls = 0;
     const provider = {

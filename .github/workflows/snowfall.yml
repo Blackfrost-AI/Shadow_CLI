@@ -2,7 +2,7 @@ name: Snowfall verification
 on:
   pull_request:
   push:
-    branches: [v10-dev, main, 'release/**']
+    branches: [v10-dev, main, 'release/**', 'validation/**']
   workflow_dispatch:
 permissions:
   contents: read

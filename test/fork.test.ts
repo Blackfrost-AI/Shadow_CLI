@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, readFileSync, existsSync, readdirSync, mkdirSync, appendFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, basename } from 'node:path';
 import { Context } from '../src/agent/context.js';
 import { SessionLog } from '../src/state/session.js';
 import { forkSession } from '../src/state/fork.js';
@@ -166,7 +166,7 @@ test('pre-fork workspace checkpoints are carried under the fork id with self-con
 
     const entries = listCheckpointsForTurn(root, forkId, 0);
     assert.equal(entries.length, 1, 'the fork lists the carried checkpoint');
-    assert.equal(entries[0]!.relPath, 'src/a.txt');
+    assert.equal(entries[0]!.relPath, join('src', 'a.txt'));
     // The index was re-pointed at the FORK's own .bak, so lineage does not depend on the source.
     assert.ok(
       entries[0]!.absPath.startsWith(forkTurnDir),
@@ -219,7 +219,7 @@ test('forkSession cleans up the partial copy if the source copy fails', () => {
     // errno, forkSession must throw AND not leave a stray partial fork transcript behind.
     assert.throws(() => forkSession(source, root));
     const dir = join(root, '.shadow', 'sessions');
-    const leftover = readdirSync(dir).filter((f) => f !== realPath.split('/').pop());
+    const leftover = readdirSync(dir).filter((f) => f !== basename(realPath));
     assert.deepEqual(leftover, [], 'no partial fork transcript left behind');
   } finally {
     rmSync(root, { recursive: true, force: true });

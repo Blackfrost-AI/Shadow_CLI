@@ -1,3 +1,4 @@
+import { shellFixture } from './helpers/shellFixture.js';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync, chmodSync, existsSync } from 'node:fs';
@@ -20,7 +21,7 @@ function script(root: string, name: string, body: string): string {
   const p = join(root, name);
   writeFileSync(p, `#!/bin/sh\n${body}\n`, 'utf8');
   chmodSync(p, 0o755);
-  return p;
+  return shellFixture(p);
 }
 
 // ─── F08-09: matcher semantics (glob/pipe on the tool name) ────────────────────────────────────
@@ -256,7 +257,7 @@ test('a global config with v2 hook entries loads through loadConfig', async () =
 
 // ─── adversarial review regressions (2026-08-14): F1–F7 ────────────────────────────────────────
 
-test('F1: a SIGTERM-immune hook is killed at the cap — the phase fails fast and no late verdict is honored', async () => {
+test('F1: a SIGTERM-immune hook is killed at the cap — the phase fails fast and no late verdict is honored', { skip: process.platform === 'win32' ? 'requires POSIX signal semantics' : false }, async () => {
   const { hookTiming, runHookPhase: runPhase } = await import('../src/hooks/runner.js');
   const saved = hookTiming.timeoutMs;
   hookTiming.timeoutMs = 700;
@@ -303,7 +304,7 @@ test('F2 (end-to-end): a hook emitting real bidi/zero-width bytes in JSON has th
   }
 });
 
-test('F3: a TERM-immune DETACHED hook group is SIGKILL-escalated at the cap (end marker never drops)', async () => {
+test('F3: a TERM-immune DETACHED hook group is SIGKILL-escalated at the cap (end marker never drops)', { skip: process.platform === 'win32' ? 'requires POSIX process groups' : false }, async () => {
   const { runHookPhaseDetached, hookTiming } = await import('../src/hooks/runner.js');
   const savedTimeout = hookTiming.timeoutMs;
   const savedGrace = hookTiming.detachedGraceMs;

@@ -175,7 +175,7 @@ test('F07-02: grep/rg/find/git-grep out-of-workspace scan roots demote to the ga
   // regardless — confirmed in the in-workspace test below.
 });
 
-test('F07-02: in-workspace grep/rg/find STILL auto-run (no UX regression)', () => {
+test('F07-02: in-workspace grep/rg/find STILL auto-run (no UX regression)', { skip: process.platform === 'win32' ? 'fixture uses POSIX absolute paths' : false }, () => {
   const roots = ['/work/repo'];
   assert.equal(isBashReadOnly('grep -r foo .', roots), true);
   assert.equal(isBashReadOnly('rg pattern src/', roots), true);
@@ -203,7 +203,7 @@ test('F07-02: shape-only classification (no roots) keeps grep/rg/find auto-allow
 });
 
 // ── Redirect-target scoping (BYPASS: `head -1 </etc/shadow` auto-ran at the default autonomy) ──
-test('isBashReadOnly: INPUT redirection to an out-of-jail file demotes to the gate', () => {
+test('isBashReadOnly: INPUT redirection to an out-of-jail file demotes to the gate', { skip: process.platform === 'win32' ? 'fixture uses unquoted POSIX paths' : false }, () => {
   // `</etc/passwd` arrives glued to the operator, so the operand scanner saw one non-absolute
   // token and resolved it INSIDE the workspace — the read rode the fast path and its contents
   // became a tool result → provider next turn. Same class as the quoted-operand bypass.

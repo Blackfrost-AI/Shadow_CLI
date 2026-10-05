@@ -167,7 +167,7 @@ function makeFixture(fake: 'lsp' | 'tsserver', flags: string[] = []): Fixture {
       return createLspService({ projectDir: root, config: cfg });
     },
     cleanup() {
-      rmSync(root, { recursive: true, force: true });
+      rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     },
   };
 }
@@ -271,7 +271,7 @@ test('service (lsp): stop() kills the spawned server (pid gone from the process 
     svc.stop();
     assert.ok(await until(() => !isAlive(pid), 4000), 'server process exited after stop()');
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     rmSync(pidfile, { force: true });
   }
 });
@@ -485,8 +485,8 @@ test('getLspService: cached per workspace root; stopLspServices clears the cache
     stopLspServices();
     assert.notEqual(getLspService(a), s1, 'cache cleared after stopLspServices');
   } finally {
-    rmSync(a, { recursive: true, force: true });
-    rmSync(b, { recursive: true, force: true });
+    rmSync(a, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    rmSync(b, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     stopLspServices();
   }
 });

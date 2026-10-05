@@ -15,7 +15,7 @@
  *
  * so the model was completely unusable in Shadow while `mlx_lm.server` served it at ~70 tok/s.
  */
-import { test } from 'node:test';
+import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -39,6 +39,16 @@ function fakeMlxLm(architectures: string[]): string {
   for (const a of architectures) writeFileSync(join(models, `${a}.py`), '# stub\n', 'utf8');
   return join(root, 'bin', 'mlx_lm.server');
 }
+
+// Planning must use a fixture installation, never the developer's Python environment.
+const previousServer = process.env.SHADOW_MLX_SERVER;
+const fixtureServer = fakeMlxLm(['gemma4', 'qwen2']);
+before(() => { process.env.SHADOW_MLX_SERVER = fixtureServer; });
+after(() => {
+  if (previousServer === undefined) delete process.env.SHADOW_MLX_SERVER;
+  else process.env.SHADOW_MLX_SERVER = previousServer;
+  rmSync(join(fixtureServer, '..', '..'), { recursive: true, force: true });
+});
 
 const GEMMA4 = { model_type: 'gemma4', architectures: ['Gemma4ForConditionalGeneration'], vision_config: { x: 1 }, image_token_id: 7 };
 const PURE_VLM = { model_type: 'some_vlm_only', architectures: ['SomeVLMForConditionalGeneration'], vision_config: { x: 1 } };

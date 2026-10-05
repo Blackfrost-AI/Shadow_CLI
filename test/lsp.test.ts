@@ -3,6 +3,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { join } from 'node:path';
 
 import { frameMessage, LspDecoder, MAX_BUFFERED_BYTES } from '../src/agent/lsp/framing.js';
 import { renderDiagnostics, NoteDeduper } from '../src/agent/lsp/note.js';
@@ -215,7 +216,7 @@ import { detectLspServers } from '../src/agent/lsp/detect.js';
 
 test('detection: a local node_modules typescript yields the tsserver flavor under execPath (trusted)', () => {
   const specs = detectLspServers('/w', {
-    exists: (p) => p === '/w/node_modules/typescript/lib/tsserver.js',
+    exists: (p) => p.replaceAll('\\', '/') === '/w/node_modules/typescript/lib/tsserver.js',
     which: () => null,
     execPath: '/usr/bin/node',
     trustNodeModules: true,
@@ -225,7 +226,7 @@ test('detection: a local node_modules typescript yields the tsserver flavor unde
       id: 'typescript',
       flavor: 'tsserver',
       command: '/usr/bin/node',
-      args: ['/w/node_modules/typescript/lib/tsserver.js'],
+      args: [join('/w', 'node_modules/typescript/lib/tsserver.js')],
       projectSourced: true,
     },
   ]);
@@ -235,14 +236,14 @@ test('detection: a local node_modules typescript WITHOUT the trust opt-in is nev
   // The repo-controlled file exists, but without trustNodeModules it must not be returned —
   // and a machine-resolved PATH server (if any) is used instead.
   const withPath = detectLspServers('/w', {
-    exists: (p) => p === '/w/node_modules/typescript/lib/tsserver.js',
+    exists: (p) => p.replaceAll('\\', '/') === '/w/node_modules/typescript/lib/tsserver.js',
     which: (bin) => (bin === 'typescript-language-server' ? '/opt/bin/typescript-language-server' : null),
   });
   assert.deepEqual(withPath, [
     { id: 'typescript', flavor: 'lsp', command: '/opt/bin/typescript-language-server', args: ['--stdio'], projectSourced: false },
   ]);
   const noPath = detectLspServers('/w', {
-    exists: (p) => p === '/w/node_modules/typescript/lib/tsserver.js',
+    exists: (p) => p.replaceAll('\\', '/') === '/w/node_modules/typescript/lib/tsserver.js',
     which: () => null,
   });
   assert.deepEqual(noPath, []); // untrusted local + nothing on PATH → no typescript server at all
@@ -260,7 +261,7 @@ test('detection: with no local typescript, a PATH typescript-language-server is 
 
 test('detection: the local node_modules install is preferred over a PATH server when trusted', () => {
   const specs = detectLspServers('/w', {
-    exists: (p) => p === '/w/node_modules/typescript/lib/tsserver.js',
+    exists: (p) => p.replaceAll('\\', '/') === '/w/node_modules/typescript/lib/tsserver.js',
     which: (bin) => (bin === 'typescript-language-server' ? '/opt/bin/typescript-language-server' : null),
     trustNodeModules: true,
   });

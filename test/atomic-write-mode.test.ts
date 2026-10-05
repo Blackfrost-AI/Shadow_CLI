@@ -9,7 +9,7 @@ const { atomicWrite } = await import('../src/tools/util.js');
 // A config/credentials rewrite that silently resets permission bits (600 → 644) publishes the
 // file world-readable between the unlink and the next chmod. atomicWrite must carry the EXISTING
 // bits forward when the caller doesn't specify a mode.
-test('atomicWrite preserves an existing file’s permission bits on rewrite', () => {
+test('atomicWrite preserves an existing file’s permission bits on rewrite', { skip: process.platform === 'win32' ? 'POSIX permission bits are not Windows ACLs' : false }, () => {
   const dir = mkdtempSync(join(tmpdir(), 'aw-mode-'));
   try {
     const p = join(dir, 'secret.json');

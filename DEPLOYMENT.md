@@ -84,7 +84,8 @@ bash scripts/build-binary.sh dist-bin/shadow-windows-x64.exe bun-windows-x64
 5. Commit the release and push.
 
 The `Signed release smoke` workflow runs on `release/**` branches and version tags. Maintainers
-upload a complete signed candidate to the existing versioned download channel first. All six
+upload a complete signed candidate to `releases/<version>/<full-source-commit>/` first.
+Each candidate is immutable, so a failed candidate can be retained while its replacement is tested. All six
 native jobs must pass before promoting the matching set to the current installer/updater channel.
 Darwin signing precedes checksum generation; manifest signatures use the pinned release key.
 The normal public push hook requires main and its exact `v<package-version>` tag to agree.

@@ -36,6 +36,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     env:
+      SHADOW_RELEASE_REVISION: ${{ github.sha }}
       SMOKE_POWERSHELL: ${{ matrix.shell }}
       SHADOW_LEGACY_SMOKE: ${{ inputs.legacy_bridge || 'false' }}
     steps:

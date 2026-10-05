@@ -64,7 +64,23 @@ function writeJsonAtomic(path: string, data: unknown, mode = 0o600): void {
   const tmp = `${path}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
   writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', { mode });
   chmodSync(tmp, mode); // force perms even if umask widened the create mode
-  renameSync(tmp, path);
+  try {
+    const deadline = Date.now() + 1000;
+    for (;;) {
+      try {
+        renameSync(tmp, path);
+        break;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (process.platform !== 'win32' || !['EPERM', 'EACCES', 'EBUSY'].includes(code ?? '') || Date.now() >= deadline) throw error;
+        // This writer is synchronous. Keep the old complete file in place while a
+        // competing Windows reader releases its handle; never delete the destination.
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+      }
+    }
+  } finally {
+    rmSync(tmp, { force: true });
+  }
 }
 
 /** Non-secret global preferences (provider, model, …) — merged below the project config. */

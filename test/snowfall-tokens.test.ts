@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import { GLYPHS, PROMPT_WIDTH, stripPrompt } from '../src/tui/glyphs.js';
 import { THEMES, applyTheme, paletteSnapshot } from '../src/tui/theme.js';
@@ -34,7 +35,7 @@ test('presentation literals cannot reintroduce the borrowed vocabulary outside g
       visit(source);
     }
   }
-  walk(new URL('../src', import.meta.url).pathname);
+  walk(fileURLToPath(new URL('../src', import.meta.url)));
 });
 
 test('Snowfall text clears AA on its background and panel surfaces', () => {

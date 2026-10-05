@@ -23,7 +23,7 @@ test('saveCheckpoint writes .bak under .shadow/checkpoints and round-trips conte
 
     const listed = listCheckpointsForTurn(root, 'sess-1', 3);
     assert.equal(listed.length, 1);
-    assert.equal(listed[0]!.relPath, 'src/foo.ts');
+    assert.equal(listed[0]!.relPath, join('src', 'foo.ts'));
     assert.ok(existsSync(listed[0]!.absPath));
 
     const raw = readFileSync(join(root, '.shadow', 'checkpoints', 'sess-1', '3', 'index.json'), 'utf8');
@@ -63,7 +63,7 @@ test('saveCheckpoint keeps the .bak private (0600) and writes it atomically', ()
   const root = tmp();
   try {
     const path = saveCheckpoint(root, 'sess-2', 1, 'src/bar.ts', 'payload');
-    assert.equal(statSync(path).mode & 0o777, 0o600, 'checkpoint payload stays private');
+    if (process.platform !== 'win32') assert.equal(statSync(path).mode & 0o777, 0o600, 'checkpoint payload stays private');
     assert.equal(restoreCheckpoint(path), 'payload', 'content round-trips through the atomic write');
   } finally {
     rmSync(root, { recursive: true, force: true });

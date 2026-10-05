@@ -9,7 +9,7 @@ import { isMlxDir, mlxOfflineReady } from '../src/gguf.js';
 
 const APPLE = process.platform === 'darwin' && process.arch === 'arm64';
 
-test('an MLX model FOLDER (config.json inside) builds an mlx entry — Apple Silicon only', () => {
+test('a model FOLDER selects MLX on Apple Silicon and vLLM on Linux', () => {
   const dir = mkdtempSync(join(tmpdir(), 'mlx-model-'));
   writeFileSync(join(dir, 'config.json'), '{}');
   writeFileSync(join(dir, 'model.safetensors'), 'x');
@@ -19,6 +19,13 @@ test('an MLX model FOLDER (config.json inside) builds an mlx entry — Apple Sil
     if (r.ok) {
       assert.equal(r.value.mlx, dir);
       assert.equal(r.value.gguf, undefined);
+      assert.equal(r.value.provider, 'openai');
+    }
+  } else if (process.platform === 'linux') {
+    assert.equal(r.ok, true);
+    if (r.ok) {
+      assert.equal(r.value.mlx, undefined);
+      assert.ok(r.value.vllm);
       assert.equal(r.value.provider, 'openai');
     }
   } else {
@@ -35,6 +42,13 @@ test('an mlx-community repo id builds an mlx entry with a download note', () => 
     if (r.ok) {
       assert.equal(r.value.mlx, 'mlx-community/Qwen2.5-0.5B-Instruct-4bit');
       assert.match(r.note ?? '', /download.*HuggingFace/i);
+    }
+  } else if (process.platform === 'linux') {
+    assert.equal(r.ok, true);
+    if (r.ok) {
+      assert.equal(r.value.mlx, undefined);
+      assert.ok(r.value.vllm);
+      assert.equal(r.value.provider, 'openai');
     }
   } else {
     assert.equal(r.ok, false);

@@ -296,7 +296,7 @@ test('overrides: extension keys are dot/case-insensitive; a kind override beats 
 
 // ── runner with the REAL spawn + PATH ──────────────────────────────────────────
 
-test('real exec: fake prettier on PATH formats the file', async () => {
+test('real exec: fake prettier on PATH formats the file', { skip: process.platform === 'win32' ? 'fixture is an executable POSIX shell script' : false }, async () => {
   const binDir = fakeBin('prettier', 'for f; do :; done\nprintf "// fake-prettier\\n" >> "$f"');
   const ws = fixture({ 'package.json': JSON.stringify({ devDependencies: { prettier: '1' } }) });
   const file = join(ws, 'a.ts');
@@ -308,7 +308,7 @@ test('real exec: fake prettier on PATH formats the file', async () => {
   assert.equal(readFileSync(file, 'utf8'), 'const a=1\n// fake-prettier\n');
 });
 
-test('real exec: failing binary → note, no throw', async () => {
+test('real exec: failing binary → note, no throw', { skip: process.platform === 'win32' ? 'fixture is an executable POSIX shell script' : false }, async () => {
   const binDir = fakeBin('prettier', 'echo "fakefmt: syntax error at line 3" >&2\nexit 1');
   const ws = fixture({ 'package.json': JSON.stringify({ devDependencies: { prettier: '1' } }) });
   const file = join(ws, 'a.ts');
@@ -321,7 +321,7 @@ test('real exec: failing binary → note, no throw', async () => {
   });
 });
 
-test('real exec: timeout kills the child and reports a note', async () => {
+test('real exec: timeout kills the child and reports a note', { skip: process.platform === 'win32' ? 'fixture is an executable POSIX shell script' : false }, async () => {
   const binDir = fakeBin('prettier', 'sleep 5');
   const ws = fixture({ 'package.json': JSON.stringify({ devDependencies: { prettier: '1' } }) });
   const file = join(ws, 'a.ts');

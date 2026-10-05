@@ -159,7 +159,7 @@ function runSignalProbe(signal: 'SIGINT' | 'SIGTERM' | 'SIGHUP'): {
 }
 
 for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
-  test(`${signal}: every claimed mode is reset, and the process still dies`, () => {
+  test(`${signal}: every claimed mode is reset, and the process still dies`, { skip: process.platform === 'win32' ? 'requires POSIX signal delivery' : false }, () => {
     const { written } = runSignalProbe(signal);
     for (const reset of ['PASTE_OFF', 'TITLE_POP', 'BG_OFF', 'MOUSE_OFF']) {
       assert.ok(

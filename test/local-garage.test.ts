@@ -165,6 +165,6 @@ test('buildLocalEntry expands a leading ~ (how humans type paths in the onboardi
   assert.equal(r.ok, false);
   if (!r.ok) {
     assert.ok(!r.message.includes('/~/'), 'no literal ~ segment in the resolved path');
-    assert.match(r.message, /File not found: \//, 'expanded to an absolute path');
+    assert.match(r.message, /File not found: (?:\/|[A-Za-z]:[\\/])/, 'expanded to an absolute path');
   }
 });

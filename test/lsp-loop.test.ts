@@ -96,7 +96,7 @@ function makeFx(notes?: { maxSessionChars: number }): LoopFx {
     cleanup() {
       getLspService(root, lspCfg).stop();
       stopLspServices();
-      rmSync(root, { recursive: true, force: true });
+      rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     },
   };
 }

@@ -150,7 +150,7 @@ test('scope "code" restores workspace files and leaves the conversation alone', 
 
     const res = rewindToTurn(log.path, 0, root, { ...HYDRATE, scope: 'code' });
     assert.equal(res.context, undefined, 'no hydrated context — the conversation did not move');
-    assert.deepEqual(res.restoredFiles, ['src/a.ts']);
+    assert.deepEqual(res.restoredFiles, [join('src', 'a.ts')]);
     assert.equal(readFileSync(join(root, 'src/a.ts'), 'utf8'), 'ORIGINAL');
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -170,7 +170,7 @@ test('the default scope rewinds BOTH conversation and files (v6.18 behavior inta
     const res = rewindToTurn(log.path, 0, root, HYDRATE);
     assert.ok(res.context, 'conversation rewound');
     assert.equal(res.turn, 0);
-    assert.deepEqual(res.restoredFiles, ['src/a.ts']);
+    assert.deepEqual(res.restoredFiles, [join('src', 'a.ts')]);
     assert.equal(readFileSync(join(root, 'src/a.ts'), 'utf8'), 'ORIGINAL');
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -290,7 +290,7 @@ test('F6: a missing OLDEST backup surfaces in partialFiles instead of silently r
     for (const e of idx) rmSync(e.absPath, { force: true });
 
     const res = rewindToTurn(log.path, 0, root, { ...HYDRATE, scope: 'code' });
-    assert.deepEqual(res.partialFiles, ['src/a.ts'], 'reported as partially restored');
+    assert.deepEqual(res.partialFiles, [join('src', 'a.ts')], 'reported as partially restored');
     assert.equal(
       readFileSync(join(root, 'src/a.ts'), 'utf8'),
       'STATE-BEFORE-TURN-2',

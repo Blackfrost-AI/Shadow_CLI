@@ -67,7 +67,7 @@ test('an ABSENT marker records that a file did not exist before the turn', () =>
     saveCheckpointAbsent(root, 's1', 3, 'src/new.ts');
     const [entry] = listCheckpointsForTurn(root, 's1', 3);
     assert.equal(entry!.absent, true);
-    assert.equal(entry!.relPath, 'src/new.ts');
+    assert.equal(entry!.relPath, join('src', 'new.ts'));
     // first-write-wins applies here too
     saveCheckpoint(root, 's1', 3, 'src/new.ts', 'SOMETHING');
     assert.equal(listCheckpointsForTurn(root, 's1', 3).length, 1);
@@ -132,7 +132,7 @@ test('rewind restores EVERY turn from the target onward, oldest backup winning',
       'a.ts must go back to its turn-2 original, not to turn 4’s backup');
     assert.equal(readFileSync(join(root, 'src/b.ts'), 'utf8'), 'B0',
       'b.ts was edited in a LATER turn — rewinding past it must undo that too');
-    assert.deepEqual(res.restoredFiles.sort(), ['src/a.ts', 'src/b.ts']);
+    assert.deepEqual(res.restoredFiles.sort(), [join('src', 'a.ts'), join('src', 'b.ts')]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -156,7 +156,7 @@ test('rewind deletes files created after the target turn', () => {
 
     const res = rewindToTurn(log.path, 0, root, HYDRATE);
     assert.equal(existsSync(join(root, 'src/new.ts')), false, 'a file created after the target must be removed');
-    assert.deepEqual(res.deletedFiles, ['src/new.ts']);
+    assert.deepEqual(res.deletedFiles, [join('src', 'new.ts')]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -176,7 +176,7 @@ test('rewind to turn 0 finds turn 0 checkpoints (the old off-by-one read an empt
 
     const res = rewindToTurn(log.path, 0, root, HYDRATE);
     assert.equal(readFileSync(join(root, 'src/a.ts'), 'utf8'), 'ORIGINAL');
-    assert.deepEqual(res.restoredFiles, ['src/a.ts']);
+    assert.deepEqual(res.restoredFiles, [join('src', 'a.ts')]);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

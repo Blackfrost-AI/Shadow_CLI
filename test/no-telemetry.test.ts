@@ -123,7 +123,7 @@ test('hardcoded remote-host snapshot — new egress hosts require deliberate rev
 test('raw fetch() call sites are capped: the broker transport + one inline browser template (P2-02.1)', () => {
   const offenders: string[] = [];
   for (const f of listSrcFiles(join(repoRoot, 'src'))) {
-    if (/\bfetch\s*\(/.test(codeLines(readFileSync(f, 'utf8')))) offenders.push(relative(repoRoot, f));
+    if (/\bfetch\s*\(/.test(codeLines(readFileSync(f, 'utf8')))) offenders.push(relative(repoRoot, f).replaceAll('\\', '/'));
   }
   offenders.sort();
   assert.deepEqual(

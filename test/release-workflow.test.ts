@@ -135,7 +135,7 @@ test('public main requires its own version tag at the pushed commit', (t) => {
   assert.equal(f.hook().status, 1, 'correct name on another commit must fail');
 });
 
-test('private backup pushes fail closed on wrong destination, public visibility, and lookup failure', (t) => {
+test('private backup pushes fail closed on wrong destination, public visibility, and lookup failure', { skip: process.platform === 'win32' ? 'fixture gh is an executable POSIX shebang script' : false }, (t) => {
   const f = fixture(t);
   const internal = join(f.cwd, 'docs/internal');
   mkdirSync(internal, { recursive: true });

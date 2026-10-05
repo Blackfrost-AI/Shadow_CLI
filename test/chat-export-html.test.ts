@@ -149,7 +149,7 @@ test('exportSession with format html writes a .html file under workspace exports
       meta: { ...META, workspaceRoot: root, sessionPath },
     });
     assert.ok(bytes > 0);
-    assert.match(path, /exports\/shadow-.*\.html$/);
+    assert.match(path.replaceAll('\\', '/'), /exports\/shadow-.*\.html$/);
     const body = readFileSync(path, 'utf8');
     assert.match(body, /^<!doctype html>/);
     assert.match(body, /hello/);

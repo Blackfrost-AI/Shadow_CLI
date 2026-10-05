@@ -93,7 +93,7 @@ test('exportSession writes markdown file under workspace exports/', () => {
       meta: { ...META, workspaceRoot: root, sessionPath },
     });
     assert.ok(bytes > 0);
-    assert.match(path, /exports\/shadow-/);
+    assert.match(path.replaceAll('\\', '/'), /exports\/shadow-/);
     const body = readFileSync(path, 'utf8');
     assert.match(body, /hello/);
   } finally {

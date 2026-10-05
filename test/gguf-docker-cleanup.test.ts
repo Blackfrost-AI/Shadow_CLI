@@ -116,7 +116,7 @@ function alive(pid: number): boolean {
   }
 }
 
-test('stopGgufServers SIGTERMs first, then force-removes the container of a wedged docker CLI', async () => {
+test('stopGgufServers SIGTERMs first, then force-removes the container of a wedged docker CLI', { skip: process.platform === 'win32' ? 'requires POSIX process groups' : false }, async () => {
   const base = mkdtempSync(join(tmpdir(), 'vllm-stop-'));
   const pidFile = join(base, 'pid');
   const termMarker = join(base, 'termed');
@@ -135,7 +135,7 @@ test('stopGgufServers SIGTERMs first, then force-removes the container of a wedg
   }
 });
 
-test('forceStopGgufServers force-removes the container WITHOUT a graceful signal', async () => {
+test('forceStopGgufServers force-removes the container WITHOUT a graceful signal', { skip: process.platform === 'win32' ? 'requires POSIX process groups' : false }, async () => {
   const base = mkdtempSync(join(tmpdir(), 'vllm-force-'));
   const pidFile = join(base, 'pid');
   const termMarker = join(base, 'termed');
