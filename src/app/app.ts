@@ -1068,7 +1068,9 @@ export class ShadowApp {
   }
 
   private abortTurn(): void {
-    this.controller?.abort();
+    if (!this.controller || this.controller.signal.aborted) return;
+    this.flushStreamToTranscript();
+    this.controller.abort();
     this.pushLine({ text: '  ⏹ interrupted', dimColor: true });
   }
 

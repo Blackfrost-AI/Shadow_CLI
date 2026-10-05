@@ -6,7 +6,7 @@
 
 > **A true gift of freedom and privacy.**
 > Zero-telemetry · provider-neutral · phone home to no one.
-> Current build: **`v10.0.1`** — guided onboarding and named sessions. Full-screen terminal, full-width conversation, compact status bar and the classic block-letter SHADOW banner.
+> Current build: **`v10.0.2`** — guided onboarding and named sessions. Full-screen terminal, full-width conversation, compact status bar and the classic block-letter SHADOW banner.
 
 **Shadow is a zero-telemetry, provider-neutral coding agent that runs on your terms.** Point it at any model — Anthropic, any OpenAI-compatible endpoint, Gemini, or a local model on your own box — and it works as a coding / sysadmin agent over your workspace. **No Shadow account, no signup, no phone-home:** network access follows your provider, tool and update choices. Your config stays local and readable (`~/.shadow/config.json`), credentials are sent to their configured services, and you can switch models mid-session **without losing context**.
 

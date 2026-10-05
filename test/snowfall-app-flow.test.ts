@@ -115,7 +115,7 @@ test('production fullscreen shell: commands, queued paste, interrupt, safe overl
     async *send(request): AsyncIterable<ProviderEvent> {
       calls++;
       prompts.push(JSON.stringify(request.messages));
-      yield { type: 'text', delta: `Fixture answer ${calls}.\n\n` };
+      yield { type: 'text', delta: `Fixture answer ${calls}.` };
       if (calls === 1) await new Promise<void>((resolve) => {
         if (request.signal?.aborted) resolve();
         else request.signal?.addEventListener('abort', () => resolve(), { once: true });
@@ -132,14 +132,17 @@ test('production fullscreen shell: commands, queued paste, interrupt, safe overl
   };
   const terminal = new HeadlessTerminal(120, 36);
   const app = new ShadowApp(opts, terminal);
-  const inspect = app as unknown as { tui: TuiAltScreen; editor: SnowfallEditor; gate: ApprovalGate; running: boolean; queued: string[] };
+  const inspect = app as unknown as {
+    tui: TuiAltScreen; editor: SnowfallEditor; gate: ApprovalGate;
+    running: boolean; queued: string[]; streamBuf: string; items: Array<{ text: string }>;
+  };
   const run = app.run();
   try {
     await terminal.flush();
     assert.match(terminal.lines().join('\n'), /SHADOW/);
     terminal.input('/inspect the  terminal');
     terminal.input('\r');
-    await until(() => calls === 1, 'custom command runs through the real agent loop');
+    await until(() => calls === 1 && inspect.streamBuf.includes('Fixture answer 1.'), 'custom command streams through the real agent loop');
     assert.match(prompts[0]!, /Inspect the {2}terminal without editing files/);
     const pasted = 'queued 漢字\n' + 'line\n'.repeat(30);
     terminal.input(`\x1b[200~${pasted}\x1b[201~`);
@@ -149,6 +152,11 @@ test('production fullscreen shell: commands, queued paste, interrupt, safe overl
     assert.equal(inspect.queued.length, 1);
     assert.ok(inspect.queued[0]?.includes('line\nline'), 'expanded paste is queued, not its display badge');
     terminal.input('\x1b');
+    terminal.input('\x1b'); // Repeated Escape must not duplicate the notice while cancellation unwinds.
+    const interruptedAt = inspect.items.findIndex((item) => item.text.includes('⏹ interrupted'));
+    const partialAt = inspect.items.findIndex((item) => item.text === 'Fixture answer 1.');
+    assert.ok(partialAt >= 0 && partialAt < interruptedAt, 'partial answer is committed before its interrupt notice');
+    assert.equal(inspect.items.filter((item) => item.text.includes('⏹ interrupted')).length, 1);
     await until(() => calls >= 2 && !inspect.running, 'interrupt releases the first turn and drains the queued follow-up');
     assert.match(prompts[1]!, /queued 漢字/);
 

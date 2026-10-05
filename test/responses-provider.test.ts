@@ -122,35 +122,23 @@ function mockResponsesFetch(opts: {
     assert.match(String(url), /\/responses$/, 'ResponsesProvider must POST to /responses');
     const body = init?.body ? (JSON.parse(init.body as string) as { stream?: boolean }) : {};
     if (body.stream === false) {
-      return {
-        ok: true,
-        status: 200,
-        text: async () => JSON.stringify(opts.nonStreamPayload),
-      } as Response;
+      return new Response(JSON.stringify(opts.nonStreamPayload));
     }
     if (opts.streamThrows) {
-      return {
-        ok: true,
-        status: 200,
-        body: new ReadableStream<Uint8Array>({
-          pull() {
-            throw new Error('truncated responses SSE — force non-stream fallback');
-          },
-        }),
-      } as Response;
-    }
-    return {
-      ok: true,
-      status: 200,
-      body: new ReadableStream<Uint8Array>({
-        start(controller) {
-          for (const line of opts.streamLines ?? []) {
-            controller.enqueue(new TextEncoder().encode(line));
-          }
-          controller.close();
+      return new Response(new ReadableStream<Uint8Array>({
+        pull() {
+          throw new Error('truncated responses SSE — force non-stream fallback');
         },
-      }),
-    } as Response;
+      }));
+    }
+    return new Response(new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const line of opts.streamLines ?? []) {
+          controller.enqueue(new TextEncoder().encode(line));
+        }
+        controller.close();
+      },
+    }));
   };
   return () => {
     restoreEgress();

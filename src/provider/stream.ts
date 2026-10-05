@@ -105,6 +105,45 @@ class IdleWatchdog {
   }
 }
 
+/** Read with explicit cancellation: some transports close the socket without settling read(). */
+async function* responseChunks(body: ReadableStream<Uint8Array>, signal?: AbortSignal): AsyncIterable<Uint8Array> {
+  const reader = body.getReader();
+  let rejectRead: ((reason: unknown) => void) | undefined;
+  const onAbort = () => {
+    rejectRead?.(signal?.reason);
+    // Transport cleanup can itself stall. Release the consumer independently of its completion.
+    void reader.cancel(signal?.reason).catch(() => {});
+  };
+  signal?.addEventListener('abort', onAbort, { once: true });
+  try {
+    if (signal?.aborted) onAbort();
+    for (;;) {
+      signal?.throwIfAborted();
+      const { done, value } = await new Promise<Awaited<ReturnType<typeof reader.read>>>((resolve, reject) => {
+        rejectRead = reject;
+        void reader.read().then(resolve, reject);
+      });
+      rejectRead = undefined;
+      signal?.throwIfAborted();
+      if (done) return;
+      yield value;
+    }
+  } finally {
+    rejectRead = undefined;
+    signal?.removeEventListener('abort', onAbort);
+    reader.releaseLock();
+  }
+}
+
+async function responseText(res: Response, signal?: AbortSignal): Promise<string> {
+  signal?.throwIfAborted();
+  if (!res.body) return '';
+  const decoder = new TextDecoder();
+  let text = '';
+  for await (const chunk of responseChunks(res.body, signal)) text += decoder.decode(chunk, { stream: true });
+  return text + decoder.decode();
+}
+
 /**
  * Split a fetch response body (a web ReadableStream of bytes) into text lines.
  * Yields each line WITHOUT its trailing newline; callers trim and filter for
@@ -116,28 +155,26 @@ class IdleWatchdog {
 export async function* streamLines(
   body: ReadableStream<Uint8Array>,
   onChunk?: () => void,
+  signal?: AbortSignal,
 ): AsyncIterable<string> {
-  const reader = body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      onChunk?.();
-      buf += decoder.decode(value, { stream: true });
-      let nl: number;
-      while ((nl = buf.indexOf('\n')) >= 0) {
-        yield buf.slice(0, nl);
-        buf = buf.slice(nl + 1);
-      }
+  for await (const chunk of responseChunks(body, signal)) {
+    onChunk?.();
+    buf += decoder.decode(chunk, { stream: true });
+    let nl: number;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      signal?.throwIfAborted();
+      yield buf.slice(0, nl);
+      buf = buf.slice(nl + 1);
     }
-    buf += decoder.decode();
-    if (buf.length > 0) {
-      for (const line of buf.split('\n')) yield line;
+  }
+  buf += decoder.decode();
+  if (buf.length > 0) {
+    for (const line of buf.split('\n')) {
+      signal?.throwIfAborted();
+      yield line;
     }
-  } finally {
-    reader.releaseLock();
   }
 }
 
@@ -350,7 +387,8 @@ export async function* streamWithRetry(a: StreamAttempt): AsyncIterable<Provider
     if (res.status === 429 || res.status >= 500) {
       idle.clear();
       const retryAfterMs = parseRetryAfter(res.headers.get('retry-after'));
-      const message = await readErrorMessage(res);
+      const message = await readErrorMessage(res, fetchSignal);
+      if (a.signal?.aborted) return;
       if (attempt < maxRetries) {
         try {
           await backoff(attempt, retryAfterMs, a.signal); // honor the server's Retry-After when sent
@@ -364,7 +402,8 @@ export async function* streamWithRetry(a: StreamAttempt): AsyncIterable<Provider
     }
     if (!res.ok) {
       idle.clear();
-      const message = await readErrorMessage(res);
+      const message = await readErrorMessage(res, fetchSignal);
+      if (a.signal?.aborted) return;
       // A 400 meaning "your request exceeds the model's context/token limit" is recoverable in
       // exactly one way: ask for fewer output tokens. This bites reasoning models on small-window
       // endpoints (e.g. a 64k-context local/OpenRouter reasoner where the max_tokens floor requests
@@ -449,7 +488,7 @@ export async function* streamWithRetry(a: StreamAttempt): AsyncIterable<Provider
 
     let emitted = 0;
     try {
-      for await (const ev of a.parse(streamLines(res.body, () => idle.kick()))) {
+      for await (const ev of a.parse(streamLines(res.body, () => idle.kick(), fetchSignal))) {
         emitted++;
         yield ev;
       }
@@ -500,10 +539,11 @@ export async function fetchNonStreamResponse(
     { purpose: 'provider', origin: 'user', streaming: true },
   );
   if (!res.ok) {
-    const message = await readErrorMessage(res);
+    const message = await readErrorMessage(res, signal);
+    signal?.throwIfAborted();
     throw new Error(`HTTP ${res.status}: ${message}`);
   }
-  const text = await res.text();
+  const text = await responseText(res, signal);
   if (!text.trim()) throw new Error('provider returned empty non-stream body');
   try {
     return JSON.parse(text) as unknown;
@@ -746,8 +786,8 @@ export function stripImagesFromBody(body: unknown, reason?: string): boolean {
 }
 
 /** Best-effort extraction of a human message from an error response body. */
-async function readErrorMessage(res: Response): Promise<string> {
-  const raw = await res.text().catch(() => '');
+async function readErrorMessage(res: Response, signal?: AbortSignal): Promise<string> {
+  const raw = await responseText(res, signal).catch(() => '');
   try {
     const j = JSON.parse(raw) as { error?: { message?: string } | string };
     if (j && typeof j.error === 'object' && typeof j.error.message === 'string') return j.error.message;

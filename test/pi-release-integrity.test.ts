@@ -227,11 +227,15 @@ test('pi /clear resets every conversation-scoped approval, read, attachment, tod
 test('pi Esc interrupts a running turn even when the composer holds an unsent draft', (t) => {
   let listener: ((data: string) => { consume?: boolean } | undefined) | undefined;
   let aborts = 0;
+  const controller = new AbortController();
+  controller.signal.addEventListener('abort', () => aborts++);
   let draft = 'keep this unsent draft';
   let draftWrites = 0;
   const h = commandHarness(workspace(t), {
     running: true,
-    controller: { abort: () => aborts++ },
+    controller,
+    streamBuf: '',
+    streamCell: { setText() {} },
     editor: {
       getText: () => draft,
       setText: (next: string) => {
