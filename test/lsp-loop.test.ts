@@ -1,3 +1,4 @@
+import { rm } from 'node:fs/promises';
 // Plan 3.1 — LSP notes at the LOOP level: after a successful write_file, the note rides the
 // tool result INTO the next provider round, result.ok stays true, and every gate holds.
 // (diagnostics-loop.test.ts harness: hand-built LoopDeps, evented provider, ScriptedApprovalGate.)
@@ -8,7 +9,7 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -70,7 +71,7 @@ interface LoopFx {
   root: string;
   lspCfg: { timeoutMs: number; servers: Record<string, { command: string; args: string[] }>; notes?: { maxSessionChars: number } };
   warm(): Promise<void>;
-  cleanup(): void;
+  cleanup(): Promise<void>;
 }
 
 function makeFx(notes?: { maxSessionChars: number }): LoopFx {
@@ -93,10 +94,10 @@ function makeFx(notes?: { maxSessionChars: number }): LoopFx {
         return svc.snapshot().servers.some((s) => s.state === 'ready');
       }, 8000);
     },
-    cleanup() {
+    async cleanup() {
       getLspService(root, lspCfg).stop();
       stopLspServices();
-      rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     },
   };
 }
@@ -173,7 +174,7 @@ test('loop: an LSP note rides the write result into the NEXT provider round — 
     assert.equal(seen[0]!.ok, true, 'ADVISORY INVARIANT: diagnostics never fail the write');
     assert.ok(rounds[0]!.includes('[lsp: typescript]'), 'the next model round sees the note in the tool result');
   } finally {
-    fx.cleanup();
+    await fx.cleanup();
   }
 });
 
@@ -190,7 +191,7 @@ test('loop: identical rewrites dedupe — the second write carries no note, the 
     assert.ok(!seen[1]!.summary.includes('[lsp:'), 'identical diagnostics are suppressed');
     assert.equal(seen[1]!.ok, true);
   } finally {
-    fx.cleanup();
+    await fx.cleanup();
   }
 });
 
@@ -206,7 +207,7 @@ test('loop: a clean file and a non-source file produce no note at all', async ()
     assert.ok(!seen[0]!.summary.includes('[lsp:'), 'clean file → silence');
     assert.ok(!seen[1]!.summary.includes('[lsp:'), 'markdown → no server, no note');
   } finally {
-    fx.cleanup();
+    await fx.cleanup();
   }
 });
 
@@ -221,7 +222,7 @@ test('loop: SHADOW_NO_LSP=1 and enabled:false leave tool results untouched', asy
   } finally {
     if (prev === undefined) delete process.env.SHADOW_NO_LSP;
     else process.env.SHADOW_NO_LSP = prev;
-    fx.cleanup();
+    await fx.cleanup();
   }
   const fx2 = makeFx();
   try {
@@ -229,7 +230,7 @@ test('loop: SHADOW_NO_LSP=1 and enabled:false leave tool results untouched', asy
     const off = await runLoop(fx2, [{ path: 'k.ts', content: 'BOOM' }], { lsp: { ...fx2.lspCfg, enabled: false } });
     assert.ok(!off.seen[0]!.summary.includes('[lsp:'), 'enabled:false: no note');
   } finally {
-    fx2.cleanup();
+    await fx2.cleanup();
   }
 });
 
@@ -248,6 +249,6 @@ test('loop: session budget exhaustion suppresses notes and emits exactly one fin
     assert.equal(findings.length, 1, 'exactly one finding on first latch');
     assert.match(findings[0]!, /LSP diagnostics notes paused/);
   } finally {
-    fx.cleanup();
+    await fx.cleanup();
   }
 });

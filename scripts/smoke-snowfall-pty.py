@@ -2,8 +2,7 @@
 """Exercise a built CLI in a real POSIX PTY; no provider requests or external tool execution.
 Usage: python3 scripts/smoke-snowfall-pty.py node dist/index.js
        python3 scripts/smoke-snowfall-pty.py ./dist-bin/shadow
-Uses the caller's normal configuration, with provider=mock, offline and dry-run CLI overrides.
-Never run against an account that still needs plaintext credential migration.
+Uses a fresh profile with provider=mock, an explicit loopback endpoint, offline and dry-run overrides.
 """
 import fcntl
 import json
@@ -32,8 +31,10 @@ def exercise(command, ending):
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 36, 120, 0, 0))
     output = bytearray()
     with tempfile.TemporaryDirectory(prefix='shadow-snowfall-pty-') as workspace:
-        env = dict(os.environ, TERM='xterm-256color', SHADOW_TUI='pi', SHADOW_NO_IMAGE_OPEN='1')
-        argv = command + ['--provider', 'mock', '--model', 'mock-1', '--offline', '--dry-run', '--reduced-motion', '--workspace', workspace]
+        profile = str(Path(workspace) / 'profile')
+        Path(profile).mkdir()
+        env = dict(os.environ, HOME=profile, USERPROFILE=profile, TERM='xterm-256color', SHADOW_TUI='pi', SHADOW_NO_IMAGE_OPEN='1')
+        argv = command + ['--provider', 'mock', '--model', 'mock-1', '--base-url', 'http://127.0.0.1:1/v1', '--offline', '--dry-run', '--reduced-motion', '--workspace', workspace]
         process = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=slave, env=env, start_new_session=True)
 
         def read_for(seconds):
@@ -56,7 +57,7 @@ def exercise(command, ending):
                 return text in output or text in plain
             while not present() and time.monotonic() < end and process.poll() is None:
                 read_for(0.1)
-            check(present(), f'{ending}: missing {text!r}; process={process.poll()}')
+            check(present(), f'{ending}: missing {text!r}; process={process.poll()}; tail={bytes(output[-2000:])!r}')
 
         try:
             expect(b'\x1b[?1049h')
@@ -112,7 +113,5 @@ def exercise(command, ending):
 
 if __name__ == '__main__':
     check(len(sys.argv) > 1, 'provide a built CLI command')
-    # An interactive launch can migrate this file. This harness must not trigger that workflow.
-    check(not (Path.home() / '.shadow/credentials.json').exists(), 'refusing a CLI smoke with unmigrated credentials')
     command = sys.argv[1:]
     print(json.dumps({'platform': sys.platform, 'command': command, 'checks': [exercise(command, ending) for ending in ['quit', 'Ctrl+C', 'SIGTERM']]}, indent=2))

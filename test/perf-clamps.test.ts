@@ -1,3 +1,4 @@
+import { rm } from 'node:fs/promises';
 // P2-06 acceptance pins — every performance clamp this batch ships, in one file.
 // F06-05 read_file cap/stream · F06-06 width single-pass · F06-08 reasoning round-trip trim ·
 // F06-09 first paint not gated on MCP/hooks · F06-10 sub-agent concurrency semaphore.
@@ -232,7 +233,7 @@ test('F06-08: the field routes to the exact wire name (reasoning vs reasoning_co
 // F06-09 — first paint: startup is never gated on hooks or a dead MCP server
 // ---------------------------------------------------------------------------
 
-test('F06-09: session_start hooks fire detached — first paint is not gated on init scripts', () => {
+test('F06-09: session_start hooks fire detached — first paint is not gated on init scripts', async () => {
   const ws = mkdtempSync(join(tmpdir(), 'pf-hook-'));
   try {
     const hook = join(ws, 'slow-init.sh');
@@ -243,7 +244,7 @@ test('F06-09: session_start hooks fire detached — first paint is not gated on 
     const ms = Date.now() - t0;
     assert.ok(ms < 500, `detached hook returned in ${ms}ms — must not block first paint behind a 1s init script`);
   } finally {
-    rmSync(ws, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(ws, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 

@@ -19,7 +19,7 @@ function tmp(): string {
 
 function script(root: string, name: string, body: string): string {
   const p = join(root, name);
-  writeFileSync(p, `#!/bin/sh\n${body}\n`, 'utf8');
+  writeFileSync(p, `#!/bin/sh\ncat >/dev/null\n${body}\n`, 'utf8');
   chmodSync(p, 0o755);
   return shellFixture(p);
 }
@@ -173,7 +173,7 @@ test('context is clamped at MAX_HOOK_CONTEXT_CHARS with a truncation marker', ()
     const big = 'x'.repeat(MAX_HOOK_CONTEXT_CHARS + 2000);
     const s = script(root, 'h.sh', `printf '{"context":"%s"}' "${big}"`);
     const r = runHookPhase('post_tool_use', [s], { workspaceRoot: root, tool: 'x' });
-    assert.ok(r.context, 'context present');
+    assert.ok(r.context, `context present: ${JSON.stringify(r)}`);
     assert.ok(
       (r.context ?? '').length <= MAX_HOOK_CONTEXT_CHARS + 64,
       `clamped near the cap, got ${(r.context ?? '').length}`,

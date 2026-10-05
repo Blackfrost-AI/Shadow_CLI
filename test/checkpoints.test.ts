@@ -27,7 +27,7 @@ test('saveCheckpoint writes .bak under .shadow/checkpoints and round-trips conte
     assert.ok(existsSync(listed[0]!.absPath));
 
     const raw = readFileSync(join(root, '.shadow', 'checkpoints', 'sess-1', '3', 'index.json'), 'utf8');
-    assert.match(raw, /src\/foo\.ts/);
+    assert.equal(JSON.parse(raw)[0].relPath, join('src', 'foo.ts'));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -1,3 +1,4 @@
+import { rm } from 'node:fs/promises';
 // LSP service + client supervision tests (plan 3.1, Package 3). REAL child processes — fake
 // servers written into mkdtemp fixtures and spawned through the production spawn path
 // (scrubbedEnv, unref'd pipes, Content-Length framing on both wires).
@@ -143,7 +144,7 @@ interface Fixture {
   root: string;
   write(rel: string, text: string): string;
   service(config?: Partial<LspServiceConfig>): LspService;
-  cleanup(): void;
+  cleanup(): Promise<void>;
 }
 
 function makeFixture(fake: 'lsp' | 'tsserver', flags: string[] = []): Fixture {
@@ -166,8 +167,8 @@ function makeFixture(fake: 'lsp' | 'tsserver', flags: string[] = []): Fixture {
       }
       return createLspService({ projectDir: root, config: cfg });
     },
-    cleanup() {
-      rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    async cleanup() {
+      await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     },
   };
 }
@@ -202,7 +203,7 @@ test('service (lsp): first collect during cold start is null (honesty), then dia
     assert.equal(svc.serverIdFor(abs), 'typescript');
     svc.stop();
   } finally {
-    fx.cleanup();
+    await fx.cleanup();
   }
 });
 
@@ -217,7 +218,7 @@ test('service (lsp): warnings ride, clean files answer []', async () => {
     assert.deepEqual(clean, []);
     svc.stop();
   } finally {
-    fx.cleanup();
+    await fx.cleanup();
   }
 });
 
@@ -233,7 +234,7 @@ test('service (lsp): a silent server resolves [] at the deadline — the turn st
     assert.ok(elapsed < 3200, `deadline respected (took ${elapsed}ms)`);
     svc.stop();
   } finally {
-    fx.cleanup();
+    await fx.cleanup();
   }
 });
 
@@ -271,7 +272,7 @@ test('service (lsp): stop() kills the spawned server (pid gone from the process 
     svc.stop();
     assert.ok(await until(() => !isAlive(pid), 4000), 'server process exited after stop()');
   } finally {
-    rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     rmSync(pidfile, { force: true });
   }
 });
@@ -299,7 +300,7 @@ test('service (lsp): a dying server is restarted at most RESTART_CAP times, then
     assert.equal(svc.snapshot().servers[0]!.state, 'disabled');
     assert.equal(notices.length, 1); // still exactly one notice
   } finally {
-    fx.cleanup();
+    await fx.cleanup();
   }
 });
 
@@ -329,7 +330,7 @@ test('service (tsserver): local node_modules detection → native protocol → e
     assert.deepEqual(clean, []);
     svc.stop();
   } finally {
-    fx.cleanup();
+    await fx.cleanup();
   }
 });
 
@@ -353,7 +354,7 @@ test('service (tsserver): an UNTRUSTED repo-local typescript is never a spawn ta
     assert.equal(notices.length, 1);
     svc.stop();
   } finally {
-    fx.cleanup();
+    await fx.cleanup();
   }
 });
 
@@ -383,7 +384,7 @@ test('lspNoteFor: full chain — write with a type error yields the [lsp: typesc
     assert.match(note, /a\.ts:1:1 — this exploded \(error, 1000\)/);
     svc.stop();
   } finally {
-    fx.cleanup();
+    await fx.cleanup();
   }
 });
 
@@ -403,7 +404,7 @@ test('lspNoteFor: every gate answers null — kill switch, disabled, !ok, dry-ru
     assert.equal(await lspNoteFor({ ...base, input: { path: 'notes.md' }, tool: 'write_file' }), null);
     svc.stop();
   } finally {
-    fx.cleanup();
+    await fx.cleanup();
   }
 });
 
@@ -428,7 +429,7 @@ test('lspNoteFor: apply_patch paths come from result.data.files; files outside t
     assert.ok(!note.includes('outside.ts'), 'outside-workspace path never reaches a server');
     svc.stop();
   } finally {
-    fx.cleanup();
+    await fx.cleanup();
   }
 });
 
@@ -445,7 +446,7 @@ test('lspNoteFor: identical diagnostics dedupe away; a changed file emits again'
     assert.ok(again && again.includes('warning'), 'changed content re-emits');
     svc.stop();
   } finally {
-    fx.cleanup();
+    await fx.cleanup();
   }
 });
 
@@ -468,7 +469,7 @@ test('lspNoteFor: session budget exhaustion blocks the note and emits exactly ON
     assert.equal(findings.length, 1); // still exactly one finding
     svc.stop();
   } finally {
-    fx.cleanup();
+    await fx.cleanup();
   }
 });
 
@@ -551,7 +552,7 @@ test('service (lsp): after a server crash the restarted instance is re-OPENED, n
       `no didChange may precede a didOpen on any instance (log: ${JSON.stringify(seen)})`,
     );
   } finally {
-    fx.cleanup();
+    await fx.cleanup();
     rmSync(logPath, { force: true });
   }
 });
