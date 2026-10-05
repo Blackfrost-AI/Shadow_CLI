@@ -1,3 +1,4 @@
+import { shellFixture } from './helpers/shellFixture.js';
 import { rm } from 'node:fs/promises';
 // P2-06 acceptance pins — every performance clamp this batch ships, in one file.
 // F06-05 read_file cap/stream · F06-06 width single-pass · F06-08 reasoning round-trip trim ·
@@ -240,7 +241,7 @@ test('F06-09: session_start hooks fire detached — first paint is not gated on 
     writeFileSync(hook, '#!/bin/sh\nsleep 1\n');
     chmodSync(hook, 0o755);
     const t0 = Date.now();
-    runHookPhaseDetached('session_start', [hook], { workspaceRoot: ws, sessionId: 'pin' });
+    runHookPhaseDetached('session_start', [shellFixture(hook)], { workspaceRoot: ws, sessionId: 'pin' });
     const ms = Date.now() - t0;
     assert.ok(ms < 500, `detached hook returned in ${ms}ms — must not block first paint behind a 1s init script`);
   } finally {
@@ -600,7 +601,7 @@ test('F06-09: a hook that slams stdin or fails to spawn cannot crash the session
     const stdinSlammer = join(ws, 'slam.sh');
     writeFileSync(stdinSlammer, '#!/bin/sh\nexec 0<&-\nexit 0\n');
     chmodSync(stdinSlammer, 0o755);
-    runHookPhaseDetached('session_start', [stdinSlammer], { workspaceRoot: ws, sessionId: 'pin' });
+    runHookPhaseDetached('session_start', [shellFixture(stdinSlammer)], { workspaceRoot: ws, sessionId: 'pin' });
     // (b) a cwd that does not exist → spawn fails ASYNC via the 'error' event; unhandled, that is
     // an uncaught exception at session start. The handler must swallow it.
     runHookPhaseDetached('session_start', ['/bin/true'], {
@@ -612,6 +613,6 @@ test('F06-09: a hook that slams stdin or fails to spawn cannot crash the session
     await new Promise((r) => setTimeout(r, 200));
     assert.ok(true, 'neither hook failure mode crashed the session');
   } finally {
-    rmSync(ws, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(ws, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
