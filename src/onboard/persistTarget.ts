@@ -33,6 +33,8 @@ export interface OnboardTargetInput {
   selectedModels?: string[];
   /** Picker group for selected models (normally the catalog provider label). */
   entryGroup?: string;
+  /** Endpoint-specific credential slot, so adding another provider keeps previous keys usable. */
+  credentialRef?: string;
 }
 
 /** Build the common terminal/browser onboarding patch.
@@ -210,7 +212,12 @@ export function persistOnboardTarget(input: OnboardTargetInput): void {
   const patch = onboardTargetPatch(input);
   const models = (loadGlobalConfig().models as ModelEntry[] | undefined) ?? [];
   if (input.selectedModels?.length) {
-    const selectedEntries = onboardModelSelectionUpsert(models, input);
+    const selectedEntries = onboardModelSelectionUpsert(models, input).map((entry) =>
+      input.credentialRef && entry.provider === input.provider &&
+      input.selectedModels!.includes(entry.model) && sameEndpoint(entry.baseUrl, input.baseUrl)
+        ? { ...entry, credRef: input.credentialRef }
+        : entry,
+    );
     patch.models = selectedEntries;
     // Pin the explicitly chosen default by label. Matching only provider+model is ambiguous when
     // two custom endpoints expose the same id; lastModel carries the selected endpoint atomically.

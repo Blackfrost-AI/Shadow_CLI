@@ -192,7 +192,10 @@ export function adoptLegacyIntoUnlockedVault(write: (s: string) => void = () => 
 }
 
 /** Unlock the vault for this session: keychain (silent) → env → masked prompt. */
-async function unlockExisting(write: (s: string) => void): Promise<'ok' | 'failed'> {
+export async function unlockExistingVault(
+  write: (s: string) => void,
+  prompt: (question: string) => Promise<string> = promptLine,
+): Promise<'ok' | 'failed'> {
   // 1) OS-keychain-cached derived key — silent.
   const cached = retrieveKey();
   if (cached) {
@@ -223,7 +226,7 @@ async function unlockExisting(write: (s: string) => void): Promise<'ok' | 'faile
     return 'failed';
   }
   for (let i = 0; i < 3; i++) {
-    const pw = await promptLine('Master password to unlock your vault: ');
+    const pw = await prompt('Master password to unlock your vault: ');
     if (!pw) break;
     try {
       const { data, key } = unlockWithPassword(pw);
@@ -246,7 +249,7 @@ export async function ensureVaultReady(write: (s: string) => void = (s) => proce
   try {
     await maybeMigrateLegacy(write);
     if (!vaultExists()) return true; // no vault (fresh install / declined migration) — env/onboarding path
-    if ((await unlockExisting(write)) !== 'ok') return false;
+    if ((await unlockExistingVault(write)) !== 'ok') return false;
     // A vault created by `onboard --web` may have left the old plaintext file behind.
     adoptLegacyIntoUnlockedVault(write);
     // Plaintext keys hand-written into config.json presets move into the vault too. Imported

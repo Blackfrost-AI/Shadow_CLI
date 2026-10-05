@@ -69,6 +69,7 @@ import { listRewindableTurns, rewindToTurn } from '../state/rewind.js';
 import { forkSession } from '../state/fork.js';
 import { ProjectMemory } from '../state/memory.js';
 import { SessionLog } from '../state/session.js';
+import { normalizeSessionTitle, sessionTerminalTitle } from '../state/sessionTitle.js';
 import { readLatestWorkCenterSnapshot, recordWorkCenterSnapshot } from '../state/workCenterPersistence.js';
 import { sanitizeAssistantText } from '../tui/sanitize.js';
 import type { ResumableSession } from '../state/resume.js';
@@ -373,6 +374,11 @@ export class ShadowApp {
   private adoptSessionLog(log: SessionLog): void {
     this.opts.sessionLog = log;
     if (this.opts.sessionLogBox) this.opts.sessionLogBox.current = log;
+    this.refreshSessionTitle();
+  }
+
+  private refreshSessionTitle(): void {
+    this.terminal?.setTitle(sessionTerminalTitle(this.sessionLog.title));
   }
 
   /** The live state object the HUD components read. Rebuilt only when a scalar changes. */
@@ -461,7 +467,7 @@ export class ShadowApp {
     this.installInputHandling();
 
     this.tui.setFocus(this.editor);
-    this.terminal.setTitle('Shadow');
+    this.refreshSessionTitle();
     this.tui.start();
 
     this.showSplash();
@@ -1198,6 +1204,7 @@ export class ShadowApp {
       }
       const shown = taskText || task;
       this.sessionLog.record({ kind: 'user', task: shown });
+      this.refreshSessionTitle();
       this.opts.bus.emit({ type: 'user', text: shown });
 
       const budget = new Budget(
@@ -1456,6 +1463,11 @@ export class ShadowApp {
         triggerRatio: this.opts.cfg.summarizeTriggerRatio,
         keepLastTurns: this.opts.cfg.keepLastTurns,
       });
+      const previous = this.sessionLog;
+      const log = SessionLog.open(this.opts.workspaceRoot);
+      log.setTitle(SessionLog.titleFor(pick.path));
+      this.adoptSessionLog(log);
+      previous.close?.();
       this.opts.context.loadState(resumed.exportState());
       this.opts.workCenter?.restore(readLatestWorkCenterSnapshot(pick.path));
       this.first = this.opts.context.messages().length === 0;
@@ -1471,7 +1483,7 @@ export class ShadowApp {
         /* a log that cannot be written must not fail the resume itself */
       }
       this.refreshRewindTurns();
-      this.pushLine({ text: `  Resumed ${approvalText(pick.id)} (${this.opts.context.messages().length} messages).`, color: C.cyan });
+      this.pushLine({ text: `  Resumed ${approvalText(pick.title)} · ${approvalText(pick.id)} (${this.opts.context.messages().length} messages).`, color: C.cyan });
       // A different session is a different grant scope.
       this.approvals.clear();
       this.readTracker.clear();
@@ -1482,7 +1494,7 @@ export class ShadowApp {
 
   private openResumePicker(sessions: ResumableSession[]): void {
     const picker = new ChoicePicker({
-      title: 'Resume a session', items: sessions, label: (session) => `${session.id} · ${session.ts}`,
+      title: 'Resume a session', items: sessions, label: (session) => `${oneLine(session.title, 34)} · ${session.id}`,
       choose: (session) => { this.closePicker(); this.applyResume(session); },
       close: () => this.closePicker(), repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
     });
@@ -1619,6 +1631,7 @@ export class ShadowApp {
       kind: 'system',
       text: '',
       lines: [
+        { text: approvalText(`session name ${this.sessionLog.title || 'New session'}`), color: C.cyan },
         { text: approvalText(`session id   ${sessionId}`) },
         { text: approvalText(`session log  ${logPath}`) },
         { text: `messages     ${this.opts.context.messages().length}` },
@@ -1734,7 +1747,12 @@ export class ShadowApp {
                 .filter((m) => !m.disabled && m.label.toLowerCase().startsWith(p.toLowerCase()))
                 .slice(0, 8)
                 .map((m) => ({ value: m.label, label: m.label, description: `${m.provider}/${m.model}` }))
-          : c.args,
+          : c.name === '/resume'
+            ? (prefix: string) => listResumableSessions(this.opts.workspaceRoot)
+                .filter((session) => `${session.title} ${session.id}`.toLowerCase().includes(prefix.toLowerCase()))
+                .slice(0, 20)
+                .map((session) => ({ value: session.id, label: session.title, description: session.id }))
+            : c.args,
     }));
   }
 
@@ -1773,6 +1791,15 @@ export class ShadowApp {
       case '/new':
         if (this.running || this.compacting || this.modelChecking || this.switcher.isSwitching) {
           this.pushLine({ text: '  Finish the current operation before clearing the conversation.', dimColor: true });
+          return;
+        }
+        try {
+          const previous = this.sessionLog;
+          this.adoptSessionLog(SessionLog.open(this.opts.workspaceRoot));
+          previous.close?.();
+          this.refreshRewindTurns();
+        } catch (error) {
+          this.pushLine({ kind: 'error', text: `  Could not start a new session: ${approvalText((error as Error).message)}`, color: C.red });
           return;
         }
         this.items = [];
@@ -2023,6 +2050,20 @@ export class ShadowApp {
       case '/resume':
         this.doResume(arg);
         return;
+      case '/rename': {
+        const title = normalizeSessionTitle(arg);
+        if (!title) {
+          this.pushLine({ text: '  Usage: /rename <session name>', dimColor: true });
+          return;
+        }
+        if (!this.sessionLog.setTitle(title)) {
+          this.pushLine({ kind: 'error', text: '  Could not save the session name.', color: C.red });
+          return;
+        }
+        this.refreshSessionTitle();
+        this.pushLine({ text: `  Session named ${title}`, color: C.cyan });
+        return;
+      }
       case '/rewind':
         this.doRewind(arg);
         return;
@@ -2277,7 +2318,7 @@ export class ShadowApp {
           lines: [
             { text: `Resumable sessions (${sessions.length})`, bold: true },
             ...sessions.slice(0, 50).map((x) => ({
-              text: approvalText(`  ${x.id === currentId ? '▸ ' : '  '}${x.id}  ${x.ts}`),
+              text: approvalText(`  ${x.id === currentId ? '▸ ' : '  '}${x.title} · ${x.id}`),
               color: x.id === currentId ? C.cyan : undefined,
               dimColor: x.id !== currentId,
             })),

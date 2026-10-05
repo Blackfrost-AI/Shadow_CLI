@@ -1,1048 +1,787 @@
-import * as readline from 'node:readline/promises';
-import * as readlineCore from 'node:readline';
 import { stdin, stdout } from 'node:process';
-import { execSync } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { providersForMode, type ProviderPreset, type OnboardMode } from './catalog.js';
-import { createProvider, type ProviderName } from '../provider/index.js';
+import { stripVTControlCharacters } from 'node:util';
+import {
+  featuredProviders,
+  findPreset,
+  providersForMode,
+  type ProviderPreset,
+  type OnboardMode,
+} from './catalog.js';
+import type { ProviderName } from '../provider/index.js';
 import {
   saveCredential,
   saveGlobalConfig,
   loadGlobalConfig,
-  GLOBAL_DIR,
+  vaultUnlocked,
 } from '../state/globalStore.js';
-import { addLocalModel, testLocalModel } from '../local/garage.js';
+import { vaultExists } from '../auth/vault.js';
+import { unlockExistingVault } from '../auth/unlock.js';
+import { addLocalModel } from '../local/garage.js';
 import { defaultModelPatch } from '../config/modelPresets.js';
-import type { ModelEntry } from '../config.js';
+import { normalizeBaseUrl, type ModelEntry } from '../config.js';
 import { looksAnthropicDistilled, toAnthropicBaseUrl } from '../util/transport.js';
-import { normalizeBaseUrl } from '../config.js';
-import { SHADOW_LOGOTYPE, SHADOW_COMPACT, degradeArt } from '../tui/brand.js';
-import type { Message } from '../provider/provider.js';
 import { registerSecret, redactString } from '../util/redact.js';
 import { persistOnboardTarget, type OnboardTargetInput } from './persistTarget.js';
-import { parseModelSelection, probeModelEndpoint, type EndpointProbeResult } from './probe.js';
+import { probeModelEndpoint, type EndpointProbeResult } from './probe.js';
+import { testConnection, type ConnectionResult } from './connection.js';
+import {
+  BACK,
+  OnboardCancelled,
+  TerminalOnboardUI,
+  PlainOnboardUI,
+  type OnboardUI,
+  type Screen,
+  type Choice,
+} from './ui.js';
 
-const ESC = '\x1b[';
-const c = {
-  bold: (s: string) => `${ESC}1m${s}${ESC}0m`,
-  cyan: (s: string) => `${ESC}36m${s}${ESC}0m`,
-  green: (s: string) => `${ESC}32m${s}${ESC}0m`,
-  red: (s: string) => `${ESC}31m${s}${ESC}0m`,
-  yellow: (s: string) => `${ESC}33m${s}${ESC}0m`,
-  gray: (s: string) => `${ESC}90m${s}${ESC}0m`,
-};
-
-// ── Centered banner / box layout ─────────────────────────────────────────────
-// Use the same retro banner and narrow-screen fallbacks as both interactive shells.
-
-// Compatibility disclaimer.
-const DISCLAIMER = [
-  'For AGENTIC (tool-calling) models only — OpenAI- or',
-  'Anthropic-compatible. A chat-only model will reply but will',
-  'NOT call tools and is not intended to work in this CLI.',
-  'Capability + format also vary by model; each performs best on',
-  'the wire format it was trained for. You own the models you connect.',
-];
-
-const stripAnsi = (s: string): string => s.replace(/\x1b\[[0-9;]*m/g, '');
-const visLen = (s: string): number => stripAnsi(s).length;
-const cols = (): number => Math.max(40, Math.min(stdout.columns || 80, 100));
-
-/** Left-pad a block of lines so it sits centered as a unit (internal alignment preserved). */
-function centerBlock(lines: string[], width = cols()): string[] {
-  const max = Math.max(...lines.map(visLen));
-  const pad = ' '.repeat(Math.max(0, Math.floor((width - max) / 2)));
-  return lines.map((l) => pad + l);
-}
-
-/** Wrap lines in a rounded border box sized to the widest line. */
-function boxed(lines: string[]): string[] {
-  const w = Math.max(...lines.map(visLen));
-  return [
-    '╭' + '─'.repeat(w + 2) + '╮',
-    ...lines.map((l) => '│ ' + l + ' '.repeat(w - visLen(l)) + ' │'),
-    '╰' + '─'.repeat(w + 2) + '╯',
-  ];
-}
-
-function writeCentered(lines: string[], width = cols()): void {
-  for (const l of centerBlock(lines, width)) stdout.write(l + '\n');
-}
-
-// ── Context Cooler (optional, opt-in MCP server) ─────────────────────────────
-const CC_REPO = 'Blackfrost-AI/context-cooler';
-const CC_URL = 'https://github.com/Blackfrost-AI/context-cooler';
-
-function sh(cmd: string, cwd?: string): void {
-  execSync(cmd, { cwd, stdio: 'inherit', timeout: 300_000 });
-}
-
-/** Clone (or update) + build + register Context Cooler natively for Shadow. Its own
- *  installer writes the MCP entry into ~/.shadow/config.json via `--platform=shadow`. */
-function installContextCooler(dir: string): void {
-  if (existsSync(join(dir, '.git'))) {
-    sh(`git -C "${dir}" pull --ff-only`);
-  } else {
-    try {
-      sh(`gh repo clone ${CC_REPO} "${dir}"`); // gh carries the user's auth for the private repo
-    } catch {
-      sh(`git clone ${CC_URL}.git "${dir}"`);
-    }
-  }
-  sh('npm install', dir);
-  sh('python3 install.py --platform=shadow --non-interactive', dir);
-}
-
-const BACK = Symbol('back');
-const QUIT = Symbol('quit');
-type PromptResult = string | typeof BACK | typeof QUIT;
-type SetupStep =
+type Step =
   | 'mode'
   | 'provider'
-  | 'ggufPath'
-  | 'customCompatibility'
-  | 'customSelfHosted'
-  | 'customBaseUrl'
-  | 'customSecret'
-  | 'localBaseUrl'
-  | 'localSecret'
-  | 'cloudSecret'
-  | 'discoverModels'
-  | 'model'
-  | 'defaultModel'
+  | 'browse'
+  | 'file'
+  | 'fileReview'
+  | 'endpoint'
+  | 'key'
+  | 'discover'
+  | 'discoveryFailure'
+  | 'compatibility'
+  | 'hosting'
+  | 'models'
+  | 'manual'
+  | 'default'
   | 'transport'
   | 'test'
-  | 'contextCooler';
-
-interface DraftSetup {
-  preset?: ProviderPreset;
-  adapter?: ProviderName;
+  | 'testFailure'
+  | 'review';
+interface Draft {
+  preset: ProviderPreset;
+  adapter: ProviderName;
   baseUrl?: string;
-  apiKey?: string;
-  authToken?: string;
-  model?: string;
-  availableModels?: string[];
-  selectedModels?: string[];
-  probe?: EndpointProbeResult;
-  /** Explicit trust marker for a public remote OpenAI-compatible server. */
+  key?: string;
+  bearer?: boolean;
   selfHosted?: boolean;
+  probe?: EndpointProbeResult;
+  selected: string[];
+  model?: string;
+  test?: ConnectionResult;
 }
 
-/** Persist the terminal wizard's target, including removal of a stale endpoint trust marker.
- * Exported so persistence behavior can be regression-tested without driving process stdin. */
 export function persistTerminalOnboardTarget(input: {
   adapter: ProviderName;
   model: string;
   baseUrl?: string;
   customEndpoint: boolean;
   selfHosted?: boolean;
-  /** Contract extras from the chosen catalog preset (persisted as a ModelEntry — P1A-06 step 4). */
   entryExtras?: OnboardTargetInput['entryExtras'];
   selectedModels?: string[];
   entryGroup?: string;
+  credentialRef?: string;
 }): void {
-  persistOnboardTarget({
-    provider: input.adapter,
-    model: input.model,
-    baseUrl: input.baseUrl,
-    customEndpoint: input.customEndpoint,
-    selfHosted: input.selfHosted,
-    entryExtras: input.entryExtras,
-    selectedModels: input.selectedModels,
-    entryGroup: input.entryGroup,
-  });
+  const { adapter, ...target } = input;
+  persistOnboardTarget({ ...target, provider: adapter });
 }
 
-function controlAnswer(raw: string): typeof BACK | typeof QUIT | null {
-  const value = raw.trim().toLowerCase();
-  if (value === 'b' || value === 'back') return BACK;
-  if (value === 'q' || value === 'quit' || value === 'exit') return QUIT;
-  return null;
+/** Validate the entered address instead of silently replacing a typo with localhost. */
+export function validateOnboardUrl(value: string): string | undefined {
+  const normalized = normalizeBaseUrl(value);
+  if (!normalized) return 'Enter an http:// or https:// API base URL.';
+  const url = new URL(normalized);
+  if (url.username || url.password || url.search || url.hash)
+    return 'Use the API base URL only; enter the key in the next step.';
+  if (/\/(?:chat\/completions|messages|models)\/?$/i.test(url.pathname))
+    return 'Use the base URL before /chat/completions, /messages, or /models.';
+  return undefined;
 }
 
-async function askText(rl: readline.Interface, query: string): Promise<PromptResult> {
-  const raw = (await rl.question(query)).trim();
-  return controlAnswer(raw) ?? raw;
+function modelError(value: string): string | undefined {
+  return !value || /[\s\u0000-\u001f\u007f]/.test(value) || value.length > 256
+    ? 'Enter one exact model ID, without spaces.'
+    : undefined;
+}
+const safeError = (error: unknown) =>
+  stripVTControlCharacters(
+    redactString(error instanceof Error ? error.message : String(error)),
+  ).slice(0, 400);
+const choices = (items: [string, string, string?][]): Choice[] =>
+  items.map(([id, label, detail]) => ({ id, label, detail }));
+const providerChoices = (items: ProviderPreset[]) =>
+  items.map((item) => ({ id: item.id, label: item.label, detail: item.baseUrl }));
+const credentials = (draft: Draft) =>
+  draft.bearer ? { authToken: draft.key } : { apiKey: draft.key };
+
+/** Test seams replace only network/UI boundaries; production uses the same state machine. */
+export interface OnboardOptions {
+  ui?: OnboardUI;
+  probe?: typeof probeModelEndpoint;
+  test?: typeof testConnection;
 }
 
-async function askSecretStep(
-  rl: readline.Interface,
-  query: string,
-): Promise<{ value: PromptResult; rl: readline.Interface }> {
-  const { value, rl: next } = await askSecret(rl, query);
-  return { value: controlAnswer(value) ?? value, rl: next };
-}
-
-function backHint(): string {
-  return c.gray('(back to previous, quit to exit)');
-}
-
-function previousCredentialStep(preset: ProviderPreset | undefined): SetupStep {
-  if (!preset) return 'provider';
-  if (preset.kind === 'custom') return 'customSecret';
-  if (preset.kind === 'local') return 'localSecret';
-  return 'cloudSecret';
-}
-
-/**
- * Optional onboarding step — offer Context Cooler (our token-saving MCP server) and,
- * on opt-in, install + register it so it loads automatically. Never bundled; the
- * user chooses. Failures are non-fatal — onboarding always completes.
- */
-async function offerContextCooler(rl: readline.Interface): Promise<'done' | 'back' | 'quit'> {
-  stdout.write(c.gray('\nOptional: Context Cooler adds a local search index for compact tool results.\n'));
-  stdout.write(c.gray(`You can add it later: ${CC_URL}\n`));
-  const ans = await askText(rl, `  Install Context Cooler now? ${c.gray('[y/N/back]')}: `);
-  if (ans === BACK) return 'back';
-  if (ans === QUIT) return 'quit';
-  const choice = ans.toLowerCase();
-  if (choice !== 'y' && choice !== 'yes') {
-    return 'done';
-  }
-  const dir = join(homedir(), '.shadow', 'context-cooler');
-  stdout.write(c.gray('\n  Installing Context Cooler (clone + build + register, ~1 min)…\n\n'));
-  try {
-    installContextCooler(dir);
-    stdout.write(
-      c.green('\n  ✓ Context Cooler installed') +
-        c.gray(` — registered as an MCP server in ${GLOBAL_DIR}/config.json.\n`) +
-        c.gray('    It loads automatically when you start a session.\n'),
-    );
-  } catch (err) {
-    stdout.write(
-      c.red(`\n  ✗ Install failed: ${(err as Error).message.split('\n')[0]}\n`) +
-        c.gray(`    No worries — install it later from ${CC_URL}\n`),
-    );
-  }
-  return 'done';
-}
-
-/**
- * Guided provider setup. Picks a provider from the catalog, collects the key /
- * base URL / model, runs a live connection test, and persists to ~/.shadow so
- * future runs connect with no flags. Returns true if a provider was saved.
- */
-export async function runOnboard(): Promise<boolean> {
-  let rl = readline.createInterface({ input: stdin, output: stdout });
-  try {
-    let step: SetupStep = 'mode';
-    let mode: OnboardMode = 'cloud';
-    let savedGguf: ModelEntry | undefined; // set when the 'file' mode has already persisted a model
-    let ggufTestFailed = false; // the inline test failed — the finale must not claim a working setup
-    const draft: DraftSetup = {};
-
-    // Quitting mid-wizard: if the ggufPath step already persisted + activated a model, that work
-    // is durable — say so and report success. Only a truly empty run is "cancelled".
-    const quitOutcome = (): boolean => {
-      if (savedGguf) {
-        stdout.write(
-          c.gray(
-            `Setup closed — local model "${savedGguf.label}" is saved and active. Run \`shadow\` to use it.\n`,
-          ),
-        );
-        return true;
-      }
-      stdout.write(c.gray('Setup cancelled — nothing saved.\n'));
-      return false;
-    };
-
-    const showBanner = () => {
-      stdout.write('\n');
-      const width = Math.min(stdout.columns || 80, cols());
-      const art = degradeArt(SHADOW_LOGOTYPE, width);
-      writeCentered((art.length ? art : [SHADOW_COMPACT]).map((l) => c.cyan(l)), width);
-      stdout.write('\n');
-      writeCentered(boxed(DISCLAIMER).map((l) => c.gray(l)));
-      stdout.write('\n');
-    };
-
-    const showProviderMenu = (list: ProviderPreset[]) => {
-      stdout.write('\n');
-      writeCentered([c.bold('Connect a model provider')]);
-      writeCentered([
-        c.gray('No Shadow account. Credentials are stored locally and sent to your chosen provider.'),
-      ]);
-      stdout.write('\n');
-      const menu = list.map((p, i) => {
-        const n = c.bold(String(i + 1).padStart(2));
-        return p.comingSoon ? `${n}. ${c.gray(p.label)}` : `${n}. ${p.label}`;
-      });
-      writeCentered(menu);
-      stdout.write('\n');
-      stdout.write(
-        c.gray('  Tip: type `back` or `b` at any prompt to go to the previous step.\n\n'),
-      );
-    };
-
-    while (true) {
-      switch (step) {
-        case 'mode': {
-          // The positioning choice comes FIRST: local is a front door, not a submenu buried
-          // under cloud vendors. A self-hosted endpoint is the default starting point.
-          showBanner();
-          writeCentered([c.bold('How do you want to run Shadow?')]);
-          stdout.write('\n');
-          writeCentered([
-            `${c.bold('1')}. Local file    ${c.gray('— a .gguf or MLX model on this machine (auto-served)')}`,
-            `${c.bold('2')}. Model server  ${c.gray('— Ollama, LM Studio, vLLM or your own endpoint')}`,
-            `${c.bold('3')}. Cloud         ${c.gray('— Anthropic, OpenAI, Z.ai (GLM), OpenRouter, …')}`,
-          ]);
-          stdout.write('\n');
-          const pick = await askText(rl, `Choose ${c.gray('[2]')} ${backHint()}: `);
-          if (pick === QUIT) return quitOutcome();
-          if (pick === BACK) {
-            stdout.write(c.gray('Already at the first step.\n'));
-            continue;
-          }
-          const choice = pick === '' ? '2' : pick;
-          if (choice === '1') mode = 'file';
-          else if (choice === '2') mode = 'server';
-          else if (choice === '3') mode = 'cloud';
-          else {
-            stdout.write(c.red('Choose 1, 2, or 3.\n'));
-            continue;
-          }
-          step = mode === 'file' ? 'ggufPath' : 'provider';
-          break;
-        }
-
-        case 'ggufPath': {
-          const ans = await askText(
-            rl,
-            `Model to run: .gguf path, MLX folder, or mlx-community/<model> id ${backHint()}: `,
-          );
-          if (ans === QUIT) return quitOutcome(); // a previously saved model stays saved
-          if (ans === BACK) {
-            step = 'mode';
-            break;
-          }
-          if (!ans) {
-            stdout.write(c.red('Enter the path to a .gguf file.\n'));
-            continue;
-          }
-          const models = (loadGlobalConfig().models as ModelEntry[] | undefined) ?? [];
-          // Re-entry with an already-registered file (e.g. `back` from a later step) must not
-          // dead-end on "already exists" — reuse the existing entry and move forward.
-          const resolved =
-            ans.startsWith('~/') || ans === '~' ? join(homedir(), ans.slice(1)) : ans;
-          const abs = resolve(resolved);
-          const existing = models.find(
-            (m) =>
-              (m.gguf &&
-                (m.gguf === abs || m.gguf.endsWith(`/${resolved.split('/').pop() ?? resolved}`))) ||
-              (m.mlx && (m.mlx === abs || m.mlx === resolved || m.mlx === ans)),
-          );
-          let entry: ModelEntry;
-          if (existing) {
-            saveGlobalConfig(defaultModelPatch(existing));
-            entry = existing;
-            stdout.write(
-              c.gray(`\n"${existing.label}" is already registered — made it the active model.\n`),
-            );
-          } else {
-            const res = addLocalModel(models, { path: ans });
-            if (!res.ok) {
-              stdout.write(c.red(`${res.message}\n`));
-              continue;
-            }
-            entry = res.value.entry;
-            // Persist the preset AND make it the active model (same patch `shadow local use` writes).
-            saveGlobalConfig({ models: res.value.models, ...defaultModelPatch(entry) });
-            stdout.write(
-              c.green(`\n✓ Added local model "${entry.label}"`) +
-                c.gray(
-                  entry.mlx
-                    ? ' (MLX, auto-served on demand)\n'
-                    : ` (ctx ${entry.ctx}, auto-served on demand)\n`,
-                ),
-            );
-            if (res.note) stdout.write(c.yellow(`  ⚠ ${res.note}\n`));
-          }
-          savedGguf = entry;
-          ggufTestFailed = false;
-
-          const t = await askText(
-            rl,
-            `Test it now? Loads the model — can take a minute. ${c.gray('[Y/n/back]')}: `,
-          );
-          if (t === QUIT) return quitOutcome(); // model is already saved; quitting here loses nothing
-          if (t === BACK) {
-            step = 'mode';
-            break;
-          }
-          if (t === '' || t.toLowerCase() === 'y' || t.toLowerCase() === 'yes') {
-            stdout.write(c.gray('\nStarting llama-server and running a tiny completion…\n'));
-            const result = await testLocalModel(entry, (m) => stdout.write(c.gray(`  ${m}\n`)));
-            if (result.ok) {
-              stdout.write(
-                c.green(`✓ PASS`) +
-                  c.gray(
-                    ` — ${result.endpoint}${result.tokensPerSec ? ` · ${result.tokensPerSec.toFixed(1)} tok/s` : ''}\n`,
-                  ),
-              );
-            } else {
-              ggufTestFailed = true;
-              stdout.write(c.red(`✗ test failed: ${result.error}\n`));
-              stdout.write(
-                c.gray(
-                  `  The model is saved — fix the issue above, then verify with: shadow local test ${entry.label}\n`,
-                ),
-              );
-            }
-          }
-          step = 'contextCooler';
-          break;
-        }
-
-        case 'provider': {
-          const list = providersForMode(mode);
-          showProviderMenu(list);
-          const firstReal = Math.max(
-            0,
-            list.findIndex((p) => !p.comingSoon),
-          );
-          const pick = await askText(
-            rl,
-            `Choose a provider ${c.gray(`[${firstReal + 1}]`)} ${backHint()}: `,
-          );
-          if (pick === QUIT) return quitOutcome();
-          if (pick === BACK) {
-            step = 'mode';
-            break;
-          }
-          const idx = pick === '' ? firstReal : parseInt(pick, 10) - 1;
-          const preset = list[idx];
-          if (!preset) {
-            stdout.write(c.red('Invalid choice. Choose a number from the menu.\n'));
-            continue;
-          }
-          if (preset.comingSoon) {
-            stdout.write(
-              c.yellow(
-                `\n${preset.label.replace(/\s*\(coming soon\)/i, '')} isn't available yet — coming soon.\n`,
-              ),
-            );
-            stdout.write(c.gray('Pick another provider for now.\n'));
-            continue;
-          }
-          draft.preset = preset;
-          draft.adapter = preset.adapter;
-          draft.baseUrl = preset.baseUrl;
-          draft.apiKey = undefined;
-          draft.authToken = undefined;
-          draft.model = undefined;
-          draft.availableModels = undefined;
-          draft.selectedModels = undefined;
-          draft.probe = undefined;
-          draft.selfHosted = undefined;
-          step =
-            preset.kind === 'custom'
-              ? 'customBaseUrl'
-              : preset.kind === 'local'
-                ? 'localBaseUrl'
-                : 'cloudSecret';
-          break;
-        }
-
-        case 'customCompatibility': {
-          const comp = await askText(
-            rl,
-            `API compatibility ${c.gray('(openai/anthropic) [openai]')} ${backHint()}: `,
-          );
-          if (comp === QUIT) return false;
-          if (comp === BACK) {
-            step = 'customSecret';
-            break;
-          }
-          const value = comp.toLowerCase();
-          if (value && value !== 'openai' && value !== 'anthropic') {
-            stdout.write(c.red('Choose openai or anthropic.\n'));
-            break;
-          }
-          draft.adapter = value === 'anthropic' ? 'anthropic' : 'openai';
-          if (draft.adapter === 'anthropic' && draft.apiKey) {
-            draft.authToken = draft.apiKey;
-            draft.apiKey = undefined;
-          }
-          // Native Anthropic requests never use OpenAI self-host-only sampling fields.
-          if (draft.adapter === 'anthropic') draft.selfHosted = false;
-          step =
-            draft.adapter === 'openai' && draft.probe?.hosting === 'unknown'
-              ? 'customSelfHosted'
-              : 'model';
-          break;
-        }
-
-        case 'customSelfHosted': {
-          const answer = await askText(
-            rl,
-            `Is this OpenAI-compatible endpoint self-hosted? ${c.gray('(enables self-hosted sampling) [y/N]')} ${backHint()}: `,
-          );
-          if (answer === QUIT) return false;
-          if (answer === BACK) {
-            step = draft.probe?.ok ? 'discoverModels' : 'customCompatibility';
-            break;
-          }
-          const value = answer.toLowerCase();
-          if (value && value !== 'y' && value !== 'yes' && value !== 'n' && value !== 'no') {
-            stdout.write(c.red('Choose yes or no.\n'));
-            break;
-          }
-          draft.selfHosted = value === 'y' || value === 'yes';
-          step = 'model';
-          break;
-        }
-
-        case 'customBaseUrl': {
-          const baseUrl = await askText(rl, `Base URL ${backHint()}: `);
-          if (baseUrl === QUIT) return false;
-          if (baseUrl === BACK) {
-            step = 'provider';
-            break;
-          }
-          if (!baseUrl) {
-            stdout.write(c.red('Base URL is required.\n'));
-            break;
-          }
-          draft.baseUrl = baseUrl;
-          step = 'customSecret';
-          break;
-        }
-
-        case 'customSecret': {
-          const secret = await askSecretStep(
-            rl,
-            `API key/token ${c.gray('(Enter to skip)')} ${backHint()}: `,
-          );
-          rl = secret.rl;
-          const key = secret.value;
-          if (key === QUIT) return false;
-          if (key === BACK) {
-            step = 'customBaseUrl';
-            break;
-          }
-          draft.apiKey = undefined;
-          draft.authToken = undefined;
-          if (key) draft.apiKey = key;
-          step = 'discoverModels';
-          break;
-        }
-
-        case 'localBaseUrl': {
-          const preset = draft.preset!;
-          const baseUrl = await askText(
-            rl,
-            `Base URL ${c.gray(`(Enter to use ${preset.baseUrl})`)} ${backHint()}: `,
-          );
-          if (baseUrl === QUIT) return false;
-          if (baseUrl === BACK) {
-            step = 'provider';
-            break;
-          }
-          // Sanitize: strips a pasted [bracket]/quote hint + validates; empty/garbage → the preset.
-          draft.baseUrl = normalizeBaseUrl(baseUrl) ?? preset.baseUrl;
-          step = 'localSecret';
-          break;
-        }
-
-        case 'localSecret': {
-          const preset = draft.preset!;
-          const secret = await askSecretStep(
-            rl,
-            `API key/token ${c.gray('(Enter to skip for local)')} ${backHint()}: `,
-          );
-          rl = secret.rl;
-          const key = secret.value;
-          if (key === QUIT) return false;
-          if (key === BACK) {
-            step = 'localBaseUrl';
-            break;
-          }
-          draft.apiKey = undefined;
-          draft.authToken = undefined;
-          if (key) {
-            if (preset.bearer || draft.adapter === 'anthropic') draft.authToken = key;
-            else draft.apiKey = key;
-          } else if (preset.bearer) {
-            draft.authToken = 'ollama';
-          }
-          step = 'discoverModels';
-          break;
-        }
-
-        case 'cloudSecret': {
-          const preset = draft.preset!;
-          if (preset.keyUrl) stdout.write(c.gray(`  Get a key: ${preset.keyUrl}\n`));
-          const secret = await askSecretStep(rl, `API key ${backHint()}: `);
-          rl = secret.rl;
-          const key = secret.value;
-          if (key === QUIT) return false;
-          if (key === BACK) {
-            step = 'provider';
-            break;
-          }
-          if (!key) {
-            stdout.write(c.red('An API key is required for this provider.\n'));
-            break;
-          }
-          draft.apiKey = key;
-          draft.authToken = undefined;
-          step = 'discoverModels';
-          break;
-        }
-
-        case 'discoverModels': {
-          const preset = draft.preset!;
-          stdout.write(c.gray('\n  Checking endpoint and fetching available models…\n'));
-          const probe = await probeModelEndpoint({
-            adapter:
-              preset.kind === 'custom'
-                ? 'auto'
-                : draft.adapter === 'anthropic'
-                  ? 'anthropic'
-                  : 'openai',
-            baseUrl: draft.baseUrl,
-            apiKey: draft.apiKey,
-            authToken: draft.authToken,
-            fallbackModels:
-              preset.recommendedModels ?? (preset.defaultModel ? [preset.defaultModel] : []),
-            hostingHint:
-              preset.kind === 'cloud'
-                ? 'hosted'
-                : preset.kind === 'local'
-                  ? 'self-hosted'
-                  : undefined,
-          });
-          draft.probe = probe;
-          draft.availableModels = probe.models;
-          if (probe.baseUrl) draft.baseUrl = probe.baseUrl;
-          if (preset.kind === 'custom' && probe.ok) {
-            draft.adapter = probe.compatibility;
-            // Auto-detection proved Anthropic compatibility with x-api-key, so retain apiKey.
-            // The manual compatibility fallback below preserves the older Bearer-token path for
-            // Anthropic-compatible self-hosted proxies whose /models route cannot be discovered.
-          }
-          if (probe.hosting === 'self-hosted') draft.selfHosted = true;
-          else if (probe.hosting === 'hosted') draft.selfHosted = false;
-
-          if (probe.ok) {
-            stdout.write(
-              c.green(
-                `  ✓ ${probe.models.length} model${probe.models.length === 1 ? '' : 's'} found`,
-              ) +
-                c.gray(
-                  ` · ${probe.compatibility} · ${probe.hosting}${probe.modelsUrl ? `\n    ${probe.modelsUrl}` : ''}\n`,
-                ),
-            );
-          } else if (probe.source === 'curated') {
-            stdout.write(
-              c.yellow('  Model listing unavailable') +
-                c.gray(
-                  ` (${probe.error ?? 'not supported'}). Showing Shadow's current recommendations instead.\n`,
-                ),
-            );
-          } else {
-            stdout.write(
-              c.yellow('  Model listing unavailable') +
-                c.gray(
-                  ` (${probe.error ?? 'not supported'}). You can still enter an exact model id.\n`,
-                ),
-            );
-          }
-
-          if (preset.kind === 'custom' && !probe.ok) {
-            step = 'customCompatibility';
-          } else if (
-            preset.kind === 'custom' &&
-            draft.adapter === 'openai' &&
-            probe.hosting === 'unknown'
-          ) {
-            step = 'customSelfHosted';
-          } else {
-            step = 'model';
-          }
-          break;
-        }
-
-        case 'model': {
-          const preset = draft.preset!;
-          const available = draft.availableModels ?? [];
-          const recommended = (
-            preset.recommendedModels ?? (preset.defaultModel ? [preset.defaultModel] : [])
-          )
-            .map(
-              (wanted) =>
-                available.find((model) => model.toLowerCase() === wanted.toLowerCase()) ?? wanted,
-            )
-            .filter((model, index, list) => model && list.indexOf(model) === index);
-          let shown = [
-            ...recommended.filter((model) => available.includes(model)),
-            ...available.filter((model) => !recommended.includes(model)),
-          ];
-          if (shown.length > 40) {
-            const query = await askText(
-              rl,
-              `Filter ${shown.length} models by name ${c.gray('(Enter shows recommendations + first matches)')} ${backHint()}: `,
-            );
-            if (query === QUIT) return false;
-            if (query === BACK) {
-              step = previousCredentialStep(preset);
-              break;
-            }
-            const matches = query
-              ? shown.filter((model) => model.toLowerCase().includes(query.toLowerCase()))
-              : shown;
-            if (matches.length === 0) {
-              stdout.write(
-                c.yellow(
-                  'No discovered model matches that filter — type an exact id at the next prompt.\n',
-                ),
-              );
-              shown = recommended.slice(0, 40);
-            } else {
-              shown = matches.slice(0, 40);
-            }
-          }
-
-          if (shown.length > 0) {
-            stdout.write('\n');
-            writeCentered([
-              c.bold(
-                draft.probe?.source === 'live'
-                  ? 'Models available to this key'
-                  : 'Recommended agentic models',
-              ),
-            ]);
-            const lines = shown.map((model, index) => {
-              const mark = recommended.some((item) => item.toLowerCase() === model.toLowerCase())
-                ? c.green(' recommended')
-                : '';
-              return `${c.bold(String(index + 1).padStart(2))}. ${model}${mark}`;
-            });
-            writeCentered(lines);
-            stdout.write('\n');
-          }
-
-          const defaults = recommended.filter((model) => shown.includes(model));
-          const defaultIndexes = defaults
-            .map((model) => shown.indexOf(model) + 1)
-            .filter((index) => index > 0)
-            .join(',');
-          const prompt = shown.length
-            ? `Models to add ${c.gray(`(numbers/ranges, e.g. 1,3-5; "all"; or exact id)${defaultIndexes ? ` [${defaultIndexes}]` : ''}`)} ${backHint()}: `
-            : `Model id ${backHint()}: `;
-          const mAns = await askText(rl, prompt);
-          if (mAns === QUIT) return false;
-          if (mAns === BACK) {
-            step = previousCredentialStep(preset);
-            break;
-          }
-          let selected: string[] | null;
-          if (!mAns && defaultIndexes) selected = defaults;
-          else selected = parseModelSelection(mAns, shown, available);
-          // Manual escape hatch for providers whose catalog is stale or unavailable.
-          if (selected === null && mAns && !mAns.includes(',') && !/^\d+(?:-\d+)?$/.test(mAns))
-            selected = [mAns];
-          if (!selected || selected.length === 0) {
-            stdout.write(c.red('Choose at least one model by number, range, or exact model id.\n'));
-            break;
-          }
-          draft.selectedModels = selected;
-          if (selected.length === 1) {
-            draft.model = selected[0];
-            step = 'transport';
-          } else {
-            step = 'defaultModel';
-          }
-          break;
-        }
-
-        case 'defaultModel': {
-          const selected = draft.selectedModels ?? [];
-          stdout.write('\n');
-          writeCentered([c.bold('Choose the default model')]);
-          writeCentered(
-            selected.map((model, index) => `${c.bold(String(index + 1).padStart(2))}. ${model}`),
-          );
-          stdout.write('\n');
-          const answer = await askText(rl, `Default model ${c.gray('[1]')} ${backHint()}: `);
-          if (answer === QUIT) return false;
-          if (answer === BACK) {
-            step = 'model';
-            break;
-          }
-          const index = answer === '' ? 0 : Number(answer) - 1;
-          if (!Number.isInteger(index) || !selected[index]) {
-            stdout.write(c.red(`Choose a number from 1 to ${selected.length}.\n`));
-            break;
-          }
-          draft.model = selected[index];
-          step = 'transport';
-          break;
-        }
-
-        case 'transport': {
-          if (draft.adapter === 'openai' && draft.model && looksAnthropicDistilled(draft.model)) {
-            stdout.write(
-              `\n${c.yellow('⚠ "' + draft.model + '" looks distilled on Claude/Anthropic.')}\n` +
-                c.gray(
-                  '  On the OpenAI transport such models often emit unparseable tool calls.\n',
-                ) +
-                c.gray(
-                  '  The Anthropic transport (e.g. Ollama /v1/messages) usually works far better.\n',
-                ),
-            );
-            const sw = await askText(
-              rl,
-              `Use the Anthropic transport instead? ${c.gray('[Y/n/back]')}: `,
-            );
-            if (sw === QUIT) return false;
-            if (sw === BACK) {
-              step = 'model';
-              break;
-            }
-            const choice = sw.toLowerCase();
-            if (choice === '' || choice === 'y' || choice === 'yes') {
-              draft.adapter = 'anthropic';
-              draft.selfHosted = false;
-              if (draft.baseUrl) draft.baseUrl = toAnthropicBaseUrl(draft.baseUrl);
-              if (draft.apiKey) {
-                draft.authToken = draft.apiKey;
-                draft.apiKey = undefined;
-              } else if (!draft.authToken) {
-                draft.authToken = 'ollama';
-              }
-              stdout.write(
-                c.gray(
-                  `  → switched to anthropic transport${draft.baseUrl ? ` (${draft.baseUrl})` : ''}\n`,
-                ),
-              );
-            }
-          }
-          step = 'test';
-          break;
-        }
-
-        case 'test': {
-          if (!draft.adapter || !draft.model || !draft.preset) {
-            step = 'provider';
-            break;
-          }
-          stdout.write(c.gray('\nTesting connection…\n'));
-          const test = await testConnection({
-            adapter: draft.adapter,
-            model: draft.model,
-            apiKey: draft.apiKey,
-            authToken: draft.authToken,
-            baseUrl: draft.baseUrl,
-          });
-          if (test.ok) {
-            stdout.write(c.green('✓ connected\n'));
-            step = 'contextCooler';
-            break;
-          }
-          stdout.write(c.red(`✗ connection test failed: ${test.error}\n`));
-          const cont = await askText(rl, `Save anyway? ${c.gray('[y/N/back]')}: `);
-          if (cont === QUIT) return false;
-          if (cont === BACK) {
-            step = 'model';
-            break;
-          }
-          const choice = cont.toLowerCase();
-          if (choice === 'y' || choice === 'yes') {
-            step = 'contextCooler';
-          } else {
-            stdout.write(c.gray('Nothing saved yet — returning to model setup.\n'));
-            step = 'model';
-          }
-          break;
-        }
-
-        case 'contextCooler': {
-          const result = await offerContextCooler(rl);
-          // A COMPLETED cloud/server draft always takes precedence over an earlier gguf save:
-          // the user who backed out of file mode and finished a cloud setup typed a key and
-          // watched it test green — discarding that (the old savedGguf-first order) silently
-          // dropped their credentials and misreported what was saved.
-          const draftComplete = Boolean(draft.preset && draft.adapter && draft.model);
-          if (result === 'quit') return savedGguf !== undefined; // durable gguf work survives a quit
-          if (result === 'back') {
-            step = draftComplete ? 'model' : savedGguf ? 'ggufPath' : 'model';
-            break;
-          }
-          // Local-file mode (no completed draft): the model + activation were already saved.
-          if (savedGguf && !draftComplete) {
-            const finale = ggufTestFailed
-              ? `\n${c.yellow('⚠ Saved, but the test FAILED')} — ${c.bold(savedGguf.label)} ${c.gray('·')} ${c.bold('local .gguf')}\n` +
-                c.gray(`  file: ${savedGguf.gguf}\n  config: ${GLOBAL_DIR}/config.json\n`) +
-                `\nFix the issue above, then verify with ${c.bold(`shadow local test ${savedGguf.label}`)} before starting a session.\n`
-              : `\n${c.green('✓ Saved')} — ${c.bold(savedGguf.label)} ${c.gray('·')} ${c.bold('local .gguf')}\n` +
-                c.gray(`  file: ${savedGguf.gguf}\n  config: ${GLOBAL_DIR}/config.json\n`) +
-                `\nRun ${c.bold('shadow')} to start — the server launches automatically. ${c.gray('(manage local models with `shadow local`)')}\n`;
-            stdout.write(finale);
-            return true;
-          }
-          const { preset, adapter, model, baseUrl, apiKey, authToken, selfHosted, selectedModels } =
-            draft;
-          if (!preset || !adapter || !model) {
-            step = 'provider';
-            break;
-          }
-          // Replace a stale lastModel with this run's explicit default. Multi-model onboarding
-          // pins the new entry label; the legacy single-target path clears the old label.
-          persistTerminalOnboardTarget({
-            adapter,
-            model,
-            baseUrl,
-            customEndpoint: preset.kind === 'custom',
-            selfHosted,
-            selectedModels,
-            entryGroup: preset.label,
-            // P1A-06 step 4: a preset shipping a wire contract persists it as a ModelEntry so the
-            // capability block + idle knob actually reach bootstrap (provider+model resolution).
-            entryExtras: preset.entry ? { label: preset.label, ...preset.entry } : undefined,
-          });
-          if (apiKey) saveCredential(adapter, { apiKey, ...(baseUrl ? { baseUrl } : {}) });
-          if (authToken) saveCredential(adapter, { authToken, ...(baseUrl ? { baseUrl } : {}) });
-
-          stdout.write(
-            `\n${c.green('✓ Saved')} — ${c.bold(preset.label)} ${c.gray('·')} ${c.bold(model)}\n` +
-              (selectedModels && selectedModels.length > 1
-                ? c.gray(
-                    `  ${selectedModels.length} models added to the picker · default: ${model}\n`,
-                  )
-                : '') +
-              c.gray(
-                `  config: ${GLOBAL_DIR}/config.json · credentials: ${GLOBAL_DIR}/credentials.json (chmod 600)\n`,
-              ) +
-              `\nRun ${c.bold('shadow')} to start. ${c.gray('(re-run `shadow onboard` to change providers)')}\n`,
-          );
-          return true;
-        }
-      }
-    }
-  } finally {
-    rl.close();
-  }
-}
-
-async function testConnection(o: {
-  adapter: ProviderName;
-  model: string;
-  apiKey?: string;
-  authToken?: string;
-  baseUrl?: string;
-}): Promise<{ ok: boolean; error?: string }> {
-  // Teach the redactor about the key BEFORE anything can echo it (C8). Provider keys are
-  // otherwise only registered at bootstrap.ts, which onboarding never reaches — so a gateway
-  // that reflects the request back in its error body (and readErrorMessage returns a non-JSON
-  // body verbatim) landed the just-typed key in the user's terminal scrollback.
-  registerSecret(o.apiKey);
-  registerSecret(o.authToken);
-  /** Never print a raw provider body: redact known secrets, then bound the length. */
-  const safeErr = (msg: string): string => {
-    const clean = redactString(msg);
-    return clean.length > 500 ? clean.slice(0, 500) + '… (truncated)' : clean;
+export async function runOnboard(options: OnboardOptions = {}): Promise<boolean> {
+  const theme = loadGlobalConfig().lastTheme;
+  const ui =
+    options.ui ??
+    (stdin.isTTY && stdout.isTTY && process.env.TERM !== 'dumb'
+      ? new TerminalOnboardUI(undefined, typeof theme === 'string' ? theme : undefined)
+      : new PlainOnboardUI());
+  const probeEndpoint = options.probe ?? probeModelEndpoint;
+  const checkConnection = options.test ?? testConnection;
+  let step: Step = 'mode';
+  let mode: OnboardMode = 'server';
+  let draft: Draft | undefined;
+  let filePath = '';
+  let local: { entry: ModelEntry; models: ModelEntry[] } | undefined;
+  let finale = 'Setup cancelled — your existing configuration is unchanged.';
+  const pick = async (screen: Screen, items: Choice[], initial?: string, search = false) => {
+    const answer = await ui.choose(screen, items, { initial, search });
+    return answer === BACK ? BACK : answer[0]!;
+  };
+  const details = () => (draft ? [draft.preset.label, draft.baseUrl ?? ''] : []);
+  const afterDiscovery = (): Step => {
+    if (draft?.preset.kind === 'custom' && !draft.probe?.ok) return 'compatibility';
+    if (
+      draft?.preset.kind === 'custom' &&
+      draft.adapter === 'openai' &&
+      draft.probe?.hosting === 'unknown'
+    )
+      return 'hosting';
+    return 'models';
   };
 
-  let provider;
   try {
-    provider = createProvider({
-      provider: o.adapter,
-      model: o.model,
-      apiKey: o.apiKey,
-      authToken: o.authToken,
-      baseUrl: o.baseUrl,
-    });
-  } catch (e) {
-    return { ok: false, error: safeErr((e as Error).message) };
-  }
-
-  const messages: Message[] = [
-    { role: 'user', content: [{ type: 'text', text: 'Reply with: ok' }] },
-  ];
-  const probe = (async (): Promise<{ ok: boolean; error?: string }> => {
-    try {
-      for await (const ev of provider.send({
-        model: o.model,
-        system: '',
-        messages,
-        tools: [],
-        maxOutputTokens: 16,
-      })) {
-        // ANY error fails the test — recoverable ones (network down, a persistent
-        // 429, a typo'd base URL that 5xx's) are exactly the broken-config cases the
-        // live test exists to catch, so they must not be saved as "✓ connected".
-        if (ev.type === 'error') return { ok: false, error: safeErr(`${ev.code}: ${ev.message}`) };
-        // Require EVIDENCE the endpoint actually generated something. Accepting a bare `usage`
-        // or `done` was the onboarding half of the non-SSE bug: a gateway ignoring `stream: true`
-        // produced exactly [usage 0/0/0, done end_turn], and onboarding printed "✓ connected" —
-        // blessing a config in which every later turn comes back blank.
-        if (ev.type === 'text' || ev.type === 'tool_call') return { ok: true };
-        if (ev.type === 'usage' && (ev.inputTokens > 0 || ev.outputTokens > 0)) return { ok: true };
+    while (true) {
+      try {
+        switch (step) {
+          case 'mode': {
+            const answer = await pick(
+              {
+                stage: 0,
+                title: 'How do you want to run Shadow?',
+                description: 'Connect a model that supports tools. No Shadow account needed.',
+              },
+              choices([
+                ['file', 'Local file', 'A GGUF file or MLX model, served on this machine'],
+                ['server', 'Model server', 'Ollama, LM Studio, vLLM, or your own endpoint'],
+                ['cloud', 'Cloud provider', 'Connect with a provider API key'],
+              ]),
+              mode,
+            );
+            if (answer === BACK) continue;
+            mode = answer as OnboardMode;
+            step = mode === 'file' ? 'file' : 'provider';
+            break;
+          }
+          case 'provider':
+          case 'browse': {
+            const browsing: boolean = step === 'browse';
+            const available = providersForMode(mode).filter(
+              (preset) => !preset.comingSoon && preset.kind !== 'custom',
+            );
+            const items = browsing
+              ? providerChoices(available)
+              : [
+                  ...providerChoices(featuredProviders(mode)),
+                  {
+                    id: '@browse',
+                    label: 'Browse all providers',
+                    detail: `${available.length} providers · type / to search`,
+                  },
+                  {
+                    id: 'custom',
+                    label: 'Custom endpoint',
+                    detail: 'Any OpenAI- or Anthropic-compatible API',
+                  },
+                ];
+            const answer = await pick(
+              {
+                stage: 0,
+                title: browsing
+                  ? 'All providers'
+                  : mode === 'cloud'
+                    ? 'Choose a cloud provider'
+                    : 'Choose a model server',
+                description: 'Your key goes only to the endpoint you choose.',
+              },
+              items,
+              draft?.preset.id,
+              browsing,
+            );
+            if (answer === BACK) {
+              step = browsing ? 'provider' : 'mode';
+              break;
+            }
+            if (answer === '@browse') {
+              step = 'browse';
+              break;
+            }
+            const preset = findPreset(answer)!;
+            if (draft?.preset.id !== preset.id)
+              draft = {
+                preset,
+                adapter: preset.adapter,
+                baseUrl: preset.baseUrl,
+                bearer: preset.bearer,
+                selected: [],
+              };
+            step = 'endpoint';
+            break;
+          }
+          case 'file': {
+            const answer = await ui.text(
+              {
+                stage: 1,
+                title: 'Choose a local model',
+                description: 'GGUF file, MLX folder, or mlx-community/model ID',
+              },
+              {
+                initial: filePath,
+                validate: (value) =>
+                  value ? undefined : 'Enter a model path or MLX repository ID.',
+              },
+            );
+            if (answer === BACK) {
+              step = 'mode';
+              break;
+            }
+            filePath = answer;
+            const models = (loadGlobalConfig().models as ModelEntry[] | undefined) ?? [];
+            const expanded = answer.startsWith('~/') ? join(homedir(), answer.slice(2)) : answer;
+            const absolute = resolve(expanded);
+            const existing = models.find(
+              (model) => model.gguf === absolute || model.mlx === answer || model.mlx === absolute,
+            );
+            if (existing) local = { entry: existing, models };
+            else {
+              const result = addLocalModel(models, { path: answer });
+              if (!result.ok) throw new Error(result.message);
+              local = result.value;
+            }
+            step = 'fileReview';
+            break;
+          }
+          case 'fileReview': {
+            const answer = await pick(
+              {
+                stage: 4,
+                title: 'Save local model',
+                description:
+                  'The server will start on first use. The model has not been tested yet.',
+                details: [local!.entry.label, filePath],
+              },
+              choices([
+                ['save', 'Save and make default'],
+                ['edit', 'Choose a different model'],
+              ]),
+            );
+            if (answer === BACK || answer === 'edit') {
+              step = 'file';
+              break;
+            }
+            const models = (loadGlobalConfig().models as ModelEntry[] | undefined) ?? [];
+            const entry = local!.entry;
+            saveGlobalConfig({
+              models: [...models.filter((model) => model.label !== entry.label), entry],
+              ...defaultModelPatch(entry),
+            });
+            finale = `Saved ${entry.label}. Run shadow to start. Test it with: shadow local test ${JSON.stringify(entry.label)}`;
+            return true;
+          }
+          case 'endpoint': {
+            const d = draft!;
+            const answer = await ui.text(
+              {
+                stage: 1,
+                title: 'Endpoint URL',
+                description: 'Confirm or edit the API base URL.',
+                details: [d.preset.label],
+              },
+              {
+                initial: d.baseUrl ?? '',
+                placeholder: 'http://localhost:8000/v1',
+                validate: validateOnboardUrl,
+              },
+            );
+            if (answer === BACK) {
+              step = 'provider';
+              break;
+            }
+            const baseUrl = normalizeBaseUrl(answer)!;
+            if (baseUrl !== d.baseUrl) {
+              if (!d.baseUrl || new URL(baseUrl).origin !== new URL(d.baseUrl).origin)
+                d.key = undefined;
+              d.probe = undefined;
+              d.selected = [];
+              d.model = undefined;
+              d.test = undefined;
+              d.adapter = d.preset.adapter;
+              d.bearer = d.preset.bearer;
+            }
+            d.baseUrl = baseUrl;
+            step = 'key';
+            break;
+          }
+          case 'key': {
+            const d = draft!;
+            const required = d.preset.kind === 'cloud';
+            const answer = await ui.text(
+              {
+                stage: 1,
+                title: 'API key',
+                description: required
+                  ? 'Paste your provider key. Input stays hidden.'
+                  : 'Paste a key, or leave blank if your server needs none.',
+                details: [
+                  ...details(),
+                  ...(d.preset.keyUrl ? [`Get a key: ${d.preset.keyUrl}`] : []),
+                ],
+              },
+              {
+                initial: d.key,
+                secret: true,
+                placeholder: required ? 'Paste your API key' : 'Enter to skip',
+                validate: (value) =>
+                  required && !value
+                    ? 'This provider requires an API key.'
+                    : /\s/.test(value)
+                      ? 'The key contains whitespace. Paste the key without extra text.'
+                      : undefined,
+              },
+            );
+            if (answer === BACK) {
+              step = 'endpoint';
+              break;
+            }
+            d.key = answer || (d.preset.bearer ? 'ollama' : undefined);
+            registerSecret(d.key);
+            d.test = undefined;
+            step = 'discover';
+            break;
+          }
+          case 'discover': {
+            const d = draft!;
+            const probe = await ui.busy(
+              {
+                stage: 2,
+                title: 'Discover models',
+                description: 'Checking the catalog · up to 6 seconds',
+                details: details(),
+              },
+              (signal) =>
+                probeEndpoint({
+                  adapter:
+                    d.preset.kind === 'custom'
+                      ? 'auto'
+                      : d.adapter === 'anthropic'
+                        ? 'anthropic'
+                        : 'openai',
+                  baseUrl: d.baseUrl,
+                  ...credentials(d),
+                  signal,
+                  fallbackModels:
+                    d.preset.recommendedModels ??
+                    (d.preset.defaultModel ? [d.preset.defaultModel] : []),
+                  hostingHint:
+                    d.preset.kind === 'cloud'
+                      ? 'hosted'
+                      : d.preset.kind === 'local'
+                        ? 'self-hosted'
+                        : undefined,
+                }),
+            );
+            if (probe === BACK) {
+              step = 'key';
+              break;
+            }
+            d.probe = probe;
+            if (probe.baseUrl) d.baseUrl = probe.baseUrl;
+            if (probe.ok && d.preset.kind === 'custom') d.adapter = probe.compatibility;
+            d.selfHosted = probe.hosting === 'self-hosted';
+            step = probe.ok ? afterDiscovery() : 'discoveryFailure';
+            break;
+          }
+          case 'discoveryFailure': {
+            const d = draft!;
+            const answer = await pick(
+              {
+                stage: 2,
+                title: 'Model discovery unavailable',
+                description: 'Your entries are kept. You can retry or continue with a model ID.',
+                details: details(),
+                error: d.probe?.error,
+              },
+              choices([
+                [
+                  'continue',
+                  d.probe?.models.length
+                    ? 'Use suggested models / enter an ID'
+                    : 'Enter a model ID',
+                ],
+                ['retry', 'Retry discovery'],
+                ['endpoint', 'Edit endpoint'],
+                ['key', 'Edit API key'],
+              ]),
+            );
+            step =
+              answer === BACK
+                ? 'key'
+                : answer === 'retry'
+                  ? 'discover'
+                  : answer === 'endpoint'
+                    ? 'endpoint'
+                    : answer === 'key'
+                      ? 'key'
+                      : afterDiscovery();
+            break;
+          }
+          case 'compatibility': {
+            const answer = await pick(
+              {
+                stage: 1,
+                title: 'API format',
+                description:
+                  'Discovery could not detect the format. Choose what your server supports.',
+              },
+              choices([
+                ['openai', 'OpenAI-compatible', 'Chat Completions API'],
+                ['anthropic', 'Anthropic-compatible', 'Messages API'],
+              ]),
+              draft!.adapter,
+            );
+            if (answer === BACK) {
+              step = 'key';
+              break;
+            }
+            draft!.adapter = answer as ProviderName;
+            draft!.bearer = answer === 'anthropic';
+            step =
+              answer === 'openai' && draft!.probe?.hosting === 'unknown' ? 'hosting' : 'models';
+            break;
+          }
+          case 'hosting': {
+            const answer = await pick(
+              {
+                stage: 1,
+                title: 'Who runs this endpoint?',
+                description: 'This sets the connection timeout and local model options.',
+              },
+              choices([
+                ['hosted', 'A hosted provider'],
+                [
+                  'self',
+                  'I run this server',
+                  'Your own machine, rented GPU, or private model server',
+                ],
+              ]),
+              draft!.selfHosted ? 'self' : 'hosted',
+            );
+            if (answer === BACK) {
+              step = 'key';
+              break;
+            }
+            draft!.selfHosted = answer === 'self';
+            step = 'models';
+            break;
+          }
+          case 'models': {
+            const d = draft!;
+            const available = d.probe?.models ?? [];
+            if (!available.length) {
+              step = 'manual';
+              break;
+            }
+            const preferred = d.preset.recommendedModels ?? [d.preset.defaultModel];
+            const ordered = [
+              ...available.filter((id) => preferred.includes(id)),
+              ...available.filter((id) => !preferred.includes(id)),
+            ];
+            const answer = await ui.choose(
+              {
+                stage: 2,
+                title: 'Choose models',
+                description: 'Enter picks one · Space selects several · / searches all models',
+                details: [
+                  `${d.preset.label} · ${available.length} ${d.probe?.source === 'live' ? 'available' : 'suggested'} models`,
+                ],
+              },
+              [
+                ...ordered.map((id) => ({
+                  id,
+                  label: id,
+                  detail: preferred.includes(id)
+                    ? 'Recommended · choose a model with tool support'
+                    : undefined,
+                })),
+                {
+                  id: '@manual',
+                  label: 'Enter a model ID…',
+                  detail: 'Use an exact ID that is not in the catalog',
+                },
+              ],
+              {
+                search: true,
+                multiple: true,
+                selected: d.selected.filter((id) => available.includes(id)),
+                initial: d.model,
+              },
+            );
+            if (answer === BACK) {
+              step = 'key';
+              break;
+            }
+            if (answer.includes('@manual')) {
+              if (answer[1]) d.model = answer[1];
+              step = 'manual';
+              break;
+            }
+            d.selected = answer;
+            step = answer.length > 1 ? 'default' : 'transport';
+            if (answer.length === 1) d.model = answer[0];
+            break;
+          }
+          case 'manual': {
+            const answer = await ui.text(
+              {
+                stage: 2,
+                title: 'Model ID',
+                description: 'Use the exact ID served by your endpoint.',
+                details: details(),
+              },
+              { initial: draft!.model ?? '', validate: modelError },
+            );
+            if (answer === BACK) {
+              step = draft!.probe?.models.length ? 'models' : 'key';
+              break;
+            }
+            draft!.model = answer;
+            draft!.selected = [answer];
+            step = 'transport';
+            break;
+          }
+          case 'default': {
+            const answer = await pick(
+              {
+                stage: 2,
+                title: 'Default model',
+                description: 'The other selected models will be available in /model.',
+              },
+              draft!.selected.map((id) => ({ id, label: id })),
+              draft!.model,
+            );
+            if (answer === BACK) {
+              step = 'models';
+              break;
+            }
+            draft!.model = answer;
+            step = 'transport';
+            break;
+          }
+          case 'transport': {
+            const d = draft!;
+            if (
+              d.adapter === 'openai' &&
+              d.preset.kind !== 'cloud' &&
+              looksAnthropicDistilled(d.model!)
+            ) {
+              const answer = await pick(
+                {
+                  stage: 3,
+                  title: 'Model compatibility',
+                  description:
+                    'This model may work better with an Anthropic-compatible server route.',
+                },
+                choices([
+                  ['keep', 'Keep OpenAI format'],
+                  [
+                    'anthropic',
+                    'Use Anthropic format',
+                    'Only if your endpoint supports the Messages API',
+                  ],
+                ]),
+              );
+              if (answer === BACK) {
+                step = 'models';
+                break;
+              }
+              if (answer === 'anthropic') {
+                d.adapter = 'anthropic';
+                d.baseUrl = toAnthropicBaseUrl(d.baseUrl!);
+                d.bearer = true;
+                d.selfHosted = false;
+                d.key ||= 'ollama';
+              }
+            }
+            d.test = undefined;
+            step = 'test';
+            break;
+          }
+          case 'test': {
+            const d = draft!;
+            const result = await ui.busy(
+              {
+                stage: 3,
+                title: 'Test connection',
+                description: 'Requesting a short reply · up to 30 seconds',
+                details: [...details(), d.model!],
+              },
+              (signal) =>
+                checkConnection(
+                  {
+                    provider: d.adapter,
+                    model: d.model!,
+                    baseUrl: d.baseUrl,
+                    ...credentials(d),
+                    selfHosted: d.selfHosted,
+                    capabilities:
+                      d.model === d.preset.defaultModel ? d.preset.entry?.capabilities : undefined,
+                  },
+                  signal,
+                ),
+            );
+            if (result === BACK) {
+              step = 'models';
+              break;
+            }
+            d.test = result;
+            step = result.ok ? 'review' : 'testFailure';
+            break;
+          }
+          case 'testFailure': {
+            const answer = await pick(
+              {
+                stage: 3,
+                title: 'Connection needs attention',
+                description: 'Nothing has been saved. Your setup entries are still here.',
+                error: draft!.test?.error,
+                details: details(),
+              },
+              choices([
+                ['retry', 'Retry connection'],
+                ['endpoint', 'Edit endpoint'],
+                ['key', 'Edit API key'],
+                ['models', 'Choose another model'],
+                ['save', 'Continue without a successful test'],
+              ]),
+            );
+            step =
+              answer === BACK
+                ? 'models'
+                : answer === 'retry'
+                  ? 'test'
+                  : answer === 'save'
+                    ? 'review'
+                    : (answer as Step);
+            break;
+          }
+          case 'review': {
+            const d = draft!;
+            const answer = await pick(
+              {
+                stage: 4,
+                title: 'Review and save',
+                description: d.test?.ok
+                  ? 'Connection verified. Save these models and make the default active.'
+                  : 'Connection unverified. Save only if you want to fix it later.',
+                details: [
+                  d.preset.label,
+                  d.baseUrl!,
+                  `Default: ${d.model}`,
+                  `${d.selected.length} model${d.selected.length === 1 ? '' : 's'} · key ${d.key ? 'provided (hidden)' : 'not provided'}`,
+                ],
+              },
+              choices([
+                ['save', d.test?.ok ? 'Save and finish' : 'Save unverified setup'],
+                ['endpoint', 'Edit endpoint'],
+                ['key', 'Edit API key'],
+                ['models', 'Change models'],
+              ]),
+            );
+            if (answer === BACK) {
+              step = 'models';
+              break;
+            }
+            if (answer !== 'save') {
+              step = answer as Step;
+              break;
+            }
+            if (vaultExists() && !vaultUnlocked()) {
+              let message = '';
+              let back = false;
+              const unlocked = await unlockExistingVault(
+                (text) => {
+                  message = text;
+                },
+                async () => {
+                  const password = await ui.text(
+                    {
+                      stage: 4,
+                      title: 'Unlock saved credentials',
+                      description: 'Enter your vault password to save the new key.',
+                      error: message || undefined,
+                    },
+                    { secret: true },
+                  );
+                  if (password === BACK) {
+                    back = true;
+                    return '';
+                  }
+                  return password;
+                },
+              );
+              if (back) break;
+              if (unlocked !== 'ok')
+                throw new Error('Vault remains locked. Unlock it to save your new endpoint key.');
+            }
+            const credentialRef = `onboard-${d.adapter}-${createHash('sha256').update(d.baseUrl!).digest('hex').slice(0, 20)}`;
+            saveCredential(credentialRef, {
+              apiKey: undefined,
+              authToken: undefined,
+              ...credentials(d),
+              baseUrl: d.baseUrl,
+              noAuth: d.key ? undefined : true,
+            });
+            persistTerminalOnboardTarget({
+              adapter: d.adapter,
+              model: d.model!,
+              baseUrl: d.baseUrl,
+              customEndpoint: d.preset.kind === 'custom',
+              selfHosted: d.selfHosted,
+              selectedModels: d.selected,
+              entryGroup: d.preset.label,
+              credentialRef,
+              entryExtras: d.preset.entry
+                ? { label: d.preset.label, ...d.preset.entry }
+                : undefined,
+            });
+            finale = `Saved ${d.preset.label} · ${d.model}${d.test?.ok ? ' · connection verified' : ' · connection unverified'}.\nRun shadow to start. Use /model to switch between your selected models.`;
+            return true;
+          }
+        }
+      } catch (error) {
+        if (error instanceof OnboardCancelled) throw error;
+        const answer = await pick(
+          {
+            stage: step === 'review' || step === 'fileReview' ? 4 : 1,
+            title: 'Setup needs attention',
+            description: 'Your entries are kept. Fix the issue and retry.',
+            error: safeError(error),
+          },
+          choices([
+            ['retry', 'Retry this step'],
+            ['endpoint', 'Return to connection setup'],
+          ]),
+        );
+        if (answer === BACK || answer === 'endpoint')
+          step = draft && mode !== 'file' ? 'endpoint' : 'mode';
       }
-      return {
-        ok: false,
-        error:
-          'the endpoint accepted the request but produced no output — check the model id, and any ' +
-          'gateway in front of it (one that ignores `stream: true` looks exactly like this)',
-      };
-    } catch (e) {
-      return { ok: false, error: safeErr((e as Error).message) };
     }
-  })();
-  const timeout = new Promise<{ ok: boolean; error?: string }>((res) =>
-    setTimeout(() => res({ ok: false, error: 'timed out after 30s' }), 30_000),
-  );
-  return Promise.race([probe, timeout]);
-}
-
-/**
- * Prompt that masks typed input with `*`.
- *
- * `rl` is a node:readline/promises Interface — that class does NOT expose `_writeToOutput`, so
- * hooking it is inert and every keystroke echoes in cleartext (verified on Node 22–26: an API
- * key lands in tmux/terminal scrollback and recordings). Close the promises interface and read
- * the secret through a node:readline interface, whose hook works — closing first also guarantees
- * the wizard's only stdin consumer is the masked reader, so nothing else can echo the key.
- * Returns a fresh promises interface for the rest of the wizard.
- */
-async function askSecret(
-  rl: readline.Interface,
-  query: string,
-): Promise<{ value: string; rl: readline.Interface }> {
-  rl.close();
-  const secretRl = readlineCore.createInterface({ input: stdin, output: stdout });
-  const iface = secretRl as unknown as { _writeToOutput?: (s: string) => void };
-  const orig = iface._writeToOutput?.bind(secretRl);
-  let promptShown = false;
-  if (orig) {
-    iface._writeToOutput = (s: string) => {
-      // Only the FIRST prompt write passes through verbatim. Later writes are line refreshes
-      // (prompt + the typed line), so passing them through would echo the secret on every
-      // backspace/arrow-key redraw — mask everything else.
-      if (!promptShown && s.includes(query)) {
-        promptShown = true;
-        orig(s);
-      } else {
-        orig(s.replace(/[^\r\n]/g, '*'));
-      }
-    };
-  }
-  try {
-    // node:readline's question() is callback-style (the promises class is the one without the
-    // masking hook). A close while the question is pending rejects — same as the promises
-    // interface did — so an EOF'd stdin cannot spin the wizard into an empty-answer loop.
-    const value = await new Promise<string>((res, rej) => {
-      secretRl.once('close', () => rej(new Error('input stream closed before the secret was entered')));
-      secretRl.question(query, (answer) => res(answer));
-    });
-    return { value: value.trim(), rl: readline.createInterface({ input: stdin, output: stdout }) };
+  } catch (error) {
+    if (!(error instanceof OnboardCancelled))
+      finale = `Setup could not complete: ${safeError(error)}. Run shadow onboard to retry.`;
+    return false;
   } finally {
-    if (orig) iface._writeToOutput = orig;
-    secretRl.close();
-    stdout.write('\n');
+    ui.close();
+    stdout.write('\n' + finale + '\n');
   }
 }

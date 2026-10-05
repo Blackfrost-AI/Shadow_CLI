@@ -426,6 +426,7 @@ export function formatPrivacyReport(r: PrivacyReport, color = true): string {
     L.push(`  ${dot(e.active)} ${e.name} ${c.dim}→${c.reset} ${e.target} ${scope}`);
     if (e.note) L.push(`      ${c.dim}${e.note}${c.reset}`);
   }
+  L.push(`  ${c.dim}Setup checks contact only the selected endpoint. Provider key-creation links are displayed, not fetched.${c.reset}`);
   L.push('');
   const credColor = r.credentials.store === 'plaintext' ? c.red : r.credentials.store === 'vault' ? c.green : c.dim;
   L.push(`${c.bold}Credentials at rest${c.reset}  ${credColor}${r.credentials.store}${c.reset}`);

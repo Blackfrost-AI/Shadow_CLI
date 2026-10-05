@@ -20,7 +20,7 @@ export interface PresetEntryExtras {
  * default model, and how to authenticate. The user can always override the model.
  */
 export interface ProviderPreset {
-  /** Catalog key (also the credentials-store key). */
+  /** Catalog key used by menus and browser setup. */
   id: string;
   label: string;
   /** Which Shadow adapter speaks to it. */
@@ -225,8 +225,87 @@ export const PROVIDERS: ProviderPreset[] = [
     },
   },
   {
+    // Sources for these bases are linked in docs/USER_GUIDE.md. Model discovery supplies
+    // account-specific IDs; avoid pinning a soon-to-be-retired model as a hidden default.
+    id: 'cerebras',
+    label: 'Cerebras',
+    adapter: 'openai',
+    baseUrl: 'https://api.cerebras.ai/v1',
+    defaultModel: '',
+    kind: 'cloud',
+    keyUrl: 'https://cloud.cerebras.ai',
+    promptModel: true,
+  },
+  {
+    id: 'fireworks',
+    label: 'Fireworks AI',
+    adapter: 'openai',
+    baseUrl: 'https://api.fireworks.ai/inference/v1',
+    defaultModel: '',
+    kind: 'cloud',
+    keyUrl: 'https://app.fireworks.ai',
+    promptModel: true,
+  },
+  {
+    id: 'deepinfra',
+    label: 'DeepInfra',
+    adapter: 'openai',
+    baseUrl: 'https://api.deepinfra.com/v1/openai',
+    defaultModel: '',
+    kind: 'cloud',
+    keyUrl: 'https://deepinfra.com/dash',
+    promptModel: true,
+  },
+  {
+    id: 'huggingface',
+    label: 'Hugging Face',
+    adapter: 'openai',
+    baseUrl: 'https://router.huggingface.co/v1',
+    defaultModel: '',
+    kind: 'cloud',
+    keyUrl: 'https://huggingface.co/settings/tokens',
+    promptModel: true,
+  },
+  {
+    id: 'nvidia',
+    label: 'NVIDIA NIM',
+    adapter: 'openai',
+    baseUrl: 'https://integrate.api.nvidia.com/v1',
+    defaultModel: '',
+    kind: 'cloud',
+    keyUrl: 'https://build.nvidia.com',
+    promptModel: true,
+  },
+  {
+    id: 'vllm',
+    label: 'vLLM',
+    adapter: 'openai',
+    baseUrl: 'http://localhost:8000/v1',
+    defaultModel: '',
+    kind: 'local',
+    promptModel: true,
+  },
+  {
+    id: 'sglang',
+    label: 'SGLang',
+    adapter: 'openai',
+    baseUrl: 'http://localhost:30000/v1',
+    defaultModel: '',
+    kind: 'local',
+    promptModel: true,
+  },
+  {
+    id: 'llamacpp',
+    label: 'llama.cpp',
+    adapter: 'openai',
+    baseUrl: 'http://localhost:8080/v1',
+    defaultModel: '',
+    kind: 'local',
+    promptModel: true,
+  },
+  {
     id: 'custom',
-    label: 'Custom endpoint (you supply everything)',
+    label: 'Custom endpoint',
     adapter: 'openai',
     defaultModel: '',
     kind: 'custom',
@@ -250,4 +329,12 @@ export function providersForMode(mode: OnboardMode): ProviderPreset[] {
   if (mode === 'file') return [];
   if (mode === 'server') return PROVIDERS.filter((p) => p.kind === 'local' || p.kind === 'custom');
   return PROVIDERS.filter((p) => p.kind === 'cloud' || p.kind === 'custom');
+}
+
+/** Keep the first provider screen small; the searchable browser exposes the full catalog. */
+export function featuredProviders(mode: OnboardMode): ProviderPreset[] {
+  const ids = mode === 'cloud'
+    ? ['anthropic', 'openai', 'gemini', 'openrouter', 'zai']
+    : ['ollama', 'lmstudio', 'vllm', 'sglang', 'llamacpp'];
+  return ids.flatMap((id) => providersForMode(mode).filter((preset) => preset.id === id && !preset.comingSoon));
 }

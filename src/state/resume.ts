@@ -6,11 +6,13 @@ export interface ResumableSession {
   path: string;
   id: string;
   ts: string;
+  title: string;
 }
 
 export interface ResumeMeta {
   sessionId: string;
   sessionPath: string;
+  title: string;
   snapshotTs?: string;
   turn?: number;
   subAgentTasks?: any[];
@@ -34,6 +36,7 @@ export function listResumableSessions(workspaceRoot: string): ResumableSession[]
       path,
       id: SessionLog.sessionIdFromPath(path),
       ts: info.ts ?? sessionTsFromPath(path),
+      title: SessionLog.titleFor(path) || 'Untitled session',
     });
   }
   return out;
@@ -56,6 +59,7 @@ export function resumeSession(
     meta: {
       sessionId: SessionLog.sessionIdFromPath(sessionPath),
       sessionPath,
+      title: SessionLog.titleFor(sessionPath),
       snapshotTs: record?.ts as string | undefined,
       turn: typeof record?.turn === 'number' ? record.turn : undefined,
       subAgentTasks: (data as any).subAgentTasks,

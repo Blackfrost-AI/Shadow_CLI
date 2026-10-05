@@ -1,3 +1,4 @@
+import { withDeadline } from './deadline.js';
 import { isLocalBaseUrl } from '../safety/offline.js';
 import { shadowFetch } from '../safety/egress.js';
 import { registerSecret, redactString } from '../util/redact.js';
@@ -29,6 +30,7 @@ export interface ProbeEndpointOptions {
   /** Catalog providers are known hosted; local presets are known self-hosted. */
   hostingHint?: Exclude<EndpointHosting, 'unknown'>;
   timeoutMs?: number;
+  signal?: AbortSignal;
   /** Test seam. Production always uses Shadow's audited egress broker. */
   fetcher?: ProbeFetch;
 }
@@ -129,18 +131,24 @@ export function parseModelCatalog(body: unknown): string[] | null {
   return unique(ids);
 }
 
-async function readBoundedJson(response: Response): Promise<unknown> {
+async function readBoundedJson(response: Response, signal: AbortSignal): Promise<unknown> {
   const declared = Number(response.headers.get('content-length') ?? '0');
   if (Number.isFinite(declared) && declared > MAX_CATALOG_BYTES) {
     throw new Error('model catalog is larger than 2 MiB');
   }
   if (!response.body) return null;
   const reader = response.body.getReader();
+  const abort = () => {
+    void reader.cancel(signal.reason).catch(() => undefined);
+  };
+  signal.addEventListener('abort', abort, { once: true });
   const chunks: Uint8Array[] = [];
   let bytes = 0;
   try {
     while (true) {
+      signal.throwIfAborted();
       const { done, value } = await reader.read();
+      signal.throwIfAborted();
       if (done) break;
       if (!value) continue;
       bytes += value.byteLength;
@@ -151,6 +159,7 @@ async function readBoundedJson(response: Response): Promise<unknown> {
     await reader.cancel().catch(() => undefined);
     throw error;
   } finally {
+    signal.removeEventListener('abort', abort);
     reader.releaseLock();
   }
   const merged = new Uint8Array(bytes);
@@ -172,9 +181,19 @@ async function readBoundedJson(response: Response): Promise<unknown> {
  * Named so the intent is legible at the call site rather than an inline string match.
  */
 function isUnreachableError(error: unknown): boolean {
-  const code = (error as { cause?: { code?: string }; code?: string } | undefined);
+  const code = error as { cause?: { code?: string }; code?: string } | undefined;
   const c = code?.cause?.code ?? code?.code ?? '';
-  if (['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN', 'EHOSTUNREACH', 'ENETUNREACH', 'ECONNRESET'].includes(c)) return true;
+  if (
+    [
+      'ECONNREFUSED',
+      'ENOTFOUND',
+      'EAI_AGAIN',
+      'EHOSTUNREACH',
+      'ENETUNREACH',
+      'ECONNRESET',
+    ].includes(c)
+  )
+    return true;
   const msg = error instanceof Error ? error.message : String(error);
   // A TIMEOUT counts too. The candidates differ only by a PATH on the same origin, so a host that
   // swallowed one request is not going to answer the other — and a black-holed route (a VPN that is
@@ -184,7 +203,9 @@ function isUnreachableError(error: unknown): boolean {
   // whenever their inference box is off.
   const name = (error as { name?: string } | undefined)?.name ?? '';
   if (name === 'TimeoutError' || name === 'AbortError') return true;
-  return /ECONNREFUSED|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH|fetch failed|timed out|timeout/i.test(msg);
+  return /ECONNREFUSED|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH|fetch failed|timed out|timeout/i.test(
+    msg,
+  );
 }
 
 function safeError(error: unknown): string {
@@ -244,52 +265,62 @@ export async function probeModelEndpoint(
   const timeoutMs = options.timeoutMs ?? 6_000;
   let lastError = 'model discovery is not supported by this endpoint';
 
-  for (const adapter of adapters) {
-    for (const candidate of modelEndpointCandidates(baseUrl, adapter)) {
-      const signal = AbortSignal.timeout(timeoutMs);
-      let response: Response;
-      try {
-        const fetcher: ProbeFetch =
-          options.fetcher ??
-          ((url, init) => shadowFetch(url, init, { purpose: 'provider', origin: 'user' }));
-        response = await fetcher(candidate.url, {
-          method: 'GET',
-          headers: authHeaders(adapter, options.apiKey, options.authToken),
-          redirect: 'error',
-          signal,
-        });
-      } catch (error) {
-        lastError = safeError(error);
-        // A dead host fails every path variant identically; stop rather than serially re-timing-out.
-        if (isUnreachableError(error)) return fallback(lastError);
-        continue;
-      }
-      if (!response.ok) {
-        lastError = `model catalog returned HTTP ${response.status}`;
-        await response.body?.cancel().catch(() => undefined);
-        continue;
-      }
-      try {
-        const parsed = parseModelCatalog(await readBoundedJson(response));
-        if (!parsed) {
-          lastError = 'model catalog returned an unrecognized response';
-          continue;
+  try {
+    return await withDeadline(
+      async (signal) => {
+        for (const adapter of adapters) {
+          for (const candidate of modelEndpointCandidates(baseUrl, adapter)) {
+            signal.throwIfAborted();
+            let response: Response;
+            try {
+              const fetcher: ProbeFetch =
+                options.fetcher ??
+                ((url, init) => shadowFetch(url, init, { purpose: 'provider', origin: 'user' }));
+              response = await fetcher(candidate.url, {
+                method: 'GET',
+                headers: authHeaders(adapter, options.apiKey, options.authToken),
+                redirect: 'error',
+                signal,
+              });
+            } catch (error) {
+              lastError = safeError(error);
+              // A dead host fails every path variant identically; stop rather than serially re-timing-out.
+              if (isUnreachableError(error)) return fallback(lastError);
+              continue;
+            }
+            if (!response.ok) {
+              lastError = `model catalog returned HTTP ${response.status}`;
+              await response.body?.cancel().catch(() => undefined);
+              continue;
+            }
+            try {
+              const parsed = parseModelCatalog(await readBoundedJson(response, signal));
+              if (!parsed) {
+                lastError = 'model catalog returned an unrecognized response';
+                continue;
+              }
+              return {
+                ok: true,
+                models: parsed,
+                source: 'live',
+                compatibility: adapter,
+                hosting: hostingFor(candidate.baseUrl, options.hostingHint),
+                baseUrl: candidate.baseUrl,
+                modelsUrl: candidate.url,
+              };
+            } catch (error) {
+              lastError = safeError(error);
+            }
+          }
         }
-        return {
-          ok: true,
-          models: parsed,
-          source: 'live',
-          compatibility: adapter,
-          hosting: hostingFor(candidate.baseUrl, options.hostingHint),
-          baseUrl: candidate.baseUrl,
-          modelsUrl: candidate.url,
-        };
-      } catch (error) {
-        lastError = safeError(error);
-      }
-    }
+        return fallback(lastError);
+      },
+      timeoutMs,
+      options.signal,
+    );
+  } catch (error) {
+    return fallback(safeError(error));
   }
-  return fallback(lastError);
 }
 
 /** Parse terminal multi-selection such as `1,3-5`, `all`, or exact model IDs. */

@@ -45,6 +45,37 @@ shadow onboard
 It walks you through picking a provider (Anthropic, any OpenAI-compatible endpoint, Gemini, a local
 llama.cpp/Ollama server, …), entering a base URL + key, and saves a model preset.
 
+The terminal wizard uses the same retro banner and theme as your session. Start with **Local file**,
+**Model server**, or **Cloud provider**. Each provider menu shows five shortcuts, **Browse all providers**,
+and **Custom endpoint**. The full list scrolls and supports search; no provider is hidden permanently.
+
+- **↑/↓**, then **Enter**: choose an item. A typed number also requires Enter.
+- **/**: search the provider or model list, including items outside the visible page.
+- **Space**: select several models; Enter continues to the default-model choice.
+- **Esc**: clear search first, then go back. During a check, cancel the check and return to setup.
+- **Ctrl+C**: quit. Configuration changes happen only at **Save and finish**.
+
+Keys remain masked when pasted or edited. Endpoint discovery has one six-second deadline, and the
+connection check has a thirty-second deadline. Failed checks keep your entries and offer retry,
+endpoint/key editing, another model, or an explicitly unverified save. The review screen shows the
+endpoint, default model, model count, and connection status. It never displays your key.
+
+Each endpoint gets its own credential reference, so adding another provider preserves previous
+provider keys. If you already use an encrypted vault, setup unlocks it before saving into it.
+Keyless servers explicitly use no authentication instead of inheriting a cloud key. Local files are
+registered on confirmation and start on first use; run `shadow local test <name>` to test one.
+Optional MCP extensions can be configured after connecting a model through `/mcp`.
+
+The expanded catalog includes [Cerebras](https://inference-docs.cerebras.ai/resources/openai),
+[Fireworks](https://docs.fireworks.ai/tools-sdks/openai-compatibility),
+[DeepInfra](https://docs.deepinfra.com/chat/overview),
+[Hugging Face](https://huggingface.co/docs/inference-providers/en/index), and
+[NVIDIA NIM](https://docs.api.nvidia.com/nim/reference/llm-apis). These presets use their documented
+compatible endpoints and discover model IDs from the account instead of pinning a model that may
+be retired. Server choices also include [vLLM](https://docs.vllm.ai/en/stable/serving/openai_compatible_server.html),
+[SGLang](https://github.com/sgl-project/sglang/blob/main/docs/docs/get-started/quickstart.mdx), and
+[llama.cpp](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md).
+
 Once you have presets, switch between them live in the HUD with **`/model`** (↑/↓ to select, Enter to
 switch). Each preset can carry its **own** base URL and key, so you can keep a local model and a cloud
 model side by side and hop between them mid-session without losing context.
@@ -329,6 +360,13 @@ a follow-up. The normal terminal paste command inserts a draft without submittin
   (files untouched), **`--code-only`** restores only the files (conversation untouched). After a
   rewind the composer is prefilled with the first undone prompt, so you can rephrase and resubmit.
   `/resume` loads a prior session from its last snapshot.
+- **Keep track of named sessions**: the opening prompt becomes a short session name, generated
+  locally without another model request. It appears in the terminal title (`Website launch — Shadow`),
+  `/session`, `/sessions`, and `/resume`. Type `/resume ` followed by part of a name to filter the
+  choices; selecting a row uses its stable session ID. Use `/rename Website launch` to choose a
+  name yourself. Names survive restarts, resumes and forks. `/new` (or `/clear`) starts a separate
+  conversation so the previous named session stays available. Older logs get a name from their
+  first readable prompt when available. Closing Shadow restores the terminal's previous title.
 - **Vim editing (`/vim`, Ink only)**: the composer gets a vim NORMAL/INSERT model — **Esc** enters NORMAL;
   `i` `a` `I` `A` (and `o`/`O`, which open a new line) enter INSERT. Motions: `h l 0 $ w b e j k`
   plus in-line finds `f`/`F`/`t`/`T` — repeat the last find with `;`, reverse it with `,`. Edits:

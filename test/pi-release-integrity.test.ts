@@ -167,6 +167,7 @@ test('pi /clear resets every conversation-scoped approval, read, attachment, tod
       version: '9.0.0-test',
       cfg: { provider: 'mock', model: 'mock-model', models: [], contextBudget: 128_000, sandbox: 'auto' },
       context: { reset: () => contextResets++ },
+      sessionLog: SessionLog.open(root),
       todoList,
       planMode: planModeState,
     },

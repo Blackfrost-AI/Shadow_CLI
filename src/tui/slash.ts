@@ -49,6 +49,7 @@ import { ProjectMemory } from '../state/memory.js';
 import { listResumableSessions, resumeSession } from '../state/resume.js';
 import { rewindToTurn, type RewindableTurn } from '../state/rewind.js';
 import { SessionLog } from '../state/session.js';
+import { normalizeSessionTitle } from '../state/sessionTitle.js';
 import { readLatestWorkCenterSnapshot, recordWorkCenterSnapshot } from '../state/workCenterPersistence.js';
 import { customStyleNames, type OutputStyle } from '../styles.js';
 import { imageMediaType, MAX_IMAGE_BYTES } from '../util/image.js';
@@ -422,6 +423,18 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
     }
     case '/new':
     case '/clear':
+      if (runningRef.current) {
+        pushLine({ text: 'Finish the current turn before starting a new session.', dimColor: true });
+        break;
+      }
+      try {
+        const previous = sessionLogRef.current;
+        sessionLogRef.current = SessionLog.open(opts.workspaceRoot);
+        previous.close?.();
+      } catch {
+        pushLine({ text: 'Could not start a new session.', color: C.red });
+        break;
+      }
       ctx.resetActivity?.();
       // isTTY-gated like every sibling escape site (reflow, theme, paste, mouse, startupSequence
       // all are). This one was not, so it leaked 2J/3J into pipes and files — and since several
@@ -462,8 +475,7 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
       setStatus('0 tokens');
       loadCustomCommands(); // F10-07: pick up any commands added since launch
       fileListLoadedRef.current = false; // F08-04: re-walk for @-mentions on next use
-      // Same log path — the size-keyed gate makes this a no-op re-list unless something else
-      // appended; keeps the /rewind menu consistent no matter what /clear evolves to touch.
+      // The new conversation has its own log; earlier named sessions remain resumable.
       refreshRewindTurns();
       // Exit plan mode for REAL, not just in React state (D2). setPlanMode alone changed the
       // badge while PlanModeState stayed active — so plan.block() kept going into the system
@@ -1114,6 +1126,11 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
           triggerRatio: opts.cfg.summarizeTriggerRatio,
           keepLastTurns: opts.cfg.keepLastTurns,
         });
+        const previous = sessionLogRef.current;
+        const log = SessionLog.open(opts.workspaceRoot);
+        log.setTitle(SessionLog.titleFor(pick.path));
+        sessionLogRef.current = log;
+        previous.close?.();
         context.loadState(resumed.exportState());
         opts.workCenter?.restore(readLatestWorkCenterSnapshot(pick.path));
         firstRef.current = context.messages().length === 0;
@@ -1134,7 +1151,7 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
         // the resume sees the resumed lineage (the size-keyed gate makes this cheap).
         refreshRewindTurns();
         pushLine({
-          text: `Resumed ${pick.id} (${context.messages().length} messages).`,
+          text: `Resumed ${pick.title} · ${pick.id} (${context.messages().length} messages).`,
           color: C.cyan,
         });
         // A different session is a different grant scope: "approve run_shell for this session"
@@ -1147,6 +1164,17 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
         if (opts.cfg.resumeRecap && context.messages().length >= 6) void showResumeRecap();
       } catch (e) {
         pushLine({ text: `Resume failed: ${(e as Error).message}`, color: C.red });
+      }
+      break;
+    }
+    case '/rename': {
+      const title = normalizeSessionTitle(arg);
+      if (!title) {
+        pushLine({ text: 'Usage: /rename <session name>', dimColor: true });
+      } else if (!sessionLogRef.current.setTitle(title)) {
+        pushLine({ text: 'Could not save the session name.', color: C.red });
+      } else {
+        pushLine({ text: `Session named ${title}`, color: C.cyan });
       }
       break;
     }
@@ -1644,7 +1672,7 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
         lines: [
           { text: `Resumable sessions (${sessions.length}) — /resume <id> to load one`, bold: true },
           ...sessions.slice(0, SHOWN).map((s) => ({
-            text: `  ${s.id === currentId ? '▸ ' : '  '}${s.id}${s.ts ? `  · snapshot ${s.ts}` : ''}`,
+            text: `  ${s.id === currentId ? '▸ ' : '  '}${s.title} · ${s.id}`,
             color: s.id === currentId ? C.cyan : undefined,
             dimColor: s.id !== currentId,
           })),
@@ -1662,6 +1690,7 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
         kind: 'system',
         text: 'session',
         lines: [
+          { text: `name: ${sessionLogRef.current.title || 'New session'}`, color: C.cyan },
           { text: `id: ${id}`, color: C.cyan },
           { text: `messages: ${messages.toLocaleString()} · style ${styleRef.current} · autonomy ${autonomyRef.current}`, dimColor: true },
           { text: `log: ${sessionLogRef.current.path ? shortPath(sessionLogRef.current.path) : 'not available'}`, dimColor: true },

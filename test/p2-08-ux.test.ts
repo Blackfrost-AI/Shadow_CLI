@@ -338,7 +338,10 @@ test('bare /resume with exactly one candidate still resumes it directly (F02-04 
       stdin.write('/resume');
       await tick();
       stdin.write('\r');
-      assert.ok(await until(() => strip(lastFrame() ?? '').includes(`Resumed ${id}`), 3000), 'the only session resumed');
+      assert.ok(await until(() => {
+        const frame = strip(lastFrame() ?? '');
+        return frame.includes('Resumed Task for the seeded session') && frame.includes(id);
+      }, 3000), 'the only session resumed with its readable name and stable id');
     } finally {
       unmount();
     }

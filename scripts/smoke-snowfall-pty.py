@@ -34,6 +34,7 @@ def exercise(command, ending):
         profile = str(Path(workspace) / 'profile')
         Path(profile).mkdir()
         env = dict(os.environ, HOME=profile, USERPROFILE=profile, TERM='xterm-256color', SHADOW_TUI='pi', SHADOW_NO_IMAGE_OPEN='1')
+        env.pop('SHADOW_SESSION_DIR', None)
         argv = command + ['--provider', 'mock', '--model', 'mock-1', '--base-url', 'http://127.0.0.1:1/v1', '--offline', '--dry-run', '--reduced-motion', '--workspace', workspace]
         process = subprocess.Popen(argv, stdin=slave, stdout=slave, stderr=slave, env=env, start_new_session=True)
 
@@ -68,6 +69,9 @@ def exercise(command, ending):
             check(b'I received' not in output, 'paste submitted before Enter')
             os.write(master, b'\r')
             expect(b'I received')
+            expect('\x1b]0;PTY cafe 漢字 — Shadow\x07'.encode())
+            os.write(master, b'/rename PTY session name\r')
+            expect('\x1b]0;PTY session name — Shadow\x07'.encode())
             for columns, rows in [(80, 24), (28, 8), (200, 40), (120, 36)]:
                 fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', rows, columns, 0, 0))
                 os.kill(process.pid, signal.SIGWINCH)

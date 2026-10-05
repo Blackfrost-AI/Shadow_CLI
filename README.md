@@ -6,7 +6,7 @@
 
 > **A true gift of freedom and privacy.**
 > Zero-telemetry · provider-neutral · phone home to no one.
-> Current build: **`v10.0.0`** — Snowfall. Full-screen terminal, full-width conversation, compact status bar and the classic block-letter SHADOW banner.
+> Current build: **`v10.0.1`** — guided onboarding and named sessions. Full-screen terminal, full-width conversation, compact status bar and the classic block-letter SHADOW banner.
 
 **Shadow is a zero-telemetry, provider-neutral coding agent that runs on your terms.** Point it at any model — Anthropic, any OpenAI-compatible endpoint, Gemini, or a local model on your own box — and it works as a coding / sysadmin agent over your workspace. **No Shadow account, no signup, no phone-home:** network access follows your provider, tool and update choices. Your config stays local and readable (`~/.shadow/config.json`), credentials are sent to their configured services, and you can switch models mid-session **without losing context**.
 
@@ -16,7 +16,16 @@ Under the hood it's a **tool-calling agentic runtime**: the model reasons, emits
 
 This is **not a chat app** — it is a tool-calling runtime.
 
-## What's new in v10.0.0 — Snowfall
+## What's new in v10.0.1
+
+- **Guided setup in the Snowfall style:** choose Local file, Model server or Cloud, with compact menus, arrow keys, search and a review before saving.
+- **Reliable endpoint setup:** cancellable checks, clear time limits, masked keys, and retry/edit controls that keep your entries when a server fails. Each endpoint keeps its own credentials.
+- **More providers:** Cerebras, Fireworks, DeepInfra, Hugging Face, NVIDIA NIM, vLLM, SGLang and llama.cpp join the catalog without crowding the first screen.
+- **Named conversations:** sessions take a name from the opening prompt. Use `/rename` to choose one, find it in `/resume`, and see it in the terminal title. `/new` preserves the previous conversation.
+
+See the [10.0.1 verification record](docs/V10_0_1_VERIFICATION.md) and [release notes](CHANGELOG.md).
+
+## Previous highlights: v10.0.0 — Snowfall
 
 - **Snowfall is now the default terminal:** a full-width conversation, pinned composer and compact footer keep your work centered. The original thick SHADOW wordmark returns in cyan with responsive fallbacks for narrow terminals.
 - **A navigable transcript:** page and wheel scrolling, prompt jumps, text selection, search, folded tool details and scrollback restoration on normal exit.

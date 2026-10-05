@@ -12,6 +12,8 @@ import { isolateHome, assertStoreIsolated } from './helpers/isolateHome.js';
 import { HeadlessTerminal } from './helpers/snowfallTerminal.js';
 
 const isolated = isolateHome('snowfall-flow');
+const previousSessionDir = process.env.SHADOW_SESSION_DIR;
+delete process.env.SHADOW_SESSION_DIR;
 const { GLOBAL_DIR } = await import('../src/state/globalStore.js');
 assertStoreIsolated(GLOBAL_DIR, isolated.home);
 const { ShadowApp } = await import('../src/app/app.js');
@@ -20,7 +22,12 @@ const { Context } = await import('../src/agent/context.js');
 const { EventBus } = await import('../src/agent/events.js');
 const { ToolRegistry } = await import('../src/tools/registry.js');
 const { SessionLog } = await import('../src/state/session.js');
-after(() => rmSync(isolated.home, { recursive: true, force: true }));
+const { listResumableSessions } = await import('../src/state/resume.js');
+after(() => {
+  if (previousSessionDir === undefined) delete process.env.SHADOW_SESSION_DIR;
+  else process.env.SHADOW_SESSION_DIR = previousSessionDir;
+  rmSync(isolated.home, { recursive: true, force: true });
+});
 
 const pause = (ms = 40) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 async function until(predicate: () => boolean, label: string): Promise<void> {
@@ -28,6 +35,72 @@ async function until(predicate: () => boolean, label: string): Promise<void> {
   while (!predicate() && Date.now() < deadline) await pause();
   assert.ok(predicate(), label);
 }
+
+test('named sessions stay in sync across the terminal title, resume picker, new conversations and forks', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'shadow-named-flow-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  let calls = 0;
+  const provider: Provider = {
+    name: 'mock', estimateTokens: () => 20,
+    async *send(): AsyncIterable<ProviderEvent> {
+      calls++;
+      yield { type: 'text', delta: 'Done.' };
+      yield { type: 'done', stopReason: 'end_turn' };
+    },
+  };
+  const cfg = loadConfig(root, { provider: 'mock', model: 'fixture', reducedMotion: true, notify: 'off', instructionAutopilot: false });
+  const first = SessionLog.open(root);
+  const opts: TuiOpts = {
+    provider, cfg, bus: new EventBus(), registry: new ToolRegistry(),
+    context: new Context({ contextBudget: 32768, triggerRatio: 0.8, keepLastTurns: 4 }),
+    sessionLog: first, system: 'Session naming test.', workspaceRoot: root,
+    autonomy: 'manual', bypass: false, offline: true, version: '10.0.0-test',
+  };
+  const terminal = new HeadlessTerminal(120, 36);
+  const app = new ShadowApp(opts, terminal);
+  const inspect = app as unknown as {
+    running: boolean;
+    runSlash(command: string): void;
+    commandSpecs(): Array<{ name: string; args?: (query: string) => Array<{ value: string; label: string }> }>;
+  };
+  const run = app.run();
+  const title = () => terminal.writes.filter((write) => write.startsWith('\x1b]2;')).at(-1);
+  try {
+    terminal.input('Fix the login redirect'); terminal.input('\r');
+    await until(() => calls === 1 && !inspect.running, 'the opening turn completes');
+    assert.equal(first.title, 'Fix the login redirect');
+    assert.equal(title(), '\x1b]2;Fix the login redirect — Shadow\x07');
+    inspect.runSlash('/rename Website launch');
+    assert.equal(title(), '\x1b]2;Website launch — Shadow\x07');
+    inspect.runSlash('/new');
+    assert.notEqual(opts.sessionLog.path, first.path);
+    assert.equal(title(), '\x1b]2;New session — Shadow\x07');
+    terminal.input('Review the database migration'); terminal.input('\r');
+    await until(() => calls === 2 && !inspect.running, 'the second conversation completes');
+    assert.equal(opts.sessionLog.title, 'Review the database migration');
+    const names = listResumableSessions(root).map((session) => session.title);
+    assert.ok(names.includes('Website launch'));
+    assert.ok(names.includes('Review the database migration'));
+    const matches = inspect.commandSpecs().find((command) => command.name === '/resume')!.args!('website');
+    assert.deepEqual(matches.map((match) => [match.label, match.value]), [['Website launch', SessionLog.sessionIdFromPath(first.path)]]);
+    inspect.runSlash('/resume');
+    await terminal.flush();
+    assert.match(terminal.lines().join('\n'), /Website launch/);
+    assert.match(terminal.lines().join('\n'), /Review the database migration/);
+    terminal.input('\x1b');
+    inspect.runSlash('/resume ' + SessionLog.sessionIdFromPath(first.path));
+    assert.equal(title(), '\x1b]2;Website launch — Shadow\x07');
+    inspect.runSlash('/fork');
+    inspect.runSlash('/rename Website follow-up');
+    assert.equal(title(), '\x1b]2;Website follow-up — Shadow\x07');
+    assert.equal(SessionLog.titleFor(first.path), 'Website launch');
+    assert.equal(calls, 2, 'naming and session navigation make no provider requests');
+    inspect.runSlash('/quit');
+    await run;
+  } finally {
+    app.stop(); await run; opts.sessionLog.close(); terminal.screen.dispose();
+  }
+});
 
 test('production fullscreen shell: commands, queued paste, interrupt, safe overlays, theme persistence and exit', async (t) => {
   const root = mkdtempSync(join(tmpdir(), 'shadow-snowfall-flow-'));

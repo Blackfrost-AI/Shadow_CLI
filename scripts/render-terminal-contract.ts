@@ -47,6 +47,11 @@ are listed below. \`/editor\` / Ctrl+G provides external-editor access while idl
 
 ## Images and terminal behavior
 
+Sessions take a short name from the opening prompt. \`/rename <name>\` overrides it; \`/resume\`
+and its completions show searchable names alongside stable IDs. The terminal title shows the
+active name followed by Shadow and restores the prior title on exit. \`/new\` preserves the
+previous named session. Naming runs locally and makes no additional model request.
+
 Kitty, Ghostty and WezTerm can display PNG images using pi's managed graphics placements,
 including cropping and cleanup while scrolling. Other formats, iTerm2, unknown terminals,
 tmux and oversized images retain a text description and source path. Use an OS viewer for

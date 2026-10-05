@@ -1011,6 +1011,7 @@ export function resolveEntryCredential(
   const provider = entry?.provider ?? 'openai';
   if (entry?.credRef) {
     const slot = entry.credRef;
+    if (getCredential(slot)?.noAuth === true) return { ok: true, source: 'credRef' };
     const apiKey = resolveApiKey(provider, { slot });
     const authToken = resolveAuthToken(provider, slot);
     if (apiKey || authToken) return { ok: true, apiKey, authToken, source: 'credRef' };

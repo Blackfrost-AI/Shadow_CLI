@@ -212,7 +212,7 @@ test('no module restates its own SHADOW art', () => {
   // (figlet block letters) that disagreed with wordmark.ts, so onboarding and the
   // session splash showed different marks. v10 requires ONE brand module, so the
   // consumers that used to draw art must now import it.
-  const offenders = ['src/onboard/onboard.ts', 'src/tui.tsx', 'src/app/app.ts'];
+  const offenders = ['src/onboard/ui.ts', 'src/tui.tsx', 'src/app/app.ts'];
   for (const rel of offenders) {
     const src = readFileSync(join(import.meta.dirname, '..', rel), 'utf8');
     assert.ok(
@@ -231,7 +231,7 @@ test('no module restates its own SHADOW art', () => {
 });
 
 test('the block-letter banner stays centralized in the brand module', () => {
-  const files = ['src/onboard/onboard.ts', 'src/tui.tsx', 'src/app/app.ts'];
+  const files = ['src/onboard/ui.ts', 'src/tui.tsx', 'src/app/app.ts'];
   for (const rel of files) {
     const src = readFileSync(join(import.meta.dirname, '..', rel), 'utf8');
     assert.ok(

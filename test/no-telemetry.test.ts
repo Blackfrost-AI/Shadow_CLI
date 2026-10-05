@@ -72,7 +72,10 @@ function codeLines(text: string): string {
 const HOST_SNAPSHOT = [
   'aistudio.google.com', // Gemini console link
   'api.anthropic.com', // provider default
+  'api.cerebras.ai', // catalog preset (explicitly chosen provider)
+  'api.deepinfra.com', // catalog preset (explicitly chosen provider)
   'api.deepseek.com', // catalog preset
+  'api.fireworks.ai', // catalog preset (explicitly chosen provider)
   'api.groq.com', // catalog preset
   'api.mistral.ai', // catalog preset
   'api.moonshot.ai', // catalog preset
@@ -80,22 +83,29 @@ const HOST_SNAPSHOT = [
   'api.together.xyz', // catalog preset
   'api.x.ai', // catalog preset
   'api.z.ai', // catalog preset (GLM)
+  'app.fireworks.ai', // catalog key-creation link, not fetched
   'auth.openai.com', // opt-in `shadow login codex` OAuth
   'bailian.console.aliyun.com', // catalog preset console link
+  'build.nvidia.com', // catalog key-creation link, not fetched
   'chatgpt.com', // Codex OAuth client origin
+  'cloud.cerebras.ai', // catalog key-creation link, not fetched
   'console.anthropic.com', // catalog preset console link
   'console.groq.com', // catalog preset console link
   'console.mistral.ai', // catalog preset console link
   'console.x.ai', // catalog preset console link
   'dashscope.aliyuncs.com', // catalog preset (Qwen via Aliyun)
+  'deepinfra.com', // catalog key-creation link, not fetched
   'duckduckgo.com', // web_search tool (model-origin, netguard + pin)
   'generativelanguage.googleapis.com', // catalog preset
   'github.com', // Blackfrost-AI repo links
+  'huggingface.co', // catalog key-creation link, not fetched
+  'integrate.api.nvidia.com', // catalog preset (explicitly chosen provider)
   'openrouter.ai', // catalog preset
   'platform.deepseek.com', // catalog preset console link
   'platform.moonshot.ai', // catalog preset console link
   'platform.openai.com', // catalog preset console link
   'raw.githubusercontent.com', // update channel metadata
+  'router.huggingface.co', // catalog preset (explicitly chosen provider)
   'storage.googleapis.com', // Blackfrost binary release bucket (signed manifest)
   'z.ai', // catalog preset console link
 ];

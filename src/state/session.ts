@@ -16,6 +16,7 @@ import { basename, join } from 'node:path';
 import { redact } from '../util/redact.js';
 import type { Context } from '../agent/context.js';
 import { serializeContext } from './snapshot.js';
+import { deriveSessionTitle, normalizeSessionTitle } from './sessionTitle.js';
 
 // Append-only JSONL session log. Each run gets its own file under
 // <workspaceRoot>/.shadow/sessions/, one JSON object per line: user inputs,
@@ -101,6 +102,7 @@ function msgDigest(m: unknown): string {
  * changes. Lets `listResumableSessions` / `countSnapshots` answer without re-reading the log.
  */
 interface SessionManifest {
+  title: string;
   mtimeMs: number;
   size: number;
   hasSnapshot: boolean;
@@ -150,6 +152,7 @@ function parseSnapshotLine(lineBuf: Buffer): Record<string, unknown> | null {
 function tailScanLatestSnapshot(
   path: string,
   accept?: (rec: Record<string, unknown>, offset: number) => boolean,
+  onTitle?: (title: string) => void,
 ): { record: Record<string, unknown>; offset: number } | null {
   let fd: number;
   try {
@@ -158,6 +161,16 @@ function tailScanLatestSnapshot(
     return null;
   }
   try {
+    const inspectTitle = (line: Buffer): void => {
+      if (!onTitle || !line.includes('"session_title"')) return;
+      try {
+        const record = JSON.parse(line.toString('utf8'));
+        if (record.kind === 'session_title' && typeof record.title === 'string') {
+          onTitle(normalizeSessionTitle(record.title));
+          onTitle = undefined; // reverse scan: only the newest explicit name wins
+        }
+      } catch { /* ignore a torn metadata line */ }
+    };
     const size = fstatSync(fd).size;
     if (size === 0) return null;
     let pos = size;
@@ -174,7 +187,9 @@ function tailScanLatestSnapshot(
       let end = combined.length;
       let nl = combined.lastIndexOf(NL, end - 1);
       while (nl !== -1) {
-        const rec = parseSnapshotLine(combined.subarray(nl + 1, end));
+        const line = combined.subarray(nl + 1, end);
+        inspectTitle(line);
+        const rec = parseSnapshotLine(line);
         if (rec && (!accept || accept(rec, pos + nl + 1))) return { record: rec, offset: pos + nl + 1 };
         end = nl;
         if (end === 0) break;
@@ -182,6 +197,7 @@ function tailScanLatestSnapshot(
       }
       // combined[0, end) starts at file offset `pos`. Complete only once pos === 0.
       if (pos === 0) {
+        inspectTitle(combined.subarray(0, end));
         const rec = parseSnapshotLine(combined.subarray(0, end));
         if (rec && (!accept || accept(rec, 0))) return { record: rec, offset: 0 };
       } else {
@@ -196,6 +212,41 @@ function tailScanLatestSnapshot(
       /* best-effort */
     }
   }
+}
+
+/** Old logs have no title metadata. Inspect only a bounded prefix, never a whole transcript. */
+function legacySessionTitle(path: string): string {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, 'r');
+    const bytes = Buffer.alloc(Math.min(fstatSync(fd).size, 256 * 1024));
+    const length = readSync(fd, bytes, 0, bytes.length, 0);
+    for (const line of bytes.subarray(0, length).toString('utf8').split('\n')) {
+      try {
+        const record = JSON.parse(line);
+        if (typeof record.sessionTitle === 'string' && record.sessionTitle) return normalizeSessionTitle(record.sessionTitle);
+        if (record.kind === 'user' || (record.kind === 'event' && record.type === 'user')) {
+          const prompt = record.task ?? record.text;
+          if (typeof prompt === 'string') {
+            const title = deriveSessionTitle(prompt);
+            if (title) return title;
+          }
+        }
+        if (record.kind === 'context_snapshot' && Array.isArray(record.data?.messages)) {
+          const first = record.data.messages.find((message: { role?: string }) => message.role === 'user');
+          const text = first?.content?.filter((block: { type?: string }) => block.type === 'text')
+            .map((block: { text: string }) => block.text).join(' ');
+          if (text) return deriveSessionTitle(text);
+        }
+      } catch { /* a truncated or malformed line does not prevent reading the next one */ }
+    }
+  } catch { /* unreadable older logs stay unnamed */ }
+  finally {
+    if (fd !== undefined) {
+      try { closeSync(fd); } catch { /* best-effort */ }
+    }
+  }
+  return '';
 }
 
 /** Read the single JSONL line beginning at `offset` on an OPEN fd and parse it as a snapshot
@@ -250,16 +301,20 @@ function getManifest(path: string): SessionManifest {
   const st = statOrNull(path);
   if (!st) {
     manifestCache.delete(path);
-    return { mtimeMs: 0, size: 0, hasSnapshot: false, snapshotCount: 0 };
+    return { title: '', mtimeMs: 0, size: 0, hasSnapshot: false, snapshotCount: 0 };
   }
   const cached = manifestCache.get(path);
   if (cached && cached.mtimeMs === st.mtimeMs && cached.size === st.size) return cached;
 
-  const found = tailScanLatestSnapshot(path);
+  let title: string | undefined;
+  const found = tailScanLatestSnapshot(path, undefined, (value) => { title = value; });
+  title ??= typeof found?.record.sessionTitle === 'string'
+    ? normalizeSessionTitle(found.record.sessionTitle) : legacySessionTitle(path);
   const turn = found && typeof found.record.turn === 'number' ? (found.record.turn as number) : undefined;
   const manifest: SessionManifest = found
     ? {
         mtimeMs: st.mtimeMs,
+        title,
         size: st.size,
         hasSnapshot: true,
         snapshotTs: typeof found.record.ts === 'string' ? (found.record.ts as string) : undefined,
@@ -269,12 +324,38 @@ function getManifest(path: string): SessionManifest {
         snapshotCount: (turn ?? -1) + 1,
         latestOffset: found.offset,
       }
-    : { mtimeMs: st.mtimeMs, size: st.size, hasSnapshot: false, snapshotCount: 0 };
+    : { title, mtimeMs: st.mtimeMs, size: st.size, hasSnapshot: false, snapshotCount: 0 };
   manifestCache.set(path, manifest);
   return manifest;
 }
 
 export class SessionLog {
+  private currentTitle?: string;
+
+  get title(): string {
+    return this.currentTitle ??= SessionLog.titleFor(this.path);
+  }
+
+  static titleFor(path: string): string {
+    return getManifest(path).title;
+  }
+
+  /** Append a rename; snapshot offsets and the original transcript remain intact. */
+  setTitle(title: string): boolean {
+    const next = normalizeSessionTitle(title);
+    if (this.record({ kind: 'session_title', title: next }) === undefined) return false;
+    this.currentTitle = next;
+    manifestCache.delete(this.path);
+    return true;
+  }
+
+  /** Release an inactive log's append descriptor when the UI switches conversations. */
+  close(): void {
+    if (this.fd === null) return;
+    try { closeSync(this.fd); }
+    catch { /* best-effort, like the write path */ }
+    this.fd = null;
+  }
   /** Set (instead of throwing) if a write ever fails, so the loop survives. */
   public lastError?: string;
 
@@ -377,8 +458,14 @@ export class SessionLog {
    *  bookkeeping can chain `baseOffset`s without re-stating the file. */
   record(event: Record<string, unknown>): number | undefined {
     try {
+      const isUser = event.kind === 'user' || (event.kind === 'event' && event.type === 'user');
+      if (isUser && !this.title) {
+        const prompt = event.task ?? event.text;
+        if (typeof prompt === 'string') this.currentTitle = deriveSessionTitle(prompt);
+      }
       const ts = new Date().toISOString();
-      const line = JSON.stringify(redact({ ts, ...event })) + '\n';
+      const name = isUser || event.kind === 'context_snapshot' ? { sessionTitle: this.title } : {};
+      const line = JSON.stringify(redact({ ts, ...event, ...name })) + '\n';
       const offset = this.bytesWritten; // byte offset where this line begins
       this.write(line);
       if (event.kind === 'context_snapshot') this.rememberSnapshot(ts, event.turn, offset);
@@ -435,6 +522,7 @@ export class SessionLog {
     const prev = manifestCache.get(this.path);
     const prevCount = prev?.hasSnapshot ? prev.snapshotCount : 0;
     manifestCache.set(this.path, {
+      title: this.title,
       mtimeMs: st?.mtimeMs ?? 0,
       size: st?.size ?? this.bytesWritten,
       hasSnapshot: true,
@@ -458,6 +546,12 @@ export class SessionLog {
   recordSnapshot(ctx: Context, turn?: number): void {
     const data = serializeContext(ctx);
     const msgs = Array.isArray(data.messages) ? data.messages : [];
+    if (!this.title) {
+      const first = msgs.find((message) => message.role === 'user');
+      const text = first?.content.filter((block) => block.type === 'text')
+        .map((block) => 'text' in block ? block.text : '').join(' ');
+      if (text) this.currentTitle = deriveSessionTitle(text);
+    }
     const digests = new Array<string>(msgs.length);
     for (let i = 0; i < msgs.length; i++) digests[i] = msgDigest(msgs[i]);
 

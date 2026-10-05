@@ -1,5 +1,20 @@
 # Shadow release notes
 
+## 10.0.1 — 2026-10-05
+
+- Rebuild terminal onboarding in the shared retro style with compact provider menus, arrow/number
+  selection, searchable lists, model multi-selection, editable drafts, and a final review.
+- Keep a single input owner across masked key prompts; bound and cancel endpoint checks, clear
+  completed timers, and offer retry/edit/manual-model recovery without losing setup entries.
+- Add Cerebras, Fireworks, DeepInfra, Hugging Face, NVIDIA NIM, vLLM, SGLang, and llama.cpp presets.
+- Save endpoint-specific credentials, preserve previous provider keys, support existing encrypted
+  vaults, and keep keyless endpoints from inheriting another provider's key.
+- Save local-file setup on confirmation and defer model loading and optional extensions until needed.
+- Automatically name sessions from their opening prompt, with persistent `/rename` overrides.
+- Show session names in `/resume`, its searchable completions, `/sessions` and the terminal title.
+- Preserve the prior named conversation when starting `/new` or resuming another session.
+- Recover readable names from older logs without rewriting their transcripts.
+
 ## 10.0.0 — 2026-10-04
 
 - Made Snowfall the default interactive terminal, with a full-width conversation, pinned composer,

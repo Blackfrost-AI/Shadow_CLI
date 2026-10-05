@@ -53,6 +53,7 @@ import { isLocalBaseUrl, isLocalModelTarget } from './safety/offline.js';
 import { clampLocalContextBudget, keepLastTurnsForBudget, triggerRatioForBudget } from './util/contextBudget.js';
 import { familyProfile } from './config/familyProfiles.js';
 import { SessionLog } from './state/session.js';
+import { sessionTerminalTitle } from './state/sessionTitle.js';
 import { createProvider, entryStreamContract, type ProviderName } from './provider/index.js';
 import { subProviderFor } from './auth/spec.js';
 import { ensureFreshSubscriptionCredential } from './auth/refresh.js';
@@ -421,6 +422,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // swap too — otherwise events after a fork would keep landing in the SOURCE transcript.
   const localSessionLogRef = useRef(sessionLog);
   const sessionLogRef = opts.sessionLogBox ?? localSessionLogRef;
+  const activeSessionTitle = sessionLogRef.current.title;
+  useEffect(() => {
+    if (stdout.isTTY) stdout.write(`\x1b]2;${sessionTerminalTitle(activeSessionTitle)}\x07`);
+  }, [stdout, activeSessionTitle]);
   const [style, setStyle] = useState<OutputStyle>(opts.styleState?.style ?? opts.cfg.lastStyle ?? 'proactive');
 
   const terminalSize = useTerminalSize();
@@ -1017,22 +1022,25 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
    * Refreshed each render and held in a ref so the key handler — which is not re-created per
    * render — always sees the current one.
    *
-   * `sessions` is deliberately read from disk ONCE per mount: listResumableSessions opens every
-   * session log in the workspace looking for a snapshot, and the menu re-filters on every
-   * keystroke. The set only grows when a NEW session starts, which by definition is not this one.
+   * Refresh the inventory when the resume menu opens, then filter the cached rows while typing.
+   * /new, /fork and /rename can change the inventory without restarting the process.
    */
   const argCtxRef = useRef<ArgContext | null>(null);
-  const resumableRef = useRef<{ id: string; label: string }[] | null>(null);
-  if (resumableRef.current === null) {
+  const resumableRef = useRef<{ id: string; label: string; title: string }[] | null>(null);
+  const resumeMenuWasOpen = useRef(false);
+  const resumeMenuIsOpen = /^\/resume(?:\s|$)/i.test(input);
+  if (resumableRef.current === null || (resumeMenuIsOpen && !resumeMenuWasOpen.current)) {
     try {
       resumableRef.current = listResumableSessions(opts.workspaceRoot).map((s) => ({
         id: s.id,
         label: s.ts ? `Snapshot ${s.ts}` : s.path,
+        title: s.title,
       }));
     } catch {
       resumableRef.current = []; // an unreadable session dir must never break the menu
     }
   }
+  resumeMenuWasOpen.current = resumeMenuIsOpen;
 
   const setComposer = useCallback((nextInput: string, nextCursor: number) => {
     inputRef.current = nextInput;
@@ -3770,9 +3778,11 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
                   // and would overflow the shaded bar (descRoom ≤ 0, rectangle lost). Slash names —
                   // including argument rows like `/config get temperature` — are the thing the user
                   // is choosing and stay COMPLETE; pad-only, so descriptions align at the column.
-                  const clippedName = c.mention && displayWidth(c.name) > SLASH_NAME_WIDTH
-                    ? takeByWidth(c.name, Math.max(1, SLASH_NAME_WIDTH - 1)).head + '…'
-                    : c.name;
+                  const rowName = c.label ?? c.name;
+                  const nameWidth = c.label ? Math.max(SLASH_NAME_WIDTH, BAR_W - 30) : SLASH_NAME_WIDTH;
+                  const clippedName = (c.mention || c.label) && displayWidth(rowName) > nameWidth
+                    ? takeByWidth(rowName, Math.max(1, nameWidth - 1)).head + '…'
+                    : rowName;
                   const namePart = clippedName + ' '.repeat(Math.max(0, SLASH_NAME_WIDTH - displayWidth(clippedName)));
                   const descRoom = Math.max(0, BAR_W - 2 - displayWidth(namePart) - 1);
                   const clippedDesc = takeByWidth(c.desc, descRoom).head;
@@ -3816,8 +3826,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
 // ── Entry point ────────────────────────────────────────────────────────────────
 /**
  * Escape sequence to emit ONCE at TUI launch on a real TTY. Two privacy measures:
- *   1. Set the terminal title to "Shadow" (pushed onto the xterm title stack, popped on exit) so the
- *      working-directory path terminals show by default doesn't leak in screenshots / over-the-shoulder.
+ *   1. Save the prior title and set a "Shadow" placeholder. The mounted UI replaces it with the
+ *      active session name; exit pops the original title from the xterm title stack.
  *   2. Wipe the visible screen AND the scrollback (`2J` + `3J`, then home) so your PRE-LAUNCH shell
  *      history — earlier commands, other work, secrets — can't be scrolled up to from inside the
  *      Shadow session. Same escape `/clear` uses; the transcript then accumulates in a fresh

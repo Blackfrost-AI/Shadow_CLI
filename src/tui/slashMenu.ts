@@ -15,6 +15,8 @@ import { THEME_NAMES, THEME_DESCRIPTIONS } from './theme.js';
  *  `name` then holds the full submission text ("/theme colorblind") and `base` the command. */
 export interface SlashMenuItem extends SlashCommand {
   base?: string;
+  /** Display name can differ from the stable id submitted by a session picker. */
+  label?: string;
   /** An informational row ("no prior sessions yet") — shown, but never completed or run. */
   hint?: boolean;
 }
@@ -28,6 +30,7 @@ const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
 export interface ArgCompletion {
   value: string;
   desc: string;
+  label?: string;
 }
 
 /**
@@ -41,7 +44,7 @@ export interface ArgContext {
   cfg: ShadowConfig;
   workspaceRoot: string;
   /** Prior sessions, newest first (for /resume). */
-  sessions: { id: string; label: string }[];
+  sessions: { id: string; label: string; title?: string }[];
   /**
    * The rewindable SNAPSHOT turns this session has (for /rewind), newest first, each carrying
    * the prompt that produced its turn (F08-07 — the picker names turns by what the user asked,
@@ -159,7 +162,7 @@ const SLASH_ARG_COMPLETIONS: Record<string, ArgProvider> = {
   // sessions or YOUR turn count, which is exactly where "type the id from memory" hurt most.
   '/resume': (ctx) =>
     ctx.sessions.length
-      ? ctx.sessions.map((s) => ({ value: s.id, desc: s.label }))
+      ? ctx.sessions.map((s) => ({ value: s.id, label: s.title, desc: s.title ? s.id : s.label }))
       : [{ value: '', desc: 'No prior sessions in this workspace yet' }],
   // Turn indexes are 0-based (`0` = the first assistant turn — see the /rewind handler), and the
   // newest is listed first because that is overwhelmingly the one you want.
@@ -223,7 +226,7 @@ export function slashMatches(
   extra: SlashCommand[] = [],
 ): SlashMenuItem[] {
   if (!input.startsWith('/')) return [];
-  if (isPathLikeSlashToken(input)) return []; // a path (/Users/…, /x.y) is not a command — no menu
+  if (isPathLikeSlashToken(input.split(/\s/, 1)[0]!)) return []; // classify the command, not a name being searched
   const all = extra.length ? [...SLASH_COMMANDS, ...extra] : SLASH_COMMANDS;
   const sp = input.indexOf(' ');
   if (sp < 0) {
@@ -245,17 +248,18 @@ export function slashMatches(
   // can't put a bare `/resume ` on the composer and run the wrong thing on Enter.
   if (!completions.length) return [];
   const partial = input.slice(sp + 1);
-  if (/\s/.test(partial)) return []; // only the FIRST argument completes
+  if (/\s/.test(partial) && slashDispatchName(cmd) !== '/resume') return [];
   const active = current?.[slashDispatchName(cmd)];
   const items: SlashMenuItem[] = completions.map((a) => ({
     name: a.value ? `${cmd.name} ${a.value}` : cmd.name,
     desc: a.value === active ? `✓ current · ${a.desc}` : a.desc,
     dispatch: cmd.dispatch,
     base: cmd.name,
+    ...(a.label ? { label: a.label } : {}),
     ...(a.value ? {} : { hint: true }),
   }));
   if (!partial) return items;
-  return fuzzyRank(items, partial, (i) => i.name.slice(cmd.name.length + 1)).map((r) => r.item);
+  return fuzzyRank(items, partial, (i) => `${i.label ?? ''} ${i.name.slice(cmd.name.length + 1)}`.trim()).map((r) => r.item);
 }
 
 /** Levenshtein distance, early-exiting when it must exceed `max` — for did-you-mean on typos.

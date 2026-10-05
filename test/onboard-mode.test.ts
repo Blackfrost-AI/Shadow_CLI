@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { providersForMode, PROVIDERS } from '../src/onboard/catalog.js';
+import { featuredProviders, providersForMode, PROVIDERS } from '../src/onboard/catalog.js';
 
 test('mode "cloud" lists every cloud provider + custom, and NO local servers', () => {
   const list = providersForMode('cloud');
@@ -41,7 +41,7 @@ test('mode "server" lists local servers + custom, and NO cloud vendors', () => {
   const ids = list.map((p) => p.id);
   assert.deepEqual(
     ids.sort(),
-    ['custom', 'lmstudio', 'ollama', 'ollama-anthropic', 'qwen-selfhosted'].sort(),
+    ['custom', 'llamacpp', 'lmstudio', 'ollama', 'ollama-anthropic', 'qwen-selfhosted', 'sglang', 'vllm'].sort(),
     'exactly the local-server entries + custom',
   );
 });
@@ -55,4 +55,11 @@ test('every catalog entry is reachable from at least one mode (nothing orphaned)
     [...providersForMode('cloud'), ...providersForMode('server')].map((p) => p.id),
   );
   for (const p of PROVIDERS) assert.ok(reachable.has(p.id), `${p.id} reachable`);
+});
+
+test('the first provider menu stays compact while the complete expanded catalog is reachable', () => {
+  for (const mode of ['cloud', 'server'] as const) assert.equal(featuredProviders(mode).length, 5);
+  for (const id of ['cerebras', 'fireworks', 'deepinfra', 'huggingface', 'nvidia']) {
+    assert.ok(providersForMode('cloud').some((item) => item.id === id && item.baseUrl?.startsWith('https://')));
+  }
 });

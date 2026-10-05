@@ -32,3 +32,6 @@ jobs:
       - name: Native PTY lifecycle (POSIX)
         if: runner.os != 'Windows'
         run: python3 scripts/smoke-snowfall-pty.py node dist/index.js
+      - name: Guided onboarding lifecycle (POSIX)
+        if: runner.os != 'Windows'
+        run: python3 scripts/smoke-onboard-pty.py node dist/index.js

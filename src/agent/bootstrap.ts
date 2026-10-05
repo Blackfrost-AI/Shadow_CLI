@@ -596,6 +596,7 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   let context: Context;
   if (opts.resumeSessionPath) {
     ({ context } = resumeSession(opts.resumeSessionPath, contextOpts));
+    sessionLog.setTitle(SessionLog.titleFor(opts.resumeSessionPath));
     // /goal mission survives resume: the last mission event in the OLD session log is
     // authoritative (a trailing `clear` rehydrates nothing). Best-effort — a missing or
     // unreadable log resumes mission-less, never blocks startup.

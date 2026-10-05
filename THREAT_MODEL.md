@@ -212,9 +212,8 @@ No analytics, crash reporting, or phone-home. The **on-turn** egress: your provi
 onboarding connection test to the host you are configuring), the web tools when invoked, and the
 MCP servers you configure. Everything else is **user-initiated only**: (opt-in, off by default,
 once daily, payload-free) the update check; `shadow update`'s signed-manifest + binary download;
-the `shadow login codex` OAuth scaffold (token exchange unwired); the Context Cooler onboarding
-install (explicit Y/n); MLX/vLLM first-serve weight downloads; and the plugin paths — an index
-lookup that exists ONLY if you set `pluginIndexUrl`, and the `shadow plugin add <git-url>` clone
+the `shadow login codex` OAuth scaffold (token exchange unwired); MLX/vLLM first-serve weight
+downloads; and the plugin paths — an index lookup that exists ONLY if you set `pluginIndexUrl`, and the `shadow plugin add <git-url>` clone
 that runs only when you run it. Appendix A inventories every one.
 `shadow doctor --privacy` prints every egress path for the active config, live vs inactive, with **no
 network calls**. A source-level test (`no-telemetry`) pins the absence of install identifiers AND
@@ -413,6 +412,22 @@ macOS or Linux.
 
 ## Appendix A — Egress inventory (every byte that leaves the machine, verified 2026-08-16)
 
+Onboarding catalog update reviewed 2026-10-05:
+
+| Destination | Trigger and payload |
+| --- | --- |
+| `api.cerebras.ai`, `api.fireworks.ai`, `api.deepinfra.com`, `router.huggingface.co`, `integrate.api.nvidia.com` | Only when the user selects/configures that provider: authenticated model-list GET during setup, a short completion for the connection check, then ordinary provider turns. All use the existing egress broker. No catalog-wide probing. |
+| `cloud.cerebras.ai`, `app.fireworks.ai`, `deepinfra.com`, `huggingface.co`, `build.nvidia.com` | Display-only key-creation links. The wizard does not fetch or open these URLs. |
+| User-supplied vLLM, SGLang, llama.cpp, and custom endpoints | The same explicit setup checks and provider traffic; the server address remains editable. |
+
+Terminal discovery has one six-second budget across all URL variants and response bodies;
+connection checks have a thirty-second budget, with request abortion on timeout or cancellation.
+The terminal has one input owner through key prompts. Per-endpoint credential references prevent
+new provider setup from replacing an unrelated provider's key; a keyless slot explicitly opts out
+of provider-key fallback. Existing vaults are unlocked and resealed when setup saves a key.
+The refreshed terminal wizard no longer installs Context Cooler or starts model downloads during
+setup; those are separate explicit actions after the model configuration is saved.
+
 Reproduced from the Frontier Launch Plan §10. Kept in sync by the host-snapshot guard
 (`test/no-telemetry.test.ts`, HOST_SNAPSHOT) and the broker-only fetch lint rule — since v6.7.0
 every item below whose bytes SHADOW'S OWN PROCESS sends routes through `shadowFetch()`
@@ -422,8 +437,7 @@ every item below whose bytes SHADOW'S OWN PROCESS sends routes through `shadowFe
 `cfg.vision.baseUrl`, not a model-authored URL. **Child-process paths** (not brokered, not always
 journaled): the plugin git clone (item 16 — bypasses the broker but enforces the offline wall
 itself and journals its own receipt, purpose `plugin-clone`); the Playwright preset's first-connect
-`npx -y` resolution (item 8 — an npm-registry fetch from inside the child); the Context Cooler
-install (item 13 — `git clone` + `npm install` children); and the MLX/vLLM weight download
+`npx -y` resolution (item 8 — an npm-registry fetch from inside the child); and the MLX/vLLM weight download
 (item 14 — the `mlx-lm` child talks to huggingface.co). Those are bounded by the offline wall
 (refused under `--offline`) and, for stdio children, the OS jail — not by the journal.
 
@@ -448,9 +462,9 @@ registry at first connect (skipped under --offline).
 of public package.json, no params/headers/body, 3s cap, TUI-only. (10) `shadow update` binary
 (`binary.ts:40`) — signed-manifest-first; asset path reveals OS/arch to storage.googleapis.com/blackfrost-ai-prod-shadow-releases/bin.
 (11) OAuth scaffold (`oauth.ts:62`) — auth.openai.com, only via explicit `shadow login codex`; token
-exchange unwired. (12) onboarding connection test (`onboard.ts:665`) — user-chosen host via the
+exchange unwired. (12) onboarding connection test (`onboard/connection.ts`) — user-chosen host via the
 provider stream path, key registered with the redactor BEFORE the test. (13) Context Cooler
-onboarding install (`onboard.ts`) — explicit Y/n, git clone + npm install. (14) MLX/vLLM repo-id
+onboarding install — removed in the 2026-10-05 refresh; no setup-time clone or npm install. (14) MLX/vLLM repo-id
 first-serve weight download — mlx-lm subprocess → huggingface.co; refused under --offline.
 (15) Plugin index lookup (`registry.ts`) — exists ONLY if `pluginIndexUrl` is set (global-only key;
 a project file cannot set it), fetched through the broker (purpose `plugin-index`), 1 MB streaming

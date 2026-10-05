@@ -37,6 +37,8 @@ export interface CredentialEntry {
   apiKey?: string;
   authToken?: string;
   baseUrl?: string;
+  /** Explicit keyless endpoint: never inherit a different provider's key. */
+  noAuth?: boolean;
 }
 type Credentials = Record<string, CredentialEntry>;
 
