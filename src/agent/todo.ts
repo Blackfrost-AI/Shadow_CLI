@@ -15,24 +15,29 @@
 export type TodoStatus = 'pending' | 'in_progress' | 'completed';
 
 export interface TodoItem {
-  /** Positional id assigned by the list (todo-1, todo-2, ...). Stable within a write. */
+  /** Stable id assigned by the list (todo-1, todo-2, ...), preserved across reordering. */
   id: string;
   subject: string;
   status: TodoStatus;
   description?: string;
+  /** Explicit persistent job reference; model completion does not complete this checklist item. */
+  jobId?: string;
 }
 
 /** Input shape the `todo_write` tool accepts — the whole list, replaced each call. */
 export interface TodoWriteEntry {
+  id?: string;
   subject: string;
   status: TodoStatus;
   description?: string;
+  jobId?: string;
 }
 
 export type TodoListener = (items: TodoItem[]) => void;
 
 export class TodoList {
   private items: TodoItem[] = [];
+  private nextId = 1;
   private readonly listeners = new Set<TodoListener>();
 
   /**
@@ -42,13 +47,21 @@ export class TodoList {
    * snapshot so the tool can report it back to the model.
    */
   write(entries: TodoWriteEntry[]): TodoItem[] {
-    this.items = entries.map((e, i) => {
+    const used = new Set<string>();
+    this.items = entries.map((e) => {
+      const candidates = this.items.filter((item) => !used.has(item.id) && (e.id ? item.id === e.id : item.subject === e.subject));
+      // Never inherit ownership through a positional id after a list reorder or replacement.
+      const previous = candidates.length === 1 ? candidates[0] : undefined;
+      const id = previous?.id ?? `todo-${this.nextId++}`;
+      used.add(id);
       const item: TodoItem = {
-        id: `todo-${i + 1}`,
+        id,
         subject: e.subject,
         status: e.status,
       };
       if (e.description !== undefined) item.description = e.description;
+      const jobId = e.jobId ?? previous?.jobId;
+      if (jobId !== undefined) item.jobId = jobId;
       return item;
     });
     this.emit();
@@ -58,6 +71,19 @@ export class TodoList {
   /** A defensive copy so consumers (the TUI, the prompt renderer) can't mutate state. */
   snapshot(): TodoItem[] {
     return this.items.map((item) => ({ ...item }));
+  }
+
+  /** Preserve stable task IDs across restart rather than renumbering recorded ownership. */
+  restore(items: TodoItem[]): TodoItem[] {
+    this.items = items.filter((item) => item && typeof item.id === 'string' && typeof item.subject === 'string'
+      && ['pending', 'in_progress', 'completed'].includes(item.status)).map((item) => ({
+        id: item.id, subject: item.subject, status: item.status,
+        ...(typeof item.description === 'string' ? { description: item.description } : {}),
+        ...(typeof item.jobId === 'string' ? { jobId: item.jobId } : {}),
+      }));
+    this.nextId = Math.max(this.nextId, ...this.items.map((item) => Number(item.id.match(/^todo-(\d+)$/)?.[1] ?? 0) + 1));
+    this.emit();
+    return this.snapshot();
   }
 
   /** Register a listener fired on every write. Returns an unsubscribe function. */
@@ -77,7 +103,7 @@ export class TodoList {
       const tag =
         it.status === 'completed' ? 'done' : it.status === 'in_progress' ? 'in-progress' : 'pending';
       const desc = it.description ? ` — ${it.description}` : '';
-      return `${it.id.replace('todo-', '')}. [${tag}] ${it.subject}${desc}`;
+      return `${it.id.replace('todo-', '')}. [${tag}] ${it.subject}${desc}${it.jobId ? ` (job: ${it.jobId})` : ''}`;
     });
     return `\n\n## Task list\n${lines.join('\n')}`;
   }

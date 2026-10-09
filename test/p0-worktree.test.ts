@@ -3,11 +3,13 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 import {
   createWorktree,
   removeWorktree,
   makeWorktreeCreateTool,
   makeWorktreeRemoveTool,
+  relativeManagedWorktreePath,
 } from '../src/tools/worktree.js';
 import type { ToolContext } from '../src/tools/types.js';
 
@@ -21,6 +23,21 @@ const ctxFor = (ws: string): ToolContext => ({
   signal: new AbortController().signal,
   log: () => {},
   dryRun: false,
+});
+
+function initRepo(ws: string): void {
+  execFileSync('git', ['init', '-q'], { cwd: ws });
+  execFileSync('git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '--allow-empty', '-qm', 'initial'], { cwd: ws });
+}
+
+test('managed worktree containment handles Git Windows path spelling without accepting root or siblings', () => {
+  const root = 'C:\\Users\\runner\\project\\.shadow\\worktrees';
+  assert.equal(relativeManagedWorktreePath(root, 'c:/Users/runner/project/.shadow/worktrees/worker', 'win32'), 'worker');
+  assert.equal(relativeManagedWorktreePath(root, 'C:/Users/runner/project/.shadow/worktrees', 'win32'), null);
+  assert.equal(relativeManagedWorktreePath(root, 'C:/Users/runner/project/.shadow/worktrees-other/worker', 'win32'), null);
+  assert.equal(relativeManagedWorktreePath(root, 'D:/Users/runner/project/.shadow/worktrees/worker', 'win32'), null);
+  assert.equal(relativeManagedWorktreePath('/project/.shadow/worktrees', '/project/.shadow/worktrees/worker', 'posix'), 'worker');
+  assert.equal(relativeManagedWorktreePath('/project/.shadow/worktrees', '/project/.shadow/worktrees-other/worker', 'posix'), null);
 });
 
 // Inputs that previously reached `git worktree add --detach "${wtPath}"` / rmSync.
@@ -83,11 +100,10 @@ test('worktree_create + worktree_remove reject path-traversal / absolute ids', a
 test('worktree_create accepts a well-formed id and creates a dir under .shadow/worktrees', async () => {
   const ws = mkdtempSync(join(tmpdir(), 'p0-wt-ok-'));
   try {
+    initRepo(ws);
     const tool = makeWorktreeCreateTool();
     const res = await tool.run({ id: 'good-id_1.2' } as any, ctxFor(ws));
     assert.equal(res.ok, true, 'a safe id must be accepted');
-    // git worktree add fails outside a repo -> fallback plain dir; either way it lands
-    // inside the managed worktrees root.
     assert.ok(existsSync(join(ws, '.shadow/worktrees', 'good-id_1.2')), 'worktree dir created under managed root');
   } finally {
     rmSync(ws, { recursive: true, force: true });
@@ -137,9 +153,10 @@ test('createWorktree (core) throws on a traversal id instead of escaping worktre
   }
 });
 
-test('removeWorktree (core) round-trips a legitimately-created fallback worktree', () => {
+test('removeWorktree (core) round-trips a clean Git worktree', () => {
   const ws = mkdtempSync(join(tmpdir(), 'p0-wt-roundtrip-'));
   try {
+    initRepo(ws);
     const info = createWorktree(ws, 'rt-1');
     assert.ok(existsSync(info.path), 'worktree created');
     // Passing the absolute managed path (as agent isolation cleanup does) must work.
@@ -148,4 +165,27 @@ test('removeWorktree (core) round-trips a legitimately-created fallback worktree
   } finally {
     rmSync(ws, { recursive: true, force: true });
   }
+});
+
+test('worktree creation fails explicitly outside Git and never substitutes an empty checkout', async () => {
+  const ws = mkdtempSync(join(tmpdir(), 'p0-wt-nongit-'));
+  try {
+    const result = await makeWorktreeCreateTool().run({ id: 'isolated' }, ctxFor(ws));
+    assert.equal(result.ok, false);
+    assert.match(result.summary, /No fallback directory/);
+    assert.equal(existsSync(join(ws, '.shadow/worktrees/isolated')), false);
+  } finally { rmSync(ws, { recursive: true, force: true }); }
+});
+
+test('worktree removal refuses uncommitted files unless discard was explicitly selected', () => {
+  const ws = mkdtempSync(join(tmpdir(), 'p0-wt-dirty-'));
+  try {
+    initRepo(ws);
+    const worktree = createWorktree(ws, 'worker');
+    writeFileSync(join(worktree.path, 'result.txt'), 'preserve me');
+    assert.throws(() => removeWorktree(ws, worktree.path));
+    assert.ok(existsSync(join(worktree.path, 'result.txt')));
+    removeWorktree(ws, worktree.path, { discardChanges: true });
+    assert.equal(existsSync(worktree.path), false);
+  } finally { rmSync(ws, { recursive: true, force: true }); }
 });

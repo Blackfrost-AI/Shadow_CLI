@@ -26,7 +26,7 @@ import type { LspServerSpec } from './detect.js';
 import { killTree, type ConnectionState, type CreateConnectionOptions, type ServerConnection } from './client.js';
 
 /** tsserver commands we ever send. Everything else is the wider protocol, untouched. */
-type Pending = { resolve: () => void; reject: (err: Error) => void };
+type Pending = { resolve: (body?: unknown) => void; reject: (err: Error) => void };
 
 function toUri(file: string): string {
   return file.startsWith('file:') ? file : pathToFileURL(file).href;
@@ -121,12 +121,13 @@ export function createTsserverConnection(spec: LspServerSpec, opts: CreateConnec
       return; // a malformed body is dropped; framing resyncs at the byte layer
     }
     if (typeof msg !== 'object' || msg === null) return;
-    const m = msg as { type?: unknown; request_seq?: unknown; event?: unknown; body?: unknown };
+    const m = msg as { type?: unknown; request_seq?: unknown; event?: unknown; body?: unknown; success?: unknown; message?: unknown };
     if (m.type === 'response') {
       const p = typeof m.request_seq === 'number' ? pending.get(m.request_seq) : undefined;
       if (p) {
         pending.delete(m.request_seq as number);
-        p.resolve(); // success/failure of configure is equally "the wire works"
+        if (m.success === false) p.reject(new Error(typeof m.message === 'string' ? m.message : 'tsserver request failed'));
+        else p.resolve(m.body);
       }
       return;
     }
@@ -187,7 +188,7 @@ export function createTsserverConnection(spec: LspServerSpec, opts: CreateConnec
           return;
         }
         const mySeq = send('configure', { hostInfo: 'shadow-cli' }); // handshake probe
-        const p: Pending = { resolve, reject };
+        const p: Pending = { resolve: () => resolve(), reject };
         pending.set(mySeq, p);
         const giveUp = (): void => {
           if (pending.delete(mySeq)) {
@@ -230,6 +231,27 @@ export function createTsserverConnection(spec: LspServerSpec, opts: CreateConnec
     notifyChange(absPath, text) {
       // tsserver has no didChange: re-open reloads the buffer, then re-pull diagnostics.
       openFile(absPath, text);
+    },
+
+    navigate(request) {
+      if (state !== 'ready' || request.signal?.aborted) return Promise.reject(new Error('Navigation unavailable or interrupted.'));
+      const command = request.kind === 'symbols' ? 'navtree' : request.kind === 'definition' ? 'definition' : 'references';
+      return new Promise((resolve, reject) => {
+        const mySeq = send(command, { file: request.path, line: request.line ?? 1, offset: request.col ?? 1 });
+        let settled = false;
+        const done = (error: Error | null, body?: unknown): void => {
+          if (settled) return;
+          settled = true;
+          pending.delete(mySeq);
+          clearTimeout(timer);
+          request.signal?.removeEventListener('abort', onAbort);
+          if (error) reject(error); else resolve(body);
+        };
+        const onAbort = (): void => done(new Error('Navigation interrupted.'));
+        const timer = setTimeout(() => done(new Error('Navigation deadline exceeded.')), request.deadlineMs ?? 3000);
+        request.signal?.addEventListener('abort', onAbort, { once: true });
+        pending.set(mySeq, { resolve: (body) => done(null, body), reject: (error) => done(error) });
+      });
     },
 
     awaitDiagnostics(uri, deadlineMs, signal) {

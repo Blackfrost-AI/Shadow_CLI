@@ -13,7 +13,6 @@ import { streamWithRetry } from './stream.js';
 import { sseEvents, parseSseData, nonEmptyParts } from './sse.js';
 import { buildOpenAIBody, toOpenAIMessages } from './openai.js';
 import { parseToolArgs } from './toolJson.js';
-import { ThinkingSplitter } from '../util/thinkingTags.js';
 import { isLocalBaseUrl } from '../safety/offline.js';
 
 const DEFAULT_BASE_URL = 'https://api.openai.com/v1';
@@ -78,29 +77,16 @@ interface ResponsesSSE {
   error?: { message?: string; code?: string | number; type?: string };
 }
 
-function* yieldSplitSpans(splitter: ThinkingSplitter): Generator<ProviderEvent> {
-  for (const span of splitter.flush()) {
-    yield span.kind === 'thinking' ? { type: 'thinking', delta: span.text } : { type: 'text', delta: span.text };
-  }
-}
-
-function* yieldTextThroughSplitter(text: string, splitter: ThinkingSplitter): Generator<ProviderEvent> {
-  for (const span of splitter.push(text)) {
-    yield span.kind === 'thinking' ? { type: 'thinking', delta: span.text } : { type: 'text', delta: span.text };
-  }
-}
-
 function* yieldResponsesOutputItems(
   output: ResponsesOutputItem[],
-  opts: { emitText: boolean; splitter?: ThinkingSplitter },
+  opts: { emitText: boolean },
   calls: Map<string, { id: string; name: string; args: string }>,
   keySeq: { n: number },
 ): Generator<ProviderEvent> {
-  const splitter = opts.splitter ?? new ThinkingSplitter();
   for (const item of output) {
     if (opts.emitText && item.type === 'message') {
       for (const c of item.content ?? []) {
-        if (c.type === 'output_text' && c.text) yield* yieldTextThroughSplitter(c.text, splitter);
+        if (c.type === 'output_text' && c.text) yield { type: 'text', delta: c.text };
       }
     }
     if (item.type === 'function_call' || item.type === 'tool_call') {
@@ -184,9 +170,7 @@ export function* eventsFromResponsesCompletion(obj: unknown): Generator<Provider
   const keySeq = { n: 0 };
   const { inputTokens, outputTokens, cacheReadTokens } = readResponsesUsage(body.usage);
 
-  const splitter = new ThinkingSplitter();
-  yield* yieldResponsesOutputItems(body.output ?? [], { emitText: true, splitter }, calls, keySeq);
-  yield* yieldSplitSpans(splitter);
+  yield* yieldResponsesOutputItems(body.output ?? [], { emitText: true }, calls, keySeq);
   yield* yieldResponsesToolCalls(calls, keySeq);
 
   if (calls.size > 0 && stopReason === 'end_turn') stopReason = 'tool_use';
@@ -204,7 +188,6 @@ export async function* parseResponsesSSE(lines: AsyncIterable<string>): AsyncIte
   const calls = new Map<string, { id: string; name: string; args: string }>();
   const keySeq = { n: 0 };
   let streamedOutputText = false;
-  const splitter = new ThinkingSplitter();
 
   for await (const ev of sseEvents(lines)) {
     if (ev.kind === 'other') continue;
@@ -227,7 +210,7 @@ export async function* parseResponsesSSE(lines: AsyncIterable<string>): AsyncIte
 
       if (obj.type === 'response.output_text.delta' && obj.delta) {
         streamedOutputText = true;
-        yield* yieldTextThroughSplitter(obj.delta, splitter);
+        yield { type: 'text', delta: obj.delta };
       }
 
       if (obj.type === 'response.function_call_arguments.delta') {
@@ -244,7 +227,7 @@ export async function* parseResponsesSSE(lines: AsyncIterable<string>): AsyncIte
         cacheReadTokens = u.cacheReadTokens;
         yield* yieldResponsesOutputItems(
           obj.response.output ?? [],
-          { emitText: !streamedOutputText, splitter },
+          { emitText: !streamedOutputText },
           calls,
           keySeq,
         );
@@ -253,7 +236,6 @@ export async function* parseResponsesSSE(lines: AsyncIterable<string>): AsyncIte
     }
   }
 
-  yield* yieldSplitSpans(splitter);
   yield* yieldResponsesToolCalls(calls, keySeq);
 
   if (calls.size > 0 && stopReason === 'end_turn') stopReason = 'tool_use';

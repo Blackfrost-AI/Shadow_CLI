@@ -71,6 +71,7 @@ export const snowfallFixtureState = (): SnowfallState => ({
 
 export const snowfallFixtureItems = (): FlattenItem[] => [
   { id: 1, kind: 'user', text: 'Finish the Snowfall build, then show me the result.' },
+  { id: 'thinking', kind: 'reasoning', text: 'I’ll check the layout at each terminal size, then verify that the composer and status bar stay available.\nThe answer should remain separate from the thinking preview.', reasoningState: 'complete', durationMs: 65000 },
   { id: 2, kind: 'assistant', text: 'The new layout gives your conversation the full width, with task and context totals in the footer.\n\n### Ready for review\n- Responsive layout at 80, 120 and 200 columns\n- Unicode stays readable: café, 漢字, ❄\n- Search and prompt navigation preserve your place.' },
   { id: 3, kind: 'tool', text: '', tool: { name: 'run_shell', arg: 'npm test', ok: true, durationMs: 1234, summary: 'Terminal checks passed' }, lines: [{ text: 'PASS  scrolling, search, paste and restoration' }], meta: 'output' },
   { id: 4, kind: 'assistant', text: '| Surface | Result |\n| --- | --- |\n| Transcript | Full width |\n| Composer | Always available |\n| Footer | Session totals |\n\n```ts\nconst renderer = "snowfall";\n```\n\nUse **Ctrl+Shift+F** to find a line, or **End** to return to the latest output.' },
@@ -83,7 +84,7 @@ export function fixture(theme: CanonicalThemeName, width: number, height = 36, s
   const document = new Container();
   const state = snowfallFixtureState();
   if (splash) document.addChild(new BrandSplash({ version: state.version, workspace: state.workspace, providerModel: state.providerModel, help: '/help · /model · @ files' }, SHADOW_LOGOTYPE));
-  else for (const item of snowfallFixtureItems()) document.addChild(new FlatCell(item, false));
+  else for (const item of snowfallFixtureItems()) document.addChild(new FlatCell(item, item.kind === 'reasoning'));
   const editor = new SnowfallEditor(tui, {
     borderColor: (text) => style.fg(C.border ?? C.dim, text),
     selectList: { selectedPrefix: style.cyan, selectedText: style.cyan, description: style.dim, scrollInfo: style.dim, noMatch: style.dim },

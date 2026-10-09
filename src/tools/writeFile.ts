@@ -5,7 +5,7 @@ import { ok, fail } from './types.js';
 import { resolveWithin } from '../safety/workspaceJail.js';
 import { atomicWrite } from './util.js';
 import { diffLines } from '../util/diff.js';
-import { saveCheckpoint } from '../state/checkpoints.js';
+import { saveCheckpoint, saveCheckpointAbsent } from '../state/checkpoints.js';
 import { formatAfterWrite } from '../agent/formatter.js';
 
 const inputSchema = z.object({
@@ -81,8 +81,9 @@ export const writeFile: Tool<WriteFileInput, WriteFileData> = {
     }
 
     try {
-      if (ctx.checkpoint && existed) {
-        saveCheckpoint(ctx.workspaceRoot, ctx.checkpoint.sessionId, ctx.checkpoint.turn, input.path, oldText);
+      if (ctx.checkpoint) {
+        if (existed) saveCheckpoint(ctx.workspaceRoot, ctx.checkpoint.sessionId, ctx.checkpoint.turn, input.path, oldText);
+        else saveCheckpointAbsent(ctx.workspaceRoot, ctx.checkpoint.sessionId, ctx.checkpoint.turn, input.path);
       }
       atomicWrite(abs, input.content);
     } catch (e) {

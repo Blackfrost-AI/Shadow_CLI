@@ -6,7 +6,7 @@
 
 > **A true gift of freedom and privacy.**
 > Zero-telemetry · provider-neutral · phone home to no one.
-> Current build: **`v10.0.2`** — guided onboarding and named sessions. Full-screen terminal, full-width conversation, compact status bar and the classic block-letter SHADOW banner.
+> Current build: **`v10.0.3`** — recoverable jobs, independent consultations and bounded collaboration in the full-width retro terminal.
 
 **Shadow is a zero-telemetry, provider-neutral coding agent that runs on your terms.** Point it at any model — Anthropic, any OpenAI-compatible endpoint, Gemini, or a local model on your own box — and it works as a coding / sysadmin agent over your workspace. **No Shadow account, no signup, no phone-home:** network access follows your provider, tool and update choices. Your config stays local and readable (`~/.shadow/config.json`), credentials are sent to their configured services, and you can switch models mid-session **without losing context**.
 
@@ -16,7 +16,21 @@ Under the hood it's a **tool-calling agentic runtime**: the model reasons, emits
 
 This is **not a chat app** — it is a tool-calling runtime.
 
-## What's new in v10.0.1
+## What's new in v10.0.3
+
+- **Recoverable work:** browse active workers through `/work`, inspect persistent attempts and blockers in `/jobs`, and exchange local project messages through `/room`. Restarting a session never automatically repeats commands or edits.
+- **Review and retain changes:** `/review` browses working changes, branch comparisons and commits. Worker worktrees and patches remain available to inspect, apply, keep or discard explicitly.
+- **Independent consultations:** `/consult` uses a separate read-only conversation with a selected model profile. Follow-ups survive session resume without changing the lead session's model.
+- **Bounded collaboration:** `/team` offers second opinion, implement-and-review and parallel-team presets, with pipeline, debate and plan/solve options. Child workers inherit permissions, cancellation and budgets; recorded checks remain separate from model opinions.
+- **Context and connectors:** ranked repository excerpts, semantic navigation with labeled lexical fallback, scoped instructions, skill origins and memory provenance. Snowfall's `/mcp` adds live reconnect/disable controls, progress, deadlines and large-result retrieval.
+- **Terminal and response fixes:** more footer spacing, elapsed minutes, visible `/effort` choices, separate thinking blocks, preserved structured tool calls and partial results, and clearer interrupted/cancelled states.
+- **Privacy by default:** jobs, rooms and progress records are stored locally. No analytics or crash uploads; update discovery is off unless enabled in trusted user configuration. Project files cannot enable it.
+
+Start with the [collaboration guide](docs/COLLABORATION.md), [user guide](USER_GUIDE.md) and
+[terminal contract](TERMINAL_RENDERERS.md). Workers stop when Shadow exits; remote MCP cancellation
+is best effort, and missing provider usage remains unknown. See [release notes](CHANGELOG.md).
+
+## Previous highlights: v10.0.1
 
 - **Guided setup in the Snowfall style:** choose Local file, Model server or Cloud, with compact menus, arrow keys, search and a review before saving.
 - **Reliable endpoint setup:** cancellable checks, clear time limits, masked keys, and retry/edit controls that keep your entries when a server fails. Each endpoint keeps its own credentials.
@@ -167,7 +181,7 @@ shadow export                            # export latest session to exports/*.md
 ### The web console (`shadow web`)
 
 A browser workspace for the same agent: sessions sidebar, a chat transcript with tool cards
-and approvals, an inspector with usage/telemetry, and a settings sheet covering models, agents,
+and approvals, an inspector with local usage records, and a settings sheet covering models, agents,
 MCP servers and the project allowlist. The access token travels only in the URL fragment (never
 sent to the server), the listener binds loopback only, sessions run inside the same allowlist
 jail as the CLI, and every asset is served from the binary — no CDN, no external requests.
@@ -191,7 +205,7 @@ Source of truth is the append-only session log (`.shadow/sessions/*.jsonl`), not
 npm install
 npm run typecheck && npm run lint && npm test   # all green
 
-# Interactive (TTY) — launches the Ink HUD:
+# Interactive (TTY) — launches the Snowfall terminal:
 ANTHROPIC_API_KEY=sk-ant-... npm run dev -- --system ./prompts/SHADOW.md --autonomy auto-edit
 
 # One-shot, non-interactive (plain renderer, scriptable):
@@ -473,11 +487,21 @@ Per workspace, under `<workspace>/.shadow/`:
 
 ## Zero telemetry
 
-Shadow makes **no analytics, crash-reporting, or phone-home calls of any kind.** The only outbound network traffic is (a) the configured LLM provider and (b) the explicit `web_fetch` / `web_search` tools when the agent invokes them. There is no exception.
+Shadow includes **no analytics service, crash uploads or hosted coordination service**. Sessions,
+jobs, rooms and progress records are stored locally. Prompts and selected context/tool output go
+to your configured model provider. Enabled MCP servers, invoked web tools, plugin operations,
+model downloads and updates have their own network behavior. Programs you configure can also
+access the network under their own settings.
 
 **Verify it yourself:** `shadow doctor --privacy` prints exactly what the active config can send — every outbound egress path (model provider, web tools, MCP servers, the opt-in update check) with each marked live or inactive, plus where your keys live (encrypted vault vs plaintext) and whether offline mode is usable. The report **makes no network calls** — it inspects your config and local state only. Add `--offline` to see the offline posture (everything but a local model blocked).
 
-**One opt-in exception you can enable:** an **update check** (`updateCheck: true` in `~/.shadow/config.json`, **off by default**). When on, Shadow does a single payload-free `GET` of the public `package.json` version, at most **once per day**, and prints a one-line notice if a newer release exists — it sends **no** identifiers, usage data, or key material, and never auto-downloads anything. It is suppressed entirely in `--offline` mode. Left at the default it makes **zero** calls; this is a user-initiated check for public information, not telemetry.
+**Update discovery is off by default.** To enable notices, set `"updateCheck": true` in your
+trusted global `~/.shadow/config.json`; a project-local config cannot change this choice.
+When enabled, Shadow checks the public repository's version on launch, with a local daily cache,
+and displays a notice. The request contains no analytics payload, persistent identifier or
+credentials, but the destination receives normal connection metadata such as your IP address.
+It does not install a release automatically. `shadow update` is a separate explicit download;
+offline mode blocks both network paths. With discovery disabled, no discovery request is made.
 
 ## OS support
 

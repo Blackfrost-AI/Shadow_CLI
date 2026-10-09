@@ -333,11 +333,16 @@ test('wrapMcpArgv: network:true grant removes ONLY the network deny (the rest of
 
 test('structural: MCP spawn routes through wrapMcpArgv and carries the jail knobs', () => {
   const client = readFileSync(join(repoRoot, 'src/mcp/client.ts'), 'utf8');
+  const config = readFileSync(join(repoRoot, 'src/mcp/manage.ts'), 'utf8');
+  const manager = readFileSync(join(repoRoot, 'src/mcp/manager.ts'), 'utf8');
   assert.match(client, /import { wrapMcpArgv } from '\.\.\/safety\/sandbox\.js'/, 'client imports the MCP jail wrapper');
   assert.match(client, /const wrapped = wrapMcpArgv\(\{/, 'start() wraps the spawn');
   assert.match(client, /spawn\(wrapped\.argv\[0\]!, wrapped\.argv\.slice\(1\)/, 'the child is spawned from the WRAPPED argv');
-  assert.match(client, /network\?: boolean/, 'per-server network grant exists');
-  assert.match(client, /sandbox\?: boolean/, 'per-server sandbox opt-out exists');
+  assert.match(client, /McpServerConfig/, 'transport consumes the shared server config');
+  assert.match(config, /network\?: boolean/, 'shared per-server network grant exists');
+  assert.match(config, /sandbox\?: boolean/, 'shared per-server sandbox opt-out exists');
+  assert.match(manager, /registerMcpServers\(options\.registry/, 'live manager uses the confined registration path');
+  assert.match(manager, /options\.jail/, 'live manager forwards the caller jail');
   assert.match(client, /cfg\.sandbox !== false/, 'sandbox:false is honored as an explicit opt-out');
   assert.match(client, /Boolean\(this\.cfg\.network\)/, 'allowNetwork comes from the server config, default off');
 });

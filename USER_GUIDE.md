@@ -11,6 +11,7 @@ instructions, and security model, see the [README](README.md); this guide is the
 - [Reasoning effort](#reasoning-effort)
 - [Autonomy & safety](#autonomy--safety)
 - [Everyday use](#everyday-use)
+- [Collaboration and recoverable jobs](#collaboration-and-recoverable-jobs)
 - [The config file](#the-config-file)
 - [Troubleshooting](#troubleshooting)
 
@@ -29,8 +30,11 @@ shadow --version
 ```
 
 Shadow is a single self-contained binary — no Node or npm needed to run it. It reads your config from
-`~/.shadow/config.json` and never phones home; the only outbound traffic is the model endpoint **you**
-choose and the web tools the agent explicitly invokes.
+`~/.shadow/config.json` and has no analytics service or crash uploads. Requests use your configured
+model providers, enabled MCP connections and invoked tools. Plugin operations, model downloads,
+manual updates and programs you configure have their own network behavior. Background update
+discovery is off by default; see [the config file](#the-config-file) for its trusted-user opt-in.
+Restart Shadow after updating to load the new executable.
 
 ---
 
@@ -348,6 +352,8 @@ In Snowfall, **Ctrl+G** opens your external editor while idle; **Ctrl+T** shows 
 **Ctrl+Shift+F** searches the transcript if your terminal forwards that chord; **Home/End**
 go to the first/latest output. Drag to select and copy text. Press Enter while busy to queue
 a follow-up. The normal terminal paste command inserts a draft without submitting it.
+Thinking appears separately from answers and tool output. The footer gives longer runs elapsed
+time in minutes, and `/effort` shows its available choices.
 
 - **`/help`** lists every slash command; **`/model`**, **`/effort`**, **`/theme`**, **`/context`**,
   **`/copy`**, **`/export`**, **`/resume`**, **`/fork`**, **`/mcp`** are the common ones.
@@ -359,7 +365,9 @@ a follow-up. The normal terminal paste command inserts a draft without submittin
   conversation and that turn's file checkpoints — **`--chat-only`** rewinds only the conversation
   (files untouched), **`--code-only`** restores only the files (conversation untouched). After a
   rewind the composer is prefilled with the first undone prompt, so you can rephrase and resubmit.
-  `/resume` loads a prior session from its last snapshot.
+  Snowfall previews affected files before applying a rewind. `/resume` restores the prior
+  conversation with its plan, tasks, work history and recorded tool activity; it does not rerun
+  commands or edits. An interrupted job needs an explicit retry.
 - **Keep track of named sessions**: the opening prompt becomes a short session name, generated
   locally without another model request. It appears in the terminal title (`Website launch — Shadow`),
   `/session`, `/sessions`, and `/resume`. Type `/resume ` followed by part of a name to filter the
@@ -378,8 +386,10 @@ a follow-up. The normal terminal paste command inserts a draft without submittin
 - **Workspace memory**: the agent can save durable facts about your project (the build command,
   conventions, where key modules live) with its `memory` tool instead of re-discovering them each
   session. Only a one-line **index** of stored facts rides in the system prompt; the agent recalls
-  a key's full value on demand. The store lives at `.shadow/memory.json` — inspect or hand-edit it
-  there, and never put secrets in it.
+  a key's full value on demand. In Snowfall, use `/memory list`, `/memory show <key>`,
+  `/memory set <key> <value>` and `/memory delete <key>` to inspect and manage facts with their
+  user/generated/legacy origin. Unknown legacy dates stay unknown. The store lives at
+  `.shadow/memory.json`; never put secrets in it.
 - **Ctrl-O** expands a collapsed reasoning / tool-output block; **PageUp/PageDown** scroll the
   transcript. Mouse input is opt-in with `"mouse": true` or `SHADOW_MOUSE=1`.
 - **Copy & paste**: paste multi-line text straight into the composer (it inserts atomically — newlines
@@ -429,6 +439,30 @@ may repeat external effects, requires confirmation and an in-memory retry specif
 limited to three retries. Persisted historical items cannot be retried. Web/ACP controls apply
 the same restrictions.
 
+### Collaboration and recoverable jobs
+
+Shadow 10.0.3 adds these Snowfall workflows:
+
+| Command | Use it to |
+|---|---|
+| `/jobs` | Inspect persistent jobs, attempts, dependencies and acceptance; prepare an explicit retry. |
+| `/room` | Read or post local project messages, including replies and unread history. |
+| `/work artifacts` | Inspect retained worktrees and patches, then apply, keep or discard them explicitly. |
+| `/review` | Review working changes, a branch comparison or a commit, with file and hunk navigation. |
+| `/consult` | Select a model profile for an independent read-only conversation. |
+| `/team` | Choose a bounded collaboration preset, then add a task in the composer. |
+| `/map` and `/instructions` | Inspect repository context and the origins of scoped instructions. |
+
+Use arrows and Enter to select a row, a number followed by Enter for a shortcut, or `/` to filter.
+Escape clears a search and then closes the picker; with overlays closed, Escape interrupts work.
+Consultation follow-ups survive session resume and keep the lead session's model unchanged.
+
+Jobs and rooms are stored in the workspace's `.shadow/jobs.sqlite`. Work records survive exit;
+workers do not. Restoring a session never automatically repeats a command or edit. Check evidence
+and acceptance remain separate from whether execution finished and what a model said. Missing
+provider usage remains unknown. See the [collaboration guide](docs/COLLABORATION.md) for presets,
+budgets, recovery, connector controls and their limits.
+
 ---
 
 ## Optional browser automation (Playwright MCP)
@@ -441,15 +475,18 @@ shadow mcp enable browser       # from your shell
 ```
 
 Shadow pins the official `@playwright/mcp@0.0.79` server and launches a visible Chrome window with
-an isolated profile, separate from your everyday Chrome cookies and logins. Restart Shadow after
-enabling it; MCP servers connect when a session starts. Every browser tool is treated as executable:
+an isolated profile, separate from your everyday Chrome cookies and logins. Snowfall applies its
+`/mcp` enable/disable commands to the live connection. Restart after changing configuration from
+the shell or Ink's compatibility menu. Every browser tool is treated as executable:
 at the default `auto-edit` level Shadow asks before it runs, unless you approve that tool for the
 session or choose `full` autonomy.
 
 Profile isolation prevents browser state from carrying between sessions; it is **not a security
 boundary**. The MCP server and Chrome still run as your OS user and retain network access, so treat
 visited pages as untrusted and do not use this profile for sensitive accounts. Disable the opt-in with
-`shadow mcp disable playwright` (or `/mcp disable playwright`) and restart again.
+`shadow mcp disable playwright` and restart, or use Snowfall's `/mcp disable playwright` to
+disconnect immediately. Snowfall's additional connector controls are in the
+[collaboration guide](docs/COLLABORATION.md#extensions-and-repository-context).
 
 ---
 
@@ -511,7 +548,7 @@ signature-verified. See [THREAT_MODEL.md](THREAT_MODEL.md) for the full trust mo
 | `lastTheme` | color theme |
 | `mcpServers` | MCP servers to auto-connect |
 | `notify` | terminal ping on a long turn / waiting approval (default `auto`) — see below |
-| `updateCheck` | opt-in update notice (default `false`) — see below |
+| `updateCheck` | trusted-user opt-in update notice (default `false`; ignored in project config) — see below |
 | `diagnostics` | extension → linter/compiler command run after each successful file write — see below |
 | `hooks` | your own commands at lifecycle points (`pre_tool_use`, `stop`, …) — see below |
 | `pluginIndexUrl` | optional plugin-index JSON for `shadow plugin search` / `add <name>` (off unless set; global-only) |
@@ -537,11 +574,15 @@ inactive, where your keys live (encrypted vault vs plaintext), and whether offli
 > custom command? A `stop` hook runs at every turn end: `{"hooks": {"stop": ["printf '\\a'"]}}` (or any
 > notifier you like, e.g. `terminal-notifier -message done`).
 
-> **Update check (opt-in, off by default).** Set `"updateCheck": true` and Shadow will, at most **once a
-> day**, do a single payload-free `GET` of the public `package.json` version and print a one-line notice if
-> a newer release exists. It sends **no** identifiers, usage data, or key material, and never downloads
-> anything on its own. Left at the default it makes **zero** network calls — this is the only outbound
-> traffic Shadow can ever originate beyond your chosen model endpoint and the explicit web tools.
+> **Update discovery (opt-in, off by default).** Set `"updateCheck": true` in your trusted global
+> `~/.shadow/config.json` to enable a version check on launch. A local cache limits checks to once
+> per day when its timestamp can be saved. A project-local `shadow.config.json` cannot enable or
+> override this choice. The request reads the public repository's `package.json` and may display
+> an update notice; it does not install a release. It sends no analytics payload, persistent
+> identifier or credentials, but GitHub receives ordinary connection metadata such as your IP
+> address. With this setting off, no discovery request is made. `shadow update` remains a separate
+> explicit download, and offline mode blocks both network paths. Other configured integrations
+> and invoked tools retain their documented network behavior.
 
 > **Diagnostics (`diagnostics`, off until you set it).** Map a file extension to a command and Shadow
 > runs it after every **successful** `write_file` / `edit_file` / `multi_edit`, folding the output into
@@ -600,8 +641,9 @@ inactive, where your keys live (encrypted vault vs plaintext), and whether offli
 > ```
 
 > **Trust boundary:** your global `~/.shadow/config.json` is trusted. A project-local config inside a repo
-> is **de-fanged** — it cannot set base URLs, keys, hooks, diagnostics, or MCP command servers — so cloning
-> an untrusted repo can't redirect your key or run code.
+> cannot set base URLs, keys, hooks, diagnostics, MCP servers or `updateCheck`. These settings must
+> come from trusted user configuration. Project content is still untrusted input; review requested
+> commands and tool approvals before granting them access.
 
 ---
 

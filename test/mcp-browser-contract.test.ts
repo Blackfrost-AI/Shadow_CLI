@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { removeFixtureTree } from './helpers/removeFixtureTree.js';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { test } from 'node:test';
@@ -137,9 +138,9 @@ lines.on('line', (line) => {
     { playwright: { command: process.execPath, args: [fixture] } },
     root,
   );
-  t.after(() => {
+  t.after(async () => {
     for (const client of clients) client.stop();
-    rmSync(root, { recursive: true, force: true });
+    await removeFixtureTree(root);
   });
 
   assert.equal(clients.length, 1, 'the stdio server completed the MCP handshake');

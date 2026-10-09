@@ -11,6 +11,10 @@ import type { ApprovalKind, UserQuestion } from './approval.js';
  * the loop itself never imports any UI code — this seam keeps it headless/testable.
  */
 export type LoopEvent =
+  | { type: 'mcp_call'; server: string; requestId: number; progressToken: string; tool: string;
+      status: 'running' | 'completed' | 'failed' | 'cancelled'; startedAt: number; lastActivityAt: number }
+  | { type: 'mcp_progress'; server: string; requestId: number; progressToken: string; tool: string;
+      progress: number; total?: number; message?: string; lastActivityAt: number }
   | { type: 'session_closed' }
   | { type: 'mode'; mode: 'thinking' | 'acting' | 'idle' }
   // The user's own turn. Emitted by the SUBMIT sites (tui.tsx, index.ts), not by the loop —
@@ -84,8 +88,19 @@ export type LoopEvent =
       parentId?: string;
       depth?: number;
       priority?: 'low' | 'normal' | 'high';
+      profile?: string;
+      provider?: string;
+      model?: string;
+      jobId?: string;
     }
-  | { type: 'subagent_end'; taskId: string; ok: boolean; subagentType?: string }
+  | {
+      type: 'subagent_end'; taskId: string; ok: boolean; subagentType?: string;
+      status?: 'completed' | 'partial' | 'failed' | 'cancelled';
+      stopReason?: StopReasonExt;
+      answer?: string;
+      artifactIds?: string[];
+      jobId?: string;
+    }
   // A REQUEST (UI → running bg agent) to cancel a background sub-agent by taskId, or all when
   // taskId is '*'. Emitted on the parent bus; the bg `agent` tool run listens for its own taskId and
   // aborts its sub-loop. Completes the F10-02 story: bg agents were visible but uncancellable.

@@ -8,6 +8,8 @@ import type { TuiOpts } from '../src/tui.js';
 import type { ApprovalGate, ApprovalDecision, ApprovalRequest } from '../src/agent/approval.js';
 import type { Provider, ProviderEvent } from '../src/provider/provider.js';
 import type { SnowfallEditor } from '../src/app/snowfall.js';
+import type { FlattenItem } from '../src/tui/flatten.js';
+import type { ShadowAutocompleteProvider } from '../src/app/autocomplete.js';
 import { isolateHome, assertStoreIsolated } from './helpers/isolateHome.js';
 import { HeadlessTerminal } from './helpers/snowfallTerminal.js';
 
@@ -35,6 +37,168 @@ async function until(predicate: () => boolean, label: string): Promise<void> {
   while (!predicate() && Date.now() < deadline) await pause();
   assert.ok(predicate(), label);
 }
+
+test('/effort offers completions and a cancelable picker, persists the choice and sends it to the provider', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'shadow-effort-flow-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const sent: Array<string | undefined> = [];
+  const provider: Provider = {
+    name: 'mock', estimateTokens: () => 20,
+    async *send(request): AsyncIterable<ProviderEvent> {
+      sent.push(request.effort);
+      yield { type: 'text', delta: 'Effort received.' };
+      yield { type: 'done', stopReason: 'end_turn' };
+    },
+  };
+  const cfg = loadConfig(root, { provider: 'mock', model: 'fixture', effort: 'high', reducedMotion: true, notify: 'off', instructionAutopilot: false });
+  const log = SessionLog.open(root);
+  const terminal = new HeadlessTerminal(120, 36);
+  const app = new ShadowApp({
+    provider, cfg, bus: new EventBus(), registry: new ToolRegistry(), sessionLog: log,
+    context: new Context({ contextBudget: 32768, triggerRatio: 0.8, keepLastTurns: 4 }),
+    system: 'Effort test.', workspaceRoot: root, autonomy: 'manual', bypass: false, offline: true, version: 'test',
+  }, terminal);
+  const inspect = app as unknown as { tui: TuiAltScreen; editor: SnowfallEditor; running: boolean; autocomplete: ShadowAutocompleteProvider; runSlash(command: string): void };
+  const run = app.run();
+  const screen = () => terminal.lines().join('\n');
+  try {
+    terminal.input('/effort ');
+    await terminal.flush();
+    for (const level of ['low', 'medium', 'high', 'xhigh', 'max']) assert.ok(screen().includes(level));
+    const found = await inspect.autocomplete.getSuggestions(['/effort X'], 0, 9, { signal: new AbortController().signal });
+    assert.deepEqual(found?.items.map((item) => item.value), ['xhigh']);
+    terminal.input('\x1b');
+    inspect.editor.setText('');
+    terminal.input('/effort');
+    await terminal.flush();
+    terminal.input('\r');
+    await terminal.flush();
+    assert.ok(inspect.tui.hasOverlay());
+    assert.match(screen(), /Reasoning effort · current: high/);
+    assert.equal(cfg.effort, 'high', 'opening the menu must not change effort');
+    terminal.input('\x1b[B');
+    terminal.input('\x1b');
+    assert.equal(cfg.effort, 'high', 'Escape cancels a highlighted choice');
+    inspect.runSlash('/effort');
+    terminal.input('5');
+    assert.equal(cfg.effort, 'high', 'numbers select without committing');
+    terminal.input('\r');
+    assert.equal(cfg.effort, 'max');
+    await until(() => JSON.parse(readFileSync(join(GLOBAL_DIR, 'config.json'), 'utf8')).effort === 'max', 'effort persists');
+    inspect.runSlash('/effort invalid');
+    assert.equal(cfg.effort, 'max');
+    inspect.runSlash('/effort');
+    terminal.input('\x1b[A');
+    terminal.input('\r');
+    assert.equal(cfg.effort, 'xhigh');
+    terminal.input('Confirm the selected effort.'); terminal.input('\r');
+    await until(() => sent.length === 1 && !inspect.running, 'the next prompt completes');
+    assert.deepEqual(sent, ['xhigh']);
+    inspect.runSlash('/effort LOW');
+    assert.equal(cfg.effort, 'low', 'explicit arguments still work');
+  } finally { app.stop(); await run; log.close(); terminal.screen.dispose(); }
+});
+
+test('thinking streams in its own panel before the answer, expands, survives resize and stops cleanly on Escape', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'shadow-thinking-flow-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  let releaseThinking!: () => void;
+  let releaseAnswer!: () => void;
+  const thinkingGate = new Promise<void>((resolve) => { releaseThinking = resolve; });
+  const answerGate = new Promise<void>((resolve) => { releaseAnswer = resolve; });
+  const thinking = Array.from({ length: 7 }, (_, i) => `Reasoning step ${i + 1}: inspect the layout.`).join('\n');
+  let calls = 0;
+  const provider: Provider = {
+    name: 'mock', estimateTokens: () => 20,
+    async *send(request): AsyncIterable<ProviderEvent> {
+      calls++;
+      if (calls === 1) {
+        yield { type: 'thinking', delta: thinking };
+        await thinkingGate;
+        yield { type: 'thinking_block', thinking, signature: 'fixture-signature' };
+        yield { type: 'text', delta: 'The answer is separate.\n\nHere is the result.' };
+        await answerGate;
+      } else if (calls === 2) {
+        yield { type: 'thinking', delta: 'Checking the interrupted task.' };
+        await new Promise<void>((resolve) => {
+          if (request.signal?.aborted) resolve();
+          else request.signal?.addEventListener('abort', () => resolve(), { once: true });
+        });
+      } else {
+        yield { type: 'text', delta: 'Fresh answer without reasoning.' };
+      }
+      yield { type: 'done', stopReason: 'end_turn' };
+    },
+  };
+  const cfg = loadConfig(root, { provider: 'mock', model: 'fixture', reducedMotion: true, notify: 'off', instructionAutopilot: false });
+  const log = SessionLog.open(root);
+  const terminal = new HeadlessTerminal(120, 36);
+  const app = new ShadowApp({
+    provider, cfg, bus: new EventBus(), registry: new ToolRegistry(), sessionLog: log,
+    context: new Context({ contextBudget: 32768, triggerRatio: 0.8, keepLastTurns: 4 }),
+    system: 'Thinking layout test.', workspaceRoot: root, autonomy: 'manual', bypass: false, offline: true, version: 'test',
+  }, terminal);
+  const inspect = app as unknown as {
+    tui: TuiAltScreen; running: boolean; items: FlattenItem[]; streamBuf: string; runStart: number;
+    reasoning: { item: FlattenItem; startedAt: number | null } | null; repaintFromContext(): void;
+  };
+  const run = app.run();
+  const screen = () => terminal.lines().join('\n');
+  try {
+    terminal.input('Review the layout.'); terminal.input('\r');
+    await until(() => !!inspect.reasoning, 'thinking arrives before any answer');
+    inspect.reasoning!.startedAt! -= 65000;
+    inspect.runStart -= 65000;
+    await until(() => (inspect.reasoning?.item.durationMs ?? 0) >= 65000, 'live thinking clock reaches minutes');
+    await terminal.flush();
+    assert.match(screen(), /Thinking · 1m/);
+    assert.match(terminal.lines().at(-1)!, /working 1m/);
+    assert.match(screen(), /Reasoning step 7/);
+    assert.doesNotMatch(screen(), /Reasoning step 1/);
+    terminal.input('\x0f'); await terminal.flush();
+    assert.match(screen(), /Reasoning step 1/);
+    assert.match(screen(), /Ctrl\+O compact/);
+    terminal.input('\x0f'); await terminal.flush();
+    assert.doesNotMatch(screen(), /Reasoning step 1/);
+    for (const [width, height] of [[40, 12], [28, 8], [120, 36]]) {
+      terminal.resize(width!, height!); inspect.tui.renderNow(true); await terminal.flush();
+      assert.ok(terminal.screen.buffer.active.cursorY < height!);
+      assert.match(terminal.lines().at(-1)!, /manual/);
+    }
+    releaseThinking();
+    await until(() => inspect.streamBuf.includes('Here is the result.'), 'answer streams after thinking');
+    await terminal.flush();
+    const trace = inspect.items.find((item) => item.kind === 'reasoning')!;
+    const duration = trace.durationMs;
+    assert.equal(trace.reasoningState, 'complete');
+    assert.match(screen(), /Thought for 1m/);
+    assert.ok(screen().indexOf('Reasoning step 7') < screen().indexOf('The answer is separate.'));
+    await pause(1100);
+    assert.equal(trace.durationMs, duration, 'the thinking timer freezes while the answer streams');
+    releaseAnswer();
+    await until(() => !inspect.running, 'the first turn completes');
+    assert.equal(inspect.items.filter((item) => item.kind === 'reasoning').length, 1, 'reasoning_done updates the original panel');
+    assert.ok(inspect.items.some((item) => /done · 1m/.test(item.text)));
+    inspect.repaintFromContext();
+    await terminal.flush();
+    assert.match(screen(), /Reasoning step 7/);
+    assert.ok(screen().indexOf('Reasoning step 7') < screen().indexOf('The answer is separate.'));
+    terminal.input('A task I will interrupt.'); terminal.input('\r');
+    await until(() => calls === 2 && !!inspect.reasoning, 'the next turn starts a fresh panel');
+    terminal.input('\x1b'); terminal.input('\x1b');
+    await until(() => !inspect.running, 'Escape cancels while thinking');
+    assert.equal(inspect.reasoning, null);
+    const interrupted = inspect.items.find((item) => item.text === 'Checking the interrupted task.')!;
+    assert.equal(interrupted.reasoningState, 'interrupted');
+    assert.equal(inspect.items.filter((item) => item.text.includes('⏹ interrupted')).length, 1);
+    terminal.input('Continue with a new answer.'); terminal.input('\r');
+    await until(() => calls === 3 && !inspect.running, 'next prompt completes without stale thinking');
+    assert.equal(inspect.items.filter((item) => item.kind === 'reasoning').length, 2);
+    assert.ok(!inspect.items.some((item) => item.reasoningState === 'streaming'));
+  } finally {
+    releaseThinking(); releaseAnswer(); app.stop(); await run; log.close(); terminal.screen.dispose();
+  }
+});
 
 test('named sessions stay in sync across the terminal title, resume picker, new conversations and forks', async (t) => {
   const root = mkdtempSync(join(tmpdir(), 'shadow-named-flow-'));

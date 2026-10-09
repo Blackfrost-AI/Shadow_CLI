@@ -23,6 +23,7 @@ export interface SubAgentView {
   /** Set once subagent_end arrives; the entry lingers (bg) until the next user turn clears it. */
   done?: boolean;
   ok?: boolean;
+  status?: 'completed' | 'partial' | 'failed' | 'cancelled';
 }
 
 export type SubAgentLineKind = 'header' | 'agent' | 'more' | 'summary';
@@ -62,7 +63,7 @@ function plural(n: number, one: string): string {
 
 /** The status clause for one agent line. */
 function agentStatus(a: SubAgentView): string {
-  if (a.done) return a.ok === false ? 'failed' : 'Done';
+  if (a.done) return a.status && a.status !== 'completed' ? a.status : a.ok === false ? 'failed' : 'Done';
   // F06-10: an agent waiting on a concurrency slot says so — "Initializing…" would lie about it.
   if (a.queued) return 'queued…';
   if (a.tool) return a.argPreview ? `${a.tool} ${a.argPreview}` : a.tool;

@@ -1,8 +1,10 @@
 import type { Message } from '../provider/provider.js';
 import { Context, type ContextOptions } from '../agent/context.js';
+import type { SessionStateSnapshot } from './sessionState.js';
 
 /** Payload stored in session JSONL `context_snapshot` records. */
 export interface ContextSnapshotData {
+  sessionState?: SessionStateSnapshot;
   messages: Message[];
   pinnedPrefix: number;
   lastActualTokens: number;

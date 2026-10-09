@@ -2,6 +2,7 @@
 import { GLYPHS } from './tui/glyphs.js';
 import { readFileSync, existsSync, unlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { resolve, parse, join } from 'node:path';
 import { homedir } from 'node:os';
 import { stdout } from 'node:process';
@@ -46,7 +47,11 @@ import { runLock, CLI_HOLDER } from './web/runLock.js';
 import { updateInstalledBinary } from './update/binary.js';
 import { ensureVaultReady } from './auth/unlock.js';
 import { makeAgentTool, makeScheduleWakeupTool } from './tools/index.js';
-import { registerMcpServers } from './mcp/client.js';
+import { makeProjectJobsTool, makeProjectRoomTool, makeAcceptanceCheckTool } from './tools/projectJobs.js';
+import { makeCollaborationTool } from './agent/collaboration.js';
+import type { Tool, ToolContext, ToolResult } from './tools/types.js';
+import type { RunShellData } from './tools/runShell.js';
+import { createMcpManager } from './mcp/manager.js';
 import {
   disableMcpServer,
   enableContextCooler,
@@ -79,7 +84,7 @@ import type { ToolCall } from './provider/provider.js';
 import { Logger } from './util/logger.js';
 import { lc } from './util/lc.js';
 import { createInterface } from 'node:readline/promises';
-import { AutoApproveGate, AutoDenyGate, type ApprovalGate } from './agent/approval.js';
+import { AutoApproveGate, AutoDenyGate, SessionApprovals, type ApprovalGate } from './agent/approval.js';
 import { stopLspServices } from './agent/lsp/index.js';
 import { ReplGate, headlessInputSource } from './replGate.js';
 import { loadGlobalConfig, saveGlobalConfig, ensureShadowLayout, configPath, GLOBAL_DIR } from './state/globalStore.js';
@@ -89,7 +94,11 @@ import {
   globalConfigLooksEmpty,
   FIRST_RUN_HINT,
 } from './config/configInit.js';
-import { listResumableSessions } from './state/resume.js';
+import { listResumableSessions, readSessionState, resolveSessionMatches } from './state/resume.js';
+import { captureSessionState } from './state/sessionState.js';
+import { ModelProfileResolver } from './agent/modelProfiles.js';
+import { ConsultationService } from './agent/consultation.js';
+import { JobStore } from './state/jobStore.js';
 import { SessionLog } from './state/session.js';
 import { scanClaudeSessions, importClaudeSession } from './state/claudeImport.js';
 import { isDumbTerm, queryTerminalBackground, themeForBackground } from './util/themeDetect.js';
@@ -1040,18 +1049,29 @@ async function main(): Promise<void> {
   if (argv[0] === 'resume') {
     const rest: string[] = [];
     let fromClaude = false;
+    let resumeQuery: string | undefined;
     for (let i = 1; i < argv.length; i++) {
       const a = argv[i]!;
       if (a === '--session' && argv[i + 1]) {
-        resumeSessionPath = resolve(process.cwd(), argv[++i]!);
+        resumeQuery = argv[++i]!;
       } else if (a === '--from-claude') {
         fromClaude = true;
+      } else if (i === 1 && !a.startsWith('-')) {
+        resumeQuery = a;
       } else {
         rest.push(a);
       }
     }
     if (fromClaude) {
       runFromClaudeImport(resolve(process.cwd()));
+    }
+    if (resumeQuery) {
+      const matches = resolveSessionMatches(listResumableSessions(resolve(process.cwd())), resumeQuery);
+      if (matches.length > 1) {
+        process.stderr.write(`Multiple sessions match "${resumeQuery}". Use a session ID, or /resume ${resumeQuery} for the picker:\n${matches.map((match) => `  ${match.id}  ${match.title}`).join('\n')}\n`);
+        process.exit(1);
+      }
+      resumeSessionPath = matches[0]?.path ?? resolve(process.cwd(), resumeQuery);
     }
     if (!resumeSessionPath) {
       const sessions = listResumableSessions(resolve(process.cwd()));
@@ -1404,8 +1424,26 @@ async function main(): Promise<void> {
   const bus = new EventBus();
   const workCenter = new WorkCenter();
   workCenter.subscribe(bus);
-  workCenter.restore(readLatestWorkCenterSnapshot(resumeSessionPath ?? sessionLog.path));
+  workCenter.restore(resumeSessionPath ? readSessionState(resumeSessionPath).workCenter ?? null : readLatestWorkCenterSnapshot(sessionLog.path));
   workCenter.syncTodos(todoList.snapshot());
+  const stateOwners = { mission, planMode, todoList, workCenter };
+  sessionLog.bindSessionState(context, () => captureSessionState(stateOwners));
+  // Coalesce synchronous restore/update notifications into one coherent state. Mutations remain
+  // journal data only: loading this bundle never restarts tools or background workers.
+  let controlSnapshotQueued = false;
+  const persistControls = () => {
+    if (controlSnapshotQueued) return;
+    controlSnapshotQueued = true;
+    queueMicrotask(() => {
+      controlSnapshotQueued = false;
+      const target = sessionLogBox.current;
+      target.bindSessionState(context, () => captureSessionState(stateOwners));
+      target.recordSnapshot(context, Math.max(0, SessionLog.countSnapshots(target.path) - 1));
+    });
+  };
+  mission.onUpdate(persistControls);
+  planMode.onUpdate(persistControls);
+  todoList.onUpdate(persistControls);
   bg.attachWorkCenter(workCenter);
   // Coalesce bursts (streaming shell output/tool events) into bounded durable snapshots.
   const workSnapshotWrites = new Map<SessionLog, { snapshot: ReturnType<WorkCenter['snapshot']>; timer?: ReturnType<typeof setTimeout> }>();
@@ -1418,12 +1456,17 @@ async function main(): Promise<void> {
     state.timer = setTimeout(() => {
       state.timer = undefined;
       recordWorkCenterSnapshot(target, state.snapshot);
+      if (target === sessionLogBox.current) persistControls();
       workSnapshotWrites.delete(target);
     }, 250);
   });
   // A resumed run writes into a fresh SessionLog. Seed its sidecar immediately so an otherwise
   // idle resume still carries the completed Work Center history into the new lineage.
-  if (resumeSessionPath) recordWorkCenterSnapshot(sessionLog, workCenter.snapshot());
+  if (resumeSessionPath) {
+    recordWorkCenterSnapshot(sessionLog, workCenter.snapshot());
+    sessionLog.recordSnapshot(context, 0);
+    sessionLog.record({ kind: 'resumed_from', sessionId: SessionLog.sessionIdFromPath(resumeSessionPath), path: resumeSessionPath });
+  }
   // recordEvent drops the per-token stream deltas (text/thinking/shell_output) that used to
   // trigger a redact+stringify+write on EVERY token; the committed assistant_done/reasoning_done
   // events carry the same text for resume/replay (P1B-06).
@@ -1560,6 +1603,13 @@ async function main(): Promise<void> {
   // Offline mode: skip MCP servers entirely — they are outbound connectors (another egress
   // vector), so an offline session keeps nothing but the local model.
   const mcpClients: Array<{ stop(): void }> = [];
+  const mcpManager = offline ? undefined : createMcpManager({ registry, workspaceRoot,
+    jail: { additionalRoots, enabled: (cfg.sandbox ?? 'auto') !== 'off', failurePolicy: cfg.sandboxFailurePolicy ?? 'auto' },
+    onCallStart: (event) => bus.emit({ type: 'mcp_call', ...event }),
+    onCallEnd: (event) => bus.emit({ type: 'mcp_call', ...event }),
+    onProgress: (event) => bus.emit({ type: 'mcp_progress', ...event }),
+  });
+  if (mcpManager) mcpClients.push({ stop: () => mcpManager.stopAll() });
   let mcpSettled: Promise<void> | undefined;
   if (offline) {
     const mcpCount = Object.keys(cfg.mcpServers ?? {}).length;
@@ -1573,13 +1623,7 @@ async function main(): Promise<void> {
     // only the interactive TUI starts painting immediately.
     // P3-08 Phase 3: stdio children get the OS jail (network off unless a server is granted
     // `network: true`); the session's sandbox request state decides whether the jail is armed.
-    const connecting = registerMcpServers(registry, cfg.mcpServers, workspaceRoot, (c) => mcpClients.push(c), {
-      // S4 (P3-08 review): pass the RESOLVED granted roots (cwd-absolute, deduped, incl. --add-dir)
-      // so the MCP jail and the run_shell jail never disagree about what's writable.
-      additionalRoots,
-      enabled: (cfg.sandbox ?? 'auto') !== 'off',
-      failurePolicy: cfg.sandboxFailurePolicy ?? 'auto',
-    });
+    const connecting = Promise.all(Object.entries(cfg.mcpServers).map(([name, config]) => mcpManager!.reconnect(name, config)));
     mcpSettled = connecting.then(
       () => undefined,
       () => undefined, // per-server failures are warned by registerMcpServers itself
@@ -1614,6 +1658,16 @@ async function main(): Promise<void> {
   };
   process.on('exit', () => {
     shutdownCore();
+    // The final worker event can arrive inside the 250 ms coalescing window. Flush the complete
+    // data bundle synchronously at exit so a completed worker does not reappear as interrupted.
+    for (const [target, pending] of workSnapshotWrites) {
+      if (pending.timer) clearTimeout(pending.timer);
+      recordWorkCenterSnapshot(target, pending.snapshot);
+    }
+    workSnapshotWrites.clear();
+    const finalLog = sessionLogBox.current;
+    finalLog.bindSessionState(context, () => captureSessionState(stateOwners));
+    finalLog.recordSnapshot(context, Math.max(0, SessionLog.countSnapshots(finalLog.path) - 1));
     forceStopGgufServers();
   });
   process.on('SIGTERM', () => {
@@ -1679,8 +1733,12 @@ async function main(): Promise<void> {
   let activeMainProvider = provider;
   // activeAgentModel is declared above (hoisted over the --web mirror for a TDZ-safe live getter).
 
-  registry.register(
-    makeAgentTool({
+  const profiles = new ModelProfileResolver({
+    cfg, current: () => ({ provider: activeAgentProvider, model: activeAgentModel }), offline,
+    baseContextPolicy: session.baseContextPolicy,
+    notice: (message) => bus.emit({ type: 'finding', severity: 'info', title: 'Model profile', body: message }),
+  });
+  const agentTool = makeAgentTool({
       makeLoopDeps: () =>
         buildLoopDeps({
           cfg,
@@ -1720,8 +1778,46 @@ async function main(): Promise<void> {
       maxIterations: cfg.maxIterations,
       priceTable: cfg.priceTable,
       subagentConcurrency: cfg.subagentConcurrency, // F06-10
-    }),
-  );
+      resolveProfile: (reference, options) => profiles.resolve(reference, options),
+      getConsultation: (id) => consultations?.continuation(id),
+    });
+  registry.register(agentTool);
+  const consultations = new ConsultationService({ cfg, profiles, agent: () => gatedAgent, workspaceRoot, additionalRoots,
+    sessionLog: () => sessionLogBox.current });
+  consultations.adopt(sessionLog, resumeSessionPath);
+  // Classification is deliberately separate from execution: interrupted work is
+  // offered for inspection and explicit retry, never automatically replayed.
+  const jobRecovery = new JobStore(workspaceRoot);
+  try {
+    const interrupted = jobRecovery.recoverOrphans();
+    if (interrupted.length) bus.emit({ type: 'finding', severity: 'warn', title: 'Interrupted project jobs',
+      body: `${interrupted.length} job(s) lost their owning process. Inspect /jobs and /work artifacts before explicitly retrying.` });
+  } finally { jobRecovery.close(); }
+
+  // Interactive jobs and orchestration use the ordinary tool execution path.
+  // In particular acceptance checks must authorize the underlying shell command
+  // (including rules/hooks/plan mode), not hide it behind a read-like workflow.
+  let nativeApprovals = new SessionApprovals();
+  const executeNativeTool = async (name: string, input: unknown, ctx: ToolContext): Promise<ToolResult> => {
+    const budget = ctx.parentBudget ?? new Budget({ maxIterations: 0, ...cfg.budget }, activeAgentModel, cfg.priceTable, Date.now());
+    const loop = new AgentLoop({ ...buildLoopDeps({ cfg, provider: activeAgentProvider, registry, gate: currentGate, bus, budget,
+      context: new Context({ contextBudget: cfg.contextBudget, triggerRatio: cfg.summarizeTriggerRatio, keepLastTurns: cfg.keepLastTurns }),
+      signal: ctx.signal, model: activeAgentModel, system: fullSystem, workspaceRoot: ctx.workspaceRoot,
+      additionalRoots: ctx.additionalRoots ?? additionalRoots, forceConfirm, todoList, planMode,
+      streamShell: true, sessionLog: sessionLogBox.current, approvals: nativeApprovals,
+    }), nestedAgent: ctx.nestedAgent, currentWorkId: ctx.currentWorkId, workDepth: ctx.workDepth, rootBudget: ctx.rootBudget ?? budget }, autonomy);
+    return loop.runToolCall({ id: `native_${randomUUID()}`, name, input });
+  };
+  const gatedAgent: typeof agentTool = { ...agentTool,
+    run: (input, ctx) => executeNativeTool('agent', input, ctx) as ReturnType<typeof agentTool.run> };
+  const configuredShell = registry.get('run_shell')!;
+  const checkedShell: Tool<unknown, RunShellData> = { ...configuredShell,
+    run: (input, ctx) => executeNativeTool('run_shell', input, ctx) as Promise<ToolResult<RunShellData>> };
+  const acceptanceTool = makeAcceptanceCheckTool(checkedShell);
+  registry.register(makeProjectJobsTool());
+  registry.register(makeProjectRoomTool());
+  registry.register(acceptanceTool);
+  registry.register(makeCollaborationTool({ agentTool: gatedAgent, runCheck: (input, ctx) => acceptanceTool.run(input, ctx) }));
 
   // Sub-agents and their budgets must use the WIRE model too — an `autoModel` entry's identity and
   // the id its endpoint actually serves are deliberately different strings.
@@ -2016,10 +2112,17 @@ async function main(): Promise<void> {
       bypass: yolo,
       offline,
       mcpPending: mcpSettled,
+      mcpManager,
       version: VERSION,
       styleState,
       todoList,
       workCenter,
+      consultations,
+      runNativeTool: (name, input, signal, parentBudget) => executeNativeTool(name, input, {
+        workspaceRoot, additionalRoots, signal, parentBudget, rootBudget: parentBudget,
+        dryRun: cfg.dryRun, log: (message) => bus.emit({ type: 'finding', severity: 'info', title: name, body: message }),
+      }),
+      onApprovalGate: (gate, approvals) => { currentGate = gate; if (approvals) nativeApprovals = approvals; },
       bgRegistry: bg,
       workHistory: (sessionId) => queryWorkHistory(workspaceRoot, sessionId),
       planMode,

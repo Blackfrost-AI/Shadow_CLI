@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { resolve } from 'node:path';
+import { redactString, isSecretKey } from '../util/redact.js';
 import { loadGlobalConfig, saveGlobalConfig } from '../state/globalStore.js';
 
 export interface McpServerConfig {
@@ -13,6 +14,12 @@ export interface McpServerConfig {
   network?: boolean;
   /** P3-08 Phase 3: false = run this ONE server outside the OS jail (explicit operator choice). */
   sandbox?: boolean;
+  /** Tool-call wall-clock deadline, 100ms–10min; initialization remains separately bounded. */
+  callTimeoutMs?: number;
+  /** Wire tool names to expose. Empty exposes none; omitted preserves all. */
+  toolNames?: string[];
+  /** Exclude schemas from the default request; tool_search discovers them on demand. */
+  deferTools?: boolean;
 }
 
 export type McpServers = Record<string, McpServerConfig>;
@@ -112,6 +119,28 @@ export function disableMcpServer(servers: McpServers, name: string): McpChange {
   return { ok: true, servers: next, message: `Disabled MCP server "${name}".` };
 }
 
+/** Hide URL userinfo, fragments and query values; connector URLs can contain nonstandard tokens. */
+export function mcpDisplayUrl(raw: string): string {
+  try {
+    const url = new URL(raw);
+    url.username = ''; url.password = ''; url.hash = '';
+    for (const key of [...url.searchParams.keys()]) url.searchParams.set(key, '[REDACTED]');
+    return redactString(url.toString());
+  } catch { return '[invalid or private endpoint]'; }
+}
+
+function displayArgs(args: string[]): string {
+  let hideNext = false;
+  return args.map((arg) => {
+    if (hideNext) { hideNext = false; return '[REDACTED]'; }
+    const flag = arg.replace(/^-+/, '');
+    const eq = flag.indexOf('=');
+    if (eq > 0 && (isSecretKey(flag.slice(0, eq).replace(/-/g, '_')) || /^(?:authorization|auth|header|headers)$/i.test(flag.slice(0, eq)))) return `${arg.slice(0, arg.indexOf('=') + 1)}[REDACTED]`;
+    if (eq < 0 && (isSecretKey(flag.replace(/-/g, '_')) || /^(?:authorization|auth|header|headers)$/i.test(flag))) { hideNext = true; return arg; }
+    return /^https?:\/\//i.test(arg) ? mcpDisplayUrl(arg) : redactString(arg);
+  }).join(' ');
+}
+
 export function mcpServerLines(
   name: string,
   server: McpServerConfig,
@@ -122,16 +151,20 @@ export function mcpServerLines(
     return [
       `${name}`,
       `  transport: http`,
-      `  url: ${server.url}`,
+      `  url: ${mcpDisplayUrl(server.url)}`,
       `  headers: ${server.headers ? Object.keys(server.headers).join(', ') || 'none' : 'none'}`,
+      `  call deadline: ${(server.callTimeoutMs ?? 180000) / 1000}s`,
+      `  tools: ${server.toolNames ? server.toolNames.join(', ') || '(none)' : 'all'} · schemas ${server.deferTools === false ? 'eager' : 'on demand in live manager'}`,
     ];
   }
   return [
     `${name}`,
     `  transport: stdio`,
     `  command: ${server.command ?? 'unknown'}`,
-    `  args: ${(server.args ?? []).join(' ') || 'none'}`,
+    `  args: ${displayArgs(server.args ?? []) || 'none'}`,
     `  env: ${server.env ? Object.keys(server.env).join(', ') || 'none' : 'none'}`,
+    `  call deadline: ${(server.callTimeoutMs ?? 180000) / 1000}s`,
+    `  tools: ${server.toolNames ? server.toolNames.join(', ') || '(none)' : 'all'} · schemas ${server.deferTools === false ? 'eager' : 'on demand in live manager'}`,
     `  confinement (P3-08): ${
       server.sandbox === false
         ? 'OFF (explicit sandbox:false)'
@@ -148,7 +181,7 @@ export function mcpListLines(servers: McpServers): string[] {
   return names.map((name) => {
     const server = servers[name]!;
     const transport = server.url ? 'http' : 'stdio';
-    const target = server.url ?? [server.command, ...(server.args ?? [])].filter(Boolean).join(' ');
+    const target = server.url ? mcpDisplayUrl(server.url) : [redactString(server.command ?? ''), displayArgs(server.args ?? [])].filter(Boolean).join(' ');
     return `${name.padEnd(18)} ${transport.padEnd(5)} ${target || '(missing target)'}`;
   });
 }

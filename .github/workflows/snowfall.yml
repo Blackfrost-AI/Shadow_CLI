@@ -35,6 +35,9 @@ jobs:
       - name: Guided onboarding lifecycle (POSIX)
         if: runner.os != 'Windows'
         run: python3 scripts/smoke-onboard-pty.py node dist/index.js
+      - name: Durable collaboration and native approval lifecycle (POSIX)
+        if: runner.os != 'Windows'
+        run: python3 scripts/smoke-parity-pty.py node dist/index.js
       - name: Interrupt stalled provider streams (POSIX)
         if: runner.os != 'Windows'
         run: python3 scripts/smoke-interrupt-pty.py node dist/index.js

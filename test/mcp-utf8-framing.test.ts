@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { removeFixtureTree } from './helpers/removeFixtureTree.js';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -144,6 +145,6 @@ test('stdio wiring decodes a real child pipe across a mid-character chunk split'
     assert.doesNotMatch(surfaced, new RegExp(REPLACEMENT, 'u'), 'no U+FFFD may reach the model');
   } finally {
     client.stop();
-    rmSync(dir, { recursive: true, force: true });
+    await removeFixtureTree(dir);
   }
 });

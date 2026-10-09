@@ -48,15 +48,15 @@ function parseFilters(arg: string): ParsedFilters {
     if (part === '--type' && i + 1 < parts.length) {
       const typeArg = parts[++i];
       const types = typeArg.split(',').filter(Boolean) as WorkItemType[];
-      if (types.some((t) => !['subagent', 'bgshell', 'plan'].includes(t))) {
-        return { error: `Invalid type: ${typeArg}. Use: subagent, bgshell, or plan.` };
+      if (types.some((t) => !['subagent', 'bgshell', 'plan', 'connector'].includes(t))) {
+        return { error: `Invalid type: ${typeArg}. Use: subagent, bgshell, plan, or connector.` };
       }
       filters.type = types.length === 1 ? types[0] : types;
     } else if (part === '--status' && i + 1 < parts.length) {
       const statusArg = parts[++i];
       const statuses = statusArg.split(',').filter(Boolean) as WorkItemStatus[];
-      if (statuses.some((s) => !['queued', 'running', 'paused', 'completed', 'failed', 'cancelled'].includes(s))) {
-        return { error: `Invalid status: ${statusArg}. Use: queued, running, paused, completed, failed, or cancelled.` };
+      if (statuses.some((s) => !['queued', 'running', 'waiting', 'paused', 'partial', 'interrupted', 'completed', 'failed', 'cancelled'].includes(s))) {
+        return { error: `Invalid status: ${statusArg}. Use: queued, running, waiting, paused, partial, interrupted, completed, failed, or cancelled.` };
       }
       filters.status = statuses.length === 1 ? statuses[0] : statuses;
     } else if (part === '--all-sessions') {
@@ -90,7 +90,7 @@ function formatElapsed(startedAt: number, endedAt?: number): string {
 
 function formatWorkItemSummary(item: WorkItem, sessionId?: string): string {
   const status = item.status.padEnd(10);
-  const typeLabel = item.type === 'subagent' ? 'agent' : item.type === 'bgshell' ? 'shell' : 'plan';
+  const typeLabel = item.type === 'subagent' ? 'agent' : item.type === 'bgshell' ? 'shell' : item.type;
   const elapsed = formatElapsed(item.startedAt, item.endedAt);
   const activity = item.currentActivity ? ` · ${approvalText(item.currentActivity)}` : '';
   const stalled = item.status === 'running' && Date.now() - item.lastActivityAt > 5 * 60_000 ? ' · ⚠ stalled' : '';
@@ -102,12 +102,16 @@ function formatWorkItemSummary(item: WorkItem, sessionId?: string): string {
   return `  ${id.padEnd(29)} ${typeLabel.padEnd(8)} ${status} ${elapsed.padEnd(9)} ${owner.padEnd(12)} ${description}${activity}${stalled}`;
 }
 
-function formatWorkItemDetail(item: WorkItem, sessionId?: string): string[] {
+export function formatWorkItemDetail(item: WorkItem, sessionId?: string): string[] {
   const lines: string[] = [];
   lines.push(`Work Item: ${approvalText(item.id)}`);
   if (sessionId) lines.push(`  Session: ${approvalText(sessionId)} (historical, read-only)`);
   lines.push(`  Type: ${item.type}`);
   lines.push(`  Status: ${item.status}`);
+  lines.push(`  Verification: ${item.verification ?? 'unverified'}`);
+  if (item.profile || item.model) lines.push(`  Model: ${[item.profile, item.provider, item.model].filter(Boolean).join(' · ')}`);
+  if (item.jobId) lines.push(`  Job: ${item.jobId}`);
+  if (item.artifactIds?.length) lines.push(`  Artifacts: ${item.artifactIds.join(', ')}`);
   lines.push(`  Description: ${approvalText(item.description)}`);
   lines.push(`  Started: ${new Date(item.startedAt).toISOString()}`);
   if (item.endedAt) {
@@ -241,7 +245,7 @@ export function executeWorkCommand(arg: string, opts: WorkCommandOptions): WorkC
     const item = workCenter.get(parts[1]);
     if (!item || item.type !== 'subagent') return { kind: 'error', lines: [], error: `No subagent found: ${parts[1]}` };
     if (!parts.includes('--confirm')) return { kind: 'error', lines: [], error: 'Retry starts a new run and may duplicate external effects. Re-run with --confirm.' };
-    if (!['completed', 'failed', 'cancelled'].includes(item.status)) return { kind: 'error', lines: [], error: `Cannot retry ${item.status} subagent` };
+    if (!['completed', 'partial', 'interrupted', 'failed', 'cancelled'].includes(item.status)) return { kind: 'error', lines: [], error: `Cannot retry ${item.status} subagent` };
     if (!item.retryable) return { kind: 'error', lines: [], error: 'This item has no in-memory retry specification (historical retries are read-only).' };
     if ((item.retryCount ?? 0) >= 3) return { kind: 'error', lines: [], error: 'Maximum retry count (3) reached.' };
     bus.emit({ type: 'retry_subagent', taskId: item.id });

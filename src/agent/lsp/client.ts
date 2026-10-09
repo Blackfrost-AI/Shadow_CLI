@@ -17,7 +17,7 @@ import { pathToFileURL } from 'node:url';
 import { RpcPeer } from '../../acp/jsonrpc.js';
 import { scrubbedEnv } from '../../util/safeEnv.js';
 import { frameMessage, LspDecoder } from './framing.js';
-import { KILL_GRACE_MS, SERVER_LANGUAGE, type LspDiagnostic } from './protocol.js';
+import { KILL_GRACE_MS, SERVER_LANGUAGE, type LspDiagnostic, type NavigationRequest } from './protocol.js';
 import type { LspServerSpec } from './detect.js';
 
 export type ConnectionState = 'idle' | 'starting' | 'ready' | 'dead';
@@ -39,6 +39,7 @@ export interface ServerConnection {
   hasOpen(absPath: string): boolean;
   /** Diagnostics reflecting the last sent version, or [] by the deadline. NEVER rejects. */
   awaitDiagnostics(uri: string, deadlineMs: number, signal?: AbortSignal): Promise<LspDiagnostic[]>;
+  navigate?(request: NavigationRequest): Promise<unknown>;
   /** SIGTERM the tree → SIGKILL after the grace window. Idempotent. */
   stop(): void;
   dead(): boolean;
@@ -223,6 +224,24 @@ export function createLspConnection(spec: LspServerSpec, opts: CreateConnectionO
         textDocument: { uri, version },
         contentChanges: [{ text }],
       });
+    },
+
+    async navigate(request) {
+      if (state !== 'ready' || !peer) throw new Error('Language server is not ready.');
+      if (request.signal?.aborted) throw new Error('Navigation interrupted.');
+      const method = request.kind === 'symbols' ? 'textDocument/documentSymbol'
+        : request.kind === 'definition' ? 'textDocument/definition' : 'textDocument/references';
+      const textDocument = { uri: pathToFileURL(request.path).href };
+      const params = request.kind === 'symbols' ? { textDocument } : {
+        textDocument, position: { line: Math.max(0, (request.line ?? 1) - 1), character: Math.max(0, (request.col ?? 1) - 1) },
+        ...(request.kind === 'references' ? { context: { includeDeclaration: true } } : {}),
+      };
+      const ac = new AbortController();
+      const timer = setTimeout(() => ac.abort(), request.deadlineMs ?? 3000);
+      const onAbort = (): void => ac.abort();
+      request.signal?.addEventListener('abort', onAbort, { once: true });
+      try { return await peer.request(method, params, { signal: ac.signal }); }
+      finally { clearTimeout(timer); request.signal?.removeEventListener('abort', onAbort); }
     },
 
     awaitDiagnostics(uri, deadlineMs, signal) {

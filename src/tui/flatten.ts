@@ -1,4 +1,4 @@
-import { GLYPHS, stripPrompt } from './glyphs.js';
+import { BORDER, GLYPHS, stripPrompt } from './glyphs.js';
 // src/tui/flatten.ts — Flatten Shadow's TranscriptItems into styled display lines.
 //
 // Each TranscriptItem is rendered to an array of ViewportLines (1 terminal row each), preserving
@@ -21,6 +21,8 @@ import { renderBrand, renderToolResult, renderToolChild, renderReasoning, render
 import type { BannerLine, BrandInfo, ToolInfo, ToolRun } from './rows.js';
 import { collapseKind, isCollapsibleTool, type CollapseKind } from './toolDisplay.js';
 import { displayWidth, takeByWidth, nextCluster, stripInvisible } from '../util/width.js';
+import { formatDuration } from './format.js';
+import { approvalText } from '../util/approvalText.js';
 
 export { TABLE_COLLAPSE_THRESHOLD };
 
@@ -707,6 +709,8 @@ export interface FlattenItem {
   image?: { bytes: string; mediaType: string; alt?: string; source?: string };
   /** Reasoning wall-clock (ms), when known — drives `thought for Ns` in the fold header. */
   durationMs?: number;
+  /** Fullscreen thinking panel; older renderers retain their existing fold presentation. */
+  reasoningState?: 'streaming' | 'complete' | 'interrupted' | 'stopped';
   /** Collaboration Mode: which model produced this assistant turn. When set, the ⏺ bullet becomes a
    *  colored `⏺ handle  provider/model` header (drawn once per turn) and the body indents under it. */
   speaker?: { handle: string; color: string; model: string };
@@ -835,6 +839,37 @@ export function flattenItem(
 
   // ── reasoning (v2: ∴ thought for Ns + fold child / expanded body) ──
   if (item.kind === 'reasoning') {
+    if (item.reasoningState) {
+      // Keep a visible tail even in compact mode. Thinking has its own boundary and never
+      // borrows the answer's bullet or disappears behind a line-count-only fold.
+      const duration = formatDuration((item.durationMs ?? 0) / 1000);
+      const label = item.reasoningState === 'streaming' ? `Thinking · ${duration}`
+        : item.reasoningState === 'complete' ? item.durationMs === undefined ? 'Thinking · complete' : `Thought for ${duration}`
+          : `Thinking ${item.reasoningState} · ${duration}`;
+      const edge = (key: string, left: string, title: string, right: string): ViewportLine => {
+        const head = takeByWidth(` ${title} `, Math.max(0, cols - 2)).head;
+        return { key, spans: [{ text: left + head + BORDER.horizontal.repeat(Math.max(0, cols - 2 - displayWidth(head))) + right, color: theme.dim }] };
+      };
+      out.push(edge(`${kp}rh`, BORDER.topLeft, `∴ ${label}`, BORDER.topRight));
+      // Bound the compact projection before wrapping; the complete original stays on the item
+      // for Ctrl+O. This keeps long reasoning streams cheap to paint on every token.
+      const previewChars = 4000;
+      const clipped = collapsed && item.text.length > previewChars;
+      const text = (clipped ? item.text.slice(-previewChars) : item.text).split('\n').map(approvalText).join('\n').trim();
+      const body = wrapLine(`${kp}rb`, [{ text, color: theme.dim }], Math.max(1, cols - 4));
+      const hidden = collapsed && (clipped || body.length > 4);
+      const shown = collapsed ? body.slice(-4) : body;
+      for (const line of shown) {
+        const used = line.spans.reduce((n, span) => n + displayWidth(span.text), 0);
+        out.push({ key: line.key, spans: [
+          { text: BORDER.vertical + ' ', color: theme.dim }, ...line.spans,
+          { text: ' '.repeat(Math.max(1, cols - 3 - used)) + BORDER.vertical, color: theme.dim },
+        ] });
+      }
+      out.push(edge(`${kp}rf`, BORDER.bottomLeft,
+        `${hidden ? '… earlier thinking · ' : ''}Ctrl+O ${collapsed ? 'expand' : 'compact'}`, BORDER.bottomRight));
+      return out;
+    }
     // Collapsed: header + `⌄ N lines · ^O`. Expanded: header only here; body is dim markdown below.
     renderReasoning(item.text, collapsed, theme, item.durationMs ?? 0).forEach((spans, i) =>
       out.push(...wrapLine(`${kp}rh${i}`, spans, cols)),

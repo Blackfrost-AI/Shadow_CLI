@@ -86,15 +86,21 @@ test('pi advertises the daily command surface and the fork/editor decisions', ()
   for (const name of expected) assert.ok(piNames.has(name), `${name} must be reachable in pi`);
 });
 
-test('pi explicitly rejects renderer-specific Ink commands', () => {
+test('pi rejects Ink-only commands and documents the table collaboration migration', () => {
   const piNames = new Set(terminalCommandsFor('pi').map((command) => command.name));
-  for (const name of ['/vim', '/table', '/statusline']) {
+  for (const name of ['/vim', '/statusline']) {
     const command = findTerminalCommand(name);
     assert.ok(command, `${name} must remain documented in the shared catalog`);
     assert.equal(command.renderers.pi.handler, undefined);
     assert.match(command.renderers.pi.unavailable ?? '', /Ink-only/);
     assert.equal(piNames.has(name), false, `${name} must not appear as a supported pi command`);
   }
+  const table = findTerminalCommand('/table')!;
+  assert.equal(table.renderers.pi.handler, 'table');
+  assert.equal(table.renderers.ink.handler, 'table');
+  assert.match(table.desc, /Snowfall presets.*Ink roundtable/);
+  for (const name of ['/table', '/team', '/consult']) assert.ok(piNames.has(name), `${name} is offered in Snowfall`);
+  assert.match(findTerminalCommand('/team')!.renderers.ink.unavailable ?? '', /native|collaborate/);
 });
 
 test('/session has one catalog entry and /act is a reachable activity alias', () => {

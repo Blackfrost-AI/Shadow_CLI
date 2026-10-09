@@ -6,8 +6,10 @@ import { hydrateContext, type ContextSnapshotData, type HydrateOptions } from '.
 import { SessionLog } from './session.js';
 import type { Context } from '../agent/context.js';
 import type { Message } from '../provider/provider.js';
+import { coerceSessionState, type SessionStateSnapshot } from './sessionState.js';
 
 export interface RewindResult {
+  sessionState?: SessionStateSnapshot;
   /** Absent for a `scope: 'code'` rewind — the conversation was deliberately left untouched. */
   context?: Context;
   restoredFiles: string[];
@@ -53,6 +55,33 @@ function loadSnapshots(sessionPath: string): SnapshotRecord[] {
     });
   }
   return out;
+}
+
+export interface RewindPreview {
+  turn: number;
+  scope: 'code' | 'chat' | 'code+chat';
+  paths: Array<{ path: string; action: 'restore' | 'delete' | 'unavailable' }>;
+}
+
+/** A read-only preview of the checkpoint targets. Shell/external edits have no checkpoint guarantee. */
+export function previewRewind(sessionPath: string, turn: number, workspaceRoot: string, scope?: 'code' | 'chat'): RewindPreview {
+  const paths = new Map<string, RewindPreview['paths'][number]>();
+  const root = resolve(workspaceRoot);
+  const sessionId = SessionLog.sessionIdFromPath(sessionPath);
+  const checkpointRoot = join(root, '.shadow', 'checkpoints', sessionId);
+  const inside = (base: string, path: string): boolean => {
+    const rel = relative(base, resolve(path));
+    return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
+  };
+  if (scope !== 'chat') for (const index of listCheckpointTurns(root, sessionId).filter((item) => item >= turn)) {
+    for (const entry of listCheckpointsForTurn(root, sessionId, index)) {
+      if (paths.has(entry.relPath) || !inside(root, resolve(root, entry.relPath))) continue;
+      const action = entry.absent ? 'delete'
+        : inside(checkpointRoot, entry.absPath) && existsSync(entry.absPath) ? 'restore' : 'unavailable';
+      paths.set(entry.relPath, { path: entry.relPath, action });
+    }
+  }
+  return { turn, scope: scope ?? 'code+chat', paths: [...paths.values()] };
 }
 
 /**
@@ -169,7 +198,7 @@ export function rewindToTurn(
     }
   }
 
-  return { context, restoredFiles, deletedFiles, partialFiles, turn, snapshotOffset: pick.offset };
+  return { context, sessionState: coerceSessionState(pick.data.sessionState), restoredFiles, deletedFiles, partialFiles, turn, snapshotOffset: pick.offset };
 }
 
 /**

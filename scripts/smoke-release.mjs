@@ -88,6 +88,7 @@ try {
   await run(target, ['--provider', 'mock', '--model', 'mock-1', '--base-url', 'http://127.0.0.1:1/v1', '--task', 'Hello', '--offline']);
   if (process.platform !== 'win32') {
     console.log(await run('python3', [resolve('scripts/smoke-interrupt-pty.py'), target]));
+    console.log(await run('python3', [resolve('scripts/smoke-parity-pty.py'), target]));
   }
   await install();
   assert.equal(installedHash(), release.checksum, 'Repeat install must remain valid');

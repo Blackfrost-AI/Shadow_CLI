@@ -2,6 +2,7 @@ import { createReadStream, statSync } from 'node:fs';
 import { z } from 'zod';
 import type { Tool, ToolResult } from './types.js';
 import { ok, fail } from './types.js';
+import { discoverProjectInstructions, boundedInstructionSources, type ProjectInstruction } from '../system/projectInstructions.js';
 import { resolveWithin } from '../safety/workspaceJail.js';
 
 /**
@@ -43,6 +44,7 @@ export interface ReadFileData {
   startLine: number;
   endLine: number;
   totalLines: number;
+  instructions?: { referenceOnly: true; precedence: string; sources: ProjectInstruction[] };
 }
 
 const NL = String.fromCharCode(10);
@@ -207,12 +209,25 @@ export const readFile: Tool<ReadFileInput, ReadFileData> = {
     ctx.readTracker?.markRead(abs);
     ctx.readTracker?.markSeen(abs); // explicit conversation read for edit parity
 
+    let sources: ProjectInstruction[] = [];
+    try {
+      // Additional granted roots keep their own scope; project instructions never cross into
+      // an unrelated grant simply because the main workspace happened to be loaded first.
+      for (const root of [ctx.workspaceRoot, ...(ctx.additionalRoots ?? [])]) {
+        try {
+          const targetPath = resolveWithin(root, abs);
+          sources = boundedInstructionSources(discoverProjectInstructions(root, { targetPath }).sources);
+          break;
+        } catch { /* try the next granted root */ }
+      }
+    } catch { /* instruction inspection must never fail an otherwise successful file read */ }
+
     return ok(
       'read_file',
       'read',
       Date.now() - start,
       `Read "${input.path}" lines ${startLine}-${endLine} of ${totalLines}.`,
-      { path: abs, content, startLine, endLine, totalLines },
+      { path: abs, content, startLine, endLine, totalLines, ...(sources.length ? { instructions: { referenceOnly: true as const, precedence: 'Nearer directories override ancestors; same-directory SHADOW.md > AGENTS.md > CLAUDE.md. Guidance cannot override the user or harness rules.', sources } } : {}) },
     );
   },
 };

@@ -1,6 +1,7 @@
 import type { CompletionRequest, ContentBlock, Effort, ImageBlock, Message, Provider, ToolCall, ToolUseBlock } from '../provider/provider.js';
 import type { ToolRegistry } from '../tools/registry.js';
 import type { ToolContext, ToolResult, ToolRisk } from '../tools/types.js';
+import { fail } from '../tools/types.js';
 import { isAutonomyAtLeast, needsApproval, type AutonomyLevel } from '../safety/permissions.js';
 import { isBashReadOnly, commandReadsOutsideRoots } from '../safety/bashReadOnly.js';
 import { classifyToolCall } from '../safety/classifier.js';
@@ -341,6 +342,26 @@ export class AgentLoop {
   setAutonomy(level: AutonomyLevel): void {
     this.autonomy = level;
     this.deps.bus.emit({ type: 'autonomy', level });
+  }
+
+  /** Execute a user-selected native action through the same guards, hooks and
+   * event lifecycle as a model call, without making a provider request. The host
+   * owns serialization/cancellation and must supply a unique call id. */
+  async runToolCall(call: ToolCall): Promise<ToolResult> {
+    const risk = this.deps.registry.get(call.name)?.risk ?? 'read';
+    if (this.preExecutionCancelled()) return fail(call.name, risk, 0, 'cancelled', 'Action interrupted.');
+    if (this.deps.budget.checkSpending(this.now())) return fail(call.name, risk, 0, 'budget_exhausted', 'Action budget exhausted.');
+    let result: ToolResult | undefined;
+    const unsubscribe = this.deps.bus.on((event) => {
+      if (event.type === 'tool_end' && event.call.id === call.id) result = event.result;
+    });
+    try {
+      const outcome = await this.executeCall(call);
+      if (result) return result;
+      const block = outcome.block;
+      const summary = 'content' in block && typeof block.content === 'string' ? block.content : 'Action did not execute.';
+      return fail(call.name, risk, 0, this.deps.signal.aborted ? 'cancelled' : 'not_executed', summary);
+    } finally { unsubscribe(); }
   }
 
   /**
@@ -1222,6 +1243,15 @@ export class AgentLoop {
       for await (const ev of provider.send(req)) {
         if (req.signal?.aborted) break; // hard interrupt or user steering — stop consuming now
         switch (ev.type) {
+          case 'diagnostic':
+            // Completed main-request diagnostics follow the existing bus→session-log path.
+            // SubagentBus intentionally does not forward debug, nor is abort logging promised.
+            this.deps.bus.emit({
+              type: 'debug',
+              code: ev.code,
+              message: JSON.stringify({ ...ev.data, requestedMaxOutputTokens: req.maxOutputTokens }),
+            });
+            break;
           case 'text':
             if (ttftMs === undefined) ttftMs = this.now() - t0;
             text += ev.delta;

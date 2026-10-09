@@ -8,10 +8,9 @@
  * offline is swallowed silently — a check never disrupts a session, and the network only moves because
  * the user chose to opt in.
  *
- * This is NOT telemetry: nothing ABOUT the user leaves the machine. It is an auditable request for a
- * PUBLIC version string, the same class as `curl <public-file>` — and because the source is public,
- * anyone can verify exactly that. Telemetry is a black box that reports the user TO the vendor; this
- * reports nothing and benefits only the user.
+ * This request carries no analytics payload or persistent user identifier. Like any network request,
+ * it exposes connection metadata (such as the source IP) to the destination, which is why it remains
+ * disabled unless the user explicitly enables it.
  */
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';

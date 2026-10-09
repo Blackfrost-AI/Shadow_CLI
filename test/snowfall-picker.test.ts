@@ -46,3 +46,16 @@ test('autocomplete renders hostile controls visibly while inserting the original
   assert.match(item.description!, /\\u202e/);
   assert.equal(provider.applyCompletion([line], 0, line.length, item, found!.prefix).lines[0], line + raw);
 });
+
+test('search filters choices, arrows select the filtered item, and Escape clears before closing', () => {
+  let chosen = ''; let closed = false;
+  const picker = new ChoicePicker({ title: 'Profiles', items: ['Local reviewer', 'Remote implementer', 'Remote reviewer'],
+    label: (item) => item, choose: (item) => { chosen = item; }, close: () => { closed = true; }, repaint: () => {}, rows: () => 18 });
+  picker.handleInput('/'); picker.handleInput('remote');
+  assert.doesNotMatch(picker.render(80).map(stripAnsi).join('\n'), /Local reviewer/);
+  picker.handleInput('\x1b[B'); picker.handleInput('\r');
+  assert.equal(chosen, 'Remote reviewer');
+  picker.handleInput('\x1b'); assert.equal(closed, false);
+  assert.match(picker.render(80).map(stripAnsi).join('\n'), /Local reviewer/);
+  picker.handleInput('\x1b'); assert.equal(closed, true);
+});

@@ -10,13 +10,19 @@ import { panelRows } from './panel.js';
 export class ChoicePicker<T> implements Component {
   private cursor: number;
   private typed = '';
+  private query = '';
+  private searching = false;
   constructor(private options: {
     title: string; items: T[]; label: (item: T) => string; selected?: number;
     choose: (item: T) => void; close: () => void; repaint: () => void; rows: () => number;
   }) { this.cursor = options.selected ?? 0; }
   invalidate(): void {}
+  private filtered(): T[] {
+    return this.query ? this.options.items.filter((item) => this.options.label(item).toLocaleLowerCase().includes(this.query.toLocaleLowerCase())) : this.options.items;
+  }
   render(width: number): string[] {
-    const { items, label } = this.options;
+    const { label } = this.options;
+    const items = this.filtered();
     const max = Math.max(1, Math.min(12, this.options.rows() - 6));
     const start = Math.min(Math.max(0, this.cursor - max + 1), Math.max(0, items.length - max));
     const lines = items.slice(start, start + max).map((item, offset) => {
@@ -26,18 +32,28 @@ export class ChoicePicker<T> implements Component {
     });
     if (start) lines.unshift(style.dim(`↑ ${start} more`));
     if (start + max < items.length) lines.push(style.dim(`↓ ${items.length - start - max} more`));
-    return panelRows(this.options.title, lines, width, this.typed ? `Choice ${this.typed} · Enter confirm · Esc cancel` : '↑/↓ or number · Enter confirm · Esc cancel');
+    if (!lines.length) lines.push(style.dim('No matching choices.'));
+    return panelRows(this.options.title, lines, width, this.searching ? `Search: ${approvalText(this.query)} · Enter choose · Esc clear` : this.typed ? `Choice ${this.typed} · Enter confirm · Esc cancel` : '↑/↓ or number · / search · Enter confirm · Esc cancel');
   }
   handleInput(data: string): void {
     if (isKeyRelease(data)) return;
-    const { items } = this.options;
-    if (matchesKey(data, 'escape')) { this.options.close(); return; }
+    const items = this.filtered();
+    if (matchesKey(data, 'escape')) {
+      if (this.searching || this.query) { this.searching = false; this.query = ''; this.cursor = 0; this.options.repaint(); }
+      else this.options.close();
+      return;
+    }
     if (matchesKey(data, 'enter')) {
       const i = this.typed ? Number(this.typed) - 1 : this.cursor;
       if (items[i] !== undefined) this.options.choose(items[i]!);
       return;
     }
-    if (/^\d+$/.test(data)) {
+    if (this.searching && !matchesKey(data, 'up') && !matchesKey(data, 'down')) {
+      if (matchesKey(data, 'backspace')) this.query = this.query.slice(0, -1);
+      else if (!/[\x00-\x1f\x7f]/.test(data)) this.query = (this.query + data).slice(0, 150);
+      this.cursor = 0; this.typed = '';
+    } else if (data === '/') { this.searching = true; this.typed = ''; }
+    else if (/^\d+$/.test(data)) {
       this.typed = (this.typed + data).slice(0, 6);
       const i = Number(this.typed) - 1;
       if (items[i] !== undefined) this.cursor = i;

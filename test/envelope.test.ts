@@ -13,7 +13,7 @@ import {
 } from '../src/safety/envelope.js';
 import { McpClient, McpHttpClient } from '../src/mcp/client.js';
 import { resolveSystem, UNTRUSTED_ENVELOPE_POLICY } from '../src/system/resolveSystem.js';
-import { egressLogPath, setEgressLogPathForTests } from '../src/safety/egress.js';
+import { egressLogPath, flushEgressLogForTests, setEgressLogPathForTests } from '../src/safety/egress.js';
 
 /**
  * P3-05 — prompt-injection containment envelopes.
@@ -315,6 +315,9 @@ test('MCP HTTP: a hostile endpoint reply lands enveloped, payload verbatim, no u
     client.stop();
   } finally {
     server.close();
+    // Receipt writes are deliberately asynchronous. Let their mkdir/append chain
+    // finish before deleting this fixture, or Linux can observe ENOTEMPTY.
+    await flushEgressLogForTests();
     setEgressLogPathForTests(prevLog); // try/finally: an assertion failure must not leak the path onward
     rmSync(dir, { recursive: true, force: true });
   }

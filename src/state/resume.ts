@@ -1,6 +1,7 @@
 import { SessionLog } from './session.js';
 import { hydrateContext, type ContextSnapshotData, type HydrateOptions } from './snapshot.js';
 import type { Context } from '../agent/context.js';
+import { coerceSessionState, legacySessionState, type SessionStateSnapshot } from './sessionState.js';
 
 export interface ResumableSession {
   path: string;
@@ -44,11 +45,28 @@ export function listResumableSessions(workspaceRoot: string): ResumableSession[]
 
 export type ResumeSessionOpts = HydrateOptions;
 
+export function readSessionState(path: string): SessionStateSnapshot {
+  const data = SessionLog.findLatestSnapshotRecord(path)?.data as ContextSnapshotData | undefined;
+  return coerceSessionState(data?.sessionState) ?? legacySessionState(path);
+}
+
+/** Exact identity wins; duplicate titles remain ambiguous and must be presented to the user. */
+export function resolveSessionMatches(sessions: ResumableSession[], query: string): ResumableSession[] {
+  const value = query.trim();
+  if (!value) return sessions;
+  const identity = sessions.filter((session) => session.id === value || session.path === value);
+  if (identity.length) return identity;
+  const title = sessions.filter((session) => session.title.toLocaleLowerCase() === value.toLocaleLowerCase());
+  if (title.length) return title;
+  return sessions.filter((session) => session.id.startsWith(value) || session.path.endsWith(value)
+    || session.title.toLocaleLowerCase().includes(value.toLocaleLowerCase()));
+}
+
 /** Hydrate context from the latest snapshot in a session log. */
 export function resumeSession(
   sessionPath: string,
   opts: ResumeSessionOpts,
-): { context: Context; meta: ResumeMeta } {
+): { context: Context; meta: ResumeMeta; state: SessionStateSnapshot } {
   // One read of the latest snapshot record — data + metadata together.
   const record = SessionLog.findLatestSnapshotRecord(sessionPath);
   const data = record?.data as ContextSnapshotData | undefined;
@@ -56,6 +74,7 @@ export function resumeSession(
   const context = hydrateContext(data, opts);
   return {
     context,
+    state: coerceSessionState(data.sessionState) ?? legacySessionState(sessionPath),
     meta: {
       sessionId: SessionLog.sessionIdFromPath(sessionPath),
       sessionPath,

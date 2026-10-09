@@ -2,12 +2,16 @@ import { existsSync, readFileSync, readdirSync, writeFileSync, unlinkSync, renam
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { enabledPluginDirs } from '../plugins/manager.js';
+import type { Effort } from '../provider/provider.js';
 
 export interface AgentDef {
   name: string;
   description: string;
   tools: string[];
   model?: string;
+  /** Configured model preset label. Resolves provider, endpoint and credentials together. */
+  profile?: string;
+  effort?: Effort;
   maxIterations?: number;
   systemPrompt: string;
   builtin?: boolean;
@@ -16,7 +20,7 @@ export interface AgentDef {
 const BUILTIN_EXPLORE: AgentDef = {
   name: 'explore',
   description: 'Fast read-only codebase exploration',
-  tools: ['read_file', 'grep', 'glob'],
+  tools: ['read_file', 'grep', 'glob', 'repository_context'],
   maxIterations: 12,
   systemPrompt:
     'You are an exploration sub-agent. Search and read the codebase only — do not edit files, ' +
@@ -27,7 +31,7 @@ const BUILTIN_EXPLORE: AgentDef = {
 const BUILTIN_REVIEWER: AgentDef = {
   name: 'reviewer',
   description: 'Careful self-review and critique sub-agent. Read/search focused.',
-  tools: ['read_file', 'grep', 'glob'],
+  tools: ['read_file', 'grep', 'glob', 'repository_context'],
   maxIterations: 10,
   systemPrompt: [
     'You are a reviewer sub-agent in the Shadow harness.',
@@ -98,11 +102,16 @@ function coerceDef(name: string, attrs: Record<string, string | string[]>, body:
   const maxIterations =
     typeof attrs.maxIterations === 'string' ? Number(attrs.maxIterations) : undefined;
   const model = typeof attrs.model === 'string' ? attrs.model : undefined;
+  const profile = typeof attrs.profile === 'string' ? attrs.profile : undefined;
+  const effort = typeof attrs.effort === 'string' && ['low', 'medium', 'high', 'xhigh', 'max'].includes(attrs.effort)
+    ? attrs.effort as Effort : undefined;
   return {
     name,
     description,
     tools,
     model,
+    profile,
+    effort,
     maxIterations: Number.isFinite(maxIterations) ? maxIterations : undefined,
     systemPrompt: body || description,
     builtin,
@@ -183,6 +192,8 @@ export function serializeAgentDef(def: AgentDef): string {
   lines.push(`name: ${def.name}`);
   lines.push(`description: ${def.description}`);
   if (def.model) lines.push(`model: ${def.model}`);
+  if (def.profile) lines.push(`profile: ${def.profile}`);
+  if (def.effort) lines.push(`effort: ${def.effort}`);
   if (def.maxIterations !== undefined) lines.push(`maxIterations: ${def.maxIterations}`);
   if (def.tools.length > 0) {
     lines.push('tools:');

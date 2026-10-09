@@ -18,6 +18,8 @@ import { createTsserverConnection } from './tsserver.js';
 import { detectLspServers, localTsserverPath, type DetectLspOptions, type LspServerOverride, type LspServerSpec } from './detect.js';
 import { createLspNoteBudget, type LspNoteBudgetConfig, type LspNoteBudgetState } from './noteBudget.js';
 import { NoteDeduper } from './note.js';
+import { normalizeNavigation } from './navigation.js';
+import type { NavigationRequest, SourceLocation } from './protocol.js';
 import { MAX_FILE_BYTES, SERVER_BY_EXT, SERVER_DEADLINE_MS, type LspDiagnostic, type LspServerFlavor } from './protocol.js';
 
 /** The `lsp` config block (src/config.ts). All fields optional; defaults applied here. */
@@ -73,6 +75,7 @@ export interface LspService {
    * NEVER throws.
    */
   collect(absPath: string, opts?: CollectOptions): Promise<LspDiagnostic[] | null>;
+  navigate?(request: NavigationRequest): Promise<SourceLocation[] | null>;
   /** The server id that would handle this file, or null when none is configured. */
   serverIdFor(absPath: string): string | null;
   noteBudget(): LspNoteBudgetState;
@@ -199,6 +202,33 @@ export function createLspService(opts: CreateLspServiceOptions): LspService {
       } catch {
         return null; // an LSP problem never fails the write
       }
+    },
+
+    async navigate(request) {
+      try {
+        if (!enabled || request.signal?.aborted || !insideProject(opts.projectDir, request.path)) return null;
+        const st = statSync(request.path);
+        if (!st.isFile() || st.size > MAX_FILE_BYTES) return null;
+        resolveSpecs();
+        const id = serverIdForExt(request.path);
+        const spec = id ? specById.get(id) : undefined;
+        if (!id || !spec) return null;
+        const deadline = Date.now() + (request.deadlineMs ?? timeoutMs);
+        ensureReady(id);
+        const conn = conns.get(id);
+        if (!conn?.navigate) return null;
+        await conn.start(Math.max(1, deadline - Date.now()), request.signal);
+        if (request.signal?.aborted || Date.now() >= deadline) return null;
+        const text = readFileSync(request.path, 'utf8');
+        const uri = pathToFileURL(request.path).href;
+        const version = (versions.get(uri) ?? 0) + 1;
+        versions.set(uri, version);
+        if (conn.hasOpen(request.path)) conn.notifyChange(request.path, text, version);
+        else conn.notifyOpen(request.path, text, version);
+        const raw = await conn.navigate({ ...request, deadlineMs: Math.max(1, deadline - Date.now()) });
+        return normalizeNavigation(raw, spec.flavor, request.kind, request.path)
+          .filter((location) => insideProject(opts.projectDir, location.path));
+      } catch { return null; }
     },
 
     serverIdFor(absPath) {

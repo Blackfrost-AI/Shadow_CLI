@@ -66,7 +66,11 @@ for (let i = 0; i < iters; i++) {
         samples++;
       }
     } catch (e) {
-      parseErrors.push(String(e));
+      // Windows can briefly deny an open while another process atomically replaces the
+      // destination. Retry on the next sample; this is not a partial JSON document.
+      // All parse failures and other I/O failures remain fatal, as does the final read.
+      const code = (e as NodeJS.ErrnoException).code;
+      if (process.platform !== 'win32' || (code !== 'EPERM' && code !== 'EBUSY')) parseErrors.push(String(e));
     }
     if (!done) setImmediate(sample);
   };

@@ -62,3 +62,22 @@ export const SERVER_LANGUAGE: Readonly<Record<string, string>> = Object.freeze({
   gopls: 'go',
   'rust-analyzer': 'rust',
 });
+
+/** Read-only source navigation, normalized to 1-based positions. */
+export type NavigationKind = 'symbols' | 'definition' | 'references';
+export interface SourceLocation {
+  path: string;
+  line: number;
+  col: number;
+  endLine?: number;
+  name?: string;
+  kind?: string;
+}
+export interface NavigationRequest {
+  kind: NavigationKind;
+  path: string;
+  line?: number;
+  col?: number;
+  deadlineMs?: number;
+  signal?: AbortSignal;
+}

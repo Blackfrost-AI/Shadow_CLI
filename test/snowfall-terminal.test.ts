@@ -6,7 +6,19 @@ import { getCapabilities, setCapabilities } from '@earendil-works/pi-tui';
 import { THEME_NAMES } from '../src/tui/theme.js';
 import { FlatCell } from '../src/app/cells.js';
 import { fullscreenImageProtocol } from '../src/util/termImage.js';
-import { fixture } from './helpers/snowfallTerminal.js';
+import { fixture, snowfallFixtureState } from './helpers/snowfallTerminal.js';
+import { SnowfallStatus } from '../src/app/snowfall.js';
+import { stripInvisible } from '../src/util/width.js';
+
+test('elapsed status rolls seconds into minutes and hours at the boundaries', () => {
+  const state = { ...snowfallFixtureState(), running: true, startedAt: 1000 };
+  for (const [elapsed, expected] of [[0, '0s'], [59999, '59s'], [60000, '1m 0s'], [125000, '2m 5s'], [3599999, '59m 59s'], [3600000, '1h 0m 0s']] as const) {
+    const status = new SnowfallStatus(() => state, () => state.startedAt + elapsed);
+    for (const width of [80, 120, 200]) {
+      assert.ok(stripInvisible(status.render(width)[0]!).includes(`working ${expected}`));
+    }
+  }
+});
 
 test('Snowfall golden VT frames at 80, 120 and 200 columns in every palette', async () => {
   const expected = JSON.parse(readFileSync(new URL('./fixtures/snowfall-frames.json', import.meta.url), 'utf8')) as Record<string, { lines: string[]; attributes: string }>;

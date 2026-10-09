@@ -23,6 +23,7 @@ import { sseEvents, parseSseData, nonEmptyParts } from './sse.js';
 import { eventsFromOpenAICompletion } from './nonStream.js';
 import { parseToolArgs } from './toolJson.js';
 import { ThinkingSplitter } from '../util/thinkingTags.js';
+import { OpenAIStreamDiagnostics } from './streamDiagnostics.js';
 import { isLocalBaseUrl } from '../safety/offline.js';
 import type { ModelCapabilities } from '../config.js';
 import { familyProfile } from '../config/familyProfiles.js';
@@ -117,7 +118,7 @@ export class OpenAIProvider implements Provider {
       parse: (lines) => parseOpenAISSE(lines, model, preserveReasoning, this.capabilities),
       signal: req.signal,
       nonStreamBody: buildOpenAIBody(req, model, false, bodyOpts),
-      parseNonStream: (obj) => eventsFromOpenAICompletion(obj, model, preserveReasoning),
+      parseNonStream: (obj) => eventsFromOpenAICompletion(obj, model, preserveReasoning, this.capabilities),
       // P1A-04: per-endpoint stream knobs. A local serve on a long prefill must never hit the 120s
       // watchdog as a silent re-POST hazard; the bus knows it's self-hosted so the rescue suppresses.
       idleTimeoutMs: this.idleTimeoutMs,
@@ -701,6 +702,7 @@ export async function* parseOpenAISSE(
   let outputTokens = 0;
   let cacheReadTokens = 0;
   let stopReason: StopReason = 'end_turn';
+  const diagnostics = new OpenAIStreamDiagnostics();
   // Tool calls accumulate keyed by a synthetic key (insertion-ordered for flush). Backends
   // vary wildly: some omit `index`, some reuse index 0 for every call. We key by `id` when a
   // chunk introduces one, correlate args-only continuation chunks by `index`, else attach to
@@ -709,17 +711,14 @@ export async function* parseOpenAISSE(
   const indexToKey = new Map<number, string>();
   let lastKey: string | null = null;
   let keySeq = 0;
-  // Only split inline  thinking for the families that actually emit it (see emitsInlineThinking).
-  // An unknown/empty model keeps the old permissive behavior — a local serve whose id we don't
-  // recognize is far more likely to be a reasoner than to be writing prose ABOUT think tags.
-  // P1A-06: a declared `reasoning: 'inline' | 'interleaved'` capability forces inline splitting
-  // for an aliased serve whose id the regexes can't classify.
-  const splitInline =
-    model === '' ||
-    capabilities?.reasoning === 'inline' ||
-    capabilities?.reasoning === 'interleaved' ||
-    emitsInlineThinking(model);
-  const splitter = new ThinkingSplitter(); // routes inline <think>/<thinking> spans to the reasoning channel
+  // Explicit capabilities override model-name guesses. A separate reasoning
+  // field, even an empty one, makes content authoritative for the rest of a turn
+  // unless the endpoint explicitly declares that it also sends inline reasoning.
+  const splitInline = capabilities?.reasoning !== undefined
+    ? capabilities.reasoning !== 'hidden'
+    : model === '' || emitsInlineThinking(model);
+  const splitter = new ThinkingSplitter();
+  let structuredReasoning = false;
   /**
    * Did ANY `data:` frame arrive? A gateway that ignores `stream: true` (a misconfigured
    * LiteLLM/vLLM, a corporate proxy, an older Ollama /v1) answers 200 with a plain JSON completion
@@ -747,14 +746,16 @@ export async function* parseOpenAISSE(
       continue;
     }
     sawDataFrame = true;
+    diagnostics.observeDataEvent();
     // P2-03 (F01-08): spec-compliant SSE reassembly — one event's data field may span several
     // `data:` lines (joined with '\n' on dispatch). '[DONE]' is filtered per part so it works as
     // a lone terminator or the last part of a multi-line event.
     const parts = nonEmptyParts(ev.parts).filter((x) => x.trim() !== '[DONE]');
     if (parts.length === 0) continue;
 
-    for (const parsed of parseSseData(parts.join('\n'), parts)) {
+    for (const parsed of parseSseData(parts.join('\n'), parts, (outcome) => diagnostics.observeParseOutcome(outcome))) {
       const obj = parsed as OAISSE;
+      diagnostics.observeFrame(obj);
 
       // An error frame on a 200 stream: surface it (recoverable) instead of dropping it,
       // so the loop reports a real failure rather than a clean empty turn.
@@ -785,6 +786,14 @@ export async function* parseOpenAISSE(
         : typeof delta?.reasoning === 'string'
           ? 'reasoning'
           : undefined;
+      const hasStructuredReasoning = reasoningField !== undefined ||
+        delta?.reasoning_content === null || delta?.reasoning === null;
+      if (hasStructuredReasoning && capabilities?.reasoning !== 'interleaved' && !structuredReasoning) {
+        structuredReasoning = true;
+        for (const span of splitter.flush()) {
+          yield span.kind === 'thinking' ? { type: 'thinking', delta: span.text } : { type: 'text', delta: span.text };
+        }
+      }
       const reasoning = reasoningField ? delta?.[reasoningField] : undefined;
       if (typeof reasoning === 'string' && reasoning) {
         yield { type: 'thinking', delta: reasoning };
@@ -795,7 +804,7 @@ export async function* parseOpenAISSE(
       }
       // Inline <think>/<thinking> spans in the content are split out to the same channel.
       if (delta?.content) {
-        if (!splitInline) {
+        if (!splitInline || structuredReasoning) {
           yield { type: 'text', delta: delta.content };
         } else {
           for (const span of splitter.push(delta.content)) {
@@ -805,6 +814,7 @@ export async function* parseOpenAISSE(
       }
 
       for (const tc of delta?.tool_calls ?? []) {
+        diagnostics.observeToolFragment(tc);
         let key: string;
         const existingById = tc.id ? findKeyById(calls, tc.id) : undefined;
         const idxKey = typeof tc.index === 'number' ? indexToKey.get(tc.index) : undefined;
@@ -862,7 +872,10 @@ export async function* parseOpenAISSE(
   const usedIds = new Set<string>();
   for (const c of calls.values()) {
     const idx = flushN++;
-    if (!c.name && !c.args) continue; // a slot that never received a name or args is not a real call
+    if (!c.name && !c.args) {
+      diagnostics.recordToolOutcome('empty');
+      continue;
+    }
     // De-dupe ids: a backend that omits or reuses ids would otherwise yield duplicate
     // tool_use ids → a hard 400 (duplicate_tool_use_id) once bridged to Anthropic.
     let id = c.id || `call_${idx}`;
@@ -873,6 +886,7 @@ export async function* parseOpenAISSE(
     // wasted round trip; the Anthropic parser already handles the identical case as a recoverable
     // `nameless_tool_call`, so mirror that and let the model resend.
     if (!c.name) {
+      diagnostics.recordToolOutcome('nameless');
       yield {
         type: 'error',
         recoverable: true,
@@ -883,11 +897,13 @@ export async function* parseOpenAISSE(
     }
     const parsed = parseToolArgs(c.args); // repair ladder before giving up
     if (parsed.ok) {
+      diagnostics.recordToolOutcome('emitted');
       yield {
         type: 'tool_call',
         call: { id, name: c.name, input: parsed.value, ...(c.signature ? { signature: c.signature } : {}) },
       };
     } else {
+      diagnostics.recordToolOutcome('invalid_args');
       yield {
         type: 'error',
         recoverable: true,
@@ -912,7 +928,7 @@ export async function* parseOpenAISSE(
         // the same generator the non-stream path uses, so the two agree exactly. It emits its own
         // usage + done, so return immediately after.
         let produced = false;
-        for (const ev of eventsFromOpenAICompletion(parsed, model, preserveQwenReasoning)) {
+        for (const ev of eventsFromOpenAICompletion(parsed, model, preserveQwenReasoning, capabilities)) {
           produced = true;
           yield ev;
         }
@@ -941,6 +957,7 @@ export async function* parseOpenAISSE(
   // Some servers omit finish_reason:'tool_calls'; infer it from emitted calls.
   if (calls.size > 0 && stopReason === 'end_turn') stopReason = 'tool_use';
 
+  yield diagnostics.event();
   yield { type: 'usage', inputTokens, outputTokens, cacheReadTokens };
   yield { type: 'done', stopReason };
 }

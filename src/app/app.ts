@@ -46,8 +46,18 @@ import { homedir } from 'node:os';
 import { discoverCustomCommands, expandCommandBody } from '../tui/customCommands.js';
 import { PI_KEYS } from './keymap.js';
 import { ChoicePicker } from './picker.js';
+import { TextViewer } from './textViewer.js';
+import { JobStore, type ProjectJob, type RoomMessage } from '../state/jobStore.js';
+import { WorkBrowser } from './workBrowser.js';
+import { ChangeReview } from './changeReview.js';
+import { readChanges, readFileDiff, reviewRequest, reviewMaterial, type ReviewScope } from '../state/gitChanges.js';
+import type { ReviewFinding } from '../agent/consultation.js';
+import { collaborationSchema, type CollaborationInput, type CollaborationResult } from '../agent/collaboration.js';
+import { resolveWithin } from '../safety/workspaceJail.js';
+import type { WorkItem } from './workCenter.js';
+import { listWorkArtifacts, inspectWorkArtifact, keepWorkArtifact, applyWorkArtifact, discardWorkArtifact, recoverWorkArtifact, type WorkArtifact } from '../state/workArtifacts.js';
 import { loadAgentDefs } from '../agent/defs.js';
-import { cycleEffort, effortDescription, effortSymbol, normalizeEffort } from '../agent/effort.js';
+import { EFFORT_LEVELS, EFFORT_SUMMARIES, effortDescription, effortSymbol, normalizeEffort } from '../agent/effort.js';
 import type { Effort } from '../provider/provider.js';
 import { clearSubAuth, type SubProvider } from '../auth/index.js';
 import { subscriptionAuthLines } from '../auth/status.js';
@@ -57,20 +67,22 @@ function parseSubProvider(value: string | undefined): SubProvider | null {
   return value === 'codex' || value === 'grok' ? value : null;
 }
 import { egressSummary } from '../safety/egress.js';
-import { discoverSkills } from '../skills/loader.js';
-import { shortPath } from '../tui/format.js';
+import { discoverSkillCatalog } from '../skills/loader.js';
+import { formatDuration, shortPath } from '../tui/format.js';
 import { imageMediaType, MAX_IMAGE_BYTES } from '../util/image.js';
 import { copyToClipboard, hasClipboard } from '../util/clipboard.js';
 import { redactString } from '../util/redact.js';
 import { GLOBAL_DIR, saveGlobalConfig, vaultUnlocked } from '../state/globalStore.js';
 import { exportSession } from '../state/chatExport.js';
-import { listResumableSessions, resumeSession } from '../state/resume.js';
-import { listRewindableTurns, rewindToTurn } from '../state/rewind.js';
+import { listResumableSessions, resolveSessionMatches, resumeSession } from '../state/resume.js';
+import { captureSessionState, restoreSessionState } from '../state/sessionState.js';
+import { sessionReplay } from '../state/sessionReplay.js';
+import { listRewindableTurns, previewRewind, rewindToTurn } from '../state/rewind.js';
 import { forkSession } from '../state/fork.js';
 import { ProjectMemory } from '../state/memory.js';
 import { SessionLog } from '../state/session.js';
 import { normalizeSessionTitle, sessionTerminalTitle } from '../state/sessionTitle.js';
-import { readLatestWorkCenterSnapshot, recordWorkCenterSnapshot } from '../state/workCenterPersistence.js';
+import { recordWorkCenterSnapshot } from '../state/workCenterPersistence.js';
 import { sanitizeAssistantText } from '../tui/sanitize.js';
 import type { ResumableSession } from '../state/resume.js';
 import type { RewindableTurn } from '../state/rewind.js';
@@ -222,6 +234,7 @@ export class ShadowApp {
   private lineId = 1;
 
   private streamBuf = '';
+  private reasoning: { item: FlattenItem; startedAt: number | null; elapsedMs: number } | null = null;
   private answerOpen = false;
   private padCarry = false;
   private pendingStream: string | null = null;
@@ -259,6 +272,9 @@ export class ShadowApp {
    *  window, and switching back to a cloud model restores this. Mirrors the Ink path. */
   private readonly baseContextPolicy: { contextBudget: number; triggerRatio: number; keepLastTurns: number };
   private pickerHandle: OverlayHandle | null = null;
+  private pickerCleanup: (() => void) | null = null;
+  private reviewFindings: ReviewFinding[] = [];
+  private reviewDiffs: Map<string, string> | undefined;
   private rewindable: RewindableTurn[] = [];
   private rewindSeen: { path: string; size: number } | null = null;
   private resumable: ResumableSession[] = [];
@@ -306,6 +322,7 @@ export class ShadowApp {
 
   constructor(private opts: TuiOpts, terminal: Terminal = new ProcessTerminal()) {
     this.terminal = terminal;
+    opts.onApprovalGate?.(this.gate, this.approvals);
     this.themeName = normalizeThemeName(opts.cfg.lastTheme) ?? 'snowfall';
     applyTheme(this.themeName);
     this.autonomy = opts.autonomy;
@@ -314,6 +331,7 @@ export class ShadowApp {
     this.activeTarget = { baseUrl: opts.activeBaseUrl, selfHosted: opts.activeSelfHosted === true };
     this.planMode = !!opts.planMode?.active;
     this.mission = opts.mission?.snapshot() ?? null;
+    this.todos = opts.todoList?.snapshot() ?? [];
     this.additionalRoots = [...(opts.additionalRoots ?? [])];
     this.effort = (opts.cfg.effort as Effort) ?? 'high';
     // Same default the Ink path uses: the session's STARTUP budget is the baseline a /model
@@ -372,6 +390,7 @@ export class ShadowApp {
   }
 
   private adoptSessionLog(log: SessionLog): void {
+    log.bindSessionState(this.opts.context, () => captureSessionState(this.opts));
     this.opts.sessionLog = log;
     if (this.opts.sessionLogBox) this.opts.sessionLogBox.current = log;
     this.refreshSessionTitle();
@@ -470,7 +489,10 @@ export class ShadowApp {
     this.refreshSessionTitle();
     this.tui.start();
 
-    this.showSplash();
+    if (this.opts.context.messages().length) {
+      this.first = false;
+      this.repaintFromContext();
+    } else this.showSplash();
     if (this.opts.mcpPending) {
       // The MCP status is CHROME (the hint line), never a transcript line: a committed line is
       // real content, and committing one at boot hid the splash before the user saw a frame.
@@ -503,6 +525,7 @@ export class ShadowApp {
   stop(): void {
     if (this.exiting) return;
     this.exiting = true;
+    this.closePicker();
     // Ink-unmount parity: abandon any in-flight turn (its loop can no longer render) and
     // release the process-wide run lock so an exiting shell can never starve the web mirror.
     this.controller?.abort();
@@ -649,6 +672,8 @@ export class ShadowApp {
   }
 
   private onTextDelta(delta: string): void {
+    if (!delta) return;
+    this.pauseReasoning();
     // Answer text is streaming — the "thinking…" activity label is stale from here on. It was
     // only cleared by tool_end/turn-end before, so a reasoning→answer turn showed "thinking…"
     // beside the spinner for the entire answer.
@@ -689,6 +714,39 @@ export class ShadowApp {
     this.streamCell.setText('', false);
   }
 
+  private onThinkingDelta(delta: string): void {
+    if (!delta || !this.running || this.controller?.signal.aborted) return;
+    if (!this.reasoning) {
+      this.flushStreamToTranscript();
+      const item: FlattenItem = { id: this.lineId++, kind: 'reasoning', text: '', reasoningState: 'streaming', durationMs: 0 };
+      this.reasoning = { item, startedAt: Date.now(), elapsedMs: 0 };
+      this.commit(item);
+    }
+    const trace = this.reasoning;
+    trace.startedAt ??= Date.now();
+    trace.item.reasoningState = 'streaming';
+    trace.item.text += delta;
+    this.cellById.get(trace.item.id)?.invalidate();
+    this.toolLine = 'thinking…';
+  }
+
+  /** Stop the thinking clock as soon as answer text starts, not when that answer ends. */
+  private pauseReasoning(state: NonNullable<FlattenItem['reasoningState']> = 'complete'): void {
+    const trace = this.reasoning;
+    if (!trace || trace.startedAt === null) return;
+    trace.elapsedMs += Math.max(0, Date.now() - trace.startedAt);
+    trace.startedAt = null;
+    trace.item.durationMs = trace.elapsedMs;
+    trace.item.reasoningState = state;
+    this.cellById.get(trace.item.id)?.invalidate();
+  }
+
+  private finishReasoning(state: NonNullable<FlattenItem['reasoningState']> = 'complete'): void {
+    this.pauseReasoning(state);
+    this.reasoning = null;
+    if (this.toolLine === 'thinking…') this.toolLine = null;
+  }
+
   // ── bus ──────────────────────────────────────────────────────────────────
 
   private onBusEvent(e: Record<string, unknown>): void {
@@ -697,23 +755,33 @@ export class ShadowApp {
     const sub = e.subagent as string | undefined;
     switch (type) {
       case 'text':
-        if (typeof e.delta === 'string') this.onTextDelta(e.delta);
+        if (!sub && typeof e.delta === 'string') this.onTextDelta(e.delta);
         break;
       case 'assistant_done':
+        if (sub) break;
+        this.finishReasoning();
         this.flushStreamToTranscript();
         break;
       case 'thinking':
-        // Extended reasoning streams into the status line, never the transcript: raw thought is
-        // noise between you and the answer, and the committed block below is the record.
-        if (this.running) this.toolLine = 'thinking…';
+        if (!sub && typeof e.delta === 'string') this.onThinkingDelta(e.delta);
         break;
       case 'reasoning_done': {
+        if (sub) break;
         const text = String(e.text ?? '');
-        if (text.trim()) {
-          this.pushLine({ kind: 'reasoning', text, durationMs: e.durationMs as number | undefined });
+        if (this.reasoning) {
+          // The provider's final projection replaces the streamed text in place, so a long
+          // answer can never push its thinking underneath the answer or duplicate it.
+          this.reasoning.item.text = text;
+          this.cellById.get(this.reasoning.item.id)?.invalidate();
+          this.finishReasoning();
+        } else if (text.trim()) {
+          this.pushLine({ kind: 'reasoning', text, durationMs: e.durationMs as number | undefined, reasoningState: 'complete' });
         }
         break;
       }
+      case 'mode':
+        if (!sub && e.mode === 'thinking') this.finishReasoning();
+        break;
       case 'tool_start': {
         if (sub) {
           // A sub-agent started a tool → the panel, NEVER the parent's live row: a tagged event
@@ -726,6 +794,7 @@ export class ShadowApp {
           }));
           break;
         }
+        this.finishReasoning();
         const call = e.call as { name: string; input?: unknown };
         this.toolLine = `${call.name}: ${previewOf(call.input)}`;
         break;
@@ -793,6 +862,7 @@ export class ShadowApp {
         this.pushLine({ text: '  ⟳ context compacted — earlier turns summarized', dimColor: true });
         break;
       case 'model_fallback':
+        if (!sub) this.finishReasoning('stopped');
         this.pushLine({ text: `  model fallback: ${e.from} → ${e.to}`, dimColor: true });
         break;
       case 'retry':
@@ -809,6 +879,7 @@ export class ShadowApp {
         this.planMode = (e.plan as { mode?: string } | undefined)?.mode === 'planning';
         break;
       case 'error':
+        if (!sub) this.finishReasoning('stopped');
         this.pushLine({ kind: 'error', text: `  ! ${String(e.message)}`, color: C.red });
         break;
       case 'subagent_start': {
@@ -838,14 +909,14 @@ export class ShadowApp {
           emitNotification(
             this.opts.cfg.notify ?? 'auto',
             'Shadow',
-            `Sub-agent ${bg.subagentType} ${e.ok ? 'finished' : 'failed'}`,
+            `Sub-agent ${bg.subagentType} ${e.status ?? (e.ok ? 'finished' : 'failed')}`,
             { isTTY: !!process.stdout.isTTY },
           );
         }
         const cur = this.subAgents.get(id);
         if (cur) {
           if (cur.background) {
-            this.subAgents.set(id, { ...cur, done: true, ok: !!e.ok, tool: undefined, argPreview: undefined });
+            this.subAgents.set(id, { ...cur, done: true, ok: !!e.ok, status: e.status as SubAgentView['status'], tool: undefined, argPreview: undefined });
           } else {
             this.subAgents.delete(id);
           }
@@ -1069,6 +1140,7 @@ export class ShadowApp {
 
   private abortTurn(): void {
     if (!this.controller || this.controller.signal.aborted) return;
+    this.finishReasoning('interrupted');
     this.flushStreamToTranscript();
     this.controller.abort();
     this.pushLine({ text: '  ⏹ interrupted', dimColor: true });
@@ -1253,6 +1325,7 @@ export class ShadowApp {
       try {
         await loop.run();
       } catch (err) {
+        this.finishReasoning('stopped');
         this.pushLine({ kind: 'error', text: `  ! ${(err as Error).message}`, color: C.red });
       } finally {
         this.loopRef = null;
@@ -1274,6 +1347,7 @@ export class ShadowApp {
   }
 
   private endTurn(): void {
+    this.finishReasoning(this.controller?.signal.aborted ? 'interrupted' : 'complete');
     // F10-02: clear FINISHED background-agent rows that lingered from the previous turn. Still-
     // running agents stay so a long bg job spans turns visibly.
     for (const [id, a] of this.subAgents) {
@@ -1283,7 +1357,7 @@ export class ShadowApp {
     this.controller = null;
     this.toolLine = null;
     const secs = Math.max(0, Math.round((Date.now() - this.runStart) / 1000));
-    if (secs >= 1) this.pushLine({ text: `${GLYPHS.tool} done · ${Math.round(secs)}s`, dimColor: true });
+    if (secs >= 1) this.pushLine({ text: `${GLYPHS.tool} done · ${formatDuration(secs)}`, dimColor: true });
     this.stopTicker();
     this.hudRef = this.hudState();
     this.tui.requestRender();
@@ -1294,6 +1368,14 @@ export class ShadowApp {
     if (this.ticker) return;
     this.ticker = setInterval(() => {
       this.tick++;
+      const trace = this.reasoning;
+      if (trace?.startedAt != null) {
+        const durationMs = trace.elapsedMs + Math.max(0, Date.now() - trace.startedAt);
+        if (Math.floor(durationMs / 1000) !== Math.floor((trace.item.durationMs ?? 0) / 1000)) {
+          trace.item.durationMs = durationMs;
+          this.cellById.get(trace.item.id)?.invalidate();
+        }
+      }
       this.tui.requestRender();
     }, this.opts.cfg.reducedMotion ? 1000 : 160);
   }
@@ -1370,39 +1452,32 @@ export class ShadowApp {
    * Repaint the visible transcript from the context actually in force. `/resume` and `/rewind`
    * replace the model's context; without this the screen kept showing the previous conversation —
    * the transcript and the model disagreeing about what was said. User and assistant text replay;
-   * tool traffic summarizes (results are in context, but re-rendering full output floods the view
-   * and is not what the user is checking).
+   * stored tool traffic replays chronologically, with bounded expandable output and an explicit
+   * marker when an older compacted context no longer contains the result.
    */
   private repaintFromContext(): void {
+    this.finishReasoning();
     this.items = [];
     this.cellById.clear();
     this.transcript.clear();
     this.lineId = 1;
     this.brandCommitted = true; // the restored conversation predates this shell — no banner inside it
-    const msgs = this.opts.context.messages();
-    let tools = 0;
-    for (const m of msgs) {
-      const text = m.content
-        .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
-        .map((b) => b.text)
-        .join('\n')
-        .trim();
-      tools += m.content.filter((b) => b.type === 'tool_use').length;
-      if (!text) continue;
-      if (m.role === 'user') {
-        this.pushLine({ kind: 'user', text: `${GLYPHS.promptPrefix}${text}`, color: C.green, bold: true, meta: 'you' });
-      } else if (m.role === 'assistant') {
-        const display = sanitizeAssistantText(text);
+    this.details = [];
+    this.turnNo = 0;
+    for (const item of sessionReplay(this.opts.context.messages())) {
+      if (item.kind === 'reasoning') {
+        this.pushLine({ kind: 'reasoning', text: item.text, reasoningState: 'complete' });
+      } else if (item.kind === 'tool') {
+        this.pushTool(item.call, item.result);
+      } else if (item.kind === 'user') {
+        this.turnNo++;
+        this.pushLine({ kind: 'user', text: `${GLYPHS.promptPrefix}${item.text}`, color: C.green, bold: true, meta: 'you' });
+      } else if (item.kind === 'assistant') {
+        const display = sanitizeAssistantText(item.text);
         if (display.trim()) {
           this.pushLine({ kind: 'assistant', text: display, color: C.fg, meta: 'assistant' });
         }
       }
-    }
-    if (tools > 0) {
-      this.pushLine({
-        text: `  ⋮ ${tools} tool call${tools === 1 ? '' : 's'} in the restored context (output not replayed)`,
-        dimColor: true,
-      });
     }
     this.tui.renderNow(true);
   }
@@ -1448,9 +1523,12 @@ export class ShadowApp {
       this.openResumePicker(sessions);
       return;
     }
-    const pick = arg
-      ? sessions.find((x) => x.id === arg || x.path === arg || x.path.endsWith(arg))
-      : sessions[0];
+    const matches = resolveSessionMatches(sessions, arg);
+    if (matches.length > 1) {
+      this.openResumePicker(matches);
+      return;
+    }
+    const pick = matches[0];
     if (!pick) {
       this.pushLine({ kind: 'error', text: `  No session matching "${approvalText(arg)}".`, color: C.red });
       return;
@@ -1460,7 +1538,7 @@ export class ShadowApp {
 
   private applyResume(pick: ResumableSession): void {
     try {
-      const { context: resumed } = resumeSession(pick.path, {
+      const { context: resumed, state } = resumeSession(pick.path, {
         contextBudget: this.opts.cfg.contextBudget,
         triggerRatio: this.opts.cfg.summarizeTriggerRatio,
         keepLastTurns: this.opts.cfg.keepLastTurns,
@@ -1471,7 +1549,10 @@ export class ShadowApp {
       this.adoptSessionLog(log);
       previous.close?.();
       this.opts.context.loadState(resumed.exportState());
-      this.opts.workCenter?.restore(readLatestWorkCenterSnapshot(pick.path));
+      restoreSessionState(this.opts, state);
+      this.mission = this.opts.mission?.snapshot() ?? null;
+      this.planMode = this.opts.planMode?.active ?? false;
+      this.todos = this.opts.todoList?.snapshot() ?? [];
       this.first = this.opts.context.messages().length === 0;
       // Repaint BEFORE the confirmation line so the notice sits at the bottom of the conversation
       // it describes.
@@ -1481,6 +1562,7 @@ export class ShadowApp {
       try {
         this.sessionLog.recordSnapshot(this.opts.context, 0);
         this.sessionLog.record({ kind: 'resumed_from', sessionId: pick.id, path: pick.path });
+        this.opts.consultations?.adopt(this.sessionLog, pick.path);
       } catch {
         /* a log that cannot be written must not fail the resume itself */
       }
@@ -1548,14 +1630,14 @@ export class ShadowApp {
       this.pushLine({ kind: 'error', text: `  No snapshot for turn ${turnIndex}. Rewindable turns: ${avail || 'none yet'}.`, color: C.red });
       return;
     }
-    this.applyRewind(turnIndex, scope);
+    this.confirmRewind(turnIndex, scope);
   }
 
   private openRewindPicker(turns: RewindableTurn[], scope: 'code' | 'chat' | undefined): void {
     const picker = new ChoicePicker({
       title: `Rewind · ${scope ?? 'code+chat'}`, items: [...turns].sort((a, b) => b.turn - a.turn),
       label: (turn) => `turn ${turn.turn} · ${turn.label}`,
-      choose: (turn) => { this.closePicker(); this.applyRewind(turn.turn, scope); },
+      choose: (turn) => { this.closePicker(); this.confirmRewind(turn.turn, scope); },
       close: () => this.closePicker(), repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
     });
     this.pickerHandle?.hide();
@@ -1563,10 +1645,33 @@ export class ShadowApp {
     this.tui.requestRender();
   }
 
+  private confirmRewind(turnIndex: number, scope: 'code' | 'chat' | undefined): void {
+    try {
+      const preview = previewRewind(this.sessionLog.path, turnIndex, this.opts.workspaceRoot, scope);
+      this.pushLine({ kind: 'system', text: `Rewind preview · turn ${turnIndex} · ${preview.scope}`, lines: [
+        ...preview.paths.map((entry) => ({ text: `  ${entry.action}: ${approvalText(entry.path)}`, color: entry.action === 'unavailable' ? C.yellow : undefined })),
+        ...(preview.paths.length ? [] : [{ text: '  No checkpointed files affected.', dimColor: true }]),
+        { text: scope === 'code' ? '  Conversation stays at its current turn.' : '  Conversation, plan and task state return to the selected turn.', dimColor: true },
+        { text: '  Shell and external edits without checkpoints are not restored.', dimColor: true },
+      ] });
+      const picker = new ChoicePicker({
+        title: `Rewind turn ${turnIndex} · ${preview.paths.length} affected path(s)`,
+        items: ['Apply rewind', 'Cancel'], label: (item) => item,
+        choose: (item) => { this.closePicker(); if (item === 'Apply rewind') this.applyRewind(turnIndex, scope); },
+        close: () => this.closePicker(), repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
+      });
+      this.pickerHandle?.hide();
+      this.pickerHandle = this.tui.showOverlay(picker, { anchor: 'center', width: 76 });
+      this.tui.requestRender();
+    } catch (error) {
+      this.pushLine({ kind: 'error', text: `  Rewind preview failed: ${approvalText((error as Error).message)}`, color: C.red });
+    }
+  }
+
   private applyRewind(turnIndex: number, scope: 'code' | 'chat' | undefined): void {
     try {
       const turnsBefore = [...this.rewindable];
-      const { context: rewound, restoredFiles, deletedFiles, partialFiles, turn, snapshotOffset } = rewindToTurn(
+      const { context: rewound, sessionState, restoredFiles, deletedFiles, partialFiles, turn, snapshotOffset } = rewindToTurn(
         this.sessionLog.path,
         turnIndex,
         this.opts.workspaceRoot,
@@ -1581,6 +1686,10 @@ export class ShadowApp {
       // untouched, so nothing to load or repaint — the file restoration IS the whole result.
       if (rewound) {
         this.opts.context.loadState(rewound.exportState());
+        restoreSessionState(this.opts, sessionState ?? captureSessionState({}));
+        this.mission = this.opts.mission?.snapshot() ?? null;
+        this.planMode = this.opts.planMode?.active ?? false;
+        this.todos = this.opts.todoList?.snapshot() ?? [];
         this.first = false; // a rewound session is mid-conversation by definition
         this.repaintFromContext();
         // Append a durable snapshot, then a lineage marker linking it to the ORIGINAL selected
@@ -1743,7 +1852,10 @@ export class ShadowApp {
       name: c.name,
       desc: c.desc,
       args:
-        c.name === '/model'
+        c.name === '/effort'
+          ? (prefix: string) => EFFORT_LEVELS.filter((level) => level.startsWith(prefix.toLowerCase()))
+              .map((level) => ({ value: level, label: `${level}${level === this.effort ? ' · current' : ''}`, description: EFFORT_SUMMARIES[level] }))
+          : c.name === '/model'
           ? (p: string) =>
               (this.opts.cfg.models ?? [])
                 .filter((m) => !m.disabled && m.label.toLowerCase().startsWith(p.toLowerCase()))
@@ -1902,7 +2014,8 @@ export class ShadowApp {
           this.opts.todoList?.write([]);
           this.todos = [];
           this.pushLine({ text: '  tasks cleared', dimColor: true });
-        } else this.printTasks();
+        } else if (this.opts.workCenter) this.openWorkBrowser(true);
+        else this.printTasks();
         return;
       case '/goal': {
         // Mission mode (8.4), ported from slash.ts: /goal <text> starts a REAL mission — plan
@@ -2006,8 +2119,8 @@ export class ShadowApp {
         try {
           let lines: string[];
           if (name === '/diff') {
-            const out = git('diff', '--no-ext-diff', '--no-textconv', '--stat', '--no-color');
-            lines = out ? out.split('\n') : ['No uncommitted changes.'];
+            this.openChanges({ kind: 'working' });
+            return;
           } else if (name === '/files') {
             const out = git('status', '--short');
             lines = out ? out.split('\n').slice(0, 40) : ['No changed files.'];
@@ -2076,7 +2189,7 @@ export class ShadowApp {
         this.doDoctor(arg);
         return;
       case '/memory':
-        this.doMemory();
+        this.doMemory(arg);
         return;
       case '/config':
         this.doConfig(arg);
@@ -2124,18 +2237,16 @@ export class ShadowApp {
         return;
       }
       case '/effort': {
-        // Only a bare /effort cycles — a garbage argument once fell through to the CYCLE and
-        // silently set an unrelated level (carried from the Ink handler's fix).
-        const parsed = normalizeEffort(arg);
-        if (arg && !parsed) {
-          this.pushLine({ kind: 'error', text: `  Unknown effort "${arg}". Use: low, medium, high, xhigh, max — or /effort alone to cycle.`, color: C.red });
+        if (!arg) {
+          this.openEffortPicker();
           return;
         }
-        this.effort = parsed ?? cycleEffort(this.effort);
-        this.opts.cfg.effort = this.effort;
-        this.loopRef?.setEffort(this.effort);
-        void saveGlobalConfig({ effort: this.effort });
-        this.pushLine({ text: `  Effort → ${this.effort} ${effortSymbol(this.effort)} — ${effortDescription(this.effort)} (applies next turn)`, color: C.green });
+        const parsed = normalizeEffort(arg);
+        if (!parsed) {
+          this.pushLine({ kind: 'error', text: `  Unknown effort "${arg}". Use: low, medium, high, xhigh, max — or /effort to choose.`, color: C.red });
+          return;
+        }
+        this.setEffort(parsed);
         return;
       }
       case '/fast': {
@@ -2254,9 +2365,23 @@ export class ShadowApp {
           this.pushLine({ text: '  Finish the current turn before /review.', dimColor: true });
           return;
         }
-        this.startTurn(
-          'Review the current uncommitted changes for bugs, regressions, and issues. Run git diff yourself to see them, then report concrete findings (file:line) and any fixes you recommend.',
-        );
+        this.chooseReviewScope(arg);
+        return;
+      case '/consult':
+        this.doConsult(arg);
+        return;
+      case '/jobs':
+        this.doJobs(arg);
+        return;
+      case '/room':
+        this.doRoom(arg);
+        return;
+      case '/team':
+        this.doTeam(arg);
+        return;
+      case '/table':
+        this.pushLine({ text: '  Snowfall collaboration uses /team and /consult. Choose a bounded preset below.', dimColor: true });
+        this.doTeam('');
         return;
       case '/plan': {
         const pm = this.opts.planMode;
@@ -2376,6 +2501,8 @@ export class ShadowApp {
           this.pushLine({ kind: 'error', text: '  Work Center is unavailable in this session.', color: C.red });
           return;
         }
+        if (!arg.trim()) { this.openWorkBrowser(); return; }
+        if (arg.trim() === 'artifacts') { this.openArtifacts(); return; }
         const result = executeWorkCommand(arg, {
           workCenter: this.opts.workCenter,
           bus: this.opts.bus,
@@ -2394,12 +2521,13 @@ export class ShadowApp {
         return;
       }
       case '/skills': {
-        const skills = discoverSkills(this.opts.workspaceRoot);
+        const { skills, conflicts } = discoverSkillCatalog(this.opts.workspaceRoot);
         this.pushLine({
           kind: 'system',
           text: '',
           lines: skills.length
-            ? skills.slice(0, 30).map((x) => ({ text: `  ${x.name.padEnd(18)} ${shortPath(x.path)} — ${x.description}`, dimColor: true }))
+            ? [...skills.slice(0, 30).map((x) => ({ text: `  ${x.name.padEnd(18)} [${x.source}] ${shortPath(x.path)} — ${x.description}`, dimColor: true })),
+              ...conflicts.map((conflict) => ({ text: `  Precedence: ${JSON.stringify(conflict)}`, dimColor: true }))]
             : [{ text: 'No skills discovered (workspace .shadow/skills or ~/.shadow/skills).', dimColor: true }],
         });
         return;
@@ -2798,9 +2926,63 @@ export class ShadowApp {
   }
 
   private doMcp(arg: string): void {
-    const parts = arg.split(/\s+/).filter(Boolean);
+    const parsed = splitPresetArgs(arg);
+    if (!parsed.ok) { this.pushLine({ text: parsed.message, color: C.red }); return; }
+    const parts = parsed.value;
     const action = parts[0] ?? 'list';
     const effective = (this.opts.cfg.mcpServers ?? {}) as McpServers;
+    const manager = this.opts.mcpManager;
+    if (!arg.trim()) { this.openMcpPicker(); return; }
+    if (action === 'add') {
+      const name = parts[1]; const target = parts[2];
+      if (!name || !/^[A-Za-z0-9_-]{1,64}$/.test(name) || !target) {
+        this.pushLine({ text: '  /mcp add <name> <http-url> OR /mcp add <name> --command <executable> [args…]', dimColor: true }); return;
+      }
+      if (effective[name]) { this.pushLine({ text: `  ${name} is already configured. Inspect it before replacing it.`, color: C.red }); return; }
+      let config: McpServers[string];
+      if (target === '--command' && parts[3]) config = { command: parts[3], args: parts.slice(4), callTimeoutMs: 180000, deferTools: true };
+      else {
+        try { const url = new URL(target); if (!['http:', 'https:'].includes(url.protocol)) throw new Error(); }
+        catch { this.pushLine({ text: '  Use an HTTP(S) URL, or --command followed by an executable and arguments.', color: C.red }); return; }
+        config = { url: target, callTimeoutMs: 180000, deferTools: true };
+      }
+      try { const next = { ...loadGlobalMcpServers(), [name]: config }; saveGlobalMcpServers(next); this.opts.cfg.mcpServers = next; }
+      catch (error) { this.pushLine({ text: approvalText((error as Error).message), color: C.red }); return; }
+      this.pushLine({ text: `  Saved ${name}. Connecting…`, dimColor: true });
+      if (manager) void manager.reconnect(name, config).then((result) => this.pushLine({ text: approvalText(redactString(result.message)), color: result.ok ? C.green : C.red }))
+        .catch((error) => this.pushLine({ text: approvalText(redactString((error as Error).message)), color: C.red }));
+      else this.pushLine({ text: '  Connector is saved; this session does not allow live connections.', dimColor: true });
+      return;
+    }
+    if (action === 'test' || action === 'reconnect') {
+      const name = parts[1] ?? ''; const config = effective[name];
+      if (!config || !manager) { this.pushLine({ text: '  Choose a configured connector in an online session.', dimColor: true }); return; }
+      this.pushLine({ text: `  ${action === 'test' ? 'Testing' : 'Connecting'} ${name}…`, dimColor: true });
+      void (action === 'test' ? manager.test(name, config) : manager.reconnect(name, config)).then((result) => {
+        this.pushLine({ text: `  ${name}: ${result.ok ? 'ready' : 'unavailable'} · ${result.tools.length} tools`, color: result.ok ? C.green : C.red });
+      }).catch((error) => this.pushLine({ text: approvalText(redactString((error as Error).message)), color: C.red }));
+      return;
+    }
+    if (action === 'timeout' || action === 'tools') {
+      const name = parts[1] ?? ''; const config = effective[name];
+      if (!config || !parts[2]) { this.pushLine({ text: '  /mcp timeout <name> <seconds> · /mcp tools <name> <all|wire-name,wire-name>', dimColor: true }); return; }
+      const seconds = Number(parts[2]);
+      if (action === 'timeout' && (!Number.isFinite(seconds) || seconds < 0.1 || seconds > 600)) {
+        this.pushLine({ text: '  Timeout must be between 0.1 and 600 seconds.', color: C.red }); return;
+      }
+      const requestedTools = parts[2].split(',').map((name) => name.trim()).filter(Boolean);
+      if (action === 'tools' && parts[2] !== 'all' && (requestedTools.length > 200 || requestedTools.some((name) => name.length > 256))) {
+        this.pushLine({ text: '  Choose at most 200 tool names, each at most 256 characters.', color: C.red }); return;
+      }
+      const nextConfig = action === 'timeout' ? { ...config, callTimeoutMs: Math.round(seconds * 1000) }
+        : { ...config, toolNames: parts[2] === 'all' ? undefined : requestedTools };
+      try { const next = { ...loadGlobalMcpServers(), [name]: nextConfig }; saveGlobalMcpServers(next); this.opts.cfg.mcpServers = next; }
+      catch (error) { this.pushLine({ text: approvalText((error as Error).message), color: C.red }); return; }
+      this.pushLine({ text: `  Updated ${name} ${action === 'timeout' ? 'call deadline' : 'tool selection'}.`, dimColor: true });
+      if (manager) void manager.reconnect(name, nextConfig).then((result) => this.pushLine({ text: approvalText(redactString(result.message)), color: result.ok ? C.green : C.red }))
+        .catch((error) => this.pushLine({ text: approvalText(redactString((error as Error).message)), color: C.red }));
+      return;
+    }
     if (action === 'get') {
       const name = parts[1] ?? '';
       const server = effective[name];
@@ -2838,9 +3020,14 @@ export class ShadowApp {
         }
       }
       this.pushLine({
-        text: approvalText(`  ${change.message}${change.ok ? ' Restart Shadow to load the new MCP tools.' : ''}`),
+        text: approvalText(`  ${change.message}`),
         color: change.ok ? C.cyan : C.red,
       });
+      if (change.ok && manager) {
+        const serverName = preset === 'browser' ? 'playwright' : 'context-cooler';
+        void manager.reconnect(serverName, change.servers[serverName]!).then((result) => this.pushLine({ text: approvalText(redactString(result.message)), color: result.ok ? C.green : C.red }))
+        .catch((error) => this.pushLine({ text: approvalText(redactString((error as Error).message)), color: C.red }));
+      }
       return;
     }
     if (action === 'disable') {
@@ -2849,6 +3036,7 @@ export class ShadowApp {
         try {
           saveGlobalMcpServers(change.servers);
           this.opts.cfg.mcpServers = change.servers;
+          manager?.disable(parts[1] ?? '');
         } catch (error) {
           this.pushLine({ kind: 'error', text: `  MCP save failed: ${approvalText((error as Error).message)}`, color: C.red });
           return;
@@ -2858,7 +3046,7 @@ export class ShadowApp {
       return;
     }
     if (action !== 'list' && action !== 'show') {
-      this.pushLine({ text: '  Usage: /mcp [list|get <name>|enable browser|enable context-cooler [--path <path>]|disable <name>]', dimColor: true });
+      this.pushLine({ text: '  /mcp [list|get|add|test|reconnect|timeout|tools|disable] · /mcp opens the picker', dimColor: true });
       return;
     }
     this.pushLine({
@@ -2866,6 +3054,26 @@ export class ShadowApp {
       text: 'mcp',
       lines: mcpListLines(effective).map((text) => ({ text: approvalText(text), dimColor: true })),
     });
+  }
+
+  private openMcpPicker(): void {
+    this.closePicker();
+    const names = Object.keys(this.opts.cfg.mcpServers ?? {});
+    const states = this.opts.mcpManager?.list() ?? [];
+    this.pickerHandle = this.tui.showOverlay(new ChoicePicker({ title: 'Connectors', items: [...names, '+ Add HTTP endpoint', '+ Add local command'],
+      label: (name) => name.startsWith('+') ? name : `${name} · ${states.find((state) => state.name === name)?.state ?? 'not connected'}`,
+      choose: (name) => {
+        this.closePicker();
+        if (name.startsWith('+')) {
+          this.editor.setText(name.includes('HTTP') ? '/mcp add name http://localhost:8000/mcp' : '/mcp add name --command executable');
+          this.tui.setFocus(this.editor); this.tui.requestRender(); return;
+        }
+        this.pickerHandle = this.tui.showOverlay(new ChoicePicker({ title: name, items: ['Inspect', 'Test connection', 'Reconnect', 'Disable'], label: (item) => item,
+          choose: (item) => { this.closePicker(); this.doMcp(`${item === 'Inspect' ? 'get' : item === 'Test connection' ? 'test' : item.toLowerCase()} ${JSON.stringify(name)}`); },
+          close: () => this.openMcpPicker(), repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
+        }), { anchor: 'center', width: 76 });
+      }, close: () => this.closePicker(), repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
+    }), { anchor: 'center', width: 76 });
   }
 
   private doPlugins(arg: string): void {
@@ -2911,8 +3119,18 @@ export class ShadowApp {
     this.pushLine({ kind: 'system', text: 'plugins', lines });
   }
 
-  private doMemory(): void {
-    const index = ProjectMemory.load(this.opts.workspaceRoot).asIndex(Number.MAX_SAFE_INTEGER);
+  private doMemory(arg = ''): void {
+    const memory = ProjectMemory.load(this.opts.workspaceRoot);
+    const [action, key, ...value] = arg.trim().split(/\s+/);
+    try {
+      if (action === 'set' && key && value.length) memory.set(key, value.join(' '), { author: 'user', source: 'terminal /memory' });
+      else if (action === 'delete' && key) memory.delete(key);
+      else if (action && !['list', 'show'].includes(action)) {
+        this.pushLine({ text: '  /memory [list|show <key>|set <key> <value>|delete <key>]', dimColor: true }); return;
+      }
+    } catch (error) { this.pushLine({ kind: 'error', text: approvalText((error as Error).message), color: C.red }); return; }
+    const entries = memory.entries().filter((entry) => action !== 'show' || !key || entry.key === key);
+    const index = entries.map((entry) => `${entry.key}: ${entry.value}\n  ${entry.author} · ${entry.source ?? 'source unspecified'} · ${entry.updatedAt ? new Date(entry.updatedAt).toLocaleString() : 'date unknown'}`).join('\n');
     if (!index) {
       this.pushLine({ text: '  No memory facts stored yet.', dimColor: true });
       return;
@@ -3232,6 +3450,478 @@ export class ShadowApp {
    * The model picker uses the shared model catalog order and names each entry's provider.
    * Esc cancels; arrows or a number select; Enter switches and closes.
    */
+  private openWorkBrowser(plansOnly = false): void {
+    const work = this.opts.workCenter;
+    if (!work || !this.opts.bgRegistry) return;
+    this.closePicker();
+    const browser = new WorkBrowser({
+      items: () => work.list(plansOnly ? { type: 'plan' } : undefined),
+      title: plansOnly ? 'Plan and task progress' : undefined,
+      rows: () => this.terminal.rows, repaint: () => this.tui.requestRender(), close: () => this.closePicker(),
+      command: (command) => {
+        const result = executeWorkCommand(command, { workCenter: work, bus: this.opts.bus, bgRegistry: this.opts.bgRegistry!, workHistory: this.opts.workHistory });
+        return result.error ?? result.lines.join('\n');
+      },
+      artifacts: (item) => this.openArtifacts(item),
+      job: (id) => {
+        try { this.openJob(id); }
+        catch (error) { this.pushLine({ kind: 'error', text: approvalText((error as Error).message), color: C.red }); }
+      },
+    });
+    this.pickerCleanup = work.onUpdate(() => this.tui.requestRender());
+    this.pickerHandle = this.tui.showOverlay(browser, { anchor: 'center', width: '90%' });
+  }
+
+  private openArtifacts(item?: WorkItem): void {
+    this.closePicker();
+    const artifacts = listWorkArtifacts(this.opts.workspaceRoot).filter((artifact) => !item || item.artifactIds?.includes(artifact.id));
+    const picker = new ChoicePicker({
+      title: artifacts.length ? 'Retained work' : 'No retained artifacts', items: artifacts,
+      label: (artifact) => `${artifact.id} · ${artifact.state} · ${artifact.changedFiles.length} files · ${artifact.verification}`,
+      choose: (artifact) => this.openArtifactActions(artifact), close: () => this.closePicker(),
+      repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
+    });
+    this.pickerHandle = this.tui.showOverlay(picker, { anchor: 'center', width: '90%' });
+  }
+
+  private openArtifactActions(artifact: WorkArtifact): void {
+    this.closePicker();
+    const choices = artifact.state === 'active' ? ['Inspect', 'Recover after worker stopped'] : ['Inspect', 'Keep', 'Apply to workspace', 'Discard checkout (keep saved patch)'];
+    const apply = (action: string): void => {
+      this.closePicker();
+      try {
+        if (action === 'Inspect') {
+          const inspected = inspectWorkArtifact(this.opts.workspaceRoot, artifact.id);
+          const changes = { title: `Artifact ${artifact.id} · ${artifact.verification}`, scope: { kind: 'working' as const },
+            files: [{ path: 'Saved patch', status: 'M', area: 'revision' as const }], summary: [artifact.diffStat || `${artifact.changedFiles.length} changed files`] };
+          this.pickerHandle = this.tui.showOverlay(new ChangeReview({ changes,
+            diff: () => inspected.patch || 'No saved patch yet. The checkout is retained at ' + artifact.worktreePath,
+            rows: () => this.terminal.rows, repaint: () => this.tui.requestRender(), close: () => this.openArtifactActions(artifact),
+          }), { anchor: 'center', width: '90%' });
+          return;
+        }
+        if (action === 'Keep') keepWorkArtifact(this.opts.workspaceRoot, artifact.id);
+        else if (action === 'Apply to workspace') applyWorkArtifact(this.opts.workspaceRoot, artifact.id);
+        else if (action.startsWith('Discard')) discardWorkArtifact(this.opts.workspaceRoot, artifact.id);
+        else {
+          const work = this.opts.workCenter?.get(artifact.taskId);
+          if (work && ['running', 'queued', 'paused', 'waiting'].includes(work.status)) throw new Error('The worker is still active. Stop it before recovering its artifact.');
+          recoverWorkArtifact(this.opts.workspaceRoot, artifact.id);
+        }
+        this.pushLine({ text: `  ${action}: ${artifact.id}`, color: C.green });
+      } catch (error) { this.pushLine({ kind: 'error', text: approvalText((error as Error).message), color: C.red }); }
+      this.openArtifacts();
+    };
+    const picker = new ChoicePicker({ title: `${artifact.id} · ${artifact.state}`, items: choices, label: (choice) => choice,
+      choose: (choice) => {
+        if (choice === 'Inspect' || choice === 'Keep') { apply(choice); return; }
+        this.closePicker();
+        const confirm = new ChoicePicker({ title: choice.startsWith('Recover') ? 'Confirm the owning worker has stopped' : `${choice}?`,
+          items: ['Cancel', choice], label: (text) => text,
+          choose: (answer) => answer === 'Cancel' ? this.openArtifactActions(artifact) : apply(choice),
+          close: () => this.openArtifactActions(artifact), repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
+        });
+        this.pickerHandle = this.tui.showOverlay(confirm, { anchor: 'center', width: '90%' });
+      }, close: () => this.openArtifacts(), repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
+    });
+    this.pickerHandle = this.tui.showOverlay(picker, { anchor: 'center', width: '90%' });
+  }
+
+  private chooseReviewScope(arg: string): void {
+    const [kind, ...rest] = arg.trim().split(/\s+/);
+    if (kind === 'findings') { this.openReviewFindings(); return; }
+    if (kind === 'base' || kind === 'commit') {
+      if (rest.length) { this.openChanges({ kind, ref: rest.join(' ') }); return; }
+      try {
+        const raw = execFileSync('git', ['-C', this.opts.workspaceRoot, ...(kind === 'base'
+          ? ['for-each-ref', '--format=%(refname:short)', 'refs/heads', 'refs/remotes']
+          : ['log', '-30', '--format=%h %s'])], { encoding: 'utf8', timeout: 5000 });
+        const entries = raw.trim().split('\n').filter(Boolean);
+        this.closePicker();
+        this.pickerHandle = this.tui.showOverlay(new ChoicePicker({ title: kind === 'base' ? 'Comparison branch' : 'Commit to review', items: entries,
+          label: (entry) => entry, choose: (entry) => this.openChanges({ kind, ref: kind === 'commit' ? entry.split(' ')[0]! : entry }),
+          close: () => this.closePicker(), repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
+        }), { anchor: 'center', width: '90%' });
+      } catch (error) { this.pushLine({ kind: 'error', text: approvalText((error as Error).message), color: C.red }); }
+      return;
+    }
+    if (kind === 'working') { this.openChanges({ kind: 'working' }); return; }
+    if (kind) { this.pushLine({ text: '  /review [working|base <branch>|commit <sha>]', dimColor: true }); return; }
+    this.closePicker();
+    this.pickerHandle = this.tui.showOverlay(new ChoicePicker({ title: 'Review scope', items: ['Uncommitted changes', 'Compare with a branch', 'A commit'], label: (entry) => entry,
+      choose: (entry) => entry === 'Uncommitted changes' ? this.openChanges({ kind: 'working' }) : this.chooseReviewScope(entry === 'A commit' ? 'commit' : 'base'),
+      close: () => this.closePicker(), repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
+    }), { anchor: 'center', width: '90%' });
+  }
+
+  private openChanges(scope: ReviewScope): void {
+    try {
+      const changes = readChanges(this.opts.workspaceRoot, scope);
+      this.closePicker();
+      this.pickerHandle = this.tui.showOverlay(new ChangeReview({ changes, diff: (file) => readFileDiff(this.opts.workspaceRoot, scope, file),
+        rows: () => this.terminal.rows, repaint: () => this.tui.requestRender(), close: () => this.closePicker(),
+        review: changes.files.length ? () => {
+          this.closePicker();
+          this.pickConsultProfile(reviewRequest(changes) + '\n\nReturn your final report as JSON: {"findings":[{"severity":"high|medium|low|info","path":"relative/path","line":1,"title":"Concrete issue","evidence":"Reason and verification evidence"}]}. Empty findings means no supported findings, not a test pass.', reviewMaterial(this.opts.workspaceRoot, changes));
+        } : undefined,
+      }), { anchor: 'center', width: '90%' });
+    } catch (error) { this.pushLine({ kind: 'error', text: approvalText((error as Error).message), color: C.red }); }
+  }
+
+  private doTeam(arg: string): void {
+    if (!this.opts.runNativeTool) { this.pushLine({ text: '  Collaboration is unavailable in this session.', dimColor: true }); return; }
+    if (this.running || this.compacting || this.modelChecking) { this.pushLine({ text: '  Finish or interrupt the current operation first.', dimColor: true }); return; }
+    const presets = [
+      { name: 'second-opinion', label: 'Second opinion · one read-only reviewer' },
+      { name: 'implement-review', label: 'Implement and review · retained worktree, independent reviewer' },
+      { name: 'parallel-team', label: 'Parallel team · two independent perspectives and synthesis' },
+      { name: 'pipeline', label: 'Pipeline · explicit ordered steps (JSON options)' },
+      { name: 'debate', label: 'Debate · evidence, challenge and structured verdict' },
+      { name: 'solve', label: 'Plan and solve · bounded research and synthesis' },
+    ];
+    if (!arg.trim()) {
+      this.closePicker();
+      this.pickerHandle = this.tui.showOverlay(new ChoicePicker({ title: 'Collaboration presets', items: presets,
+        label: (preset) => preset.label, choose: (preset) => {
+          this.closePicker(); this.editor.setText(preset.name === 'pipeline'
+            ? '/team --json {"preset":"pipeline","prompt":"","steps":[{"task":""}]}' : `/team ${preset.name} `);
+          this.tui.setFocus(this.editor); this.tui.requestRender();
+        }, close: () => this.closePicker(), repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
+      }), { anchor: 'center', width: '90%' });
+      return;
+    }
+    try {
+      let input: CollaborationInput;
+      if (arg.startsWith('--json ')) input = collaborationSchema.parse(JSON.parse(arg.slice(7)));
+      else {
+        const match = arg.match(/^(\S+)\s+([\s\S]+)$/);
+        if (!match) throw new Error('/team <preset> <task> or /team --json {"preset":…, "prompt":…, "profiles":[…], "checks":[…]}');
+        input = collaborationSchema.parse({ preset: match[1], prompt: match[2] });
+      }
+      void this.runTeam(input);
+    } catch (error) { this.pushLine({ kind: 'error', text: approvalText((error as Error).message), color: C.red }); }
+  }
+
+  private async runTeam(input: CollaborationInput): Promise<void> {
+    if (!this.opts.runNativeTool || this.running || this.exiting) return;
+    this.commitBrandLine(); this.running = true; this.runStart = Date.now();
+    const controller = new AbortController(); this.controller = controller;
+    this.startTicker(); this.hudRef = this.hudState();
+    this.pushLine({ kind: 'user', text: `${GLYPHS.promptPrefix}${input.preset}: ${input.prompt}`, color: C.green, meta: 'you' });
+    let release: (() => void) | null = null;
+    try {
+      release = await runLock.acquire(CLI_HOLDER, { priority: true, signal: controller.signal });
+      const budget = new Budget({ maxIterations: 0, ...this.opts.cfg.budget }, this.current.model, this.opts.cfg.priceTable, Date.now());
+      const result = await this.opts.runNativeTool('collaborate', input, controller.signal, budget);
+      const data = result.data as CollaborationResult | undefined;
+      this.pushLine({ kind: 'assistant', text: data?.answer ?? result.summary, meta: 'team' });
+      if (data) this.pushLine({ text: `${data.jobId} · ${data.status} · acceptance ${data.acceptance.status} · ${data.costConfidence === 'unknown' ? 'cost unknown' : '$' + budget.totalCostUSD.toFixed(4)} · /jobs · /room ${data.room} · /work artifacts`, dimColor: true });
+    } catch (error) {
+      if (!controller.signal.aborted) this.pushLine({ kind: 'error', text: approvalText((error as Error).message), color: C.red });
+    } finally { release?.(); this.endTurn(); }
+  }
+
+  private withJobs<T>(read: (store: JobStore) => T): T {
+    const store = new JobStore(this.opts.workspaceRoot);
+    try { return read(store); } finally { store.close(); }
+  }
+
+  private jobChoice(query: string, choose: (job: ProjectJob) => void): void {
+    const jobs = this.withJobs((store) => store.list());
+    const exact = jobs.find((job) => job.id === query);
+    const matches = exact ? [exact] : jobs.filter((job) => job.id.startsWith(query));
+    if (matches.length === 1) { choose(matches[0]!); return; }
+    if (!matches.length) throw new Error(`Unknown job: ${query}`);
+    this.closePicker();
+    this.pickerHandle = this.tui.showOverlay(new ChoicePicker({ title: 'Choose a job', items: matches,
+      label: (job) => `${job.id} · ${job.status} · ${redactString(job.input.description ?? job.input.prompt).slice(0, 100)}`,
+      choose: (job) => { this.closePicker(); choose(job); }, close: () => this.closePicker(),
+      repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
+    }), { anchor: 'center', width: '90%' });
+  }
+
+  private doJobs(arg: string): void {
+    const parsed = splitPresetArgs(arg);
+    if (!parsed.ok) { this.pushLine({ text: parsed.message, color: C.red }); return; }
+    const [command, id, ...rest] = parsed.value;
+    try {
+      if (!command || command === 'list') { this.openJobs(); return; }
+      if (command === 'recover') {
+        const recovered = this.withJobs((store) => store.recoverOrphans());
+        this.pushLine({ text: `  ${recovered.length} abandoned attempt(s) marked interrupted. Inspect results before preparing a retry.`, dimColor: true });
+        this.openJobs(); return;
+      }
+      const actions = ['show', 'retry', 'start', 'cancel'];
+      if (actions.includes(command) && !id) throw new Error(`/jobs ${command} <job-id>${command === 'retry' ? ' [follow-up]' : ''}`);
+      this.jobChoice(actions.includes(command) ? id! : command, (job) => {
+        try {
+          if (command === 'retry') this.withJobs((store) => store.prepareRetry(job.id, rest.join(' ')));
+          if (command === 'cancel') {
+            const ids = this.withJobs((store) => store.requestCancel(job.id));
+            this.pushLine({ text: `  Cancellation requested for ${ids.length} job(s), including active descendants.`, dimColor: true });
+          }
+          if (command === 'start') { void this.runPreparedJob(job.id); return; }
+          this.openJob(job.id);
+        } catch (error) { this.pushLine({ kind: 'error', text: approvalText((error as Error).message), color: C.red }); }
+      });
+    } catch (error) { this.pushLine({ kind: 'error', text: approvalText((error as Error).message), color: C.red }); }
+  }
+
+  private openJobs(): void {
+    const rows = this.withJobs((store) => store.list().map((job) => ({ job, blockers: store.blockers(job) })));
+    this.closePicker();
+    this.pickerHandle = this.tui.showOverlay(new ChoicePicker({ title: 'Project jobs · persistent attempts and evidence', items: rows,
+      label: ({ job, blockers }) => `${job.status} · ${job.acceptance.status}${blockers.length ? ` · ${blockers.length} blocker(s)` : ''} · ${redactString(job.input.description ?? job.input.prompt).slice(0, 150)} · ${job.id}`,
+      choose: ({ job }) => this.openJob(job.id), close: () => this.closePicker(),
+      repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
+    }), { anchor: 'center', width: '90%' });
+  }
+
+  private openJob(id: string): void {
+    const { job, blockers } = this.withJobs((store) => {
+      const job = store.get(id); if (!job) throw new Error(`Unknown job: ${id}`);
+      return { job, blockers: store.blockers(job) };
+    });
+    const actions = ['Inspect task, attempts, and acceptance', 'Inspect retained artifacts', 'Read project room', 'Refresh'];
+    if (blockers.length) actions.splice(1, 0, 'Inspect dependency blockers');
+    if (job.status === 'pending' && !blockers.length) actions.push('Start prepared attempt');
+    else if (!['pending', 'running'].includes(job.status) && job.attempts.length < job.maxAttempts) actions.push('Prepare retry');
+    if (job.status === 'running' || job.status === 'pending') actions.push('Cancel job and descendants');
+    actions.push('Back to jobs');
+    this.closePicker();
+    this.pickerHandle = this.tui.showOverlay(new ChoicePicker({ title: `${job.id} · ${job.status} · acceptance ${job.acceptance.status}`, items: actions,
+      label: (action) => action, choose: (action) => {
+        try {
+          this.closePicker();
+          if (action === 'Start prepared attempt') { void this.runPreparedJob(id); return; }
+          if (action === 'Prepare retry') { this.withJobs((store) => store.prepareRetry(id)); this.openJob(id); return; }
+          if (action === 'Cancel job and descendants') { this.withJobs((store) => store.requestCancel(id)); this.openJob(id); return; }
+          if (action === 'Read project room') { this.openRoom(job.room); return; }
+          if (action === 'Back to jobs') { this.openJobs(); return; }
+          if (action === 'Refresh') { this.openJob(id); return; }
+          if (action === 'Inspect dependency blockers') {
+            this.pickerHandle = this.tui.showOverlay(new ChoicePicker({ title: `Dependencies require ${job.dependencyMode}`, items: blockers,
+              label: (blocker) => blocker, choose: (blocker) => this.openJob(blocker), close: () => this.openJob(id),
+              repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
+            }), { anchor: 'center', width: '90%' }); return;
+          }
+          if (action === 'Inspect retained artifacts') {
+            this.openArtifacts({ id, type: 'subagent', status: job.status === 'pending' ? 'queued' : job.status,
+              description: job.input.description ?? job.input.prompt, depth: 0, startedAt: job.createdAt, lastActivityAt: job.updatedAt,
+              activities: [], artifactIds: [...new Set(job.attempts.flatMap((attempt) => attempt.artifactIds))] }); return;
+          }
+          const text = [job.input.prompt, `\nProfile: ${job.profile ?? job.input.profile ?? 'current'} · ${job.provider ?? '?'} / ${job.model ?? '?'}`,
+            `Role: ${job.input.subagent_type ?? 'general-purpose'} · Isolation: ${job.input.isolation ?? 'none'}`,
+            `Attempts: ${job.attempts.length}/${job.maxAttempts} · Dependencies (${job.dependencyMode}): ${job.dependencies.join(', ') || 'none'}`,
+            `Blockers: ${blockers.join(', ') || 'none'}`, `Acceptance: ${job.acceptance.status}`, ...job.acceptance.reasons,
+            `Expected outputs: ${job.acceptanceSpec.artifacts?.join(', ') || 'none declared'}`,
+            `Authorized checks: ${job.acceptanceSpec.checks?.join('; ') || 'none declared'}`,
+            ...job.attempts.map((attempt) => `\nAttempt ${attempt.number}: ${attempt.id} · ${attempt.status} · ${attempt.stopReason ?? 'no stop reason'}\n` +
+              `${attempt.usage?.inputTokens ?? '?'} input / ${attempt.usage?.outputTokens ?? '?'} output tokens · ${attempt.usage?.costConfidence === 'known' ? '$' + (attempt.usage.costUSD ?? 0).toFixed(4) : 'cost unknown'}\n` +
+              `Artifacts: ${attempt.artifactIds.join(', ') || 'none'}\n${attempt.answer ?? '[Recorded answer unavailable]'}`),
+            ...job.acceptance.checks.map((check) => `\nCheck: ${check.command}\nExit: ${check.exitCode ?? 'unknown'} · timed out: ${check.timedOut} · aborted: ${check.aborted}\n${check.stdout}\n${check.stderr}`),
+          ].join('\n');
+          this.openProjectText(`${id} · recorded evidence`, text, () => this.openJob(id));
+        } catch (error) { this.pushLine({ kind: 'error', text: approvalText((error as Error).message), color: C.red }); }
+      }, close: () => this.closePicker(), repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
+    }), { anchor: 'center', width: '90%' });
+  }
+
+  private openProjectText(title: string, text: string, close: () => void): void {
+    this.closePicker();
+    this.pickerHandle = this.tui.showOverlay(new TextViewer({ title, text, close,
+      repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
+    }), { anchor: 'center', width: '90%' });
+  }
+
+  private async runPreparedJob(id: string): Promise<void> {
+    if (this.running || this.compacting || this.modelChecking || this.exiting) {
+      this.pushLine({ text: '  Finish or interrupt the current operation before starting a job.', dimColor: true }); return;
+    }
+    if (!this.opts.runNativeTool) { this.pushLine({ text: '  Native job execution is unavailable in this session.', dimColor: true }); return; }
+    this.closePicker();
+    this.commitBrandLine(); this.running = true; this.runStart = Date.now();
+    const controller = new AbortController(); this.controller = controller;
+    this.startTicker(); this.hudRef = this.hudState();
+    let release: (() => void) | null = null;
+    try {
+      release = await runLock.acquire(CLI_HOLDER, { priority: true, signal: controller.signal });
+      const job = this.withJobs((store) => {
+        const job = store.get(id); if (!job) throw new Error(`Unknown job: ${id}`);
+        if (job.status !== 'pending') throw new Error('Prepare a retry before starting another attempt.');
+        const blockers = store.blockers(job); if (blockers.length) throw new Error(`Job blocked by: ${blockers.join(', ')}`);
+        return job;
+      });
+      this.pushLine({ kind: 'user', text: `${GLYPHS.promptPrefix}Start prepared job ${id}`, color: C.green, meta: 'you' });
+      const budget = new Budget({ maxIterations: 0, ...this.opts.cfg.budget }, this.current.model, this.opts.cfg.priceTable, Date.now());
+      const consultationId = job.input.consultation_id ?? job.input.conversation_id;
+      if (consultationId) {
+        if (!this.opts.consultations) throw new Error('Resume the session containing this consultation before retrying it.');
+        const result = await this.opts.consultations.followUp(consultationId, job.input.prompt,
+          { signal: controller.signal, gate: this.gate, parentBudget: budget, jobId: id });
+        this.pushLine({ kind: 'assistant', text: result.answer, meta: 'reviewer' });
+      } else {
+        const result = await this.opts.runNativeTool('agent', { ...job.input, job_id: id }, controller.signal, budget);
+        const data = result.data as { answer?: string } | undefined;
+        this.pushLine({ kind: result.ok ? 'assistant' : 'error', text: data?.answer ?? result.summary, meta: 'job' });
+      }
+      const after = this.withJobs((store) => store.get(id));
+      if (after) this.pushLine({ text: `${id} · ${after.status} · acceptance ${after.acceptance.status} · /jobs show ${id}`, dimColor: true });
+    } catch (error) {
+      if (!controller.signal.aborted) this.pushLine({ kind: 'error', text: approvalText((error as Error).message), color: C.red });
+    } finally { release?.(); this.endTurn(); }
+  }
+
+  private doRoom(arg: string): void {
+    const parsed = splitPresetArgs(arg);
+    if (!parsed.ok) { this.pushLine({ text: parsed.message, color: C.red }); return; }
+    const [command, ...parts] = parsed.value;
+    try {
+      if (!command || !['read', 'unread', 'post', 'to', 'reply'].includes(command)) { this.openRoom(command ?? 'project'); return; }
+      const room = parts[0] ?? 'project';
+      if (command === 'read' || command === 'unread') { this.openRoom(room, command === 'unread'); return; }
+      const [recipientOrId, ...bodyParts] = parts.slice(1);
+      const body = command === 'post' ? parts.slice(1).join(' ') : bodyParts.join(' ');
+      if (!body.trim()) throw new Error(command === 'post' ? '/room post <room> <message>' : `/room ${command} <room> <${command === 'to' ? 'recipient' : 'message-id'}> <message>`);
+      const replyTo = command === 'reply' ? Number(recipientOrId) : undefined;
+      if (replyTo !== undefined && (!Number.isSafeInteger(replyTo) || replyTo < 1)) throw new Error('A reply requires a valid message ID.');
+      const message = this.withJobs((store) => {
+        let to = command === 'to' ? recipientOrId : undefined;
+        if (replyTo !== undefined) {
+          const parent = store.readMessages(room, 'lead', { after: replyTo - 1, limit: 1 })[0];
+          if (!parent || parent.id !== replyTo) throw new Error('Reply target is unavailable to the lead in this room.');
+          to = parent.from === 'lead' ? parent.to : parent.from;
+        }
+        return store.postMessage({ room, from: 'lead', body, to, replyTo });
+      });
+      this.pushLine({ text: `  Local message #${message.id} posted to ${approvalText(room)}${message.to ? ' → ' + approvalText(message.to) : ''}.`, dimColor: true });
+      this.openRoom(room);
+    } catch (error) { this.pushLine({ kind: 'error', text: approvalText((error as Error).message), color: C.red }); }
+  }
+
+  private openRoom(room: string, unread = false, after?: number): void {
+    const messages = this.withJobs((store) => store.readMessages(room, 'lead', { unread, after, limit: 30 }));
+    type RoomChoice = { label: string; message?: RoomMessage; action?: 'post' | 'unread' | 'history' | 'mark' | 'next' };
+    const choices: RoomChoice[] = messages.map((message) => ({ message,
+      label: `#${message.id} ${message.from}${message.to ? ' → ' + message.to : ''}${message.replyTo ? ' ↪ #' + message.replyTo : ''} · ${redactString(message.body).replace(/\s+/g, ' ').slice(0, 120)}` }));
+    choices.push({ label: 'Write a local message', action: 'post' }, { label: unread ? 'Browse history' : 'Browse unread', action: unread ? 'history' : 'unread' });
+    if (messages.length) choices.push({ label: `Mark through #${messages.at(-1)!.id} read`, action: 'mark' });
+    if (messages.length === 30) choices.push({ label: 'Next page', action: 'next' });
+    this.closePicker();
+    this.pickerHandle = this.tui.showOverlay(new ChoicePicker({ title: `Local room ${room} · ${unread ? 'unread' : 'history'} · lead`, items: choices,
+      label: (choice) => choice.label, choose: (choice) => {
+        this.closePicker();
+        if (choice.message) { this.openRoomMessage(choice.message, () => this.openRoom(room, unread, after)); return; }
+        if (choice.action === 'post') { this.editor.setText(`/room post ${JSON.stringify(room)} `); this.tui.requestRender(); return; }
+        if (choice.action === 'mark') this.withJobs((store) => store.markRead(room, 'lead', messages.at(-1)!.id));
+        this.openRoom(room, choice.action === 'unread' || choice.action === 'mark' ? true : choice.action === 'history' ? false : unread,
+          choice.action === 'next' ? messages.at(-1)!.id : undefined);
+      }, close: () => this.closePicker(), repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
+    }), { anchor: 'center', width: '90%' });
+  }
+
+  private openRoomMessage(message: RoomMessage, back: () => void): void {
+    this.closePicker();
+    this.pickerHandle = this.tui.showOverlay(new ChoicePicker({ title: `#${message.id} · ${message.from} → ${message.to ?? 'room'}`, items: ['Read message', 'Reply', 'Back'], label: (action) => action,
+      choose: (action) => {
+        this.closePicker();
+        if (action === 'Reply') { this.editor.setText(`/room reply ${JSON.stringify(message.room)} ${message.id} `); this.tui.requestRender(); return; }
+        if (action === 'Back') { back(); return; }
+        this.openProjectText(`Local message #${message.id}`, `${message.from} → ${message.to ?? 'room'}${message.replyTo ? ' · reply to #' + message.replyTo : ''}\n${new Date(message.createdAt).toLocaleString()}${message.jobId ? '\nJob: ' + message.jobId : ''}\n\n${message.body}`, () => this.openRoomMessage(message, back));
+      }, close: back, repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
+    }), { anchor: 'center', width: '90%' });
+  }
+
+  private doConsult(arg: string): void {
+    const service = this.opts.consultations;
+    if (!service) { this.pushLine({ text: '  Consultation service is unavailable in this session.', dimColor: true }); return; }
+    const parsed = splitPresetArgs(arg);
+    if (!parsed.ok) { this.pushLine({ text: parsed.message, color: C.red }); return; }
+    const [command, ...rest] = parsed.value;
+    if (command === 'list') {
+      const entries = service.list();
+      this.pushLine({ kind: 'system', text: 'Consultations', lines: entries.length ? entries.map((entry) => ({
+        text: `${entry.id} · ${entry.status} · ${entry.profile ?? 'current model'} · ${entry.title}`, dimColor: true,
+      })) : [{ text: 'No consultations yet. /consult opens the model picker.', dimColor: true }] });
+      return;
+    }
+    if (command === 'cancel') {
+      this.pushLine({ text: service.cancel(rest[0] ?? '') ? '  Consultation cancellation requested.' : '  No running consultation with that ID.', dimColor: true }); return;
+    }
+    if (this.running || this.compacting || this.modelChecking) { this.pushLine({ text: '  Finish or interrupt the current operation first.', dimColor: true }); return; }
+    if (command === 'follow') {
+      const [id, ...question] = rest;
+      if (!id || !question.length) { this.pushLine({ text: '  /consult follow <id> <question>', dimColor: true }); return; }
+      void this.runConsult(question.join(' '), undefined, id); return;
+    }
+    if (!command) { this.pickConsultProfile(); return; }
+    if (!rest.length) { this.pushLine({ text: '  /consult "profile name" <question> · /consult list · /consult follow <id> <question>', dimColor: true }); return; }
+    void this.runConsult(rest.join(' '), command === 'current' ? undefined : command);
+  }
+
+  private pickConsultProfile(prompt?: string, material?: ReturnType<typeof reviewMaterial>): void {
+    const service = this.opts.consultations;
+    if (!service) { this.pushLine({ text: '  Consultation service is unavailable.', dimColor: true }); return; }
+    this.closePicker();
+    const profiles = [{ profile: 'current', provider: this.current.provider, model: this.current.model }, ...service.profiles()];
+    this.pickerHandle = this.tui.showOverlay(new ChoicePicker({ title: prompt ? 'Choose a read-only reviewer' : 'Consult a model', items: profiles,
+      label: (profile) => `${profile.profile} · ${profile.provider}/${profile.model}`,
+      choose: (profile) => {
+        this.closePicker();
+        if (prompt) void this.runConsult(prompt, profile.profile === 'current' ? undefined : profile.profile, undefined, material);
+        else { this.editor.setText(`/consult ${JSON.stringify(profile.profile)} `); this.tui.setFocus(this.editor); this.tui.requestRender(); }
+      }, close: () => this.closePicker(), repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
+    }), { anchor: 'center', width: '90%' });
+  }
+
+  private async runConsult(prompt: string, profile?: string, followId?: string, material?: ReturnType<typeof reviewMaterial>): Promise<void> {
+    const service = this.opts.consultations;
+    if (!service || this.running || this.exiting) return;
+    this.commitBrandLine();
+    this.running = true;
+    this.runStart = Date.now();
+    const controller = new AbortController(); this.controller = controller;
+    this.startTicker(); this.hudRef = this.hudState();
+    this.pushLine({ kind: 'user', text: `${GLYPHS.promptPrefix}${followId ? `Follow-up ${followId}` : `Consult ${profile ?? 'current model'}`}: ${prompt}`, color: C.green, meta: 'you' });
+    let release: (() => void) | null = null;
+    try {
+      release = await runLock.acquire(CLI_HOLDER, { priority: true, signal: controller.signal });
+      const budget = new Budget({ maxIterations: 0, ...this.opts.cfg.budget }, this.current.model, this.opts.cfg.priceTable, Date.now());
+      const runtime = { signal: controller.signal, gate: this.gate, parentBudget: budget };
+      const result = followId ? await service.followUp(followId, prompt, runtime) : await service.start({ prompt, profile, ...(material ? { scopedContext: material.text } : {}) }, runtime);
+      this.reviewFindings = result.findings ?? [];
+      if (!followId) this.reviewDiffs = material?.diffs;
+      const answer = result.findings ? result.findings.length ? result.findings.map((finding) =>
+        `**${finding.severity.toUpperCase()} · ${finding.path}${finding.line ? ':' + finding.line : ''} — ${finding.title}**\n\n${finding.evidence}`).join('\n\n')
+        : 'No supported findings were reported. Verification remains unverified.' : result.answer;
+      this.pushLine({ kind: 'assistant', text: answer, meta: 'reviewer' });
+      this.pushLine({ text: `${result.id} · ${result.status} · ${result.usage.costKnown ? '$' + result.usage.costUSD!.toFixed(4) : 'cost unknown'} · /consult follow ${result.id} <question>${this.reviewFindings.length ? ' · /review findings' : ''}`, dimColor: true });
+    } catch (error) {
+      if (!controller.signal.aborted) this.pushLine({ kind: 'error', text: approvalText((error as Error).message), color: C.red });
+    } finally { release?.(); this.endTurn(); }
+  }
+
+  private openReviewFindings(): void {
+    this.closePicker();
+    this.pickerHandle = this.tui.showOverlay(new ChoicePicker({ title: 'Review findings · model opinions, verification unverified', items: this.reviewFindings,
+      label: (finding) => `${finding.severity} · ${finding.path}:${finding.line ?? 1} · ${finding.title}`,
+      choose: (finding) => {
+        this.closePicker();
+        const changes = { title: `${finding.path}:${finding.line ?? 1}`, scope: { kind: 'working' as const },
+          files: [{ path: finding.path, status: '', area: 'revision' as const }], summary: [`${finding.title} — Enter to inspect source and evidence`] };
+        this.pickerHandle = this.tui.showOverlay(new ChangeReview({ changes,
+          diff: () => {
+            if (this.reviewDiffs) return `${finding.evidence}\n\nSelected review snapshot:\n${this.reviewDiffs.get(finding.path) ?? '[This location was not included in the bounded selected diff. Inspect the chosen revision before accepting this finding.]'}`;
+            const file = resolveWithin(this.opts.workspaceRoot, finding.path);
+            if (statSync(file).size > 1024 * 1024) throw new Error('Source file too large for this preview.');
+            const lines = readFileSync(file, 'utf8').split('\n'); const start = Math.max(0, (finding.line ?? 1) - 8);
+            return `${finding.evidence}\n\n${lines.slice(start, start + 20).map((line, i) => `${start + i + 1}: ${line}`).join('\n')}`;
+          }, rows: () => this.terminal.rows, repaint: () => this.tui.requestRender(), close: () => this.openReviewFindings(),
+        }), { anchor: 'center', width: '90%' });
+      }, close: () => this.closePicker(), repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
+    }), { anchor: 'center', width: '90%' });
+  }
+
   private openPicker(): void {
     if (this.pickerHandle) return;
     const rows = modelRows(this.opts.cfg);
@@ -3257,9 +3947,32 @@ export class ShadowApp {
   }
 
   private closePicker(): void {
+    this.pickerCleanup?.();
+    this.pickerCleanup = null;
     this.pickerHandle?.hide();
     this.pickerHandle = null;
     this.tui.setFocus(this.editor);
+    this.tui.requestRender();
+  }
+
+  private setEffort(effort: Effort): void {
+    this.effort = effort;
+    this.opts.cfg.effort = effort;
+    this.loopRef?.setEffort(effort);
+    void saveGlobalConfig({ effort });
+    this.pushLine({ text: `  Effort → ${effort} ${effortSymbol(effort)} — ${effortDescription(effort)} (applies next turn)`, color: C.green });
+  }
+
+  private openEffortPicker(): void {
+    const picker = new ChoicePicker({
+      title: `Reasoning effort · current: ${this.effort}`, items: [...EFFORT_LEVELS],
+      selected: EFFORT_LEVELS.indexOf(this.effort),
+      label: (level) => `${level}${level === this.effort ? ' ●' : ''} · ${EFFORT_SUMMARIES[level]}`,
+      choose: (level) => { this.closePicker(); this.setEffort(level); },
+      close: () => this.closePicker(), repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
+    });
+    this.pickerHandle?.hide();
+    this.pickerHandle = this.tui.showOverlay(picker, { anchor: 'center', width: 90 });
     this.tui.requestRender();
   }
 

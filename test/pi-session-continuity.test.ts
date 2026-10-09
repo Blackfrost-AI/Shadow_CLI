@@ -56,10 +56,10 @@ test('the renderer-neutral catalog advertises implemented pi commands and filter
   const pi = terminalCommandsFor('pi');
   const names = pi.map((command) => command.name);
 
-  for (const required of ['/fork', '/provider', '/local', '/mcp', '/plugins']) {
+  for (const required of ['/fork', '/provider', '/local', '/mcp', '/plugins', '/table', '/team', '/consult']) {
     assert.ok(names.includes(required), `${required} is advertised by the pi command catalog`);
   }
-  for (const unsupported of ['/table', '/vim', '/statusline']) {
+  for (const unsupported of ['/vim', '/statusline']) {
     assert.ok(!names.includes(unsupported), `${unsupported} is omitted from pi autocomplete/help`);
     const catalogRow = TERMINAL_COMMANDS.find((command) => command.name === unsupported);
     assert.ok(catalogRow?.renderers.pi.unavailable, `${unsupported} records why pi cannot offer it`);
@@ -229,6 +229,7 @@ test('pi /rewind persists the rewound chat state and prefills the next discarded
   const output: Array<{ text?: string }> = [];
   let readsCleared = 0;
   const snapshotsBefore = records(log.path).filter((record) => record.kind === 'context_snapshot').length;
+  let confirmation: { handleInput(data: string): void } | undefined;
 
   const app = Object.assign(Object.create(ShadowApp.prototype), {
     opts: {
@@ -249,6 +250,11 @@ test('pi /rewind persists the rewound chat state and prefills the next discarded
     rewindable: listRewindableTurns(log.path),
     rewindSeen: null,
     editor: { setText: (text: string) => drafts.push(text) },
+    terminal: { rows: 40 },
+    tui: {
+      showOverlay: (picker: { handleInput(data: string): void }) => { confirmation = picker; return { hide() {} }; },
+      requestRender() {}, setFocus() {},
+    },
     repaintFromContext: () => repaints++,
     readTracker: { clear: () => readsCleared++ },
     pushLine: (line: { text?: string }) => output.push(line),
@@ -258,6 +264,9 @@ test('pi /rewind persists the rewound chat state and prefills the next discarded
   };
 
   app.runSlash('/rewind 0 --chat-only');
+  assert.equal(live.messages().length, 4, 'preview does not rewind before confirmation');
+  assert.ok(confirmation, 'rewind opens its confirmation picker');
+  confirmation.handleInput('\r');
 
   assert.deepEqual(live.messages(), [message('user', 'first prompt'), message('assistant', 'first answer')]);
   assert.equal(app.first, false);

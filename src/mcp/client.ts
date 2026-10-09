@@ -8,6 +8,10 @@ import { scrubbedEnv } from '../util/safeEnv.js';
 import { shadowFetch } from '../safety/egress.js';
 import { wrapMcpArgv } from '../safety/sandbox.js';
 import { envelopUntrusted, fitPayload } from '../safety/envelope.js';
+import type { McpServerConfig } from './manage.js';
+import { McpLifecycle, mcpCallDeadline, type McpRuntimeOptions } from './lifecycle.js';
+import { McpArtifactStore, makeMcpArtifactTool } from './artifacts.js';
+export type { McpRuntimeOptions, McpProgress, McpCallEvent } from './lifecycle.js';
 import { readCapped } from '../tools/webFetch.js';
 import { SseAssembler, parseSseData, nonEmptyParts, type SseEvent } from '../provider/sse.js';
 
@@ -49,6 +53,16 @@ function mcpResultBody(parts: McpContentPart[]): string {
   const nonText = parts.filter((c) => c.type !== 'text' && !c.resource?.text);
   const noteTail = nonText.map((c) => `[${c.type}${c.resource?.uri ? ` ${c.resource.uri}` : ''}]`).join(' ');
   return [text, noteTail].filter(Boolean).join('\n');
+}
+
+/** Archive overflow without discarding a successful remote result if local storage fails. */
+function resultArtifact(runtime: McpRuntimeOptions, body: string, cap: number, server: string, tool: string): unknown {
+  if (body.length <= cap || !runtime.artifacts) return undefined;
+  try {
+    return { artifact: runtime.artifacts.save(body, mcpSafeNamePart(server), mcpSafeNamePart(tool)), truncated: true, retrieval: 'mcp_artifact' };
+  } catch {
+    return { truncated: true, artifactUnavailable: true, note: 'The full MCP result could not be saved locally; only the bounded excerpt is available.' };
+  }
 }
 
 /**
@@ -102,18 +116,6 @@ function mcpSchemaTextSafe(node: unknown): boolean {
   return true;
 }
 
-interface McpServerConfig {
-  command?: string;
-  args?: string[];
-  env?: Record<string, string>;
-  url?: string; // Streamable-HTTP endpoint (alternative to command/stdio)
-  headers?: Record<string, string>;
-  /** P3-08 Phase 3: grant the confined child outbound network (default: off — stdio = pipes). */
-  network?: boolean;
-  /** P3-08 Phase 3: set false to run this ONE server outside the OS jail (explicit choice). */
-  sandbox?: boolean;
-}
-
 /**
  * P3-08 Phase 3 — the OS-jail inputs for stdio children. `enabled` is the session's sandbox
  * request state (sandbox !== 'off', not --yolo); per-server `network`/`sandbox` live on the
@@ -132,7 +134,7 @@ export interface McpJail {
 }
 
 /** Shared surface of the stdio and HTTP MCP clients. */
-interface McpConnection {
+export interface McpConnection {
   start(): Promise<void>;
   listTools(): Promise<McpToolInfo[]>;
   /** `signal` (P2-01): user interrupt — aborting it cancels the in-flight MCP call.
@@ -161,7 +163,7 @@ interface McpToolAnnotations {
   title?: string;
 }
 
-interface McpToolInfo {
+export interface McpToolInfo {
   name: string;
   description?: string;
   inputSchema?: unknown;
@@ -193,13 +195,15 @@ export class McpClient implements McpConnection {
   // decoding each pipe chunk independently cannot do that (see onData).
   private decoder = new StringDecoder('utf8');
   private nextId = 1;
+  private readonly lifecycle: McpLifecycle;
   private pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
 
   constructor(
     private readonly name: string,
     private readonly cfg: McpServerConfig,
     private readonly jail?: McpJail,
-  ) {}
+    private readonly runtime: McpRuntimeOptions = {},
+  ) { this.lifecycle = new McpLifecycle(name, runtime); }
 
   async start(): Promise<void> {
     if (this.child) return;
@@ -242,6 +246,8 @@ export class McpClient implements McpConnection {
       // never inherit the agent process's provider credentials by default.
       env: scrubbedEnv(undefined, this.cfg.env),
       stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: this.jail?.workspaceRoot,
+      detached: process.platform !== 'win32',
     });
     // Never let a stdio MCP child keep the process alive past the work: unref the child and its
     // pipes so a one-shot (--task), piped-stdin, or REPL run still exits cleanly by natural drain
@@ -317,6 +323,7 @@ export class McpClient implements McpConnection {
       // (image/audio/resource-without-text) — shared with the HTTP client so both transports
       // render a tool result identically.
       const body = mcpResultBody(parts);
+      const artifactData = resultArtifact(this.runtime, body, cap, this.name, name);
       // P3-05: a server's reply is untrusted content — a compromised or hostile MCP server can put
       // model-directed instructions in any response. Envelope it (payload byte-for-byte) on BOTH
       // the success and the isError path, and stop duplicating the body into data (the old
@@ -325,10 +332,10 @@ export class McpClient implements McpConnection {
       // cut that severed it would hand a forged END inside the reply its escape wedge.
       if (res.isError) {
         const msg = body ? envelopUntrusted({ tool: headerTool, source, content: fitPayload(body, cap) }) : 'MCP tool error';
-        return fail(toolName, risk, Date.now() - start, 'mcp_error', msg);
+        return { ...fail(toolName, risk, Date.now() - start, 'mcp_error', msg), ...(artifactData ? { data: artifactData } : {}) };
       }
       if (!body) return ok(toolName, risk, Date.now() - start, parts.length ? 'tool returned non-text content' : 'ok');
-      return ok(toolName, risk, Date.now() - start, envelopUntrusted({ tool: headerTool, source, content: fitPayload(body, cap) }));
+      return ok(toolName, risk, Date.now() - start, envelopUntrusted({ tool: headerTool, source, content: fitPayload(body, cap) }), artifactData);
     } catch (e) {
       // A JSON-RPC error reply is server-authored — untrusted content too (it used to surface raw
       // via mcp_failed). Our own transport/timeout/abort messages stay plain.
@@ -375,10 +382,10 @@ export class McpClient implements McpConnection {
       this.buf = this.buf.slice(nl + 1);
       if (!line) continue;
       try {
-        const msg = JSON.parse(line) as JsonRpcResponse;
+        const msg = JSON.parse(line) as JsonRpcResponse & { method?: string; params?: unknown };
+        if (msg.method === 'notifications/progress') { this.lifecycle.progress(msg.params); continue; }
         const p = this.pending.get(msg.id);
         if (!p) continue;
-        this.pending.delete(msg.id);
         if (msg.error) p.reject(new McpServerReplyError(String(msg.error.message)));
         else p.resolve(msg.result);
       } catch {
@@ -397,37 +404,30 @@ export class McpClient implements McpConnection {
   private request(method: string, params: unknown, signal?: AbortSignal): Promise<unknown> {
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      if (signal?.aborted) {
-        reject(new Error(`MCP request aborted: ${method}`));
-        return;
-      }
-      const timer = setTimeout(() => {
-        if (this.pending.has(id)) {
-          this.pending.delete(id);
-          reject(new Error(`MCP request timeout: ${method}`));
-        }
-      }, 60_000);
-      // Always clear this timer on settle (previously it lingered for 60s after every request,
-      // keeping the event loop alive and delaying a one-shot run's exit). We do NOT unref it: during
-      // the startup handshake it is the only handle keeping the loop alive while we await a response,
-      // so unref-ing it makes Node exit 0 mid-startup on a slow server.
-      const clearAnd = (fn: (v: unknown) => void) => (v: unknown): void => {
+      if (signal?.aborted) { reject(new Error(`MCP request aborted: ${method}`)); return; }
+      const input = params as Record<string, unknown>;
+      const token = method === 'tools/call' ? this.lifecycle.start(id, String(input.name ?? 'tool')) : undefined;
+      const wireParams = token ? { ...input, _meta: { ...((input._meta as object | undefined) ?? {}), progressToken: token } } : params;
+      const finish = (error: Error | null, value?: unknown, cancelled = false): void => {
+        if (!this.pending.delete(id)) return;
         clearTimeout(timer);
         signal?.removeEventListener('abort', onAbort);
-        fn(v);
+        this.lifecycle.finish(token, cancelled ? 'cancelled' : error || (value as { isError?: boolean } | undefined)?.isError ? 'failed' : 'completed');
+        if (error) reject(error); else resolve(value);
       };
-      // P2-01: a user interrupt (ESC) now cancels the in-flight MCP call instead of letting it
-      // run its full 60s budget while the turn is already dead.
-      const onAbort = (): void => {
-        if (this.pending.has(id)) {
-          this.pending.delete(id);
-          clearTimeout(timer);
-          reject(new Error(`MCP request aborted: ${method}`));
+      const cancel = (reason: string): void => {
+        if (!this.pending.has(id)) return;
+        if (method !== 'initialize') {
+          try { void this.notify('notifications/cancelled', { requestId: id, reason }); } catch { /* disconnected */ }
         }
+        finish(new Error(`MCP request ${reason}: ${method}`), undefined, true);
       };
+      const timer = setTimeout(() => cancel('timeout'), method === 'tools/call' ? mcpCallDeadline(this.cfg.callTimeoutMs) : 10_000);
+      const onAbort = (): void => cancel('aborted');
       signal?.addEventListener('abort', onAbort, { once: true });
-      this.pending.set(id, { resolve: clearAnd(resolve), reject: clearAnd(reject) });
-      this.send({ jsonrpc: '2.0', id, method, params });
+      this.pending.set(id, { resolve: (value) => finish(null, value), reject: (error) => finish(error) });
+      try { this.send({ jsonrpc: '2.0', id, method, params: wireParams }); }
+      catch (error) { finish(error as Error); }
     });
   }
 
@@ -443,8 +443,22 @@ export class McpClient implements McpConnection {
   }
 
   stop(): void {
-    this.child?.kill();
+    const child = this.child;
+    this.failAllPending('MCP connection stopped');
     this.child = null;
+    this.buf = '';
+    this.decoder = new StringDecoder('utf8');
+    if (!child) return;
+    try {
+      if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, 'SIGTERM');
+      else child.kill('SIGTERM');
+    } catch { /* already exited */ }
+    setTimeout(() => {
+      try {
+        if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, 'SIGKILL');
+        else if (child.exitCode === null) child.kill('SIGKILL');
+      } catch { /* already exited */ }
+    }, 1000).unref();
   }
 }
 
@@ -481,14 +495,17 @@ export function parseSseResult(body: string): unknown {
 export class McpHttpClient implements McpConnection {
   private sessionId: string | null = null;
   private nextId = 1;
+  private readonly lifecycle: McpLifecycle;
+  private readonly active = new Set<AbortController>();
 
   constructor(
     private readonly name: string,
     private readonly url: string,
     private readonly headers: Record<string, string> = {},
     /** Per-RPC deadline. Parity with the stdio client's 60s request timeout. */
-    private readonly timeoutMs: number = 60_000,
-  ) {}
+    private readonly timeoutMs: number = 180_000,
+    private readonly runtime: McpRuntimeOptions = {},
+  ) { this.lifecycle = new McpLifecycle(name, runtime); }
 
   async start(): Promise<void> {
     await this.rpc('initialize', {
@@ -528,15 +545,16 @@ export class McpHttpClient implements McpConnection {
       // non-text content used to be dropped here, so a screenshot-only reply read as an empty 'ok'.
       const parts = res.content ?? [];
       const body = mcpResultBody(parts);
+      const artifactData = resultArtifact(this.runtime, body, cap, this.name, name);
       // P3-05: same containment as the stdio transport — the reply is untrusted content; envelope
       // it on both paths (payload clamped BEFORE enveloping so the END marker survives) and drop
       // the unwrapped data duplicate.
       if (res.isError) {
         const msg = body ? envelopUntrusted({ tool: headerTool, source, content: fitPayload(body, cap) }) : 'MCP tool error';
-        return fail(toolName, risk, Date.now() - start, 'mcp_error', msg);
+        return { ...fail(toolName, risk, Date.now() - start, 'mcp_error', msg), ...(artifactData ? { data: artifactData } : {}) };
       }
       if (!body) return ok(toolName, risk, Date.now() - start, parts.length ? 'tool returned non-text content' : 'ok');
-      return ok(toolName, risk, Date.now() - start, envelopUntrusted({ tool: headerTool, source, content: fitPayload(body, cap) }));
+      return ok(toolName, risk, Date.now() - start, envelopUntrusted({ tool: headerTool, source, content: fitPayload(body, cap) }), artifactData);
     } catch (e) {
       // Server-authored JSON-RPC errors are untrusted content too — envelope them; transport
       // failures (timeout/abort/HTTP status) stay plain.
@@ -549,7 +567,8 @@ export class McpHttpClient implements McpConnection {
   }
 
   stop(): void {
-    /* stateless HTTP — nothing to tear down */
+    for (const controller of this.active) controller.abort();
+    this.active.clear();
   }
 
   private hdrs(): Record<string, string> {
@@ -563,30 +582,91 @@ export class McpHttpClient implements McpConnection {
   }
 
   private async rpc(method: string, params: unknown, signal?: AbortSignal): Promise<unknown> {
-    // P2-01: timeout + caller abort were ABSENT here — a wedged MCP endpoint held the request
-    // (and the turn) open indefinitely. Bounded like every other egress surface now.
-    const deadline = AbortSignal.timeout(this.timeoutMs);
-    const resp = await shadowFetch(
-      this.url,
-      {
-        method: 'POST',
-        headers: this.hdrs(),
-        body: JSON.stringify({ jsonrpc: '2.0', id: this.nextId++, method, params }),
-        signal: signal ? AbortSignal.any([signal, deadline]) : deadline,
-      },
-      { purpose: 'mcp', origin: 'user' },
-    );
-    const sid = resp.headers.get('mcp-session-id');
-    if (sid) this.sessionId = sid;
-    // statusText is server-controlled and surfaces outside the envelope via mcp_failed — sanitize.
-    if (!resp.ok) throw new Error(`MCP HTTP ${resp.status} ${nameSafe(resp.statusText)}`);
-    const ct = resp.headers.get('content-type') ?? '';
-    // Parity with the stdio client's 16MB framing cap — the HTTP body used to be unbounded.
-    const text = await readCapped(resp, MCP_HTTP_MAX_BYTES);
-    if (ct.includes('text/event-stream')) return parseSseResult(text);
-    const json = JSON.parse(text) as JsonRpcResponse;
-    if (json.error) throw new McpServerReplyError(String(json.error.message));
-    return json.result;
+    if (signal?.aborted) throw new Error(`MCP request aborted: ${method}`);
+    const id = this.nextId++;
+    const ac = new AbortController();
+    this.active.add(ac);
+    const deadline = setTimeout(() => ac.abort(), method === 'tools/call' ? mcpCallDeadline(this.timeoutMs) : Math.min(10_000, this.timeoutMs));
+    const onAbort = (): void => ac.abort();
+    signal?.addEventListener('abort', onAbort, { once: true });
+    const input = params as Record<string, unknown>;
+    const token = method === 'tools/call' ? this.lifecycle.start(id, String(input.name ?? 'tool')) : undefined;
+    const wireParams = token ? { ...input, _meta: { ...((input._meta as object | undefined) ?? {}), progressToken: token } } : params;
+    let status: 'completed' | 'failed' | 'cancelled' = 'failed';
+    const onCancel = (): void => {
+      if (method !== 'initialize') void this.notify('notifications/cancelled', { requestId: id, reason: signal?.aborted ? 'aborted' : 'cancelled or deadline exceeded' });
+    };
+    ac.signal.addEventListener('abort', onCancel, { once: true });
+    try {
+      const resp = await shadowFetch(this.url, {
+        method: 'POST', headers: this.hdrs(),
+        body: JSON.stringify({ jsonrpc: '2.0', id, method, params: wireParams }), signal: ac.signal,
+      }, { purpose: 'mcp', origin: 'user' });
+      const sid = resp.headers.get('mcp-session-id');
+      if (sid) this.sessionId = sid;
+      if (!resp.ok) throw new Error(`MCP HTTP ${resp.status} ${nameSafe(resp.statusText)}`);
+      let result: unknown;
+      if ((resp.headers.get('content-type') ?? '').includes('text/event-stream')) result = await this.streamResult(resp, id);
+      else {
+        const json = JSON.parse(await readCapped(resp, MCP_HTTP_MAX_BYTES)) as JsonRpcResponse;
+        if (json.error) throw new McpServerReplyError(String(json.error.message));
+        if (json.id !== id) throw new Error('MCP response request ID mismatch');
+        result = json.result;
+      }
+      status = (result as { isError?: boolean } | undefined)?.isError ? 'failed' : 'completed';
+      return result;
+    } finally {
+      if (ac.signal.aborted) status = 'cancelled';
+      this.lifecycle.finish(token, status);
+      clearTimeout(deadline);
+      signal?.removeEventListener('abort', onAbort);
+      ac.signal.removeEventListener('abort', onCancel);
+      this.active.delete(ac);
+    }
+  }
+
+  /** Process notifications as bytes arrive, rather than waiting for the stream to close. */
+  private async streamResult(resp: Response, id: number): Promise<unknown> {
+    const reader = resp.body?.getReader();
+    if (!reader) throw new Error('Empty MCP SSE response');
+    const decoder = new TextDecoder();
+    const assembler = new SseAssembler();
+    let pending = '';
+    let bytes = 0;
+    const accept = (events: SseEvent[]): { found: boolean; result?: unknown } => {
+      for (const event of events) {
+        if (event.kind !== 'data') continue;
+        const parts = nonEmptyParts(event.parts);
+        for (const value of parseSseData(parts.join('\n'), parts)) {
+          const msg = value as JsonRpcResponse & { method?: string; params?: unknown };
+          if (msg.method === 'notifications/progress') this.lifecycle.progress(msg.params);
+          if (msg.id !== id) continue;
+          if (msg.error) throw new McpServerReplyError(String(msg.error.message));
+          if ('result' in msg) return { found: true, result: msg.result };
+        }
+      }
+      return { found: false };
+    };
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        bytes += value.length;
+        if (bytes > MCP_HTTP_MAX_BYTES) throw new Error('MCP SSE response exceeded 16MB');
+        pending += decoder.decode(value, { stream: true });
+        let nl: number;
+        while ((nl = pending.indexOf('\n')) >= 0) {
+          const line = pending.slice(0, nl).replace(/\r$/, '');
+          pending = pending.slice(nl + 1);
+          const outcome = accept(assembler.feed(line));
+          if (outcome.found) return outcome.result;
+        }
+      }
+      pending += decoder.decode();
+      const final = accept([...assembler.feed(pending), ...assembler.flush()]);
+      if (final.found) return final.result;
+      throw new Error('no JSON-RPC result in MCP SSE response');
+    } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
   }
 
   private async notify(method: string, params: unknown): Promise<void> {
@@ -596,10 +676,10 @@ export class McpHttpClient implements McpConnection {
         method: 'POST',
         headers: this.hdrs(),
         body: JSON.stringify({ jsonrpc: '2.0', method, params }),
-        signal: AbortSignal.timeout(this.timeoutMs),
+        signal: AbortSignal.timeout(Math.min(2000, this.timeoutMs)),
       },
       { purpose: 'mcp', origin: 'user' },
-    ).catch(() => {
+    ).then(async (response) => { await response.body?.cancel(); }).catch(() => {
       /* notifications are best-effort */
     });
   }
@@ -637,8 +717,12 @@ export async function registerMcpServers(
   onClient?: (client: McpConnection) => void,
   /** P3-08 Phase 3: OS-jail inputs for stdio children (defaults: enabled, no extra roots). */
   jail?: Omit<McpJail, 'workspaceRoot'>,
+  runtime: McpRuntimeOptions = {},
 ): Promise<McpConnection[]> {
   const clients: McpConnection[] = [];
+  const artifacts = runtime.artifacts ?? new McpArtifactStore(workspaceRoot);
+  if (!registry.get('mcp_artifact')) registry.register(makeMcpArtifactTool(artifacts));
+  const options = { ...runtime, artifacts };
   // Connect all servers in PARALLEL, each bounded by MCP_CONNECT_TIMEOUT_MS, so one slow/broken stdio
   // server can't hang `shadow` startup. (Previously: sequential + a 60s per-request timeout, so a
   // single unresponsive server blocked launch for a full minute.) A server that fails or times out is
@@ -646,14 +730,15 @@ export async function registerMcpServers(
   await Promise.all(
     Object.entries(servers).map(async ([name, cfg]) => {
       const client: McpConnection = cfg.url
-        ? new McpHttpClient(name, cfg.url, cfg.headers)
+        ? new McpHttpClient(name, cfg.url, cfg.headers, cfg.callTimeoutMs, options)
         : new McpClient(name, cfg, {
             workspaceRoot,
             additionalRoots: jail?.additionalRoots,
             enabled: jail?.enabled ?? true, // omitted jail = jail ON (fail closed)
             failurePolicy: jail?.failurePolicy,
-          });
+          }, options);
       onClient?.(client);
+      if (runtime.isActive && !runtime.isActive()) { client.stop(); return; }
       const connect = (async () => {
         await client.start();
         return client.listTools();
@@ -661,8 +746,10 @@ export async function registerMcpServers(
       connect.catch(() => {}); // swallow a late rejection if the timeout already fired
       try {
         const tools = await withTimeout(connect, MCP_CONNECT_TIMEOUT_MS, `did not respond within ${MCP_CONNECT_TIMEOUT_MS / 1000}s`);
+        if (runtime.isActive && !runtime.isActive()) { client.stop(); return; }
         const safeServer = mcpSafeNamePart(name);
         for (const t of tools) {
+          if (cfg.toolNames && !cfg.toolNames.includes(t.name)) continue;
           // BYPASS review (P2-07): a tool with no usable name cannot be called — skip it alone
           // instead of registering it as `mcp_<server>_tool` (or throwing, which would drop the
           // whole server's registration).
@@ -708,6 +795,7 @@ export async function registerMcpServers(
               content: fitPayload(rawDescription, MCP_DESCRIPTION_CAP),
             }),
             risk,
+            deferred: cfg.deferTools === true,
             inputSchema: jsonSchemaToZod(t.inputSchema),
             async run(input, ctx) {
               void workspaceRoot;
@@ -718,6 +806,7 @@ export async function registerMcpServers(
             },
           };
           registry.register(tool);
+          runtime.onRegistered?.(name, toolName);
         }
         clients.push(client);
       } catch (e) {

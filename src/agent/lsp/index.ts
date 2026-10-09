@@ -196,3 +196,6 @@ export async function lspNoteFor(opts: LspNoteForOptions): Promise<string | null
     return null; // an LSP problem never fails the write
   }
 }
+
+export type { NavigationKind, NavigationRequest, SourceLocation } from './protocol.js';
+export { normalizeNavigation } from './navigation.js';

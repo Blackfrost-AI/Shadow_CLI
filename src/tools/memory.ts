@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import type { Tool, ToolResult } from './types.js';
 import { ok, fail } from './types.js';
-import type { ProjectMemory } from '../state/memory.js';
+import type { MemoryEntry, ProjectMemory } from '../state/memory.js';
 import { MEMORY_KEY_MAX } from '../state/memory.js';
 
 // A tool the agent calls to manage its own project-memory KV
@@ -13,7 +13,7 @@ import { MEMORY_KEY_MAX } from '../state/memory.js';
 
 const inputSchema = z.object({
   action: z
-    .enum(['remember', 'recall', 'forget', 'list'])
+    .enum(['remember', 'recall', 'forget', 'list', 'inspect', 'edit'])
     .describe(
       "'remember' stores a fact (needs key + value); 'recall' fetches one (needs key); " +
         "'forget' deletes one (needs key); 'list' returns every stored fact.",
@@ -27,6 +27,7 @@ const inputSchema = z.object({
       `Short stable identifier for the fact, e.g. "build_command" (max ${MEMORY_KEY_MAX} chars). ` +
         'Required for remember/recall/forget.',
     ),
+  source: z.string().max(500).optional().describe('Source path or evidence for this generated memory. Never include secrets.'),
   value: z
     .string()
     .optional()
@@ -42,6 +43,8 @@ export interface MemoryData {
   found?: boolean;
   deleted?: boolean;
   facts?: Record<string, string>;
+  entry?: MemoryEntry;
+  entries?: MemoryEntry[];
 }
 
 /** Build the `memory` tool bound to a loaded {@link ProjectMemory} store. */
@@ -52,7 +55,7 @@ export function makeMemoryTool(mem: ProjectMemory): Tool<MemoryInput, MemoryData
       'Read and write durable, workspace-level facts that should survive across tasks and restarts. ' +
       'Remember things future-you needs — the build command, the test command, where key modules live, ' +
       'project conventions — and recall them later instead of re-discovering them. ' +
-      'Actions: remember (key+value), recall (key), forget (key), list. ' +
+      'Actions: remember or edit (key+value), recall or inspect (key), forget (key), list. Inspect/list include authorship, source, timestamps and workspace scope. ' +
       'The system prompt carries only a one-line INDEX of stored facts — recall a key to fetch its full value. ' +
       'This stores facts in Shadow’s own memory, not the workspace files. Never store secrets or passwords.',
     risk: 'write', // remember/forget mutate the store + feed future system prompts — gate as a write
@@ -60,17 +63,23 @@ export function makeMemoryTool(mem: ProjectMemory): Tool<MemoryInput, MemoryData
     async run(input, _ctx): Promise<ToolResult<MemoryData>> {
       const start = Date.now();
       switch (input.action) {
+        case 'edit':
         case 'remember': {
           if (!input.key || input.value === undefined) {
             return fail('memory', 'read', Date.now() - start, 'bad_input', "remember requires both 'key' and 'value'.");
           }
-          mem.set(input.key, input.value);
+          if (input.action === 'edit' && mem.get(input.key) === undefined) {
+            return fail('memory', 'write', Date.now() - start, 'not_found', `No memory named "${input.key}".`);
+          }
+          mem.set(input.key, input.value, { author: 'generated', source: input.source });
           return ok('memory', 'read', Date.now() - start, `Remembered "${input.key}".`, {
-            action: 'remember',
+            action: input.action,
+            entry: mem.inspect(input.key),
             key: input.key,
             value: input.value,
           });
         }
+        case 'inspect':
         case 'recall': {
           if (!input.key) {
             return fail('memory', 'read', Date.now() - start, 'bad_input', "recall requires 'key'.");
@@ -81,7 +90,7 @@ export function makeMemoryTool(mem: ProjectMemory): Tool<MemoryInput, MemoryData
             'read',
             Date.now() - start,
             value === undefined ? `No fact stored under "${input.key}".` : `Recalled "${input.key}".`,
-            { action: 'recall', key: input.key, value, found: value !== undefined },
+            { action: input.action, key: input.key, value, found: value !== undefined, entry: mem.inspect(input.key) },
           );
         }
         case 'forget': {
@@ -103,6 +112,7 @@ export function makeMemoryTool(mem: ProjectMemory): Tool<MemoryInput, MemoryData
           return ok('memory', 'read', Date.now() - start, `${n} fact${n === 1 ? '' : 's'} stored.`, {
             action: 'list',
             facts,
+            entries: mem.entries(),
           });
         }
       }

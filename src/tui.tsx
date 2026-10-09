@@ -95,7 +95,7 @@ import { sanitizeTerminalEscapes, scrubForDisplay } from './util/scrub.js';
 import { splitStreamToolIntentCapped } from './tui/streamIntent.js';
 import { scrubbedEnv } from './util/safeEnv.js';
 import { displayWidth, takeByWidth } from './util/width.js';
-import { stripCtl, formatUsage, shellCommandOf, agentAttr, oneLine } from './tui/format.js';
+import { stripCtl, formatDuration, formatUsage, shellCommandOf, agentAttr, oneLine } from './tui/format.js';
 import { THEMES, THEME_NAMES, C, normalizeThemeName, applyTheme, paletteSnapshot, backgroundSequence, themeBackground, type ThemeName, type Palette } from './tui/theme.js';
 import { SLASH_COMMANDS, SLASH_NAME_WIDTH, findSlashCommand, runSlashCommand, slashDispatchName, type SlashCommand, type SlashCtx } from './tui/slash.js';
 import { slashMatches, classifySlash, type SlashMenuItem, type ArgContext } from './tui/slashMenu.js';
@@ -265,16 +265,6 @@ function activeModelTarget(
   };
 }
 
-/** Human-readable elapsed time: `8s`, `2m 5s`, `1h 3m 12s` (the HUD "working…" timer). */
-function formatDuration(totalSec: number): string {
-  if (totalSec < 60) return `${totalSec}s`;
-  const h = Math.floor(totalSec / 3600);
-  const m = Math.floor((totalSec % 3600) / 60);
-  const s = totalSec % 60;
-  return h > 0 ? `${h}h ${m}m ${s}s` : `${m}m ${s}s`;
-}
-
-
 // Idle-countdown config: when the model asks a question and the user is away, auto-pick the
 // recommended answer after this many seconds — like every other TUI's "(default in Ns)" prompt.
 // `SHADOW_AUTO_ANSWER_SECS` overrides the delay; `SHADOW_NO_AUTO_ANSWER=1` turns it off (the
@@ -290,6 +280,11 @@ const AUTO_ANSWER_ENABLED = process.env.SHADOW_NO_AUTO_ANSWER !== '1';
 
 
 export interface TuiOpts {
+  mcpManager?: import('./mcp/manager.js').McpManager;
+  consultations?: import('./agent/consultation.js').ConsultationService;
+  runNativeTool?: (name: string, input: unknown, signal: AbortSignal, parentBudget: Budget) => Promise<import('./tools/types.js').ToolResult>;
+  /** Publish the live UI gate used by native worker/consultation calls. */
+  onApprovalGate?: (gate: ApprovalGate, approvals?: SessionApprovals) => void;
   provider: Provider;
   /** Effective endpoint backing `provider` (including a managed local server's generated port). */
   activeBaseUrl?: string;
@@ -1298,6 +1293,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       igateRef.current = g;
       gateRef.current = g;
     }
+    opts.onApprovalGate?.(gateRef.current);
   }
 
   // Ref so pushLine (stable, no deps) can trigger markdown-image scanning without a hook cycle

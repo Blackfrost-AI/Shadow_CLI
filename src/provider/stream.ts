@@ -489,7 +489,8 @@ export async function* streamWithRetry(a: StreamAttempt): AsyncIterable<Provider
     let emitted = 0;
     try {
       for await (const ev of a.parse(streamLines(res.body, () => idle.kick(), fetchSignal))) {
-        emitted++;
+        // Metadata is not response progress: it must not suppress the empty-stream rescue.
+        if (ev.type !== 'diagnostic') emitted++;
         yield ev;
       }
     } catch (e) {

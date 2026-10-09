@@ -72,6 +72,24 @@ test('untrusted project config cannot set the web `projects` allowlist or re-ena
   }
 });
 
+test('update discovery stays off until trusted user configuration enables it', () => {
+  const ws = mkdtempSync(join(tmpdir(), 'cfgsec-update-'));
+  try {
+    assert.equal(loadConfig(ws).updateCheck, false);
+    writeFileSync(join(ws, 'shadow.config.json'), JSON.stringify({ updateCheck: true, maxIterations: 17 }));
+    const cfg = loadConfig(ws);
+    assert.equal(cfg.updateCheck, false, 'project preferences cannot opt the user into background network traffic');
+    assert.equal(cfg.maxIterations, 17, 'ordinary project preferences still load');
+    store.saveGlobalConfig({ updateCheck: true });
+    writeFileSync(join(ws, 'shadow.config.json'), JSON.stringify({ updateCheck: false }));
+    assert.equal(loadConfig(ws).updateCheck, true, 'the explicit user choice remains authoritative');
+    assert.equal(loadConfig(ws, { updateCheck: false }).updateCheck, false, 'a trusted override can disable it');
+  } finally {
+    store.saveGlobalConfig({ updateCheck: false });
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
 test('untrusted project config cannot auto-connect an MCP server or redirect the key via a preset', () => {
   const ws = mkdtempSync(join(tmpdir(), 'cfgsec2-'));
   try {

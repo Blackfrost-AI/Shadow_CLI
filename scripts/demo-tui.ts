@@ -5,7 +5,7 @@
 // unicode charts (bar / braille line / spark), and the colorblind / high-contrast
 // palettes. Run: npx tsx scripts/demo-tui.ts   (supersedes the retired demo-rows.ts,
 // which drove the removed pinned renderer).
-import { flattenItem } from '../src/tui/flatten.js';
+import { flattenItem, computeToolRuns } from '../src/tui/flatten.js';
 import type { FlattenItem, StyledSpan, ViewportTheme } from '../src/tui/flatten.js';
 import { applyTheme, paletteSnapshot, THEME_NAMES } from '../src/tui.js';
 
@@ -27,7 +27,16 @@ function sgr(s: StyledSpan): string {
 }
 
 const ANSWER = [
-  'Here is the **deploy summary** — the `p95` spike traced to one region.',
+  '# Deploy summary',
+  '',
+  'The `p95` spike traced to one region. Hold **ap-south**, continue elsewhere.',
+  '',
+  '## Hotfix',
+  '',
+  '```ts',
+  'if (region === "ap-south") holdRollout = true;',
+  'log.warn("holding ap-south");',
+  '```',
   '',
   '| Region | Requests | Errors | Status |',
   '| --- | --- | --- | :--- |',
@@ -53,12 +62,24 @@ const ANSWER = [
   '3 8 4 12 9 14 6 2 11 15 9 4',
   '```',
   '',
+  'Full rollback steps in the [deploy runbook](https://example.com/runbook).',
+  '',
   '> ap-south error budget is 61% consumed — hold the rollout there.',
 ].join('\n');
 
 const ITEMS: { item: FlattenItem; collapsed?: boolean }[] = [
   { item: { id: 1, kind: 'user', text: '❯ why did latency spike after the deploy?\nand which regions are safe to continue?' } },
   { item: { id: 2, kind: 'reasoning', text: 'Check per-region metrics first.\nThen correlate with the deploy window.', durationMs: 9400 }, collapsed: true },
+  // Recon burst: collapses to ONE "Read 2 files, Grep 1 pattern" row (Ctrl-O expands).
+  { item: { id: 10, kind: 'tool', text: '', tool: { name: 'read_file', arg: 'src/metrics.ts', ok: true, durationMs: 40, summary: '412 lines' } } },
+  { item: { id: 11, kind: 'tool', text: '', tool: { name: 'read_file', arg: 'src/deploy.ts', ok: true, durationMs: 35, summary: '280 lines' } } },
+  { item: { id: 12, kind: 'tool', text: '', tool: { name: 'grep', arg: 'p95', ok: true, durationMs: 90, summary: '6 matches' } } },
+  // Edit ALWAYS stays visible — never buried inside a tool stack.
+  { item: { id: 13, kind: 'tool', text: '', meta: 'diff', tool: { name: 'edit_file', arg: 'src/deploy.ts', ok: true, durationMs: 120, summary: '+12 −3' }, lines: [
+    { text: '- holdRollout = false', color: '#ef4444' },
+    { text: '+ holdRollout = region === "ap-south"', color: '#22c55e' },
+    { text: '+ log.warn("holding ap-south")', color: '#22c55e' },
+  ] } },
   { item: { id: 3, kind: 'tool', text: '', tool: { name: 'run_shell', arg: 'shadow-metrics --by-region', ok: true, durationMs: 2300, summary: '3 regions' } } },
   { item: { id: 4, kind: 'tool', text: '', tool: { name: 'web_fetch', arg: 'status.internal/api', ok: false, durationMs: 400, summary: '404 Not Found' } } },
   // A delegated sub-agent renders distinctly (▸ type · description) instead of anonymous agent(…),
@@ -72,6 +93,8 @@ const ITEMS: { item: FlattenItem; collapsed?: boolean }[] = [
     { text: 'Recommend holding the rollout in ap-south; safe to continue elsewhere.', dimColor: true },
   ] } },
   { item: { id: 5, kind: 'assistant', text: ANSWER } },
+  // Inline image (a fetched markdown ![](url) or /image echo): placeholder + terminal-native pixels.
+  { item: { id: 8, kind: 'image', text: '🖼 deploy diagram', image: { bytes: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=', mediaType: 'image/png', alt: 'deploy diagram', source: 'markdown' } } },
   // Per-task timer: total wall-clock the agent worked on this turn.
   { item: { id: 7, kind: 'system', text: '⏺ done · 47s', dimColor: true } },
 ];
@@ -95,11 +118,14 @@ for (const name of SHOW) {
     codeBg: c.codeBg,
   };
   process.stdout.write(`\n\x1b[1m━━━ theme: ${name} ${'━'.repeat(Math.max(1, COLS - name.length - 12))}\x1b[0m\n`);
-  for (const { item, collapsed } of ITEMS) {
-    for (const row of flattenItem(item, COLS, collapsed ?? false, theme, false, false)) {
+  // Read/search stacking defaults COLLAPSED (product default): recon becomes one
+  // `Read N files, Grep M patterns` line; Update/Bash stay as their own rows. Ctrl-O expands.
+  const runs = computeToolRuns(ITEMS.map((x) => x.item), false);
+  ITEMS.forEach(({ item, collapsed }, i) => {
+    for (const row of flattenItem(item, COLS, collapsed ?? true, theme, false, true, runs.get(i))) {
       process.stdout.write(row.spans.map(sgr).join('') + '\n');
     }
-  }
+  });
 }
 applyTheme('og');
 process.stdout.write('\n');

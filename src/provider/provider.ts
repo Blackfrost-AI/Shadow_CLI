@@ -6,6 +6,8 @@
  * to/from its own wire format; the agent loop never sees a provider-specific shape.
  */
 
+import type { ProviderDiagnosticEvent } from './streamDiagnostics.js';
+
 export type Role = 'system' | 'user' | 'assistant' | 'tool';
 
 export interface TextBlock {
@@ -119,6 +121,7 @@ export interface ToolSchema {
 export type StopReason = 'end_turn' | 'tool_use' | 'max_tokens' | 'pause_turn';
 
 export type ProviderEvent =
+  | ProviderDiagnosticEvent
   | { type: 'text'; delta: string }
   | { type: 'thinking'; delta: string } // streamed reasoning text (display)
   | { type: 'reasoning_block'; text: string; field: 'reasoning_content' | 'reasoning' } // complete OpenAI-compat reasoning (echo-back)

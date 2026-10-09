@@ -4,6 +4,16 @@
 // 6000-line component purely by history, which meant none of them could be unit-tested without
 // booting Ink.
 
+/** Elapsed time shared by the live timer and completed-turn summaries. */
+export function formatDuration(totalSec: number): string {
+  const seconds = Math.max(0, Math.floor(totalSec));
+  if (seconds < 60) return `${seconds}s`;
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const rest = seconds % 60;
+  return hours > 0 ? `${hours}h ${minutes}m ${rest}s` : `${minutes}m ${rest}s`;
+}
+
 /** A lightweight renderer for the headless path that writes directly to stdout. */
 /** Strip terminal control sequences (ESC / CSI / OSC / BEL / C1) from UNTRUSTED content before the
  *  headless renderer writes it RAW to stdout. Model output, tool output, and fetched web / file content

@@ -12,9 +12,9 @@ import type { TodoItem } from '../agent/todo.js';
 import type { EventBus, LoopEvent } from '../agent/events.js';
 import { redactString } from '../util/redact.js';
 
-export type WorkItemType = 'subagent' | 'bgshell' | 'plan';
+export type WorkItemType = 'subagent' | 'bgshell' | 'plan' | 'connector';
 
-export type WorkItemStatus = 'queued' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled';
+export type WorkItemStatus = 'queued' | 'running' | 'waiting' | 'paused' | 'partial' | 'interrupted' | 'completed' | 'failed' | 'cancelled';
 
 export interface WorkItemActivity {
   timestamp: number;
@@ -42,6 +42,12 @@ export interface WorkItem {
   // Final result or exit reason
   exitReason?: string;
   finalOutput?: string;
+  artifactIds?: string[];
+  verification?: 'passed' | 'failed' | 'unverified';
+  profile?: string;
+  provider?: string;
+  model?: string;
+  jobId?: string;
   /** Only background subagents can be cancelled independently today. */
   background?: boolean;
   priority?: 'low' | 'normal' | 'high';
@@ -121,6 +127,26 @@ export class WorkCenter {
 
   private handleEvent(e: LoopEvent): void {
     switch (e.type) {
+      case 'mcp_call': {
+        const id = `mcp_${e.progressToken}`;
+        const item = this.items.get(id) ?? { id, type: 'connector' as const, status: 'running' as const,
+          description: redactString(`${e.server} · ${e.tool}`).slice(0, MAX_DETAIL_CHARS), depth: 0,
+          startedAt: e.startedAt, lastActivityAt: e.lastActivityAt, activities: [], verification: 'unverified' as const };
+        item.status = e.status;
+        item.lastActivityAt = e.lastActivityAt;
+        if (e.status !== 'running') { item.endedAt = e.lastActivityAt; item.currentActivity = undefined; }
+        this.items.set(id, item); this.notify(); break;
+      }
+      case 'mcp_progress': {
+        const item = this.items.get(`mcp_${e.progressToken}`);
+        if (item && item.status === 'running') {
+          item.lastActivityAt = e.lastActivityAt;
+          item.currentActivity = `${e.progress}${e.total === undefined ? '' : '/' + e.total}${e.message ? ' · ' + redactString(e.message) : ''}`.slice(0, MAX_DETAIL_CHARS);
+          this.addActivity(item, { timestamp: e.lastActivityAt, type: 'detail', text: item.currentActivity });
+          this.notify();
+        }
+        break;
+      }
       case 'todo': {
         // TodoList already publishes this renderer-neutral event on every surface. Consuming it
         // here keeps plan projection parity for Ink, pi, web, ACP, and headless sessions.
@@ -137,6 +163,10 @@ export class WorkCenter {
           existing.owner = e.parentId ?? existing.owner;
           existing.depth = e.depth ?? existing.depth;
           existing.priority = e.priority ?? existing.priority;
+          existing.profile = e.profile ?? existing.profile;
+          existing.provider = e.provider ?? existing.provider;
+          existing.model = e.model ?? existing.model;
+          existing.jobId = e.jobId ?? existing.jobId;
         } else {
           const now = Date.now();
           this.items.set(e.taskId, {
@@ -150,19 +180,31 @@ export class WorkCenter {
             lastActivityAt: now,
             background: e.background === true,
             priority: e.priority ?? 'normal',
+            profile: e.profile,
+            provider: e.provider,
+            model: e.model,
+            jobId: e.jobId,
             activities: [],
           });
         }
+        const worker = this.items.get(e.taskId);
+        if (worker?.jobId) this.projectJobEvidence(worker);
         this.notify();
         break;
       }
       case 'subagent_end': {
         const item = this.items.get(e.taskId);
         if (item) {
-          if (item.status !== 'cancelled') item.status = e.ok ? 'completed' : 'failed';
+          if (item.status !== 'cancelled') item.status = e.status ?? (e.ok ? 'completed' : 'failed');
+          if (e.stopReason) item.exitReason = e.stopReason;
+          if (e.jobId) item.jobId = e.jobId;
+          if (e.answer !== undefined) item.finalOutput = redactString(e.answer).slice(0, MAX_FINAL_OUTPUT_CHARS);
+          if (e.artifactIds) item.artifactIds = e.artifactIds.slice(0, 100).map((id) => redactString(id).slice(0, 500));
+          item.verification ??= 'unverified';
           item.endedAt = Date.now();
           item.lastActivityAt = item.endedAt;
           item.currentActivity = undefined;
+          if (item.jobId) this.projectJobEvidence(item);
         }
         this.notify();
         break;
@@ -413,6 +455,19 @@ export class WorkCenter {
   }
 
   /** Sync planning items from TodoList (called when todo updates) */
+  /** Attach worker evidence to explicitly linked checklist items without completing the plan. */
+  private projectJobEvidence(worker: WorkItem, only?: WorkItem): void {
+    for (const item of only ? [only] : this.items.values()) {
+      if (item.type !== 'plan' || !item.jobId || item.jobId !== worker.jobId) continue;
+      item.finalOutput = worker.finalOutput;
+      item.artifactIds = worker.artifactIds ? [...worker.artifactIds] : undefined;
+      item.verification = worker.verification ?? 'unverified';
+      item.currentActivity = `Job ${worker.status} · verification ${item.verification}`;
+      item.profile = worker.profile; item.provider = worker.provider; item.model = worker.model;
+      item.lastActivityAt = Math.max(item.lastActivityAt, worker.lastActivityAt);
+    }
+  }
+
   syncTodos(todos: TodoItem[]): void {
     // Mark all existing plan items as stale
     const staleIds = new Set<string>();
@@ -427,6 +482,11 @@ export class WorkCenter {
 
       const existing = this.items.get(id);
       if (existing) {
+        if (existing.jobId !== todo.jobId) {
+          existing.finalOutput = undefined; existing.artifactIds = undefined; existing.verification = undefined;
+          existing.currentActivity = undefined; existing.profile = undefined; existing.provider = undefined; existing.model = undefined;
+        }
+        existing.jobId = todo.jobId;
         existing.description = redactString(todo.subject).slice(0, MAX_DETAIL_CHARS);
         existing.status =
           todo.status === 'completed' ? 'completed'
@@ -435,6 +495,7 @@ export class WorkCenter {
         if (existing.status === 'completed' && !existing.endedAt) {
           existing.endedAt = Date.now();
         }
+        if (existing.status !== 'completed') existing.endedAt = undefined;
         existing.lastActivityAt = Date.now();
       } else {
         this.items.set(id, {
@@ -445,11 +506,17 @@ export class WorkCenter {
             : todo.status === 'in_progress' ? 'running'
             : 'queued',
           description: redactString(todo.subject).slice(0, MAX_DETAIL_CHARS),
+          jobId: todo.jobId,
           depth: 0,
           startedAt: Date.now(),
           lastActivityAt: Date.now(),
           activities: [],
         });
+      }
+      if (todo.jobId) {
+        const worker = [...this.items.values()].reverse().filter((item) => item.type === 'subagent' && item.jobId === todo.jobId)
+          .sort((a, b) => b.startedAt - a.startedAt || b.lastActivityAt - a.lastActivityAt)[0];
+        if (worker) this.projectJobEvidence(worker, this.items.get(id));
       }
     }
 
@@ -508,7 +575,7 @@ export class WorkCenter {
     };
   }
 
-  /** Restore a persisted projection. Live rows become failed/interrupted; processes are never revived. */
+  /** Restore a persisted projection. Live execution becomes interrupted; processes are never revived. */
   restore(snapshot: WorkCenterSnapshot | null | undefined, markInterrupted = true): void {
     this.items.clear();
     if (!snapshot || snapshot.version !== 1 || !Array.isArray(snapshot.items)) {
@@ -518,8 +585,8 @@ export class WorkCenter {
     const now = Date.now();
     for (const raw of snapshot.items.slice(0, 1000)) {
       if (!raw || typeof raw.id !== 'string' || typeof raw.description !== 'string') continue;
-      if (!['subagent', 'bgshell', 'plan'].includes(raw.type)) continue;
-      if (!['queued', 'running', 'paused', 'completed', 'failed', 'cancelled'].includes(raw.status)) continue;
+      if (!['subagent', 'bgshell', 'plan', 'connector'].includes(raw.type)) continue;
+      if (!['queued', 'running', 'waiting', 'paused', 'partial', 'interrupted', 'completed', 'failed', 'cancelled'].includes(raw.status)) continue;
       const finite = (value: unknown, fallback: number): number => typeof value === 'number' && Number.isFinite(value) ? value : fallback;
       const boundedList = (value: unknown, max = 100): string[] | undefined => {
         if (!Array.isArray(value)) return undefined;
@@ -550,6 +617,12 @@ export class WorkCenter {
         retryCount: raw.retryCount === undefined ? undefined : Math.max(0, Math.min(3, finite(raw.retryCount, 0))),
         tools: boundedList(raw.tools),
         files: boundedList(raw.files),
+        artifactIds: boundedList(raw.artifactIds),
+        verification: ['passed', 'failed', 'unverified'].includes(String(raw.verification)) ? raw.verification : undefined,
+        profile: typeof raw.profile === 'string' ? redactString(raw.profile).slice(0, 200) : undefined,
+        provider: typeof raw.provider === 'string' ? redactString(raw.provider).slice(0, 200) : undefined,
+        model: typeof raw.model === 'string' ? redactString(raw.model).slice(0, 300) : undefined,
+        jobId: typeof raw.jobId === 'string' ? redactString(raw.jobId).slice(0, 200) : undefined,
         activities: Array.isArray(raw.activities)
           ? raw.activities.slice(-this.activityLimit).flatMap((activity): WorkItemActivity[] => {
               if (!activity || typeof activity !== 'object' || !['tool', 'output', 'detail'].includes(String(activity.type))) return [];
@@ -562,8 +635,8 @@ export class WorkCenter {
             })
           : [],
       };
-      if (markInterrupted && (item.status === 'queued' || item.status === 'running' || item.status === 'paused')) {
-        item.status = 'failed';
+      if (markInterrupted && item.type !== 'plan' && (item.status === 'queued' || item.status === 'running' || item.status === 'paused' || item.status === 'waiting')) {
+        item.status = 'interrupted';
         item.endedAt = now;
         item.lastActivityAt = now;
         item.currentActivity = undefined;

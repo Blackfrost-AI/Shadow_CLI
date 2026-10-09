@@ -1,24 +1,11 @@
 /**
- * Streaming splitter for models that INLINE their reasoning in the text stream as
- * `<think>…</think>` or `<thinking>…</thinking>` (DeepSeek-R1, Qwen, many local
- * models). It routes tagged spans to the reasoning channel and keeps the rest as
- * the visible answer — the same normalization Claude gets from native thinking
- * blocks, so every reasoning-capable model behaves the same in chat.
+ * Split a leading structural reasoning block from a content stream. Once answer
+ * text begins, all tags are literal text: examples in prose/code must survive.
+ * Structured provider reasoning fields take precedence at the adapter layer.
  *
- * Streaming-safe: tags may be split across chunk boundaries, so a suffix that
- * could be the start of a tag is held back until the next chunk (or flush()).
- * Display-only — these spans carry no signature and are never replayed to the API.
- *
- * Robust to two real-world messes that used to break Qwen and friends:
- *   • WHITESPACE / VARIANT tags — `</think >`, `< / think >`, newlines inside the
- *     tag. The exact-string matcher missed these, so the closer never fired and the
- *     splitter stayed "inside" thinking forever: the answer was swallowed and the
- *     turn appeared to hang on "✻ thinking…". Matching is now whitespace-tolerant.
- *   • BARE CLOSER — Qwen's chat template routinely emits the reasoning WITHOUT an
- *     opening tag, then a lone `</think>`, then the answer. A closer seen before any
- *     opener now means "everything so far was reasoning": we route it to the thinking
- *     channel and strip the tag, instead of leaking reasoning + a raw `</think>` into
- *     the answer.
+ * A bare closing tag is accepted only at the start (some chat templates emit it
+ * with thinking disabled). Reclassifying already-streamed prose when a later
+ * closer arrives is both destructive and dependent on network chunk boundaries.
  */
 
 export interface SplitSpan {
@@ -64,56 +51,59 @@ function partialTail(s: string): number {
 
 export class ThinkingSplitter {
   private buf = '';
-  private inThinking = false;
+  private state: 'prefix' | 'thinking' | 'text' = 'prefix';
 
   /** Feed a content delta; returns any complete spans now resolvable. */
   push(chunk: string): SplitSpan[] {
     this.buf += chunk;
     const out: SplitSpan[] = [];
     for (;;) {
-      if (this.inThinking) {
-        const m = CLOSE_RE.exec(this.buf);
-        if (m) {
-          const before = this.buf.slice(0, m.index);
-          if (before) out.push({ kind: 'thinking', text: before });
-          this.buf = this.buf.slice(m.index + m[0].length);
-          this.inThinking = false;
+      if (this.state === 'prefix') {
+        const prefix = this.buf.trimStart();
+        const whitespace = this.buf.slice(0, this.buf.length - prefix.length);
+        if (prefix && /(?:^|\n)(?: {4}|\t)[^\n]*$/.test(whitespace)) {
+          this.state = 'text'; // a leading indented code block is literal content
           continue;
         }
-      } else {
-        const o = OPEN_RE.exec(this.buf);
-        const c = CLOSE_RE.exec(this.buf);
-        // Whichever tag comes first decides. An opener → the text before it is the answer so far.
-        if (o && (!c || o.index <= c.index)) {
-          const before = this.buf.slice(0, o.index);
-          if (before) out.push({ kind: 'text', text: before });
-          this.buf = this.buf.slice(o.index + o[0].length);
-          this.inThinking = true;
+        const open = OPEN_RE.exec(prefix);
+        const close = CLOSE_RE.exec(prefix);
+        const tag = open?.index === 0 ? open : close?.index === 0 ? close : undefined;
+        if (tag) {
+          this.buf = prefix.slice(tag[0].length);
+          this.state = tag === open ? 'thinking' : 'text';
           continue;
         }
-        // A BARE closer (before any opener) → everything before it was reasoning; strip the tag.
-        if (c) {
-          const before = this.buf.slice(0, c.index);
-          if (before) out.push({ kind: 'thinking', text: before });
-          this.buf = this.buf.slice(c.index + c[0].length);
-          this.inThinking = false; // past the reasoning, into the answer
-          continue;
-        }
+        // Wait only while this can still become a leading tag. The first ordinary
+        // character commits to answer text, including every later literal tag.
+        if (!prefix || (prefix.startsWith('<') && partialTail(prefix) === prefix.length)) break;
+        this.state = 'text';
       }
-      // No full tag left: emit everything except a possible partial-tag tail.
+      if (this.state === 'text') {
+        if (this.buf) out.push({ kind: 'text', text: this.buf });
+        this.buf = '';
+        break;
+      }
+      const close = CLOSE_RE.exec(this.buf);
+      if (close) {
+        const before = this.buf.slice(0, close.index);
+        if (before) out.push({ kind: 'thinking', text: before });
+        this.buf = this.buf.slice(close.index + close[0].length);
+        this.state = 'text';
+        continue;
+      }
       const keep = partialTail(this.buf);
       const emit = this.buf.slice(0, this.buf.length - keep);
-      if (emit) out.push({ kind: this.inThinking ? 'thinking' : 'text', text: emit });
+      if (emit) out.push({ kind: 'thinking', text: emit });
       this.buf = keep ? this.buf.slice(this.buf.length - keep) : '';
       break;
     }
     return out;
   }
 
-  /** Emit whatever remains at end of stream (an unclosed tag's content still surfaces). */
+  /** Emit a held-back suffix, preserving incomplete literal tags at EOF. */
   flush(): SplitSpan[] {
     if (!this.buf) return [];
-    const span: SplitSpan = { kind: this.inThinking ? 'thinking' : 'text', text: this.buf };
+    const span: SplitSpan = { kind: this.state === 'thinking' ? 'thinking' : 'text', text: this.buf };
     this.buf = '';
     return [span];
   }

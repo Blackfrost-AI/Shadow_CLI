@@ -3,30 +3,116 @@
  * Local and distilled models frequently bleed their prompt-format scaffolding
  * into `content` — observed across the local-model probe:
  *
- *   </think>            (local-n2: a bare reasoning terminator, no opening tag)
  *   <channel|> <tool_call|>          (gemma4-opus)
  *   <|tool_response> <|im_start|> <|assistant|>   (ChatML family)
  *
  * Native Anthropic thinking blocks are handled upstream (signed, round-tripped);
  * this is the safety net for everything else, applied to the COMMITTED answer so
- * history/exports stay clean. Matched `<think>…</think>` reasoning is already
- * routed to the reasoning channel by ThinkingSplitter — here we only remove the
- * stray *tokens*, not content.
+ * history/exports stay clean. Reasoning tags are never scrubbed here: only the
+ * provider adapter knows whether inline thinking is enabled or `content` is an
+ * authoritative field. That adapter's ThinkingSplitter owns structural tags;
+ * literal `<think>` and `</think>` must survive in history and exports.
  */
 
-// `<|…|>` and `<|…>` (ChatML), `<word|>` (channel/tool_call), bare think tags, and DeepSeek's
+// `<|…|>` and `<|…>` (ChatML), `<word|>` (channel/tool_call), and DeepSeek's
 // fullwidth-bar tokens `<｜…｜>` (U+FF5C bar, e.g. <｜tool▁sep｜> / <｜end▁of▁sentence｜>).
-// The reasoning-tag arm is namespace-aware AND whitespace-tolerant, matching thinkingTags.ts:
-// `</mm:think>` (MiniMax-M) and `</think >` both used to survive into exports and replayed history.
-const CONTROL_TOKEN =
-  /<\|[^>]{0,40}>|<[A-Za-z_]{1,24}\|>|<｜[^>]{0,40}>|<\s*\/?\s*(?:[A-Za-z][\w.-]{0,15}\s*:\s*)?think(?:ing)?\s*>/gi;
+const CONTROL_TOKEN = /<\|[^>]{0,40}>|<[A-Za-z_]{1,24}\|>|<｜[^>]{0,40}>/gi;
+
+type LiteralRange = { start: number; end: number };
+
+/** Regions that describe tokens instead of using them as model scaffolding. */
+function literalRanges(text: string): LiteralRange[] {
+  const ranges: LiteralRange[] = [];
+  const escaped = (at: number): boolean => {
+    let slashes = 0;
+    while (at > 0 && text[--at] === '\\') slashes++;
+    return slashes % 2 === 1;
+  };
+  for (let i = 0; i < text.length;) {
+    if (i === 0 || text[i - 1] === '\n') {
+      const newline = text.indexOf('\n', i);
+      const end = newline < 0 ? text.length : newline + 1;
+      const line = text.slice(i, end).replace(/\r?\n$/, '');
+      const fence = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+      if (fence) {
+        const close = new RegExp(`^ {0,3}${fence[1][0]}{${fence[1].length},}[ \\t]*$`);
+        let next = end;
+        while (next < text.length) {
+          const nl = text.indexOf('\n', next);
+          const after = nl < 0 ? text.length : nl + 1;
+          const closed = close.test(text.slice(next, after).replace(/\r?\n$/, ''));
+          next = after;
+          if (closed) break;
+        }
+        ranges.push({ start: i, end: next });
+        i = next;
+        continue;
+      }
+      if (/^(?: {4}|\t| {0,3}>)/.test(line)) {
+        ranges.push({ start: i, end });
+        i = end;
+        continue;
+      }
+    }
+    const char = text[i];
+    if (char === '`' && !escaped(i)) {
+      let runEnd = i + 1;
+      while (text[runEnd] === '`') runEnd++;
+      const delimiter = text.slice(i, runEnd);
+      let close = text.indexOf(delimiter, runEnd);
+      while (close >= 0 && (text[close - 1] === '`' || text[close + delimiter.length] === '`')) {
+        close = text.indexOf(delimiter, close + delimiter.length);
+      }
+      // A partial streamed code span is also literal, even before its closer arrives.
+      const end = close < 0 ? text.length : close + delimiter.length;
+      ranges.push({ start: i, end });
+      i = end;
+      continue;
+    }
+    const quoteClose = char === '“' ? '”' : char === '‘' ? '’' : char === '"' || char === "'" ? char : '';
+    if (quoteClose && !escaped(i) && !(char === "'" && /[\p{L}\p{N}]/u.test(text[i - 1] ?? ''))) {
+      let close = text.indexOf(quoteClose, i + 1);
+      while (close >= 0 && escaped(close)) close = text.indexOf(quoteClose, close + 1);
+      // An unmatched prose apostrophe/quote must not shield the rest of the answer.
+      if (close >= 0) {
+        ranges.push({ start: i, end: close + 1 });
+        i = close + 1;
+        continue;
+      }
+    }
+    if (char === '<' && escaped(i)) {
+      const end = text.indexOf('>', i + 1);
+      if (end >= 0) ranges.push({ start: i, end: end + 1 });
+    }
+    i++;
+  }
+  return ranges;
+}
+
+function removeOutsideLiterals(text: string, pattern: RegExp): { text: string; removedPrefix: boolean } {
+  const ranges = literalRanges(text);
+  const firstContent = text.search(/\S/);
+  let range = 0;
+  let removedPrefix = false;
+  const cleaned = text.replace(pattern, (match: string, offset: number) => {
+    while (ranges[range] && ranges[range].end <= offset) range++;
+    if (ranges[range] && ranges[range].start <= offset) return match;
+    if (offset === firstContent) removedPrefix = true;
+    return '';
+  });
+  return { text: cleaned, removedPrefix };
+}
 
 export function scrubControlTokens(text: string): string {
   if (!text) return text;
-  // Only the stray *tokens* are removed — never content. (A global `[ \t]{2,}` collapse used to
-  // live here: it flattened every indented/fenced code block the model emitted, in the committed
-  // answer, the replayed history, and the saved session.)
-  return text.replace(CONTROL_TOKEN, '').replace(/^[ \t\n]+/, '');
+  const cleaned = removeOutsideLiterals(text, CONTROL_TOKEN);
+  let result = cleaned.text;
+  // Shed separator whitespace after leaked prefix tokens, preserving an indented code block.
+  if (cleaned.removedPrefix) {
+    result = result.replace(/^(?:[ \t]*\r?\n)+/, '');
+    if (!/^(?: {4}|\t)/.test(result)) result = result.replace(/^[ \t]+/, '');
+  }
+  return result;
 }
 
 /**
@@ -169,7 +255,7 @@ export function sanitizeTerminalEscapes(text: string, keepSgr: boolean): string 
  */
 export function scrubForDisplay(text: string): string {
   if (!text) return text;
-  return scrubControlTokens(sanitizeTerminalEscapes(text, false).replace(TOOL_CALL_ENVELOPE, ''))
+  return scrubControlTokens(removeOutsideLiterals(sanitizeTerminalEscapes(text, false), TOOL_CALL_ENVELOPE).text)
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 }

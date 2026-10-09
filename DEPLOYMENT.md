@@ -5,7 +5,7 @@ process — everything here runs against this repository alone, with no private 
 
 **Audience:** contributors and anyone building their own artifacts.
 
-**Current release baseline:** `v10.0.0`.
+**Release version:** `v10.0.3`. The commands below are required checks, not a record that they passed.
 
 > **Maintainer note:** the *official* release pipeline (binary hosting, signing keys) is private
 > and intentionally not part of this repo. This guide covers the parts that are.
@@ -15,7 +15,7 @@ process — everything here runs against this repository alone, with no private 
 ## Prerequisites
 
 - **Node.js ≥ 22.19** (matches `engines.node` in `package.json`)
-- **[Bun](https://bun.sh) 1.4.2** — verified for this release; only needed for the single-file binary (`scripts/build-binary.sh`)
+- **[Bun](https://bun.sh) 1.4.2** — the standalone binary compiler (`scripts/build-binary.sh` checks runtime compatibility)
 - **git**
 
 ## 1. Install + verify the toolchain
@@ -24,6 +24,7 @@ process — everything here runs against this repository alone, with no private 
 git clone https://github.com/Blackfrost-AI/Shadow_CLI.git && cd Shadow_CLI
 npm ci            # reproducible install from package-lock.json
 npm test          # full suite — must be 100% green before any release
+npm run typecheck # production source typecheck
 npm run typecheck:all # strict source + test typecheck
 npm run lint      # style (0 errors)
 ```
@@ -77,18 +78,24 @@ bash scripts/build-binary.sh dist-bin/shadow-windows-x64.exe bun-windows-x64
 
 ## 3. Release checklist
 
-1. Bump `package.json` and `package-lock.json`, then update the README current-build line and release notes.
-2. `npm test` && `npm run typecheck:all` && `npm run lint` — all green.
-3. `npm run check:release-gate` — green.
-4. Build the binaries you intend to distribute and smoke-test `--version` on each.
-5. Commit the release and push.
+1. Set `package.json` and `package-lock.json` to the intended version; update the README current-build
+   line and release notes. Review the public snapshot without importing private history or local state.
+2. Run `npm test`, `npm run typecheck`, `npm run typecheck:all` and `npm run lint`.
+3. Run `npm run build`, `npm run check:assets` and `npm run check:release-gate`.
+4. On POSIX, exercise the compiled entrypoint with the terminal, onboarding, interruption and
+   collaboration smoke scripts used by `.github/workflows/snowfall.yml`, including
+   `python3 scripts/smoke-parity-pty.py node dist/index.js`.
+5. Build the binaries through `scripts/build-binary.sh`; smoke-test the exact artifacts to distribute.
+6. Commit the reviewed public source. Upload an immutable signed candidate for that source revision,
+   then run the signed-release validation below before promoting it.
 
 The `Signed release smoke` workflow runs on `release/**` branches and version tags. Maintainers
 upload a complete signed candidate to `releases/<version>/<full-source-commit>/` first.
 Each candidate is immutable, so a failed candidate can be retained while its replacement is tested. All six
 native jobs must pass before promoting the matching set to the current installer/updater channel.
 Darwin signing precedes checksum generation; manifest signatures use the pinned release key.
-The normal public push hook requires main and its exact `v<package-version>` tag to agree.
+After validation, publish the reviewed main commit and its exact `v<package-version>` tag together.
+The public push hook checks that their versions agree.
 
 Never merge private working history into the public repository. Prepare a reviewed, public-safe
 snapshot on public history, retain rollback artifacts, and verify live signed downloads after
@@ -97,9 +104,8 @@ promotion. The website's version, source provenance and installer copies must ma
 ### Dependency audit
 
 Run `npm audit --omit=dev` for shipped dependencies and `npm audit` for the complete toolchain.
-Both audits reported zero vulnerabilities for the v10.0.0 lockfile on 2026-10-04, after updating
-the development-only brace-expansion packages to 1.1.21 and 5.0.12. Recheck at build time because
-the advisory database changes.
+Record the source revision, date and results for the artifacts being released; an older release's
+audit result does not validate the current lockfile or advisory database.
 
 ---
 
@@ -109,5 +115,6 @@ the advisory database changes.
 - [USER_GUIDE.md](USER_GUIDE.md) — day-to-day usage
 - [THREAT_MODEL.md](THREAT_MODEL.md) — the security model this release process protects
 - [TESTING.md](TESTING.md) — testing conventions
-- [TERMINAL_RENDERERS.md](TERMINAL_RENDERERS.md) — supported default and preview limits
+- [TERMINAL_RENDERERS.md](TERMINAL_RENDERERS.md) — Snowfall and compatibility renderer controls
+- [Collaboration](docs/COLLABORATION.md) — jobs, consultations, retained work and runtime limits
 - [CHANGELOG.md](CHANGELOG.md) — release notes

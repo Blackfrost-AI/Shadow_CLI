@@ -83,6 +83,9 @@ const McpServerSchema = z
     // global-only by inheritance — `mcpServers` itself is stripped from project files.
     network: z.boolean().optional(),
     sandbox: z.boolean().optional(),
+    callTimeoutMs: z.number().int().min(100).max(600_000).optional(),
+    toolNames: z.array(z.string().min(1).max(256)).max(200).optional(),
+    deferTools: z.boolean().optional(),
   })
   .refine((s) => Boolean(s.command) || Boolean(s.url), {
     message: 'mcp server needs a `command` (stdio) or a `url` (http)',
@@ -396,7 +399,8 @@ const ConfigSchema = z.object({
     .default({}),
   // OPT-IN update discovery. OFF by default (zero-telemetry stance): when true, at most once a day on
   // launch Shadow does a plain payload-free GET of the PUBLIC version and prints one line if a newer
-  // release exists. Never sends anything about the user. See src/update/checkUpdate.ts.
+  // release exists. Trusted user configuration only; project files cannot opt in.
+  // See src/update/checkUpdate.ts.
   updateCheck: z.boolean().default(false),
   // P3-07 — OPTIONAL plugin index. Shadow ships with NO central catalog (zero telemetry); when
   // the user sets `pluginIndexUrl`, `shadow plugin search`/`add <name>` fetch that JSON index
@@ -617,7 +621,8 @@ const CONFIG_FILE = 'shadow.config.json';
 // `web` carries the console's bearer token (`web.token`) — a repo-pinned token is known to
 // whoever wrote the repo, and the token is the last factor after Host/Origin, so it is
 // global-only alongside `projects` (the filesystem allowlist).
-const PROJECT_UNTRUSTED_KEYS = ['baseUrl', 'selfHosted', 'shellEnvAllowlist', 'autonomy', 'denylistExtra', 'systemPromptPath', 'sandbox', 'sandboxNetwork', 'sandboxFailurePolicy', 'egress', 'additionalDirectories', 'projects', 'web', 'offline', 'hooks', 'statusLine', 'vision', 'permissionRules', 'diagnostics', 'lsp', 'pluginIndexUrl', 'pluginIndexKey', 'profiles', 'sessionRetentionDays', 'sessionRetentionKeep'];
+// Update discovery is an outbound request: only the user can enable it, not a project file.
+const PROJECT_UNTRUSTED_KEYS = ['baseUrl', 'selfHosted', 'shellEnvAllowlist', 'autonomy', 'denylistExtra', 'systemPromptPath', 'sandbox', 'sandboxNetwork', 'sandboxFailurePolicy', 'egress', 'additionalDirectories', 'projects', 'web', 'offline', 'hooks', 'statusLine', 'vision', 'permissionRules', 'diagnostics', 'lsp', 'updateCheck', 'pluginIndexUrl', 'pluginIndexKey', 'profiles', 'sessionRetentionDays', 'sessionRetentionKeep'];
 
 /**
  * Layered precedence: CLI flags > env > active profile > project config file (de-fanged) >

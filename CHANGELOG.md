@@ -1,5 +1,31 @@
 # Shadow release notes
 
+## 10.0.3 — 2026-10-09
+
+- Add Snowfall browsers for active work, persistent jobs and local project rooms, with attempts,
+  dependency blockers, directed messages, replies and unread history.
+- Retain worker worktrees and patches for explicit apply, keep, discard or interrupted-work recovery.
+  Add scoped code review with file/hunk navigation and structured findings when supplied by the model.
+- Add independent read-only consultations using complete model profiles, with resumable follow-ups.
+- Add bounded second-opinion, implement-and-review, parallel-team, pipeline, debate and plan/solve
+  workflows. Carry permissions, hooks, cancellation and budgets through child work; record check
+  evidence and acceptance separately from execution status and model claims.
+- Restore plans, tasks, work history and recorded tool activity when resuming sessions. Preview
+  rewind file changes and require explicit retries for interrupted jobs.
+- Add ranked source excerpts, repository maps and semantic navigation with labeled lexical fallback;
+  expose scoped instruction origins, skill sources and user/generated/legacy memory provenance.
+- Add live MCP management in Snowfall, configurable deadlines, progress, cancellation requests,
+  tool selection and bounded retrieval of large results. Remote cancellation remains best effort.
+- Improve footer spacing, elapsed-time formatting, effort choices and thinking separation. Preserve
+  structured provider content, tool calls and partial results with explicit termination states.
+- Recognize managed Windows Git worktrees across path aliases and separator differences.
+- Keep update discovery off by default and restrict opt-in to trusted user configuration. Project
+  configuration cannot enable it. Store collaboration records locally without analytics or
+  automatic uploads.
+
+See the [collaboration guide](docs/COLLABORATION.md) for controls and limits. Workers do not survive
+application exit; unknown provider usage remains unknown. Update with `shadow update`, then restart.
+
 ## 10.0.1 — 2026-10-05
 
 - Rebuild terminal onboarding in the shared retro style with compact provider menus, arrow/number

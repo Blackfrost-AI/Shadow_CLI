@@ -28,7 +28,7 @@ def check(condition, message):
         raise RuntimeError(message)
 
 
-def exercise(command, label, key, partial):
+def exercise(command, label, key, partial, thinking=False):
     class Provider(BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
         requests = 0
@@ -48,7 +48,8 @@ def exercise(command, label, key, partial):
             self.end_headers()
             if current > 1 or partial:
                 text = 'FIRSTSTREAMSTARTED' if current == 1 else 'SECONDTURNCOMPLETED'
-                event = {'choices': [{'index': 0, 'delta': {'content': text}}]}
+                field = 'reasoning_content' if thinking and current == 1 else 'content'
+                event = {'choices': [{'index': 0, 'delta': {field: text}}]}
                 self.wfile.write(('data: ' + json.dumps(event) + '\n\n').encode())
                 self.wfile.flush()
             Provider.started.set()
@@ -106,6 +107,8 @@ def exercise(command, label, key, partial):
             wait_for(Provider.started.is_set, 'provider did not receive the request')
             if partial:
                 wait_for(lambda: contains(b'FIRSTSTREAMSTARTED'), 'first response was not rendered')
+            if thinking:
+                wait_for(lambda: contains(b'Thinking'), 'thinking panel was not rendered')
             started = time.monotonic()
             os.write(master, key)
             wait_for(Provider.closed.is_set, 'interrupt did not close the connection', 3)
@@ -135,5 +138,5 @@ def exercise(command, label, key, partial):
 
 if __name__ == '__main__':
     check(len(sys.argv) > 1, 'provide a built CLI command')
-    cases = [('escape-streaming', b'\x1b', True), ('escape-first-token', b'\x1b', False), ('ctrl-c-streaming', b'\x03', True)]
+    cases = [('escape-streaming', b'\x1b', True), ('escape-first-token', b'\x1b', False), ('ctrl-c-streaming', b'\x03', True), ('escape-thinking', b'\x1b', True, True)]
     print(json.dumps({'platform': sys.platform, 'checks': [exercise(sys.argv[1:], *case) for case in cases]}, indent=2))

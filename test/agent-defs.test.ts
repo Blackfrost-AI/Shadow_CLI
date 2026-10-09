@@ -22,7 +22,7 @@ test('built-in explore agent resolves with read-only tools', () => {
   const def = resolveAgentDef('explore', '/tmp');
   assert.ok(def);
   assert.equal(def!.name, 'explore');
-  assert.deepEqual(def!.tools, ['read_file', 'grep', 'glob']);
+  assert.deepEqual(def!.tools, ['read_file', 'grep', 'glob', 'repository_context']);
   assert.match(def!.systemPrompt, /read-only|read the codebase/i);
 });
 

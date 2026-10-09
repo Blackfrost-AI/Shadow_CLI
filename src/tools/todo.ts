@@ -16,6 +16,8 @@ import type { TodoList, TodoStatus } from '../agent/todo.js';
 // write — gating it like `write_file` would wrongly prompt the user mid-task.
 
 const todoItemSchema = z.object({
+  id: z.string().optional().describe('Existing todo id to preserve identity when renaming or reordering a task.'),
+  jobId: z.string().optional().describe('Persistent job id returned by agent/project_jobs for this task. Links results and acceptance; does not imply completion.'),
   subject: z.string().min(1).describe('Short imperative title for the task, e.g. "Fix the failing login test".'),
   status: z
     .enum(['pending', 'in_progress', 'completed'])
@@ -72,6 +74,8 @@ export function makeTodoTool(todos: TodoList): Tool<TodoInput, TodoData> {
       const start = Date.now();
       const items = todos.write(
         input.todos.map((t) => ({
+          id: t.id,
+          jobId: t.jobId,
           subject: t.subject,
           status: t.status as TodoStatus,
           description: t.description,

@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, rmSync, existsSync, readdirSync } from 'node:fs';
-import { resolve, sep } from 'node:path';
+import { mkdirSync, existsSync, realpathSync } from 'node:fs';
+import { basename, relative, resolve, sep, win32, posix } from 'node:path';
 import { z } from 'zod';
 import type { Tool } from './types.js';
 import { ok, fail } from './types.js';
@@ -10,6 +10,23 @@ export interface WorktreeInfo {
   path: string;
   id: string;
   branch?: string;
+  baseCommit?: string;
+}
+
+/** Compare canonical filesystem paths using platform path rules, not string
+ * prefixes. Git for Windows uses forward slashes and may spell the drive letter
+ * differently from fs.realpathSync. Callers still apply the workspace jail. */
+export function relativeManagedWorktreePath(root: string, candidate: string, platform: 'win32' | 'posix' = process.platform === 'win32' ? 'win32' : 'posix'): string | null {
+  const paths = platform === 'win32' ? win32 : posix;
+  const rel = paths.relative(root, candidate);
+  return rel !== '' && rel !== '..' && !rel.startsWith(`..${paths.sep}`) && !paths.isAbsolute(rel) ? rel : null;
+}
+
+/** Existing directories are compared after realpath so root aliases (including
+ * macOS /var and Windows long/short paths) name the same registered checkout. */
+export function sameWorktreePath(left: string, right: string): boolean {
+  const canonical = (path: string): string => resolve(existsSync(path) ? realpathSync.native(path) : path);
+  return relative(canonical(left), canonical(right)) === '';
 }
 
 /**
@@ -25,7 +42,8 @@ function isSafeWorktreeId(id: string): boolean {
 }
 
 /**
- * Create a git worktree (or fallback dir) for sub-agent isolation.
+ * Create a real git worktree for sub-agent isolation. Failure is explicit: an
+ * empty directory is not a checkout and must never masquerade as one.
  * Returns the absolute path to use as the sub-agent's workspaceRoot.
  * Idempotent create.
  */
@@ -36,13 +54,16 @@ export function createWorktree(baseWorkspace: string, id: string): WorktreeInfo 
   // any '..' / absolute escape (even for not-yet-existing paths), so a malicious id
   // cannot land the worktree outside the managed dir.
   const wtPath = resolveWithin(worktreesRoot, id);
+  if (!isSafeWorktreeId(id)) throw new Error('Invalid worktree id');
 
   if (existsSync(wtPath)) {
-    return { path: wtPath, id, branch: undefined };
+    const existing = listWorktrees(baseWorkspace).find((w) => sameWorktreePath(w.path, wtPath));
+    if (!existing) throw new Error(`Worktree path already exists but is not a registered Git worktree: ${wtPath}`);
+    return existing;
   }
 
   try {
-    // Prefer real git worktree for full isolation + branch. Pass wtPath as an argv
+    // Use a real git worktree for full isolation. Pass wtPath as an argv
     // element via execFileSync so it is never shell-parsed — `$(...)` / `;` in a path
     // are inert literals, not command substitution.
     execFileSync('git', ['worktree', 'add', '--detach', wtPath], {
@@ -50,16 +71,15 @@ export function createWorktree(baseWorkspace: string, id: string): WorktreeInfo 
       stdio: 'ignore',
       timeout: 10000,
     });
-    return { path: wtPath, id, branch: undefined };
-  } catch {
-    // Fallback for non-git or no git binary: plain dir (still isolated fs scope)
-    mkdirSync(wtPath, { recursive: true });
-    return { path: wtPath, id, branch: undefined };
+    const baseCommit = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: wtPath, encoding: 'utf8', timeout: 5000 }).trim();
+    return { path: wtPath, id, baseCommit };
+  } catch (error) {
+    throw new Error(`Could not create an isolated Git worktree. Use a repository with a committed HEAD. No fallback directory was created. ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
-/** Remove a worktree (git or fallback dir). Force. */
-export function removeWorktree(baseWorkspace: string, pathOrId: string): void {
+/** Remove a registered worktree. Dirty work requires an explicit discard decision. */
+export function removeWorktree(baseWorkspace: string, pathOrId: string, options: { discardChanges?: boolean } = {}): void {
   const worktreesRoot = resolve(baseWorkspace, '.shadow/worktrees');
   // An absolute path is accepted only when it sits strictly INSIDE worktreesRoot —
   // require a separator boundary so a sibling like ".shadow/worktrees-evil" can't
@@ -71,18 +91,16 @@ export function removeWorktree(baseWorkspace: string, pathOrId: string): void {
       ? pathOrId
       : resolve(worktreesRoot, pathOrId);
   const wtPath = resolveWithin(worktreesRoot, candidate);
-  try {
-    execFileSync('git', ['worktree', 'remove', '--force', wtPath], {
-      cwd: baseWorkspace,
-      stdio: 'ignore',
-      timeout: 10000,
-    });
-  } catch {
-    // fallback
-    if (existsSync(wtPath)) {
-      rmSync(wtPath, { recursive: true, force: true });
-    }
+  if (wtPath === worktreesRoot) throw new Error('Cannot remove the managed worktree root');
+  if (!existsSync(wtPath)) return;
+  if (!listWorktrees(baseWorkspace).some((worktree) => sameWorktreePath(worktree.path, wtPath))) {
+    throw new Error('Refusing to remove a directory that is not a registered managed Git worktree');
   }
+  execFileSync('git', ['worktree', 'remove', ...(options.discardChanges ? ['--force'] : []), wtPath], {
+    cwd: baseWorkspace,
+    stdio: 'pipe',
+    timeout: 10000,
+  });
 }
 
 /** List current worktrees under .shadow/worktrees */
@@ -107,7 +125,7 @@ export function listWorktrees(baseWorkspace: string): WorktreeInfo[] {
       } else if (trimmed.startsWith('branch ')) {
         current.branch = trimmed.slice(7).trim();
       } else if (trimmed.startsWith('HEAD ')) {
-        // we don't store HEAD for now, but parse correctly so state machine works
+        current.baseCommit = trimmed.slice(5).trim();
       }
       // ignore bare/detached/locked/prunable for our purpose
     }
@@ -115,23 +133,19 @@ export function listWorktrees(baseWorkspace: string): WorktreeInfo[] {
       wts.push(current as WorktreeInfo);
     }
     // only return the ones under our managed .shadow/worktrees subdir
-    return wts
-      .filter((w) => w.path && w.path.includes('.shadow/worktrees'))
-      .map((w) => ({
-        path: w.path!,
-        id: w.path!.split('/').pop()!,
-        branch: w.branch,
-      }));
+    const canonicalRoot = realpathSync.native(worktreesRoot);
+    return wts.flatMap((worktree) => {
+      if (!worktree.path || !existsSync(worktree.path)) return [];
+      const rel = relativeManagedWorktreePath(canonicalRoot, realpathSync.native(worktree.path));
+      if (rel === null) return [];
+      // Rebase onto the caller's root spelling before applying the jail. Native
+      // realpath expands Windows DOS aliases (RUNNER~1), whereas Git may report
+      // the corresponding long path. This preserves the same physical root.
+      const path = resolveWithin(worktreesRoot, rel);
+      return [{ path, id: basename(path), branch: worktree.branch, baseCommit: worktree.baseCommit }];
+    });
   } catch {
-    // fs fallback: list dirs under the worktreesRoot
-    try {
-      const ids = readdirSync(worktreesRoot, { withFileTypes: true })
-        .filter((d: { isDirectory: () => boolean }) => d.isDirectory())
-        .map((d: { name: string }) => d.name);
-      return ids.map((id: string) => ({ path: resolve(worktreesRoot, id), id }));
-    } catch {
-      return [];
-    }
+    return [];
   }
 }
 
@@ -141,6 +155,7 @@ const createSchema = z.object({
 
 const removeSchema = z.object({
   id: z.string().min(1).describe('Worktree id or relative path under .shadow/worktrees'),
+  discardChanges: z.boolean().optional().describe('Explicitly discard uncommitted work. Prefer artifact discard so a recoverable patch is retained.'),
 });
 
 const listSchema = z.object({});
@@ -148,7 +163,7 @@ const listSchema = z.object({});
 export function makeWorktreeCreateTool(): Tool<z.infer<typeof createSchema>, WorktreeInfo> {
   return {
     name: 'worktree_create',
-    description: 'Create an isolated git worktree (or fallback dir) for a sub-task or agent. Returns the path to use as workspace.',
+    description: 'Create an isolated Git checkout for a sub-task or agent. Requires a Git repository with a committed HEAD; returns an explicit error if isolation fails.',
     risk: 'write',
     inputSchema: createSchema,
     async run(input, ctx) {
@@ -179,7 +194,7 @@ export function makeWorktreeRemoveTool(): Tool<z.infer<typeof removeSchema>, { r
         return fail('worktree_remove', 'write', Date.now()-start, 'invalid_id', `invalid worktree id "${input.id}": must match ${WORKTREE_ID_PATTERN} and not be '.' or '..'`);
       }
       try {
-        removeWorktree(ctx.workspaceRoot, input.id);
+        removeWorktree(ctx.workspaceRoot, input.id, { discardChanges: input.discardChanges });
         return ok('worktree_remove', 'write', Date.now()-start, `Worktree ${input.id} removed (or cleaned).`, { removed: input.id });
       } catch (e) {
         return fail('worktree_remove', 'write', Date.now()-start, 'worktree_failed', (e as Error).message);

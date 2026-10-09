@@ -6,6 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, utimesSync } from 'node:fs';
+import { removeFixtureTree } from './helpers/removeFixtureTree.js';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -483,7 +484,7 @@ test('F07-12: registered MCP tools get sanitized names and ENVELOPED description
     assert.ok(okTool.description.includes('MCP tool ok_tool from server fake'));
   } finally {
     for (const c of clients) c.stop();
-    rmSync(ws, { recursive: true, force: true });
+    await removeFixtureTree(ws);
   }
 });
 
@@ -786,7 +787,7 @@ test('BYPASS-M6: oversized or control-charred MCP input schemas are skipped, san
     assert.deepEqual(names, ['mcp_fake2_good'], 'only the sane tool registers; oversized/control-char schemas skip');
   } finally {
     for (const c of clients) c.stop();
-    rmSync(ws, { recursive: true, force: true });
+    await removeFixtureTree(ws);
   }
 });
 
@@ -829,6 +830,6 @@ test('BYPASS-M1: a collision-suffixed MCP tool reports its EXACT registered name
     assert.match(res.summary, /ran foo_bar/, 'the WIRE call kept the original name');
   } finally {
     for (const c of clients) c.stop();
-    rmSync(ws, { recursive: true, force: true });
+    await removeFixtureTree(ws);
   }
 });

@@ -66,6 +66,15 @@ export function effortDescription(level: Effort): string {
   return DESCRIPTIONS[level] ?? DESCRIPTIONS.high;
 }
 
+/** Short labels for menus; the longer operating directives stay unchanged. */
+export const EFFORT_SUMMARIES: Record<Effort, string> = {
+  low: 'Quick replies and small edits',
+  medium: 'Everyday tasks with basic checks',
+  high: 'Thorough work with careful verification',
+  xhigh: 'Deeper analysis and extra checks',
+  max: 'Most thorough reasoning and verification',
+};
+
 /**
  * A concise, model-agnostic directive appended to the system prompt every turn.
  * Any model — including one with no native effort param — can act on this. Kept

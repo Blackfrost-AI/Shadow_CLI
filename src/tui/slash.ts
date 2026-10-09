@@ -46,11 +46,12 @@ import { exportSession } from '../state/chatExport.js';
 import { forkSession } from '../state/fork.js';
 import { GLOBAL_DIR, saveGlobalConfig, vaultUnlocked } from '../state/globalStore.js';
 import { ProjectMemory } from '../state/memory.js';
-import { listResumableSessions, resumeSession } from '../state/resume.js';
+import { listResumableSessions, resolveSessionMatches, resumeSession } from '../state/resume.js';
+import { captureSessionState, restoreSessionState } from '../state/sessionState.js';
 import { rewindToTurn, type RewindableTurn } from '../state/rewind.js';
 import { SessionLog } from '../state/session.js';
 import { normalizeSessionTitle } from '../state/sessionTitle.js';
-import { readLatestWorkCenterSnapshot, recordWorkCenterSnapshot } from '../state/workCenterPersistence.js';
+import { recordWorkCenterSnapshot } from '../state/workCenterPersistence.js';
 import { customStyleNames, type OutputStyle } from '../styles.js';
 import { imageMediaType, MAX_IMAGE_BYTES } from '../util/image.js';
 import { firstSelectableRow, modelEntries, modelRows } from '../util/modelGroups.js';
@@ -1113,15 +1114,19 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
         });
         break;
       }
-      const pick = arg
-        ? sessions.find((s) => s.id === arg || s.path === arg || s.path.endsWith(arg))
-        : sessions[0];
+      const matches = resolveSessionMatches(sessions, arg);
+      if (matches.length > 1) {
+        setComposer(`/resume ${arg}`, `/resume ${arg}`.length);
+        pushLine({ text: `${matches.length} matching sessions — choose one below.`, dimColor: true });
+        break;
+      }
+      const pick = matches[0];
       if (!pick) {
         pushLine({ text: `No session matching "${arg}".`, dimColor: true });
         break;
       }
       try {
-        const { context: resumed } = resumeSession(pick.path, {
+        const { context: resumed, state } = resumeSession(pick.path, {
           contextBudget: opts.cfg.contextBudget,
           triggerRatio: opts.cfg.summarizeTriggerRatio,
           keepLastTurns: opts.cfg.keepLastTurns,
@@ -1129,10 +1134,11 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
         const previous = sessionLogRef.current;
         const log = SessionLog.open(opts.workspaceRoot);
         log.setTitle(SessionLog.titleFor(pick.path));
+        log.bindSessionState(context, () => captureSessionState(opts));
         sessionLogRef.current = log;
         previous.close?.();
         context.loadState(resumed.exportState());
-        opts.workCenter?.restore(readLatestWorkCenterSnapshot(pick.path));
+        restoreSessionState(opts, state);
         firstRef.current = context.messages().length === 0;
         // Repaint BEFORE the confirmation line, so the notice sits at the bottom of the
         // conversation it is describing rather than above a stale one.
@@ -1144,6 +1150,7 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
         try {
           sessionLogRef.current.recordSnapshot(context, 0);
           sessionLogRef.current.record({ kind: 'resumed_from', sessionId: pick.id, path: pick.path });
+          opts.consultations?.adopt(sessionLogRef.current, pick.path);
         } catch {
           /* a log that cannot be written must not fail the resume itself */
         }

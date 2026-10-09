@@ -3,6 +3,7 @@
  * the same ProviderEvent sequence the SSE parsers emit, so streamWithRetry can
  * fall back without the agent loop knowing which transport was used.
  */
+import type { ModelCapabilities } from '../config.js';
 import type { ProviderEvent, StopReason } from './provider.js';
 import { parseToolArgs } from './toolJson.js';
 import { ThinkingSplitter } from '../util/thinkingTags.js';
@@ -141,6 +142,7 @@ export function* eventsFromOpenAICompletion(
   obj: unknown,
   model = '',
   preserveQwenReasoning = false,
+  capabilities?: ModelCapabilities,
 ): Generator<ProviderEvent> {
   const o = obj as OAICompletion;
 
@@ -155,9 +157,10 @@ export function* eventsFromOpenAICompletion(
   let outputTokens = 0;
   let cacheReadTokens = 0;
   let stopReason: StopReason = 'end_turn';
-  // Keep non-stream behavior aligned with the SSE path: only known inline-thinking families
-  // reinterpret literal <think> prose. Empty model remains permissive for backward compatibility.
-  const splitInline = model === '' || nonStreamEmitsInlineThinking(model);
+  // Match the SSE path, including explicit capability overrides.
+  const splitInline = capabilities?.reasoning !== undefined
+    ? capabilities.reasoning !== 'hidden'
+    : model === '' || nonStreamEmitsInlineThinking(model);
   const splitter = new ThinkingSplitter();
 
   if (o.usage) {
@@ -185,7 +188,9 @@ export function* eventsFromOpenAICompletion(
     }
 
     if (typeof message.content === 'string' && message.content) {
-      if (!splitInline) {
+      const structuredReasoning = capabilities?.reasoning !== 'interleaved' &&
+        (reasoningField !== undefined || message.reasoning_content === null || message.reasoning === null);
+      if (!splitInline || structuredReasoning) {
         yield { type: 'text', delta: message.content };
       } else {
         for (const span of splitter.push(message.content)) {

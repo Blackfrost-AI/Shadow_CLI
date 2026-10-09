@@ -25,7 +25,20 @@ export class PlanModeState {
   }
 
   snapshot(): PlanSnapshot {
-    return { ...this.snapshotValue };
+    return { ...this.snapshotValue, ...(this.snapshotValue.tasks ? { tasks: [...this.snapshotValue.tasks] } : {}) };
+  }
+
+  /** Resume a recorded mode without synthesizing a user approval or side-door exit. */
+  restore(raw: PlanSnapshot): PlanSnapshot {
+    this.exitedUnapproved = false;
+    this.snapshotValue = {
+      mode: raw?.mode === 'planning' ? 'planning' : 'implement',
+      ...(typeof raw?.title === 'string' ? { title: raw.title } : {}),
+      ...(typeof raw?.path === 'string' ? { path: raw.path } : {}),
+      ...(Array.isArray(raw?.tasks) ? { tasks: raw.tasks.filter((item): item is string => typeof item === 'string') } : {}),
+    };
+    this.emit();
+    return this.snapshot();
   }
 
   recordPlan(title: string, path: string, tasks?: string[]): PlanSnapshot {

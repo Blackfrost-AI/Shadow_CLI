@@ -22,6 +22,7 @@ import {
   makeExitPlanModeTool,
   makePlanWriteTool,
   makeSkillTool,
+  makeRepositoryContextTool,
   makeToolSearch,
   makeDescribeMediaTool,
   registerBuiltinTools,
@@ -50,7 +51,8 @@ import { applyRetention } from '../state/retention.js';
 import { makeMemoryTool } from '../tools/memory.js';
 import { TodoList } from './todo.js';
 import { PlanModeState } from './planMode.js';
-import { MissionState, readMissionSnapshot } from './mission.js';
+import { MissionState } from './mission.js';
+import { captureSessionState, restoreSessionState } from '../state/sessionState.js';
 import { buildStyledSystem } from './system.js';
 import { setCustomStyles } from './styles.js';
 import { discoverCustomStyles } from './outputStyles.js';
@@ -550,7 +552,8 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   const mission = new MissionState();
   registry.register(makeMissionUpdateTool(mission));
   registry.register(makeAskUserQuestionTool());
-  if (skills.length) registry.register(makeSkillTool(skills));
+  registry.register(makeSkillTool(() => discoverSkills(workspaceRoot)));
+  registry.register(makeRepositoryContextTool(cfg.lsp));
   registry.register(makeToolSearch(registry));
 
   const wakeup = new WakeupScheduler();
@@ -595,20 +598,11 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   };
   let context: Context;
   if (opts.resumeSessionPath) {
-    ({ context } = resumeSession(opts.resumeSessionPath, contextOpts));
+    const resumed = resumeSession(opts.resumeSessionPath, contextOpts);
+    context = resumed.context;
     sessionLog.setTitle(SessionLog.titleFor(opts.resumeSessionPath));
-    // /goal mission survives resume: the last mission event in the OLD session log is
-    // authoritative (a trailing `clear` rehydrates nothing). Best-effort — a missing or
-    // unreadable log resumes mission-less, never blocks startup.
-    try {
-      const restored = readMissionSnapshot(opts.resumeSessionPath);
-      if (restored) {
-        mission.restore(restored);
-        write(`Mission resumed: ${restored.mission} (${restored.phase}${restored.tasks.length ? `, ${restored.tasks.length} task(s)` : ''}).\n`);
-      }
-    } catch {
-      /* best-effort */
-    }
+    restoreSessionState({ mission, planMode, todoList }, resumed.state);
+    if (mission.active) write(`Mission resumed: ${mission.snapshot().mission} (${mission.snapshot().phase}, ${mission.snapshot().tasks.length} task(s)).\n`);
     write(`Resumed session ${opts.resumeSessionPath} (${context.messages().length} messages in context).\n`);
     // Background sub-agent recovery note (tasks captured via extended snapshot)
     const recoveredTasks = (context as any)._subAgentTasks || [];
@@ -620,6 +614,7 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   } else {
     context = new Context(contextOpts);
   }
+  sessionLog.bindSessionState(context, () => captureSessionState({ mission, planMode, todoList }));
 
   const connectMcp = async (): Promise<Array<{ stop(): void }>> => {
     // Offline mode: skip MCP servers entirely — they are outbound connectors (another egress

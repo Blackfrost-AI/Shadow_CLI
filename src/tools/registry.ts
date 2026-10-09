@@ -17,6 +17,11 @@ export class ToolRegistry {
     this.tools.set(tool.name, tool);
   }
 
+  /** Remove an exact registered entry when its connector is disabled or replaced. */
+  unregister(name: string): boolean {
+    return this.tools.delete(name);
+  }
+
   get(name: string): Tool | undefined {
     // Exact match wins; otherwise map a known foreign name (bash → run_shell, etc.).
     return this.tools.get(name) ?? this.tools.get(canonicalToolName(name));

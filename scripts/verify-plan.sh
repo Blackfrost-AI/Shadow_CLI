@@ -47,18 +47,18 @@ append_banner() {
 # ── Step 1: typecheck + lint + test (twice) ─────────────────────────────────
 banner "$SCRATCH/verify-run-1.log" "verify-run-1 (typecheck+lint+test)"
 {
-  echo "COMMAND=npm run typecheck:all && npm run lint && TMPDIR=.tmp npm test"
+  echo "COMMAND=npm run typecheck:all && npm run lint && TMPDIR="$REPO_ROOT/.tmp" npm test"
   npm run typecheck:all
   npm run lint
-  TMPDIR=.tmp npm test
+  TMPDIR="$REPO_ROOT/.tmp" npm test
 } 2>&1 | tee -a "$SCRATCH/verify-run-1.log"
 
 banner "$SCRATCH/verify-run-2.log" "verify-run-2 (typecheck+lint+test)"
 {
-  echo "COMMAND=npm run typecheck:all && npm run lint && TMPDIR=.tmp npm test"
+  echo "COMMAND=npm run typecheck:all && npm run lint && TMPDIR="$REPO_ROOT/.tmp" npm test"
   npm run typecheck:all
   npm run lint
-  TMPDIR=.tmp npm test
+  TMPDIR="$REPO_ROOT/.tmp" npm test
 } 2>&1 | tee -a "$SCRATCH/verify-run-2.log"
 
 # ── Step 3: build ───────────────────────────────────────────────────────────
@@ -114,46 +114,46 @@ run_recovery recovery-provider-error SHADOW_MOCK_ERROR=1 \
 # ── Step 2+4: Responses wire transport (SHADOW_WIRE_API=responses) ───────────
 banner "$SCRATCH/transport-responses-wire.log" "transport-responses-wire (createProvider + ResponsesProvider.send)"
 {
-  echo "COMMAND=SHADOW_WIRE_API=responses TMPDIR=.tmp node --import tsx --test test/responses-provider.test.ts --test-name-pattern 'createProvider|ResponsesProvider.send'"
-  SHADOW_WIRE_API=responses TMPDIR=.tmp node --import tsx --test test/responses-provider.test.ts --test-name-pattern 'createProvider|ResponsesProvider.send'
+  echo "COMMAND=SHADOW_WIRE_API=responses TMPDIR="$REPO_ROOT/.tmp" node --import tsx --test test/responses-provider.test.ts --test-name-pattern 'createProvider|ResponsesProvider.send'"
+  SHADOW_WIRE_API=responses TMPDIR="$REPO_ROOT/.tmp" node --import tsx --test test/responses-provider.test.ts --test-name-pattern 'createProvider|ResponsesProvider.send'
   echo "exit_code=$?"
 } 2>&1 | tee -a "$SCRATCH/transport-responses-wire.log"
 
 banner "$SCRATCH/recovery-responses-nonstream.log" "recovery-responses-nonstream (ResponsesProvider.send fallback)"
 {
-  echo "COMMAND=SHADOW_WIRE_API=responses TMPDIR=.tmp node --import tsx --test test/responses-provider.test.ts --test-name-pattern 'non-stream'"
-  SHADOW_WIRE_API=responses TMPDIR=.tmp node --import tsx --test test/responses-provider.test.ts --test-name-pattern 'non-stream'
+  echo "COMMAND=SHADOW_WIRE_API=responses TMPDIR="$REPO_ROOT/.tmp" node --import tsx --test test/responses-provider.test.ts --test-name-pattern 'non-stream'"
+  SHADOW_WIRE_API=responses TMPDIR="$REPO_ROOT/.tmp" node --import tsx --test test/responses-provider.test.ts --test-name-pattern 'non-stream'
   echo "exit_code=$?"
 } 2>&1 | tee -a "$SCRATCH/recovery-responses-nonstream.log"
 
 banner "$SCRATCH/recovery-loop-unknown-tool.log" "recovery-loop-unknown-tool (unit)"
 {
-  echo "COMMAND=TMPDIR=.tmp node --import tsx --test test/loop.test.ts --test-name-pattern 'unknown tool'"
-  TMPDIR=.tmp node --import tsx --test test/loop.test.ts --test-name-pattern 'unknown tool'
+  echo "COMMAND=TMPDIR="$REPO_ROOT/.tmp" node --import tsx --test test/loop.test.ts --test-name-pattern 'unknown tool'"
+  TMPDIR="$REPO_ROOT/.tmp" node --import tsx --test test/loop.test.ts --test-name-pattern 'unknown tool'
   echo "exit_code=$?"
 } 2>&1 | tee -a "$SCRATCH/recovery-loop-unknown-tool.log"
 
 # ── Step 4: eval + dialect unit tests ───────────────────────────────────────
 banner "$SCRATCH/eval-dialect.log" "eval-dialect (harness --mock --only dialect-*)"
 {
-  echo "COMMAND=TMPDIR=.tmp npm run eval -- --mock --only dialect-shell-command,dialect-update-plan"
-  TMPDIR=.tmp npm run eval -- --mock --only dialect-shell-command,dialect-update-plan
+  echo "COMMAND=TMPDIR="$REPO_ROOT/.tmp" npm run eval -- --mock --only dialect-shell-command,dialect-update-plan"
+  TMPDIR="$REPO_ROOT/.tmp" npm run eval -- --mock --only dialect-shell-command,dialect-update-plan
   echo "exit_code=$?"
 } 2>&1 | tee -a "$SCRATCH/eval-dialect.log"
 
 banner "$SCRATCH/eval-dialect-unit.log" "eval-dialect-unit (foreign-adapter.test.ts)"
 {
-  echo "COMMAND=TMPDIR=.tmp node --import tsx --test test/foreign-adapter.test.ts"
-  TMPDIR=.tmp node --import tsx --test test/foreign-adapter.test.ts
+  echo "COMMAND=TMPDIR="$REPO_ROOT/.tmp" node --import tsx --test test/foreign-adapter.test.ts"
+  TMPDIR="$REPO_ROOT/.tmp" node --import tsx --test test/foreign-adapter.test.ts
   echo "exit_code=$?"
 } 2>&1 | tee -a "$SCRATCH/eval-dialect-unit.log"
 
 banner "$SCRATCH/eval-full-mock.log" "eval-full-mock (reference only — demo mock does not invoke tools)"
 {
-  echo "COMMAND=TMPDIR=.tmp npm run eval -- --mock"
+  echo "COMMAND=TMPDIR="$REPO_ROOT/.tmp" npm run eval -- --mock"
   echo "DEVIATION: unit tests (foreign-adapter.test.ts) gate dialect normalization;"
   echo "full mock eval 2/10 expected — only dialect tasks use SHADOW_MOCK_DIALECT script."
-  TMPDIR=.tmp npm run eval -- --mock || true
+  TMPDIR="$REPO_ROOT/.tmp" npm run eval -- --mock || true
   echo "exit_code=$?"
 } 2>&1 | tee -a "$SCRATCH/eval-full-mock.log"
 
@@ -170,10 +170,10 @@ CHECKS=()
 fail() { CHECKS+=("FAIL: $1"); }
 pass() { CHECKS+=("PASS: $1"); }
 
-grep -q 'TMPDIR=.tmp npm test' "$SCRATCH/verify-run-1.log" && pass 'verify-run-1 has TMPDIR=.tmp npm test' || fail 'verify-run-1 missing TMPDIR=.tmp npm test'
-grep -q 'TMPDIR=.tmp npm test' "$SCRATCH/verify-run-2.log" && pass 'verify-run-2 has TMPDIR=.tmp npm test' || fail 'verify-run-2 missing TMPDIR=.tmp npm test'
-grep -q '# fail 0' "$SCRATCH/verify-run-1.log" && pass 'verify-run-1 tests pass' || fail 'verify-run-1 tests failed'
-grep -q '# fail 0' "$SCRATCH/verify-run-2.log" && pass 'verify-run-2 tests pass' || fail 'verify-run-2 tests failed'
+grep -q "TMPDIR=$REPO_ROOT/.tmp npm test" "$SCRATCH/verify-run-1.log" && pass 'verify-run-1 has TMPDIR npm test' || fail 'verify-run-1 missing TMPDIR npm test'
+grep -q "TMPDIR=$REPO_ROOT/.tmp npm test" "$SCRATCH/verify-run-2.log" && pass 'verify-run-2 has TMPDIR npm test' || fail 'verify-run-2 missing TMPDIR npm test'
+grep -qE '(#|ℹ) fail 0' "$SCRATCH/verify-run-1.log" && pass 'verify-run-1 tests pass' || fail 'verify-run-1 tests failed'
+grep -qE '(#|ℹ) fail 0' "$SCRATCH/verify-run-2.log" && pass 'verify-run-2 tests pass' || fail 'verify-run-2 tests failed'
 grep -q 'BUILD_OK=true' "$SCRATCH/build.log" && pass 'build.log BUILD_OK' || fail 'build.log missing BUILD_OK'
 grep -q 'dist/index.js' "$SCRATCH/build.log" && pass 'build.log references dist/index.js' || fail 'build.log missing dist/index.js'
 grep -q 'node dist/index.js doctor' "$SCRATCH/cli-doctor-1.log" && pass 'cli-doctor-1 has node dist/index.js' || fail 'cli-doctor-1 missing node dist/index.js'

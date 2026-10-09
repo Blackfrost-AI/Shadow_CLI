@@ -17,6 +17,7 @@ import { redact } from '../util/redact.js';
 import type { Context } from '../agent/context.js';
 import { serializeContext } from './snapshot.js';
 import { deriveSessionTitle, normalizeSessionTitle } from './sessionTitle.js';
+import type { SessionStateSnapshot } from './sessionState.js';
 
 // Append-only JSONL session log. Each run gets its own file under
 // <workspaceRoot>/.shadow/sessions/, one JSON object per line: user inputs,
@@ -389,6 +390,23 @@ export class SessionLog {
 
   private constructor(public readonly path: string) {}
 
+  private mainContext?: Context;
+  private readSessionState?: () => SessionStateSnapshot;
+  private snapshotObservers = new WeakMap<Context, Set<() => void>>();
+
+  onContextSnapshot(context: Context, listener: () => void): () => void {
+    const listeners = this.snapshotObservers.get(context) ?? new Set<() => void>();
+    listeners.add(listener);
+    this.snapshotObservers.set(context, listeners);
+    return () => listeners.delete(listener);
+  }
+
+  /** Child contexts share the journal, but cannot replace its resumable main conversation. */
+  bindSessionState(context: Context, read: () => SessionStateSnapshot): void {
+    this.mainContext = context;
+    this.readSessionState = read;
+  }
+
   /**
    * Open a fresh session log. Creates <workspaceRoot>/.shadow/sessions/ (0700) and a
    * new <timestamp>.jsonl file path (timestamp = ISO string with ':' → '-' so
@@ -481,7 +499,7 @@ export class SessionLog {
    * `shell_output`) that are reconstructed from the committed `assistant_done`/`reasoning_done`
    * events. This is the hot path: it is what turns O(tokens) synchronous writes into O(1).
    */
-  recordEvent(event: { type?: string; [k: string]: unknown }): void {
+  recordEvent<T extends { type?: string }>(event: T): void {
     if (typeof event.type === 'string' && SKIP_EVENT_TYPES.has(event.type)) return;
     this.record({ kind: 'event', ...event });
   }
@@ -545,8 +563,11 @@ export class SessionLog {
    */
   recordSnapshot(ctx: Context, turn?: number): void {
     const data = serializeContext(ctx);
+    const child = this.mainContext !== undefined && ctx !== this.mainContext;
+    const kind = child ? 'subagent_context_snapshot' : 'context_snapshot';
+    if (!child && this.readSessionState) data.sessionState = this.readSessionState();
     const msgs = Array.isArray(data.messages) ? data.messages : [];
-    if (!this.title) {
+    if (!this.title && !child) {
       const first = msgs.find((message) => message.role === 'user');
       const text = first?.content.filter((block) => block.type === 'text')
         .map((block) => 'text' in block ? block.text : '').join(' ');
@@ -578,7 +599,7 @@ export class SessionLog {
       delete payload.messages;
       payload.appended = msgs.slice(base.length);
       offset = this.record({
-        kind: 'context_snapshot',
+        kind,
         format: 'delta',
         baseOffset: base.offset,
         messageCount: msgs.length,
@@ -586,9 +607,12 @@ export class SessionLog {
         turn,
       });
     } else {
-      offset = this.record({ kind: 'context_snapshot', format: 'full', data, turn });
+      offset = this.record({ kind, format: 'full', data, turn });
     }
     if (offset === undefined) return; // write failed — lastError is set; bookkeeping unchanged
+    for (const notify of this.snapshotObservers.get(ctx) ?? []) {
+      try { notify(); } catch { /* snapshot observers cannot break the durable main record */ }
+    }
 
     if (chainable && base) {
       this.snapState.set(ctx, {

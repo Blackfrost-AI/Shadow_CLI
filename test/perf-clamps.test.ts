@@ -353,6 +353,10 @@ test('F06-10: agent tool queues excess sub-agents and admits them only on releas
             { type: 'tool_call', call: { id: 's1', name: 'slow_tool', input: {} } },
             { type: 'done', stopReason: 'tool_use' },
           ],
+          [
+            { type: 'text', delta: 'Worker done' },
+            { type: 'done', stopReason: 'end_turn' },
+          ],
         ]),
         registry,
         gate: new ScriptedApprovalGate([], 'approve'),
@@ -502,6 +506,10 @@ test('F06-10: a nested agent call bypasses admission — it cannot deadlock behi
                 [
                   { type: 'tool_call', call: { id: 's1', name: 'slow_tool', input: {} } },
                   { type: 'done', stopReason: 'tool_use' },
+                ],
+                [
+                  { type: 'text', delta: 'A done' },
+                  { type: 'done', stopReason: 'end_turn' },
                 ],
               ])
             : new MockProvider([

@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { atomicWrite } from '../tools/util.js';
 
 // Project memory: a flat string→string KV of durable facts about the workspace
@@ -60,64 +60,144 @@ function setFact(facts: Record<string, string>, key: string, value: string): voi
   }
 }
 
+export interface MemoryMetadata {
+  author: 'user' | 'generated' | 'legacy';
+  scope: 'workspace';
+  source?: string;
+  createdAt: string;
+  updatedAt: string;
+  reviewedAt?: string;
+}
+export interface MemoryEntry extends MemoryMetadata { key: string; value: string }
+export type MemoryWriteOptions = Partial<Pick<MemoryMetadata, 'author' | 'source' | 'reviewedAt'>>;
+
 export class ProjectMemory {
   private constructor(
     private readonly filePath: string,
     private readonly facts: Record<string, string>,
+    private readonly metadata: Map<string, MemoryMetadata>,
   ) {}
 
   /** Load from disk, tolerating a missing or corrupt file (→ empty store). */
   static load(workspaceRoot: string): ProjectMemory {
     const filePath = join(workspaceRoot, MEMORY_FILE);
     const facts: Record<string, string> = {};
+    const metadata = new Map<string, MemoryMetadata>();
     try {
       const parsed: unknown = JSON.parse(readFileSync(filePath, 'utf8'));
       if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
-          // JSON.parse can hand back an OWN __proto__ property — plain assignment would hit
-          // the prototype setter and drop the fact (load/set asymmetry).
-          if (typeof v === 'string') setFact(facts, k, v);
+        const envelope = parsed as Record<string, unknown>;
+        const versioned = envelope.version === 2 && envelope.entries && typeof envelope.entries === 'object' && !Array.isArray(envelope.entries);
+        const entries = versioned ? envelope.entries as Record<string, unknown> : envelope;
+        for (const [k, v] of Object.entries(entries)) {
+          if (!versioned && typeof v === 'string') {
+            setFact(facts, k, v);
+            metadata.set(k, { author: 'legacy', scope: 'workspace', createdAt: '', updatedAt: '', source: 'legacy memory.json (origin unknown)' });
+          } else if (versioned && v && typeof v === 'object') {
+            const entry = v as Record<string, unknown>;
+            if (typeof entry.value !== 'string') continue;
+            setFact(facts, k, entry.value);
+            metadata.set(k, {
+              author: entry.author === 'user' || entry.author === 'generated' ? entry.author : 'legacy',
+              scope: 'workspace',
+              createdAt: typeof entry.createdAt === 'string' ? entry.createdAt : '',
+              updatedAt: typeof entry.updatedAt === 'string' ? entry.updatedAt : '',
+              ...(typeof entry.source === 'string' ? { source: entry.source } : {}),
+              ...(typeof entry.reviewedAt === 'string' ? { reviewedAt: entry.reviewedAt } : {}),
+            });
+          }
         }
       }
     } catch {
       // missing or corrupt — start empty
     }
-    return new ProjectMemory(filePath, facts);
+    return new ProjectMemory(filePath, facts, metadata);
+  }
+
+  /** Slash commands and the model tool may hold separate stores in the same session. */
+  private refresh(): void {
+    const loaded = ProjectMemory.load(dirname(dirname(this.filePath)));
+    for (const key of Object.keys(this.facts)) delete this.facts[key];
+    for (const [key, value] of Object.entries(loaded.facts)) setFact(this.facts, key, value);
+    this.metadata.clear();
+    for (const [key, value] of loaded.metadata) this.metadata.set(key, value);
   }
 
   get(key: string): string | undefined {
+    this.refresh();
     // Own-property lookup only — without the guard, get('toString')/get('__proto__') would
     // return Object.prototype members (a function / the prototype), not a stored fact.
     if (!Object.prototype.hasOwnProperty.call(this.facts, key)) return undefined;
     return this.facts[key];
   }
 
-  set(key: string, value: string): void {
+  set(key: string, value: string, opts: MemoryWriteOptions = {}): void {
+    this.refresh();
     // Keys are model/user-controlled and render into every future system prompt: sanitize at
     // WRITE time too (line breaks flattened, length capped) so a hostile key cannot fake new
     // index lines or `## ` sections. The render path sanitizes again for keys that arrive via
     // a hand-edited memory.json.
     const k = capPairSafe(flatten(key), MEMORY_KEY_MAX);
     if (!k) return; // nothing left after sanitizing — refuse rather than store a ghost key
+    const previous = this.metadata.get(k);
+    const now = new Date().toISOString();
     setFact(this.facts, k, value);
+    this.metadata.set(k, {
+      author: opts.author ?? 'generated', scope: 'workspace',
+      source: opts.source === undefined ? previous?.source : capPairSafe(flatten(opts.source), 500),
+      createdAt: previous?.createdAt || now, updatedAt: now,
+      ...(opts.reviewedAt ? { reviewedAt: opts.reviewedAt } : {}),
+    });
     this.persist();
   }
 
   delete(key: string): boolean {
+    this.refresh();
     if (!Object.prototype.hasOwnProperty.call(this.facts, key)) return false;
     delete this.facts[key];
+    this.metadata.delete(key);
     this.persist();
     return true;
   }
 
+  /** Full provenance is available without changing the legacy string-valued read API. */
+  inspect(key: string): MemoryEntry | undefined {
+    const value = this.get(key);
+    const meta = this.metadata.get(key);
+    return value === undefined || !meta ? undefined : { key, value, ...meta };
+  }
+
+  private entriesSnapshot(): MemoryEntry[] {
+    return Object.keys(this.facts).map((key) => ({ key, value: this.facts[key]!, ...this.metadata.get(key)! }));
+  }
+
+  entries(): MemoryEntry[] {
+    this.refresh();
+    return this.entriesSnapshot();
+  }
+
+  /** Editing requires an existing key, so a typo cannot silently create a second memory. */
+  update(key: string, value: string, opts: MemoryWriteOptions = {}): boolean {
+    if (this.get(key) === undefined) return false;
+    this.set(key, value, opts);
+    return true;
+  }
+
+  /** Facts are stale when unreviewed since their last edit, or older than the supplied cutoff. */
+  stale(before: string): MemoryEntry[] {
+    return this.entries().filter((entry) => !entry.reviewedAt || entry.reviewedAt < entry.updatedAt || entry.reviewedAt < before);
+  }
+
   /** A copy of all facts (callers cannot mutate the store through it). */
   all(): Record<string, string> {
+    this.refresh();
     return { ...this.facts };
   }
 
   /** Render facts as a markdown bullet list for the system prompt, '' if empty. Keys render
    *  through the sanitizer (full values are this renderer's purpose, so they stay intact). */
   asContext(): string {
+    this.refresh();
     const keys = Object.keys(this.facts);
     if (keys.length === 0) return '';
     return keys.map((k) => `- **${keyLabel(k)}**: ${this.facts[k]}`).join('\n');
@@ -131,6 +211,7 @@ export class ProjectMemory {
    * list/recall instead of silently dropping keys. '' if empty.
    */
   asIndex(cap: number = MEMORY_INDEX_CAP): string {
+    this.refresh();
     const keys = Object.keys(this.facts);
     if (keys.length === 0) return '';
     // keyLabel on the KEY too — keys that arrived via a hand-edited memory.json (bypassing
@@ -143,6 +224,7 @@ export class ProjectMemory {
   }
 
   private persist(): void {
-    atomicWrite(this.filePath, JSON.stringify(this.facts, null, 2) + '\n');
+    const entries = Object.fromEntries(this.entriesSnapshot().map(({ key, ...entry }) => [key, entry]));
+    atomicWrite(this.filePath, JSON.stringify({ version: 2, entries }, null, 2) + '\n');
   }
 }

@@ -102,3 +102,13 @@ test('mcp formatters summarize list and detail views', () => {
   assert.doesNotMatch(mcpServerLines('remote', servers.remote).join('\n'), /secret/);
   assert.match(mcpListLines({})[0]!, /enable browser.*enable context-cooler/);
 });
+
+
+test('MCP inspect/list masks URL credentials and nonstandard argument credentials', () => {
+  const remote = { url: 'https://alice:private-password@example.test/mcp?session=private-query#private-fragment', headers: { Authorization: 'private-header' } };
+  const local = { command: 'node', args: ['server.js', '--api-key', 'private-key', '--token=private-token', '--header', 'Authorization: private-auth', '--endpoint', remote.url] };
+  const output = [...mcpServerLines('remote', remote), ...mcpServerLines('local', local), ...mcpListLines({ remote, local })].join('\n');
+  assert.doesNotMatch(output, /private-password|private-query|private-fragment|private-header|private-key|private-token|private-auth/);
+  assert.match(output, /example\.test/);
+  assert.match(output, /server\.js/);
+});

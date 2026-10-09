@@ -1,10 +1,11 @@
 // Fullscreen composition. Components read live state; layout owns the available space.
-import { CURSOR_MARKER, Editor, ScrollView, VStack, truncateToWidth, visibleWidth } from '@earendil-works/pi-tui';
+import { CURSOR_MARKER, Editor, ScrollView, Spacer, VStack, truncateToWidth, visibleWidth } from '@earendil-works/pi-tui';
 import type { Component, EditorTheme, TUI, TuiMouseEvent, TuiMouseEventResult } from '@earendil-works/pi-tui';
 import type { TodoItem } from '../agent/todo.js';
 import type { SubAgentView } from '../tui/subagentPanel.js';
 import { BORDER, GLYPHS, SPACING } from '../tui/glyphs.js';
 import { C } from '../tui/theme.js';
+import { formatDuration } from '../tui/format.js';
 import { approvalText } from '../util/approvalText.js';
 import { bgAnsi, RESET, style } from './ansi.js';
 
@@ -33,6 +34,7 @@ export interface SnowfallState {
 
 const safe = (text: string) => approvalText(text).replace(/\s+/g, ' ').trim();
 const cut = (text: string, width: number) => truncateToWidth(text, Math.max(0, width), '…');
+const STATUS_SPACER_MIN_ROWS = 16;
 
 function rule(label: string, width: number): string {
   const text = cut(` ${label} `, Math.max(0, width - 2));
@@ -69,7 +71,7 @@ export class SnowfallStatus implements Component {
     const parts = [style.fg(color, safe(mode))];
     if (s.running) {
       const frame = GLYPHS.spinner[(s.reducedMotion ? 0 : s.tick) % GLYPHS.spinner.length]!;
-      parts.push(style.fg(C.accent, `${frame} working ${Math.max(0, Math.floor((this.now() - s.startedAt) / 1000))}s`));
+      parts.push(style.fg(C.accent, `${frame} working ${formatDuration((this.now() - s.startedAt) / 1000)}`));
       parts.push(style.dim('Esc interrupt'));
     }
     if (s.queued) parts.push(style.fg(C.yellow, `${s.queued} queued`));
@@ -79,9 +81,12 @@ export class SnowfallStatus implements Component {
     // Keep session activity on the left and compact totals on the right, with equal
     // outer margins. Drop whole optional items when space is tight rather than clip them.
     const available = Math.max(0, width - SPACING.page * 2);
-    const separator = style.dim(' · ');
+    const separatorText = width >= 100 ? '  ·  ' : ' · ';
+    const separator = style.dim(separatorText);
+    const groupGap = width >= 100 ? 6 : 3;
     let left = parts.join(separator);
     const summaries: string[] = [];
+    if (s.missionLine && width >= 110) summaries.push(style.dim(cut(safe(s.missionLine), 28)));
     const activeAgents = s.agents.filter((agent) => !agent.done).length;
     if (activeAgents) summaries.push(style.dim(`${activeAgents} agent${activeAgents === 1 ? '' : 's'}`));
     if (s.todos.length) summaries.push(style.dim(`${s.todos.filter((t) => t.status === 'completed').length}/${s.todos.length} tasks`));
@@ -93,11 +98,11 @@ export class SnowfallStatus implements Component {
     let right = '';
     for (const summary of summaries) {
       const next = right ? right + separator + summary : summary;
-      if (visibleWidth(left) + 3 + visibleWidth(next) <= available) right = next;
+      if (visibleWidth(left) + groupGap + visibleWidth(next) <= available) right = next;
     }
-    const leftRoom = Math.max(0, available - (right ? visibleWidth(right) + 3 : 0));
+    const leftRoom = Math.max(0, available - (right ? visibleWidth(right) + groupGap : 0));
     const detail = s.running ? width >= 100 ? s.toolLine : null : s.providerModel;
-    const detailRoom = leftRoom - visibleWidth(left) - 3;
+    const detailRoom = leftRoom - visibleWidth(left) - separatorText.length;
     if (detail && detailRoom >= 8) left += separator + style.dim(cut(safe(detail), Math.min(40, detailRoom)));
     left = cut(left, leftRoom);
     const padding = ' '.repeat(SPACING.page);
@@ -125,7 +130,9 @@ export class SnowfallEditor extends Editor {
     const lines = super.render(width);
     // Replace existing padding, preserving the editor's exact two-cell input geometry.
     if (width >= 5 && lines[1]?.startsWith('  ')) lines[1] = style.fg(C.accent, GLYPHS.promptPrefix) + lines[1].slice(2);
-    const budget = Math.max(1, Math.min(lines.length, this.rows() - (this.rows() >= 10 ? 5 : 2)));
+    const height = this.rows();
+    const reserved = height >= STATUS_SPACER_MIN_ROWS ? 6 : height >= 10 ? 5 : 2;
+    const budget = Math.max(1, Math.min(lines.length, height - reserved));
     this.rowMap = lines.map((_, i) => i);
     if (lines.length > budget) {
       const cursor = Math.max(1, lines.findIndex((line) => line.includes(CURSOR_MARKER)));
@@ -149,6 +156,7 @@ export function snowfallLayout(document: Component, editor: Component, state: ()
     { component: new SnowfallHeader(state), basis: 2, shrink: 0, visible: ({ height }) => height >= 10 },
     { component: scroll, basis: 0, grow: 1, shrink: 1, minSize: 0 },
     { component: editor, basis: 'auto', shrink: 0 },
+    { component: new Spacer(1), basis: 1, shrink: 0, visible: ({ height }) => height >= STATUS_SPACER_MIN_ROWS },
     { component: new SnowfallStatus(state), basis: 1, shrink: 0 },
   ]);
   return { root, scroll };

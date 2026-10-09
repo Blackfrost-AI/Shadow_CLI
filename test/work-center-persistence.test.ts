@@ -42,8 +42,8 @@ test('restore preserves completed work and marks live/paused work interrupted', 
   const center = new WorkCenter();
   center.restore({ version: 1, capturedAt: 1, items: [item('done'), item('live', 'running'), item('wait', 'paused')] });
   assert.equal(center.get('done')?.status, 'completed');
-  assert.equal(center.get('live')?.status, 'failed');
-  assert.equal(center.get('wait')?.status, 'failed');
+  assert.equal(center.get('live')?.status, 'interrupted');
+  assert.equal(center.get('wait')?.status, 'interrupted');
   assert.match(center.get('live')?.exitReason ?? '', /session ended/);
 });
 

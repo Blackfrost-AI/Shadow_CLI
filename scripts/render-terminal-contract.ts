@@ -6,7 +6,7 @@ const commands = TERMINAL_COMMANDS.map((command) => `| \`${command.name}\` | ${c
 const keys = PI_KEYS.map(({ key, action }) => `| ${key} | ${action} |`).join('\n');
 writeFileSync('docs/TERMINAL_RENDERERS.md', `# Shadow v10 terminal contract
 
-Snowfall is the default interactive terminal in Shadow 10.0.0. It uses pi's
+Snowfall is the default interactive terminal in Shadow v10. It uses pi's
 full-screen engine: a full-width scrollable conversation, a pinned composer and a compact
 status bar. Session activity sits on the left of the footer; task, agent, context and cost
 totals sit on the right as space allows. There is no sidebar. Use \`/tasks\`, \`/agents\`,
@@ -39,11 +39,46 @@ Custom slash commands work in both renderers. Workspace, enabled plugin and glob
 commands use the same loader and argument expansion; builtins always win. New commands are
 recognized when invoked; restart for a refreshed autocomplete inventory after adding files.
 
-Vim composer mode, experimental round-table \`/table\`, shell-driven \`/statusline\`, and
+Vim composer mode, shell-driven \`/statusline\`, and
 \`~/.shadow/keybindings.json\` customization remain Ink-only for v10. They are deliberately
 excluded from the Snowfall surface. Start \`SHADOW_TUI=ink shadow\` (or
 \`SHADOW_TUI=ink npm start\` in this checkout) to use those features. Snowfall's fixed keys
 are listed below. \`/editor\` / Ctrl+G provides external-editor access while idle.
+
+In Snowfall, \`/table\` opens the shared \`/team\` preset picker. Use \`/consult\` for a
+read-only second model and follow-ups. Ink retains its legacy roundtable; new collaboration
+tools are available to its agent through \`tool_search\`.
+
+## Local collaboration
+
+Shadow 10.0.3 adds keyboard-driven workflow overlays for local project work.
+
+- \`/work\`: live workers, shell commands and plan items; Enter opens detail, A opens actions.
+  \`/tasks\` filters the plan. \`/work artifacts\` inspects retained output and offers apply,
+  keep or discard. Failed Git isolation stops the worker before any model call.
+- \`/jobs\`: project-wide durable jobs, attempts, blockers, checks and explicit recovery/retry.
+  Restart never automatically reruns a shell command. \`/room\` shows local project messages.
+- \`/diff\` and \`/review\`: working changes (including untracked files), a comparison base or
+  a commit. Enter opens files; N/P moves between hunks. R selects a reviewer. Model findings
+  remain unverified opinions until independent check evidence exists.
+- \`/consult "profile label" <question>\`, \`/consult list\`, and
+  \`/consult follow <id> <question>\`: separate read-only model contexts with resumable history.
+  Profiles resolve provider, endpoint, credential reference and model together.
+- \`/team\`: choose second opinion, implement-and-review or parallel perspectives; advanced
+  pipeline, debate and plan/solve presets use the same native workers. Every run has a deadline,
+  token ceiling and at most eight stages. \`/team --json\` accepts profile labels, steps,
+  expectedArtifacts and declared checks; see [collaboration guide](COLLABORATION.md).
+- \`/mcp\`: add, test, reconnect and disable a connector live; set timeouts and small tool
+  allowlists. Progress appears in Work Center. Cancellation is sent to the server; it is not
+  proof that a remote worker stopped. Large results have bounded artifact retrieval.
+- \`/skills\` and \`/memory\`: inspect skill sources/conflicts and fact provenance; memory
+  supports show, set and delete. Agents discover semantic navigation and ranked excerpts with
+  \`repository_context\`; lexical fallback is labeled when a language server is unavailable.
+
+Pickers support arrow keys, numbered choices followed by Enter, and / to search. Escape clears
+a search first, then closes the overlay. Active work is interrupted once the overlay is closed.
+Elapsed time changes from seconds to minutes and hours. \`/effort\` shows a selectable list.
+Thinking is a separate block with a bounded preview; Ctrl+O expands transcript detail.
 
 ## Images and terminal behavior
 

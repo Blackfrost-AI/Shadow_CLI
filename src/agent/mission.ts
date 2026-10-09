@@ -157,6 +157,7 @@ export class MissionState {
    * half-shape. Inactive snapshots restore the cleared state.
    */
   restore(candidate: MissionSnapshot): MissionSnapshot {
+    if (candidate?.active === false) return this.clear();
     const snap = coerceSnapshot(candidate);
     if (snap) {
       this.snap = snap;

@@ -3,8 +3,10 @@
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                             ",
       "────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                           ",
+      "  │ I’ll check the layout at each terminal size, then verify that the        │",
+      "  │ composer and status bar stay available.                                  │",
+      "  │ The answer should remain separate from the thinking preview.             │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and",
       "    context totals in the footer.",
@@ -30,22 +32,23 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────╮",
       "▸                                                                               ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────╯",
+      "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "0ba829851e6d792606b24b6c27657af91e2b654d690dc4d2f706b944604d756f"
+    "attributes": "9beefdf6eeb3269b9bfbd83635817393c4cad5ded7e1c1fde6ba484bc5281e7e"
   },
   "snowfall/120": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                                                                   ",
+      "  ╭ ∴ Thought for 1m 5s ─────────────────────────────────────────────────────────────────────────────╮",
+      "  │ I’ll check the layout at each terminal size, then verify that the composer and status bar stay   │",
+      "  │ available.                                                                                       │",
+      "  │ The answer should remain separate from the thinking preview.                                     │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and context totals in the footer.",
       "    ",
@@ -70,23 +73,23 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────╯",
-      "  auto-read · local / frost-coder                                              1 agent · 1/3 tasks · ctx 28% · $0.0123  "
+      "",
+      "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "dd3d96aff86c7ec7ddbc43b2ac236ff1cda18b9c4a982c5b2b0d15b530167b36"
+    "attributes": "5add3c6c95468e3ef48c0fca5e9209e043f20ddd82b750ccd22e6f3f5a69cdb1"
   },
   "snowfall/200": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                                                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                                                                                                                                                   ",
+      "  ╭ ∴ Thought for 1m 5s ─────────────────────────────────────────────────────────────────────────────╮",
+      "  │ I’ll check the layout at each terminal size, then verify that the composer and status bar stay   │",
+      "  │ available.                                                                                       │",
+      "  │ The answer should remain separate from the thinking preview.                                     │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and context totals in the footer.",
       "    ",
@@ -111,23 +114,22 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
-      "  auto-read · local / frost-coder                                                                                                                              1 agent · 1/3 tasks · ctx 28% · $0.0123  "
+      "",
+      "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "651f58ae487d699d96eb3f7fef97018e17f7b291ca28c97d0753dd3747497b25"
+    "attributes": "3f31ab1f28910117f1fed15b42b332fda09e57ed0a6a0b1b01b151c1ec8bd4ef"
   },
   "og/80": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                             ",
       "────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                           ",
+      "  │ I’ll check the layout at each terminal size, then verify that the        │",
+      "  │ composer and status bar stay available.                                  │",
+      "  │ The answer should remain separate from the thinking preview.             │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and",
       "    context totals in the footer.",
@@ -153,22 +155,23 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────╮",
       "▸                                                                               ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────╯",
+      "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "10fe4a0cbdfb1feb5c4de331f2b7b550dd935a4f5eeb9313e07cd2b509d35dda"
+    "attributes": "ba41a84978ed6e6bb33596410d719687a6682d55d535552e7dbb66ce44511fd0"
   },
   "og/120": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                                                                   ",
+      "  ╭ ∴ Thought for 1m 5s ─────────────────────────────────────────────────────────────────────────────╮",
+      "  │ I’ll check the layout at each terminal size, then verify that the composer and status bar stay   │",
+      "  │ available.                                                                                       │",
+      "  │ The answer should remain separate from the thinking preview.                                     │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and context totals in the footer.",
       "    ",
@@ -193,23 +196,23 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────╯",
-      "  auto-read · local / frost-coder                                              1 agent · 1/3 tasks · ctx 28% · $0.0123  "
+      "",
+      "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "08650f0b434d9606e32ee83aa72b2dbc57cb015f8602a3e6f97450932943bf55"
+    "attributes": "c1bb2c623221701a6684b54400eaac5e1a3dcfb6873bd982d369412a85e529d2"
   },
   "og/200": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                                                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                                                                                                                                                   ",
+      "  ╭ ∴ Thought for 1m 5s ─────────────────────────────────────────────────────────────────────────────╮",
+      "  │ I’ll check the layout at each terminal size, then verify that the composer and status bar stay   │",
+      "  │ available.                                                                                       │",
+      "  │ The answer should remain separate from the thinking preview.                                     │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and context totals in the footer.",
       "    ",
@@ -234,23 +237,22 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
-      "  auto-read · local / frost-coder                                                                                                                              1 agent · 1/3 tasks · ctx 28% · $0.0123  "
+      "",
+      "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "6436b9b3e9ae21d2365e511c55a4f839b3a72748a767a54b84c9149248fcafb1"
+    "attributes": "702d556f2e8ffa010d8abbf713baa2221f92b4c4e4acf2a8b60df0929557e7cb"
   },
   "shadow/80": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                             ",
       "────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                           ",
+      "  │ I’ll check the layout at each terminal size, then verify that the        │",
+      "  │ composer and status bar stay available.                                  │",
+      "  │ The answer should remain separate from the thinking preview.             │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and",
       "    context totals in the footer.",
@@ -276,22 +278,23 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────╮",
       "▸                                                                               ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────╯",
+      "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "6e1da300fccc282589f0dacbb6e86849d87c9c8c5ed6772f9aaeabda716f9c50"
+    "attributes": "ca333d12297d874854a94f86b3f8adb8ae6631c1b6d2a04c49dbb400eaf2609c"
   },
   "shadow/120": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                                                                   ",
+      "  ╭ ∴ Thought for 1m 5s ─────────────────────────────────────────────────────────────────────────────╮",
+      "  │ I’ll check the layout at each terminal size, then verify that the composer and status bar stay   │",
+      "  │ available.                                                                                       │",
+      "  │ The answer should remain separate from the thinking preview.                                     │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and context totals in the footer.",
       "    ",
@@ -316,23 +319,23 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────╯",
-      "  auto-read · local / frost-coder                                              1 agent · 1/3 tasks · ctx 28% · $0.0123  "
+      "",
+      "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "dfc69ec47fe9d09e4721eb35a8d3335d6afabe84cdb64515c50b289a40f50623"
+    "attributes": "033c039eff1d466ce1fccc0b08a969754c2ca7ca2f6c85915727fab871e0685a"
   },
   "shadow/200": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                                                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                                                                                                                                                   ",
+      "  ╭ ∴ Thought for 1m 5s ─────────────────────────────────────────────────────────────────────────────╮",
+      "  │ I’ll check the layout at each terminal size, then verify that the composer and status bar stay   │",
+      "  │ available.                                                                                       │",
+      "  │ The answer should remain separate from the thinking preview.                                     │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and context totals in the footer.",
       "    ",
@@ -357,23 +360,22 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
-      "  auto-read · local / frost-coder                                                                                                                              1 agent · 1/3 tasks · ctx 28% · $0.0123  "
+      "",
+      "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "7cd9b2f35827b61f8749c211db69ae9d9d9a8cbf16f844ea30539f84cfeb3f25"
+    "attributes": "e3dab64dbbbbad32432ebbc47ace0f8ee0f6e56870e8655d71a3943bd683cffa"
   },
   "pipboy/80": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                             ",
       "────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                           ",
+      "  │ I’ll check the layout at each terminal size, then verify that the        │",
+      "  │ composer and status bar stay available.                                  │",
+      "  │ The answer should remain separate from the thinking preview.             │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and",
       "    context totals in the footer.",
@@ -399,22 +401,23 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────╮",
       "▸                                                                               ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────╯",
+      "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "7b9174d94fddbcb793b21b979aba53031915c091cb5867264f08c4664ab1152c"
+    "attributes": "cf89871dfa472263651b93b54bfb95c67262ba39f87bae5f778a2b34024d2d31"
   },
   "pipboy/120": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                                                                   ",
+      "  ╭ ∴ Thought for 1m 5s ─────────────────────────────────────────────────────────────────────────────╮",
+      "  │ I’ll check the layout at each terminal size, then verify that the composer and status bar stay   │",
+      "  │ available.                                                                                       │",
+      "  │ The answer should remain separate from the thinking preview.                                     │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and context totals in the footer.",
       "    ",
@@ -439,23 +442,23 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────╯",
-      "  auto-read · local / frost-coder                                              1 agent · 1/3 tasks · ctx 28% · $0.0123  "
+      "",
+      "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "a17d825e658905f9914d09f235756e3104f01ce2492734ef38c79bb230ffeaff"
+    "attributes": "b089256d100d398f60c3b7d4360fa02a368e2cdfd736e709cbd34b74cc349ef8"
   },
   "pipboy/200": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                                                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                                                                                                                                                   ",
+      "  ╭ ∴ Thought for 1m 5s ─────────────────────────────────────────────────────────────────────────────╮",
+      "  │ I’ll check the layout at each terminal size, then verify that the composer and status bar stay   │",
+      "  │ available.                                                                                       │",
+      "  │ The answer should remain separate from the thinking preview.                                     │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and context totals in the footer.",
       "    ",
@@ -480,23 +483,22 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
-      "  auto-read · local / frost-coder                                                                                                                              1 agent · 1/3 tasks · ctx 28% · $0.0123  "
+      "",
+      "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "4ef71b93464a2c55085c928e35768d5e61c7db8d21f8be8b95d898de509cc9ce"
+    "attributes": "c7db50f55e73a7e23486b830a85f30c2c8e76eba1893c43737825afbe16bf175"
   },
   "cyberpunk/80": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                             ",
       "────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                           ",
+      "  │ I’ll check the layout at each terminal size, then verify that the        │",
+      "  │ composer and status bar stay available.                                  │",
+      "  │ The answer should remain separate from the thinking preview.             │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and",
       "    context totals in the footer.",
@@ -522,22 +524,23 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────╮",
       "▸                                                                               ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────╯",
+      "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "859cea1666b57f8877990e58305b1b6938b811bc1f75beec48fca4726b3fcc37"
+    "attributes": "ac8c6215df849437d6be6962ad11dcbdb6e9657cbf3d63ff2388168a40c3464c"
   },
   "cyberpunk/120": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                                                                   ",
+      "  ╭ ∴ Thought for 1m 5s ─────────────────────────────────────────────────────────────────────────────╮",
+      "  │ I’ll check the layout at each terminal size, then verify that the composer and status bar stay   │",
+      "  │ available.                                                                                       │",
+      "  │ The answer should remain separate from the thinking preview.                                     │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and context totals in the footer.",
       "    ",
@@ -562,23 +565,23 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────╯",
-      "  auto-read · local / frost-coder                                              1 agent · 1/3 tasks · ctx 28% · $0.0123  "
+      "",
+      "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "e7f8ee8b5ddd99755d4186073f2400c69eab40212b9b537a308f0822dd19f18c"
+    "attributes": "ea634458dbc27ca6e23537316e52b0a0aea23a837f5452cb51441a46425cdd71"
   },
   "cyberpunk/200": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                                                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                                                                                                                                                   ",
+      "  ╭ ∴ Thought for 1m 5s ─────────────────────────────────────────────────────────────────────────────╮",
+      "  │ I’ll check the layout at each terminal size, then verify that the composer and status bar stay   │",
+      "  │ available.                                                                                       │",
+      "  │ The answer should remain separate from the thinking preview.                                     │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and context totals in the footer.",
       "    ",
@@ -603,23 +606,22 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
-      "  auto-read · local / frost-coder                                                                                                                              1 agent · 1/3 tasks · ctx 28% · $0.0123  "
+      "",
+      "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "35d777fe86c1533c4477c795ae8b83b5b4759df350473a42374ef0aae9e753f1"
+    "attributes": "341ebf888534a9d91b68f4d6b137b68fa8708caa03626f1d64718360215dbd32"
   },
   "coder-chick/80": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                             ",
       "────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                           ",
+      "  │ I’ll check the layout at each terminal size, then verify that the        │",
+      "  │ composer and status bar stay available.                                  │",
+      "  │ The answer should remain separate from the thinking preview.             │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and",
       "    context totals in the footer.",
@@ -645,22 +647,23 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────╮",
       "▸                                                                               ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────╯",
+      "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "ee29aed9dc587d5c5184a6e3595524880af26bec18bbc1ac095f503109bb2ea1"
+    "attributes": "c5f85a6f52d2d587017edc3d48ebd16c2d6ce91bc57e82910efc3bbac69342a4"
   },
   "coder-chick/120": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                                                                   ",
+      "  ╭ ∴ Thought for 1m 5s ─────────────────────────────────────────────────────────────────────────────╮",
+      "  │ I’ll check the layout at each terminal size, then verify that the composer and status bar stay   │",
+      "  │ available.                                                                                       │",
+      "  │ The answer should remain separate from the thinking preview.                                     │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and context totals in the footer.",
       "    ",
@@ -685,23 +688,23 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────╯",
-      "  auto-read · local / frost-coder                                              1 agent · 1/3 tasks · ctx 28% · $0.0123  "
+      "",
+      "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "8c77cd6b79650bed283f0d5278c3b75dea3f38aed605675734a9f6e16e43a2ca"
+    "attributes": "5b6b8c9dd28feaef2d910a5a22fa7ebd88f82d87633544b7e08a6082d60e1739"
   },
   "coder-chick/200": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                                                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                                                                                                                                                   ",
+      "  ╭ ∴ Thought for 1m 5s ─────────────────────────────────────────────────────────────────────────────╮",
+      "  │ I’ll check the layout at each terminal size, then verify that the composer and status bar stay   │",
+      "  │ available.                                                                                       │",
+      "  │ The answer should remain separate from the thinking preview.                                     │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and context totals in the footer.",
       "    ",
@@ -726,23 +729,22 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
-      "  auto-read · local / frost-coder                                                                                                                              1 agent · 1/3 tasks · ctx 28% · $0.0123  "
+      "",
+      "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "d36a41bf20d271f85acb87167519dc8c6895206d8c3e58e5ce4a7a5c8a4c4f56"
+    "attributes": "409a2a0e0564fba8fa16ae8ced53c0aea3b290759118b5d0e0dc1ad6049d9d96"
   },
   "matrix/80": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                             ",
       "────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                           ",
+      "  │ I’ll check the layout at each terminal size, then verify that the        │",
+      "  │ composer and status bar stay available.                                  │",
+      "  │ The answer should remain separate from the thinking preview.             │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and",
       "    context totals in the footer.",
@@ -768,22 +770,23 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────╮",
       "▸                                                                               ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────╯",
+      "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "d1f1ee26bbffd9b5bfb2c78855ae56618a7b87d93049af91e816313fa481be5c"
+    "attributes": "dbfd01562fa8bc87593e02a04755e8c0f5788dca90e5d6097997ede4ba9e6576"
   },
   "matrix/120": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                                                                   ",
+      "  ╭ ∴ Thought for 1m 5s ─────────────────────────────────────────────────────────────────────────────╮",
+      "  │ I’ll check the layout at each terminal size, then verify that the composer and status bar stay   │",
+      "  │ available.                                                                                       │",
+      "  │ The answer should remain separate from the thinking preview.                                     │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and context totals in the footer.",
       "    ",
@@ -808,23 +811,23 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────╯",
-      "  auto-read · local / frost-coder                                              1 agent · 1/3 tasks · ctx 28% · $0.0123  "
+      "",
+      "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "1068f04abef44c1626b723c0fa7236062aa4e4be4889c5d00d1e2affb19893d6"
+    "attributes": "c3cef6dd49da4b9b6ad927071fdee19a6bad153f27b0e04813ec5934a79101c5"
   },
   "matrix/200": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                                                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                                                                                                                                                   ",
+      "  ╭ ∴ Thought for 1m 5s ─────────────────────────────────────────────────────────────────────────────╮",
+      "  │ I’ll check the layout at each terminal size, then verify that the composer and status bar stay   │",
+      "  │ available.                                                                                       │",
+      "  │ The answer should remain separate from the thinking preview.                                     │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and context totals in the footer.",
       "    ",
@@ -849,23 +852,22 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
-      "  auto-read · local / frost-coder                                                                                                                              1 agent · 1/3 tasks · ctx 28% · $0.0123  "
+      "",
+      "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "b3e3f406e46246f47ccb6602829e968632fb27a70ac6c91c8c5062102ee111c1"
+    "attributes": "6e6c7829541ae458b2e5b2323f369c46850264db5a90ce86cdcbcc09a059feaa"
   },
   "mono/80": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                             ",
       "────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                           ",
+      "  │ I’ll check the layout at each terminal size, then verify that the        │",
+      "  │ composer and status bar stay available.                                  │",
+      "  │ The answer should remain separate from the thinking preview.             │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and",
       "    context totals in the footer.",
@@ -891,22 +893,23 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────╮",
       "▸                                                                               ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────╯",
+      "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "aaffa22c3292ca97006ea055e1192dbbb95220b838d10d6be15b6bc985e43694"
+    "attributes": "0b15a5f629a66bef0a5009202defa8db961236aed6a4634000df7fe66410e16e"
   },
   "mono/120": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                                                                   ",
+      "  ╭ ∴ Thought for 1m 5s ─────────────────────────────────────────────────────────────────────────────╮",
+      "  │ I’ll check the layout at each terminal size, then verify that the composer and status bar stay   │",
+      "  │ available.                                                                                       │",
+      "  │ The answer should remain separate from the thinking preview.                                     │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and context totals in the footer.",
       "    ",
@@ -931,23 +934,23 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────╯",
-      "  auto-read · local / frost-coder                                              1 agent · 1/3 tasks · ctx 28% · $0.0123  "
+      "",
+      "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "fd889bbf5cd202490aafb25717c3471729e5a6ba77e450adc9aaf7733df4e28d"
+    "attributes": "dc3d7bfa76b165682992a5c03f0de71e596efd4744715d131b3aeab5b5e286ee"
   },
   "mono/200": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                                                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                                                                                                                                                   ",
+      "  ╭ ∴ Thought for 1m 5s ─────────────────────────────────────────────────────────────────────────────╮",
+      "  │ I’ll check the layout at each terminal size, then verify that the composer and status bar stay   │",
+      "  │ available.                                                                                       │",
+      "  │ The answer should remain separate from the thinking preview.                                     │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and context totals in the footer.",
       "    ",
@@ -972,23 +975,22 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
-      "  auto-read · local / frost-coder                                                                                                                              1 agent · 1/3 tasks · ctx 28% · $0.0123  "
+      "",
+      "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "79cb31944dabde687e65b355e2206fe2ac07e2c9920cdcb39d65c9652ed03c3d"
+    "attributes": "aa4cb0942518f9638acda9dc7c21443259f5302b97fc0ea3ce992566bfc822e4"
   },
   "light/80": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                             ",
       "────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                           ",
+      "  │ I’ll check the layout at each terminal size, then verify that the        │",
+      "  │ composer and status bar stay available.                                  │",
+      "  │ The answer should remain separate from the thinking preview.             │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and",
       "    context totals in the footer.",
@@ -1014,22 +1016,23 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────╮",
       "▸                                                                               ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────╯",
+      "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "df85469d0dd861080a113ef4da095e636990dbddc2018ab84d51918b839418b7"
+    "attributes": "9d37f80ecf6f0bc1bdbd087a2dc73b2b313a24c56af591e51840590372c33af2"
   },
   "light/120": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                                                                   ",
+      "  ╭ ∴ Thought for 1m 5s ─────────────────────────────────────────────────────────────────────────────╮",
+      "  │ I’ll check the layout at each terminal size, then verify that the composer and status bar stay   │",
+      "  │ available.                                                                                       │",
+      "  │ The answer should remain separate from the thinking preview.                                     │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and context totals in the footer.",
       "    ",
@@ -1054,23 +1057,23 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────╯",
-      "  auto-read · local / frost-coder                                              1 agent · 1/3 tasks · ctx 28% · $0.0123  "
+      "",
+      "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "b1b62d5badcf20e3a03f189d833178eca878ae56a34c52997d21f0c355c6fc7f"
+    "attributes": "dce239bd19295308eff453a74310108aa0a921cd96c5dede8afe6d87a366a2d9"
   },
   "light/200": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                                                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                                                                                                                                                   ",
+      "  ╭ ∴ Thought for 1m 5s ─────────────────────────────────────────────────────────────────────────────╮",
+      "  │ I’ll check the layout at each terminal size, then verify that the composer and status bar stay   │",
+      "  │ available.                                                                                       │",
+      "  │ The answer should remain separate from the thinking preview.                                     │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and context totals in the footer.",
       "    ",
@@ -1095,23 +1098,22 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
-      "  auto-read · local / frost-coder                                                                                                                              1 agent · 1/3 tasks · ctx 28% · $0.0123  "
+      "",
+      "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "ccb60588ae77a1d727fb940121e32db19dc993fcd302d727fcb462e7bc818639"
+    "attributes": "00ea2944e1d5e47b23d74302d9a39d70eaf9a64570fddc05dba03928e95d3cf2"
   },
   "colorblind/80": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                             ",
       "────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                           ",
+      "  │ I’ll check the layout at each terminal size, then verify that the        │",
+      "  │ composer and status bar stay available.                                  │",
+      "  │ The answer should remain separate from the thinking preview.             │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and",
       "    context totals in the footer.",
@@ -1137,22 +1139,23 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────╮",
       "▸                                                                               ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────╯",
+      "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "048dfbc61b554e9844003a6c5b848ade9acd56159f5cc0683c19ec5d634a0ae5"
+    "attributes": "111b030b433dabad96499886919c18ad60b1049c1a94c309105c903960efa611"
   },
   "colorblind/120": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                                                                   ",
+      "  ╭ ∴ Thought for 1m 5s ─────────────────────────────────────────────────────────────────────────────╮",
+      "  │ I’ll check the layout at each terminal size, then verify that the composer and status bar stay   │",
+      "  │ available.                                                                                       │",
+      "  │ The answer should remain separate from the thinking preview.                                     │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and context totals in the footer.",
       "    ",
@@ -1177,23 +1180,23 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────╯",
-      "  auto-read · local / frost-coder                                              1 agent · 1/3 tasks · ctx 28% · $0.0123  "
+      "",
+      "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "8c8d6872617801e4adf3a3ca079a7657bc4b7e0514106baa6e11d77d5e5c524f"
+    "attributes": "763d570c850f9f6f78681a44fe92e022625b3df013c8381049cb2da5a660649f"
   },
   "colorblind/200": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                                                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                                                                                                                                                   ",
+      "  ╭ ∴ Thought for 1m 5s ─────────────────────────────────────────────────────────────────────────────╮",
+      "  │ I’ll check the layout at each terminal size, then verify that the composer and status bar stay   │",
+      "  │ available.                                                                                       │",
+      "  │ The answer should remain separate from the thinking preview.                                     │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and context totals in the footer.",
       "    ",
@@ -1218,23 +1221,22 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
-      "  auto-read · local / frost-coder                                                                                                                              1 agent · 1/3 tasks · ctx 28% · $0.0123  "
+      "",
+      "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "3ba356bfed7e04c1c7a3275b9d298e0c492c67c9138040fd029196337d777972"
+    "attributes": "c430fbd7874eeb91abc7e31d8cfaa04fe78a8408e417e8ed2a04fe655be6d649"
   },
   "high-contrast/80": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                             ",
       "────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                           ",
+      "  │ I’ll check the layout at each terminal size, then verify that the        │",
+      "  │ composer and status bar stay available.                                  │",
+      "  │ The answer should remain separate from the thinking preview.             │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and",
       "    context totals in the footer.",
@@ -1260,22 +1262,23 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────╮",
       "▸                                                                               ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────╯",
+      "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "1e87125d94e6d74b488721e3db9108363e3065e31f046785316e6539fa371fee"
+    "attributes": "ea4a27cc300d96ea512a8b3227778f76bbafcba4249e1102656ff1797ec08d24"
   },
   "high-contrast/120": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                                                                   ",
+      "  ╭ ∴ Thought for 1m 5s ─────────────────────────────────────────────────────────────────────────────╮",
+      "  │ I’ll check the layout at each terminal size, then verify that the composer and status bar stay   │",
+      "  │ available.                                                                                       │",
+      "  │ The answer should remain separate from the thinking preview.                                     │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and context totals in the footer.",
       "    ",
@@ -1300,23 +1303,23 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────╯",
-      "  auto-read · local / frost-coder                                              1 agent · 1/3 tasks · ctx 28% · $0.0123  "
+      "",
+      "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "be2020ac057f102f10fdb2ce0ea011e97c484e73bda2675b109ccbcab116dc83"
+    "attributes": "b66275f1adc063ce59ba433bc0fdec3651aa5e1e76ef77b3348c70efe4c9a6e5"
   },
   "high-contrast/200": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                                                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
-      "◇ Finish the Snowfall build, then show me the result.                                                                                                                                                   ",
+      "  ╭ ∴ Thought for 1m 5s ─────────────────────────────────────────────────────────────────────────────╮",
+      "  │ I’ll check the layout at each terminal size, then verify that the composer and status bar stay   │",
+      "  │ available.                                                                                       │",
+      "  │ The answer should remain separate from the thinking preview.                                     │",
+      "  ╰ Ctrl+O expand ───────────────────────────────────────────────────────────────────────────────────╯",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and context totals in the footer.",
       "    ",
@@ -1341,15 +1344,12 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
-      "",
-      "",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
-      "  auto-read · local / frost-coder                                                                                                                              1 agent · 1/3 tasks · ctx 28% · $0.0123  "
+      "",
+      "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "270d52603ecf060cbcb74c2aae64e0595d8f90a5824ef1493e3b14edf0e62319"
+    "attributes": "b7ece7e751947f996e5b987491e0ba8eafe6e2bef7d0b9476a4d9322846c9db6"
   }
 }

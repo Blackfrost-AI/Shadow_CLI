@@ -139,12 +139,19 @@ export async function* sseEvents(lines: AsyncIterable<string>): AsyncIterable<Ss
  * result for keepalives, `[DONE]` remnants, and malformed frames — callers skip, as they
  * always did.
  */
-export function parseSseData(data: string, parts: string[]): unknown[] {
+export type SseParseOutcome = 'malformed' | 'ignored';
+
+export function parseSseData(
+  data: string,
+  parts: string[],
+  onOutcome?: (outcome: SseParseOutcome) => void,
+): unknown[] {
   const out: unknown[] = [];
   const tryPush = (s: string): boolean => {
     try {
       const v: unknown = JSON.parse(s);
       if (v !== null && typeof v === 'object') out.push(v);
+      else onOutcome?.('ignored');
       return true;
     } catch {
       return false;
@@ -157,9 +164,9 @@ export function parseSseData(data: string, parts: string[]): unknown[] {
     for (const p of parts) {
       const t = p.trim();
       if (!t) continue;
-      tryPush(t);
+      if (!tryPush(t)) onOutcome?.('malformed');
     }
-  }
+  } else onOutcome?.('malformed');
   return out;
 }
 

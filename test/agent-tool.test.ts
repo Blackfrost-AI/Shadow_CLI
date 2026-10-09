@@ -3,11 +3,12 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { execSync } from 'node:child_process';
+import { execFileSync, execSync } from 'node:child_process';
 import { makeAgentTool } from '../src/tools/agentTool.js';
 import { Budget } from '../src/agent/budget.js';
 import { Context } from '../src/agent/context.js';
-import { EventBus } from '../src/agent/events.js';
+import { EventBus, SubagentBus, type LoopEvent, type LoopListener } from '../src/agent/events.js';
+import { WorkCenter } from '../src/app/workCenter.js';
 import { ToolRegistry } from '../src/tools/registry.js';
 import { registerBuiltinTools } from '../src/tools/index.js';
 import { ScriptedApprovalGate, type ApprovalDecision } from '../src/agent/approval.js';
@@ -18,6 +19,7 @@ import type { AutonomyLevel } from '../src/safety/permissions.js';
 import type { CompletionRequest, Provider, ProviderEvent } from '../src/provider/provider.js';
 import { serializeContext, hydrateContext } from '../src/state/snapshot.js';
 import { listWorktrees } from '../src/tools/worktree.js';
+import { JobStore } from '../src/state/jobStore.js';
 
 const PRICE = { mock: { input: 1, output: 1 } };
 
@@ -84,6 +86,8 @@ test('sub-agent honors an approved write at manual autonomy', async () => {
 test('agent with isolation:worktree uses isolated sub workspace (creates .shadow/worktrees entry)', async () => {
   const ws = mkdtempSync(join(tmpdir(), 'agent-wt-'));
   try {
+    execFileSync('git', ['init', '-q'], { cwd: ws });
+    execFileSync('git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '--allow-empty', '-qm', 'initial'], { cwd: ws });
     const registry = new ToolRegistry();
     registerBuiltinTools(registry);
     const provider = new MockProvider([ [{ type: 'done', stopReason: 'end_turn' as any }] ]);
@@ -107,7 +111,7 @@ test('agent with isolation:worktree uses isolated sub workspace (creates .shadow
     const ctx: ToolContext = { workspaceRoot: ws, signal: new AbortController().signal, log: () => {}, dryRun: false };
     const res = await tool.run({ prompt: 'noop', isolation: 'worktree' } as any, ctx);
     assert.ok(res.ok);
-    // verify worktree dir was created (even if git not present, fallback)
+    // The managed root remains after a genuinely empty checkout is cleaned.
     const wtRoot = join(ws, '.shadow/worktrees');
     assert.ok(existsSync(wtRoot), 'worktrees root created for isolation');
   } finally {
@@ -123,7 +127,11 @@ test('agent with run_in_background returns taskId immediately (non blocking)', a
     const provider = new MockProvider([ [{ type: 'done', stopReason: 'end_turn' as any }] ]);
     const bus = new EventBus();
     let launched: any = null;
-    bus.on((e: any) => { if (e.type === 'bg_agent_launched') launched = e; });
+    let completed = false;
+    bus.on((e: any) => {
+      if (e.type === 'bg_agent_launched') launched = e;
+      if (e.type === 'task_notification') completed = true;
+    });
     const makeLoopDeps = (): LoopDeps => ({
       provider,
       registry,
@@ -147,6 +155,10 @@ test('agent with run_in_background returns taskId immediately (non blocking)', a
     const data = res.data as any;
     assert.ok(data.taskId && data.status === 'started', 'bg agent must return taskId immediately without awaiting full result');
     assert.ok(launched && launched.taskId === data.taskId, 'bg launch must emit bg_agent_launched for main ctx recording');
+    // Keep the launch assertion non-blocking, then await persistence/SQLite close
+    // before removing the fixture directory (Windows cannot unlink an open DB).
+    for (let i = 0; !completed && i < 1000; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert.equal(completed, true, 'background fixture must settle before filesystem cleanup');
   } finally {
     rmSync(ws, { recursive: true, force: true });
   }
@@ -336,12 +348,13 @@ test('BUG 3: agent tool emits subagent_start/end lifecycle + tags forwarded tool
     writeFileSync(join(ws, 'a.ts'), 'export const x = 1;\n');
     const registry = new ToolRegistry();
     registerBuiltinTools(registry);
-    // sub-agent: reads a file (one tool), then the provider has no more turns → loop ends.
+    // A successful sub-agent reads a file, then returns its findings.
     const provider = new MockProvider([
       [
         { type: 'tool_call', call: { id: 'r1', name: 'read_file', input: { path: 'a.ts' } } },
         { type: 'done', stopReason: 'tool_use' },
       ],
+      [{ type: 'text', delta: 'The file exports x = 1.' }, { type: 'done', stopReason: 'end_turn' }],
     ]);
     const bus = new EventBus();
     const seen: Array<{ type: string; [k: string]: unknown }> = [];
@@ -434,9 +447,13 @@ test('max_iterations sub-agent salvage pass delivers a PARTIAL report', async ()
     const registry = new ToolRegistry();
     registerBuiltinTools(registry);
     let salvageRequested = false;
+    const seen: LoopEvent[] = [];
+    const bus = new EventBus();
+    bus.on((event) => seen.push(event));
     const provider = new MockProvider([
       // turn 1: burn the iteration cap with a tool call
       [
+        { type: 'text', delta: 'I will inspect the files.' },
         { type: 'tool_call', call: { id: 'r1', name: 'read_file', input: { path: 'a.txt' } } },
         { type: 'done', stopReason: 'tool_use' },
       ],
@@ -455,7 +472,7 @@ test('max_iterations sub-agent salvage pass delivers a PARTIAL report', async ()
       provider,
       registry,
       gate: new ScriptedApprovalGate([], 'approve'),
-      bus: new EventBus(),
+      bus,
       budget: new Budget({ maxIterations: 1 }, 'mock', PRICE, Date.now()),
       context: new Context({ contextBudget: 1_000_000, triggerRatio: 0.75, keepLastTurns: 6 }),
       signal: new AbortController().signal,
@@ -479,6 +496,10 @@ test('max_iterations sub-agent salvage pass delivers a PARTIAL report', async ()
     const ctx: ToolContext = { workspaceRoot: ws, signal: new AbortController().signal, log: () => {}, dryRun: false };
     const res = await tool.run({ prompt: 'review the codebase' }, ctx);
     assert.equal(salvageRequested, true, 'the salvage pass must run on a ceiling stop');
+    assert.equal(res.ok, true, 'a controlled stop keeps its clean tool-result contract');
+    assert.equal(res.data?.status, 'partial');
+    assert.equal(seen.find((event) => event.type === 'subagent_end')?.ok, false, 'partial work is not completed');
+    assert.doesNotMatch(res.summary, /I will inspect/, 'the closing report takes precedence over stale commentary');
     assert.ok(
       String(res.summary).includes('PARTIAL'),
       `the ceiling-stopped agent's report must reach the parent, got: ${res.summary}`,
@@ -490,4 +511,347 @@ test('max_iterations sub-agent salvage pass delivers a PARTIAL report', async ()
   } finally {
     rmSync(ws, { recursive: true, force: true });
   }
+});
+
+// Regression (harness-fix): an abnormal stop with no answer must NEVER deliver a blank
+// <task-notification>. Six reviewer sub-agents once delivered empty bodies and the parent
+// had no way to know why or to retry. The stop's diagnostic (loop's `error` event) must
+// ride along in the answer.
+test('bg sub-agent stopped abnormally delivers a non-empty diagnostic notification', async () => {
+  const ws = mkdtempSync(join(tmpdir(), 'agent-bg-stop-'));
+  try {
+    const registry = new ToolRegistry();
+    registerBuiltinTools(registry);
+    // max_tokens with no answer text → loop emits an error diagnostic and stops empty.
+    const provider = new MockProvider([[{ type: 'done', stopReason: 'max_tokens' }]]);
+    const bus = new EventBus();
+    const notifs: any[] = [];
+    const work = new WorkCenter();
+    work.subscribe(bus);
+    bus.on((e: any) => { if (e.type === 'task_notification') notifs.push(e); });
+    const makeLoopDeps = (): LoopDeps => ({
+      provider,
+      registry,
+      gate: new ScriptedApprovalGate([], 'approve'),
+      bus,
+      budget: new Budget({ maxIterations: 5 }, 'mock', PRICE, Date.now()),
+      context: new Context({ contextBudget: 1_000_000, triggerRatio: 0.75, keepLastTurns: 6 }),
+      signal: new AbortController().signal,
+      model: 'mock',
+      system: 'test',
+      maxOutputTokens: 256,
+      workspaceRoot: ws,
+      dryRun: false,
+      maxToolResultChars: 1000,
+      contextBudget: 1_000_000,
+    });
+    const tool = makeAgentTool({
+      makeLoopDeps, getAutonomy: () => 'full', contextBudget: 1_000_000,
+      triggerRatio: 0.75, keepLastTurns: 2, maxIterations: 5, priceTable: PRICE,
+    });
+    const ctx: ToolContext = { workspaceRoot: ws, signal: new AbortController().signal, log: () => {}, dryRun: false };
+    const res = await tool.run({ prompt: 'review', run_in_background: true } as any, ctx);
+    assert.ok(res.ok);
+    const taskId = (res.data as { taskId: string }).taskId;
+    // The bg run completes asynchronously; wait for its notification (test timeout is 60s).
+    for (let waited = 0; notifs.length === 0 && waited < 5000; waited += 25) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.equal(notifs.length, 1, 'exactly one notification must arrive');
+    assert.equal(notifs[0].taskId, taskId);
+    assert.ok(notifs[0].answer.length > 0, 'the notification body must never be blank');
+    assert.ok(notifs[0].answer.includes('max_tokens'), `the stop reason must be named, got: ${notifs[0].answer}`);
+    assert.match(notifs[0].answer, /output-token cap/, 'keep the actual diagnostic, not only the stop code');
+    assert.equal(work.get(taskId)?.status, 'failed', 'the work registry must not show completed');
+    assert.equal(work.get(taskId)?.finalOutput, notifs[0].answer);
+    work.unsubscribe();
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+test('sync sub-agent stopped abnormally reports the failure, never "Sub-agent completed."', async () => {
+  const ws = mkdtempSync(join(tmpdir(), 'agent-sync-stop-'));
+  try {
+    const registry = new ToolRegistry();
+    registerBuiltinTools(registry);
+    // Three empty end_turns → the loop's empty-response recovery exhausts and stops
+    // with provider_error and an empty finalAnswer.
+    const provider = new MockProvider();
+    const makeLoopDeps = (): LoopDeps => ({
+      provider,
+      registry,
+      gate: new ScriptedApprovalGate([], 'approve'),
+      bus: new EventBus(),
+      budget: new Budget({ maxIterations: 10 }, 'mock', PRICE, Date.now()),
+      context: new Context({ contextBudget: 1_000_000, triggerRatio: 0.75, keepLastTurns: 6 }),
+      signal: new AbortController().signal,
+      model: 'mock',
+      system: 'test',
+      maxOutputTokens: 256,
+      workspaceRoot: ws,
+      dryRun: false,
+      maxToolResultChars: 1000,
+      contextBudget: 1_000_000,
+    });
+    const tool = makeAgentTool({
+      makeLoopDeps, getAutonomy: () => 'full', contextBudget: 1_000_000,
+      triggerRatio: 0.75, keepLastTurns: 2, maxIterations: 10, priceTable: PRICE,
+    });
+    const ctx: ToolContext = { workspaceRoot: ws, signal: new AbortController().signal, log: () => {}, dryRun: false };
+    const res = await tool.run({ prompt: 'review' } as any, ctx);
+    assert.equal(res.ok, false, 'provider failure must be a failed tool result');
+    assert.equal(res.data?.answer, res.summary, 'structured consumers receive the same diagnostic');
+    assert.equal(res.data?.status, 'failed');
+    assert.equal(String(res.summary).includes('Sub-agent completed.'), false,
+      `an abnormal stop must not masquerade as success, got: ${res.summary}`);
+    assert.ok(String(res.summary).includes('provider_error'),
+      `the stop reason must be named, got: ${res.summary}`);
+    assert.ok(String(res.summary).includes('empty response'),
+      `the loop's diagnostic must ride along, got: ${res.summary}`);
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+function outcomeHarness(provider: Provider, maxIterations = 10, concurrency = 4) {
+  const ws = mkdtempSync(join(tmpdir(), 'agent-outcome-'));
+  const registry = new ToolRegistry();
+  registerBuiltinTools(registry);
+  const bus = new EventBus();
+  const events: LoopEvent[] = [];
+  const off = bus.on((event) => events.push(event));
+  const work = new WorkCenter();
+  work.subscribe(bus);
+  const makeLoopDeps = (): LoopDeps => ({
+    provider, registry, bus, gate: new ScriptedApprovalGate([], 'approve'),
+    budget: new Budget({ maxIterations }, 'mock', PRICE, Date.now()),
+    context: new Context({ contextBudget: 1_000_000, triggerRatio: 0.75, keepLastTurns: 6 }),
+    signal: new AbortController().signal, model: 'mock', system: 'test', maxOutputTokens: 256,
+    workspaceRoot: ws, dryRun: false, maxToolResultChars: 1000, contextBudget: 1_000_000,
+  });
+  const tool = makeAgentTool({
+    makeLoopDeps, getAutonomy: () => 'full', contextBudget: 1_000_000,
+    triggerRatio: 0.75, keepLastTurns: 2, maxIterations, priceTable: PRICE,
+    subagentConcurrency: concurrency,
+  });
+  const controller = new AbortController();
+  const ctx: ToolContext = { workspaceRoot: ws, signal: controller.signal, log: () => {}, dryRun: false };
+  return {
+    tool, ctx, bus, events, work, controller,
+    close: () => { controller.abort(); off(); work.unsubscribe(); rmSync(ws, { recursive: true, force: true }); },
+  };
+}
+
+test('prepared jobs reject different task input before invoking a provider', async () => {
+  let calls = 0;
+  const h = outcomeHarness(new MockProvider([() => { calls++; return [{ type: 'text', delta: 'answer' }, { type: 'done', stopReason: 'end_turn' }]; }]));
+  const store = new JobStore(h.ctx.workspaceRoot);
+  try {
+    store.createJob({ prompt: 'recorded task' }, { id: 'prepared' });
+    const result = await h.tool.run({ prompt: 'different task', job_id: 'prepared' }, h.ctx);
+    assert.equal(result.ok, false); assert.match(result.summary, /prompt differs/); assert.equal(calls, 0);
+    assert.equal(store.get('prepared')?.attempts.length, 0);
+  } finally { store.close(); h.close(); }
+});
+
+test('closing report usage is charged once to the inherited budget', async () => {
+  const h = outcomeHarness(new MockProvider([
+    [{ type: 'tool_call', call: { id: 'fixture-read', name: 'read_file', input: { path: 'a.txt' } } }, { type: 'usage', inputTokens: 11, outputTokens: 7 }, { type: 'done', stopReason: 'tool_use' }],
+    [{ type: 'text', delta: 'PARTIAL findings' }, { type: 'usage', inputTokens: 13, outputTokens: 5 }, { type: 'done', stopReason: 'end_turn' }],
+  ]), 1);
+  try {
+    const parent = new Budget({ maxIterations: 100, maxTotalTokens: 1_000_000 }, 'mock', PRICE, Date.now());
+    const result = await h.tool.run({ prompt: 'fixture' }, { ...h.ctx, parentBudget: parent, rootBudget: parent });
+    assert.equal(result.data?.status, 'partial');
+    assert.equal(parent.totalInputTokens, 24); assert.equal(parent.totalOutputTokens, 12);
+    const store = new JobStore(h.ctx.workspaceRoot);
+    try { assert.equal(store.get(result.data!.jobId!)?.attempts[0]?.usage?.inputTokens, 24); } finally { store.close(); }
+  } finally { h.close(); }
+});
+
+test('directed room follow-up reaches an active agent at its next model boundary', async () => {
+  let sawMessage = false; let turn = 0;
+  const provider: Provider = { name: 'fixture', estimateTokens: () => 1,
+    async *send(request) {
+      if (++turn === 1) {
+        yield { type: 'tool_call', call: { id: 'read', name: 'read_file', input: { path: 'a.txt' } } };
+        yield { type: 'done', stopReason: 'tool_use' };
+      } else {
+        sawMessage = JSON.stringify(request.messages).includes('also inspect the edge case');
+        yield { type: 'text', delta: 'finished' }; yield { type: 'done', stopReason: 'end_turn' };
+      }
+    } };
+  const h = outcomeHarness(provider);
+  const store = new JobStore(h.ctx.workspaceRoot);
+  h.bus.on((event) => {
+    if (event.type === 'subagent_start' && event.jobId) store.postMessage({ room: 'project', from: 'lead', to: event.jobId, body: 'also inspect the edge case' });
+  });
+  try { const result = await h.tool.run({ prompt: 'inspect fixture' }, h.ctx); assert.equal(result.ok, true); assert.equal(sawMessage, true); }
+  finally { store.close(); h.close(); }
+});
+
+for (const background of [false, true]) {
+  for (const stop of ['provider_error', 'max_tokens', 'fatal_tool_error'] as const) {
+    test(`${background ? 'bg' : 'sync'} ${stop} reports failure before retaining partial findings`, async () => {
+      const terminal: ProviderEvent[] = stop === 'provider_error'
+        ? [{ type: 'error', recoverable: false, code: 'mock_failure', message: 'Mock endpoint rejected the request.' }]
+        : [{ type: 'done', stopReason: stop === 'max_tokens' ? 'max_tokens' : 'tool_use' }];
+      const provider = new MockProvider([
+        [{ type: 'text', delta: 'I inspected the first file.' }, ...terminal],
+        ...(stop === 'fatal_tool_error' ? [terminal, terminal, terminal] : []),
+      ]);
+      const h = outcomeHarness(provider);
+      try {
+        const result = await h.tool.run({ prompt: 'review', run_in_background: background }, h.ctx);
+        let answer: string;
+        if (background) {
+          assert.equal(result.ok, true, 'the background launch itself succeeded');
+          for (let n = 0; !h.events.some((e) => e.type === 'task_notification') && n < 200; n++) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+          const notification = h.events.find((e) => e.type === 'task_notification');
+          assert.ok(notification && notification.type === 'task_notification');
+          answer = notification.answer;
+          assert.equal(h.work.get(result.data!.taskId!)?.status, 'failed');
+          assert.equal(h.work.get(result.data!.taskId!)?.finalOutput, answer);
+        } else {
+          assert.equal(result.ok, false);
+          assert.equal(result.data?.status, 'failed');
+          assert.equal(result.data?.answer, result.summary);
+          answer = result.summary;
+        }
+        assert.match(answer, new RegExp(`^agent stopped \\(${stop}\\):`));
+        assert.match(answer, /PARTIAL findings:\nI inspected the first file\./);
+        if (stop === 'provider_error') assert.match(answer, /Mock endpoint rejected the request/);
+        const ends = h.events.filter((e) => e.type === 'subagent_end');
+        assert.equal(ends.length, 1);
+        assert.equal(ends[0].ok, false);
+      } finally { h.close(); }
+    });
+  }
+
+  test(`${background ? 'bg' : 'sync'} truncation after tool recovery does not report a stale error`, async () => {
+    const provider = new MockProvider([
+      [
+        { type: 'error', recoverable: true, code: 'bad_tool_json', message: 'Earlier tool arguments were invalid JSON.' },
+        { type: 'done', stopReason: 'tool_use' },
+      ],
+      [
+        { type: 'tool_call', call: { id: 'recovered-read', name: 'read_file', input: { path: 'demo.txt' } } },
+        { type: 'done', stopReason: 'tool_use' },
+      ],
+      [
+        { type: 'text', delta: 'The recovered read found one issue.' },
+        { type: 'done', stopReason: 'max_tokens' },
+      ],
+    ]);
+    const h = outcomeHarness(provider);
+    try {
+      writeFileSync(join(h.ctx.workspaceRoot, 'demo.txt'), 'Review fixture.\n');
+      const result = await h.tool.run({ prompt: 'review', run_in_background: background }, h.ctx);
+      let answer: string;
+      if (background) {
+        assert.equal(result.ok, true, 'the background launch itself succeeded');
+        for (let n = 0; !h.events.some((e) => e.type === 'task_notification') && n < 200; n++) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        const notification = h.events.find((e) => e.type === 'task_notification');
+        assert.ok(notification && notification.type === 'task_notification');
+        answer = notification.answer;
+        assert.equal(h.work.get(result.data!.taskId!)?.status, 'failed');
+        assert.equal(h.work.get(result.data!.taskId!)?.finalOutput, answer);
+      } else {
+        assert.equal(result.ok, false);
+        assert.equal(result.data?.status, 'failed');
+        assert.equal(result.data?.stopReason, 'max_tokens');
+        assert.equal(result.data?.answer, result.summary);
+        answer = result.summary;
+      }
+      assert.ok(h.events.some((e) => e.type === 'error' && e.message.includes('bad_tool_json')));
+      assert.ok(h.events.some((e) => e.type === 'tool_end' && e.call.id === 'recovered-read' && e.result.ok));
+      assert.match(answer, /^agent stopped \(max_tokens\):.*output-token cap/);
+      assert.match(answer, /PARTIAL findings:\nThe recovered read found one issue\./);
+      assert.doesNotMatch(answer, /bad_tool_json|Earlier tool arguments/);
+      assert.equal(h.events.find((e) => e.type === 'subagent_end')?.ok, false);
+    } finally { h.close(); }
+  });
+}
+
+test('sync cancellation takes precedence over provider diagnostics and retains partial findings', async () => {
+  let calls = 0;
+  const provider: Provider = {
+    name: 'mock', estimateTokens: () => 1,
+    async *send() {
+      if (++calls === 1) {
+        yield { type: 'text', delta: 'First finding.' };
+        yield { type: 'tool_call', call: { id: 'read', name: 'read_file', input: { path: 'demo.txt' } } };
+        yield { type: 'done', stopReason: 'tool_use' };
+        return;
+      }
+      h.controller.abort();
+      yield { type: 'error', recoverable: false, code: 'aborted', message: 'request aborted downstream' };
+    },
+  };
+  const h = outcomeHarness(provider);
+  try {
+    const result = await h.tool.run({ prompt: 'review' }, h.ctx);
+    assert.equal(result.ok, false);
+    assert.equal(result.error?.code, 'aborted');
+    assert.equal(result.data?.status, 'cancelled');
+    assert.match(result.summary, /^agent cancelled by user/);
+    assert.match(result.summary, /PARTIAL findings:\nFirst finding\./);
+    assert.doesNotMatch(result.summary, /provider_error|completed/);
+    assert.equal(h.events.find((e) => e.type === 'subagent_end')?.ok, false);
+  } finally { h.close(); }
+});
+
+test('a controlled budget stop stays a clean tool result while work remains incomplete', async () => {
+  const h = outcomeHarness(new MockProvider());
+  const parent = new Budget({ maxIterations: 10, maxTotalTokens: 1 }, 'mock', PRICE, Date.now());
+  parent.recordUsage({ inputTokens: 1, outputTokens: 0 }, Date.now());
+  try {
+    const result = await h.tool.run({ prompt: 'review' }, { ...h.ctx, parentBudget: parent });
+    assert.equal(result.ok, true, 'preserve the controlled-stop tool contract');
+    assert.equal(result.data?.status, 'partial');
+    assert.match(result.data!.answer!, /budget ceiling before producing an answer/);
+    assert.equal(h.events.find((e) => e.type === 'subagent_end')?.ok, false);
+  } finally { h.close(); }
+});
+
+test('diagnostic listeners are released after sync success, failure, throw, and queued cancellation', async (t) => {
+  const originalOn = SubagentBus.prototype.on;
+  const active = new Set<LoopListener>();
+  t.mock.method(SubagentBus.prototype, 'on', function (this: SubagentBus, listener: LoopListener) {
+    active.add(listener);
+    const off = originalOn.call(this, listener);
+    return () => { active.delete(listener); off(); };
+  });
+  for (const provider of [
+    new MockProvider([[{ type: 'text', delta: 'Done.' }, { type: 'done', stopReason: 'end_turn' }]]),
+    new MockProvider([[{ type: 'done', stopReason: 'max_tokens' }]]),
+    new MockProvider([() => { throw new Error('mock threw'); }]),
+  ]) {
+    const h = outcomeHarness(provider);
+    try { await h.tool.run({ prompt: 'review' }, h.ctx); } finally { h.close(); }
+    assert.equal(active.size, 0, 'no completed invocation retains its diagnostic listener');
+  }
+  let release!: () => void;
+  const barrier = new Promise<void>((resolve) => { release = resolve; });
+  const h = outcomeHarness({
+    name: 'mock', estimateTokens: () => 1,
+    async *send() { await barrier; yield { type: 'text', delta: 'Done.' }; yield { type: 'done', stopReason: 'end_turn' }; },
+  }, 10, 1);
+  const queued = new AbortController();
+  const first = h.tool.run({ prompt: 'first' }, h.ctx);
+  try {
+    const second = h.tool.run({ prompt: 'second' }, { ...h.ctx, signal: queued.signal });
+    queued.abort();
+    const result = await second;
+    assert.equal(result.ok, false);
+    assert.equal(active.size, 1, 'only the running first agent still listens');
+    release();
+    await first;
+    assert.equal(active.size, 0);
+  } finally { release(); await first; h.close(); }
 });
