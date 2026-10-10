@@ -78,7 +78,9 @@ Shadow 10.0.3 adds keyboard-driven workflow overlays for local project work.
 Pickers support arrow keys, numbered choices followed by Enter, and / to search. Escape clears
 a search first, then closes the overlay. Active work is interrupted once the overlay is closed.
 Elapsed time changes from seconds to minutes and hours. \`/effort\` shows a selectable list.
-Thinking is a separate block with a bounded preview; Ctrl+O expands transcript detail.
+Thinking shows a bounded preview while streaming, then collapses to one summary line when the
+answer or tool starts. Ctrl+O expands transcript detail, including completed thinking and grep
+matches; /activity also retains tool output. Empty reasoning creates no block.
 
 ## Images and terminal behavior
 

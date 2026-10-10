@@ -39,7 +39,13 @@ import {
   testLocalModel,
   LLAMA_INSTALL_HINT,
 } from './local/garage.js';
-import { defaultModelPatch, findModelPreset } from './config/modelPresets.js';
+import {
+  assertAccountPresetCompatible,
+  defaultModelPatch,
+  findModelPreset,
+  findRememberedModelPreset,
+  resolveActiveModelPreset,
+} from './config/modelPresets.js';
 import type { Message } from './provider/provider.js';
 import { runWebOnboard } from './onboard/webOnboard.js';
 import { runWeb, parseWebArgs, WEB_USAGE } from './web/cli.js';
@@ -70,7 +76,7 @@ import { Context } from './agent/context.js';
 import { AgentLoop } from './agent/loop.js';
 import { buildLoopDeps } from './agent/loopDeps.js';
 import { subProviderFor } from './auth/spec.js';
-import { subscriptionAuthLines } from './auth/status.js';
+import { runAccountLogin } from './auth/login.js';
 import { codexAuthPath, grokAuthPath, importOfficialCredential, type SubProvider } from './auth/index.js';
 import { isOfflineMode } from './safety/egress.js';
 import { ensureFreshSubscriptionCredential } from './auth/refresh.js';
@@ -94,11 +100,12 @@ import {
   globalConfigLooksEmpty,
   FIRST_RUN_HINT,
 } from './config/configInit.js';
-import { listResumableSessions, readSessionState, resolveSessionMatches } from './state/resume.js';
+import { listResumableSessions, readSessionState, resolveSessionMatches, trustLegacySession } from './state/resume.js';
 import { captureSessionState } from './state/sessionState.js';
+import { recordSessionHarnessBinding } from './state/sessionHarnessBinding.js';
 import { ModelProfileResolver } from './agent/modelProfiles.js';
 import { ConsultationService } from './agent/consultation.js';
-import { JobStore } from './state/jobStore.js';
+import { recoverOrphanJobsIfPresent } from './state/jobStore.js';
 import { SessionLog } from './state/session.js';
 import { scanClaudeSessions, importClaudeSession } from './state/claudeImport.js';
 import { isDumbTerm, queryTerminalBackground, themeForBackground } from './util/themeDetect.js';
@@ -124,6 +131,13 @@ import { runHookPhase } from './hooks/runner.js';
 import { parseArgs } from './cli/flags.js';
 import { attachScreenReader } from './tui/screenReader.js';
 import { shouldAutoOnboard, NO_PROVIDER_HINT } from './cli/autoOnboard.js';
+import {
+  discoverHarnessCatalog,
+  loadHarnessPackage,
+  CLI_LATE_NATIVE_HARNESS_TOOLS,
+  MAX_SELECTED_HARNESS_ADDONS,
+  SHADOW_SECURITY_FOUNDATION,
+} from './harness/index.js';
 
 // INSTALL_DIR (package root) is imported from ./installDir.js at the top — its own module so
 // src/web/* can share it without pulling in this file's top-level main().
@@ -179,16 +193,20 @@ function helpText(): string {
     '  export [path]        export session log to markdown, or standalone HTML with --html (--session, --out)',
     '  mcp <list|enable|disable>  manage MCP servers (e.g. `mcp enable browser`)',
     '  plugin <add|list|enable|disable|remove|search>  local-first plugin manager (data-only markdown bundles)',
+    '  harness <list|show|validate|enable|disable|use>  manage trusted local harness add-ons',
     '  local <add|list|test|use|remove>  manage local models — .gguf or MLX (no Ollama/LM Studio needed)',
     '  config init          seed a documented config template + safe defaults (never overwrites existing config)',
     '  doctor               diagnose Node, ripgrep, credentials, provider, guardrails',
     '  doctor --privacy     prove this config\'s privacy posture: egress, keys-at-rest, offline (no network)',
     '  doctor model [name]  capability test: can this model code agentically? (active model or a preset)',
     '  egress               show the outbound-connection receipt (~/.shadow/egress.log) — who Shadow talked to, why, allowed/denied',
-    '  resume [--session] [--from-claude]  resume a prior session from its latest context snapshot',
+    '  resume [--session <id/path>] [--from-claude]  resume a prior session from its latest context snapshot',
     '                       --from-claude first imports Claude Code sessions (~/.claude/projects)',
     '                       into the Shadow session store, then resumes as normal',
-    '  login codex|grok     OAuth login (codex only; grok uses API key)',
+    '                       --trust-legacy explicitly migrates one verified pre-harness log',
+    '                       into an owner-only, path-and-content-bound legacy receipt',
+    '  login chatgpt|claude subscription sign-in (or use onboard → Subscription account)',
+    '  login status        list account connections; login logout <profile-id> signs ChatGPT out',
     '  acp                  ACP agent for editors (Zed et al.) — JSON-RPC 2.0 over stdio; --add-project',
     '',
     'Options:',
@@ -199,7 +217,8 @@ function helpText(): string {
     '  --provider <name>    anthropic | openai | mock',
     '  --model <id>         model id (default claude-opus-4-8)',
     '  --profile <name>     activate a named profile from ~/.shadow/config.json — bundles model +',
-    '                       effort + autonomy + sandbox + context in one switch (also SHADOW_PROFILE)',
+    '                       harness + autonomy + context + runtime limits (also SHADOW_PROFILE)',
+    '  --harness <id>       use a local harness add-on for this new session (repeatable; also --addon)',
     '  --style <name>       proactive | explanatory | learning | procedural',
     '  --base-url <url>     override provider base URL (also ANTHROPIC_BASE_URL / OPENAI_BASE_URL)',
     '  --effort <level>     reasoning depth on Claude 4.6+: low | medium | high | xhigh | max  (default high)',
@@ -235,6 +254,115 @@ function helpText(): string {
     '  shadow --provider mock --task hi        no API key needed',
     '  shadow mcp enable browser               add isolated Chrome tools (requires Node/npm+npx)',
   ].join('\n');
+}
+
+function harnessUsage(): string {
+  return [
+    'usage: shadow harness <command>',
+    '',
+    '  list                 show the Security foundation and local add-ons',
+    '  show <id>            inspect one installed add-on',
+    '  validate <id>        validate its manifest, paths, and digest',
+    '  enable <id>          add it to future new sessions',
+    '  disable <id>         remove it from future new sessions',
+    '  use <id|security>    use exactly this add-on, or the Security foundation alone',
+    '',
+    'Drop packages under ~/.shadow/harnesses/<id>/. Selection never changes the provider,',
+    'model, endpoint, credentials, permissions, or sandbox. Existing sessions stay unchanged.',
+    '',
+  ].join('\n');
+}
+
+function safeHarnessText(value: unknown, max = 500): string {
+  return String(value ?? '').replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e]/g, '').slice(0, max);
+}
+
+/** Local-only harness management. It performs no provider call, fetch, clone, or install. */
+function runHarnessCommand(args: string[]): void {
+  const fail = (message: string): void => {
+    process.stderr.write(message + '\n');
+    process.exitCode = 1;
+  };
+  const sub = args[0];
+  if (!sub || sub === 'help' || sub === '--help' || sub === '-h') {
+    stdout.write(harnessUsage());
+    return;
+  }
+  const catalog = discoverHarnessCatalog();
+  const raw = loadGlobalConfig().harnesses;
+  const selected = Array.isArray(raw) ? raw.filter((id): id is string => typeof id === 'string') : [];
+
+  if (sub === 'list') {
+    stdout.write(`  ${lc.green('●')} ${lc.bold(SHADOW_SECURITY_FOUNDATION.id)} v${SHADOW_SECURITY_FOUNDATION.version} [always on] — ${SHADOW_SECURITY_FOUNDATION.description}\n`);
+    for (const pkg of catalog.packages) {
+      const enabled = selected.includes(pkg.id);
+      stdout.write(
+        `  ${enabled ? lc.green('●') : lc.yellow('○')} ${lc.bold(safeHarnessText(pkg.id, 64))} ` +
+          `v${safeHarnessText(pkg.manifest.version, 64)} [${enabled ? 'enabled' : 'disabled'}] — ` +
+          `${safeHarnessText(pkg.manifest.description)}\n`,
+      );
+    }
+    for (const issue of catalog.issues) {
+      stdout.write(`  ${lc.red('!')} ${safeHarnessText(issue.directory ?? 'catalog', 64)} — ${safeHarnessText(issue.message)}\n`);
+    }
+    if (catalog.packages.length === 0 && catalog.issues.length === 0) {
+      stdout.write(`  ${lc.gray(`No add-ons found under ${catalog.root}.`)}\n`);
+    }
+    stdout.write('Commands: shadow harness show|validate|enable|disable|use\n');
+    return;
+  }
+
+  const id = (args[1] ?? '').trim();
+  if (!id) return fail(`usage: shadow harness ${sub} <id>`);
+
+  if (sub === 'enable' || sub === 'disable' || sub === 'use') {
+    try {
+      let next: string[];
+      if (sub === 'use' && (id === 'security' || id === SHADOW_SECURITY_FOUNDATION.id || id === 'none')) {
+        next = [];
+      } else {
+        if (sub !== 'disable') loadHarnessPackage(id);
+        if (sub === 'use') next = [id];
+        else if (sub === 'enable') {
+          next = [...new Set([...selected, id])];
+          if (next.length > MAX_SELECTED_HARNESS_ADDONS) {
+            throw new Error(`at most ${MAX_SELECTED_HARNESS_ADDONS} harness add-ons may be selected`);
+          }
+        }
+        else next = selected.filter((item) => item !== id);
+      }
+      saveGlobalConfig({ harnesses: next });
+      stdout.write(
+        `Harness add-ons for new sessions: ${next.join(', ') || '(Security foundation only)'}. ` +
+          'Current sessions are unchanged.\n',
+      );
+    } catch (error) {
+      fail((error as Error).message);
+    }
+    return;
+  }
+
+  if (sub === 'show' || sub === 'validate') {
+    try {
+      const pkg = loadHarnessPackage(id);
+      stdout.write(`${pkg.manifest.title} (${pkg.id}@${pkg.manifest.version})\n`);
+      stdout.write(`  ${pkg.manifest.description}\n`);
+      stdout.write(`  digest: ${pkg.digest}\n`);
+      stdout.write(`  files: ${pkg.files.length} · bytes: ${pkg.bytes} · instructions: ${pkg.instructions.length}\n`);
+      stdout.write(`  skills: ${pkg.contentDirs.skills ?? '(none)'}\n`);
+      stdout.write(`  required tools: ${pkg.manifest.tools.add.join(', ') || '(none)'}\n`);
+      stdout.write(`  removed tools: ${pkg.manifest.tools.remove.join(', ') || '(none)'}\n`);
+      if (sub === 'validate') {
+        stdout.write(lc.green('  valid package structure') + '\n');
+        stdout.write('  runtime readiness is checked against the selected host when a new session starts\n');
+      }
+    } catch (error) {
+      fail((error as Error).message);
+    }
+    return;
+  }
+
+  fail(harnessUsage().trimEnd());
 }
 
 
@@ -329,17 +457,25 @@ function runConfigCommand(args: string[]): void {
 
 
 /** True when the chosen provider has no usable credentials/endpoint yet. */
-function needsOnboarding(cfg: ShadowConfig): boolean {
+function needsOnboarding(cfg: ShadowConfig, lastPicked?: ModelEntry): boolean {
   if (cfg.provider === 'mock') return false;
   // A model entry may carry its OWN apiKey/authToken/baseUrl (per-model creds in the
-  // picker — see the activeModelEntry resolution below). If the active entry is
-  // self-sufficient, we're already configured; don't force the onboarding wizard.
-  const entry = cfg.models.find((m) => m.provider === cfg.provider && m.model === cfg.model);
+  // picker — see the activeModelEntry resolution below). Use the same endpoint-bound resolver as
+  // bootstrap: while a trusted profile is active its selected global preset may intentionally be
+  // absent from cfg.models because an untrusted project models[] array replaced the visible list.
+  // Looking only in cfg.models would let that project force a configured cloud profile back into
+  // onboarding before bootstrap could consume its trusted connection/credential.
+  const entry = resolveActiveModelPreset(cfg, { lastPicked });
+  if (entry?.connection ?? cfg.connection) return false;
   // A local .gguf model is self-sufficient by definition — Shadow serves it itself; there is no
   // key or endpoint to configure. Without this, a pure-local user (no cloud key anywhere) got
   // bounced into the onboarding wizard on EVERY launch.
   if (entry?.gguf || entry?.mlx || entry?.vllm) return false;
   if (entry?.apiKey || entry?.authToken || entry?.baseUrl) return false;
+  if (entry?.credRef) {
+    const credential = resolveEntryCredential(entry, { vaultIsLocked: vaultExists() && !vaultUnlocked() });
+    if (credential.ok && (credential.apiKey || credential.authToken)) return false;
+  }
   if (resolveApiKey(cfg.provider) || resolveAuthToken(cfg.provider)) return false;
   if (resolveBaseUrl(cfg.provider, cfg.baseUrl)) return false;
   return true;
@@ -778,8 +914,8 @@ async function runLocal(args: string[]): Promise<void> {
  */
 async function runDoctorModel(name: string | undefined, cwd: string): Promise<void> {
   const cfg = loadConfig(cwd, {});
-  // Unlock/migrate the vault so resolveApiKey() below can read the encrypted key when probing.
-  await ensureVaultReady((s) => stdout.write(s));
+  let targetCfg = cfg;
+  let selectedLabel: string | undefined;
   let entry: ModelEntry | undefined;
   if (name) {
     entry = findModelPreset(cfg.models, name);
@@ -792,22 +928,56 @@ async function runDoctorModel(name: string | undefined, cwd: string): Promise<vo
     // Mirror main()'s active-model resolution: the last `/model` pick wins UNLESS an
     // explicit env override is set (loadConfig already folded SHADOW_MODEL/PROVIDER into
     // cfg.provider/cfg.model), in which case the env-selected model is the active one.
-    const envPinned = Boolean(process.env.SHADOW_MODEL || process.env.SHADOW_PROVIDER);
-    entry =
-      (!envPinned && cfg.lastModel ? cfg.models.find((m) => m.label === cfg.lastModel) : undefined) ??
-      cfg.models.find((m) => m.provider === cfg.provider && m.model === cfg.model);
+    const envPinned = Boolean(
+      process.env.SHADOW_MODEL || process.env.SHADOW_PROVIDER || process.env.SHADOW_BASE_URL,
+    );
+    const remembered = !envPinned && cfg.profile?.model == null
+      ? findRememberedModelPreset(cfg)
+      : undefined;
+    if (remembered) {
+      selectedLabel = remembered.label;
+      targetCfg = {
+        ...cfg,
+        provider: remembered.provider,
+        model: remembered.model,
+        baseUrl: remembered.baseUrl,
+        selfHosted: remembered.selfHosted,
+        connection: remembered.connection,
+      };
+    }
+    try {
+      entry = resolveActiveModelPreset(targetCfg, { lastPicked: remembered, targetPinned: envPinned });
+    } catch (error) {
+      process.stderr.write(`${error instanceof Error ? error.message : 'The selected model connection is invalid.'}\n`);
+      process.exitCode = 1;
+      return;
+    }
   }
 
-  const provider = entry?.provider ?? cfg.provider;
-  let model = entry?.model ?? cfg.model;
-  const label = entry?.label ?? `${provider}/${model}`;
+  try { if (entry) assertAccountPresetCompatible(entry); }
+  catch (error) {
+    process.stderr.write(`${error instanceof Error ? error.message : 'The selected model connection is invalid.'}\n`);
+    process.exitCode = 1;
+    return;
+  }
+  // Account connections own their authentication and do not need an API vault unlock.
+  if (!(entry ? entry.connection : targetCfg.connection) && !await ensureVaultReady((line) => stdout.write(line))) {
+    process.stderr.write('Could not unlock the API credential vault. Set SHADOW_VAULT_PASSWORD and retry.\n');
+    process.exitCode = 1;
+    return;
+  }
+
+  const provider = entry?.provider ?? targetCfg.provider;
+  let model = entry?.model ?? targetCfg.model;
+  const label = selectedLabel ?? entry?.label ?? `${provider}/${model}`;
   const isLocal = isLocalServedEntry(entry);
-  const allowImport = process.env.SHADOW_ALLOW_IMPORT === '1';
+  const connection = entry ? entry.connection : targetCfg.connection;
+  const allowImport = !connection && process.env.SHADOW_ALLOW_IMPORT === '1';
 
   let startProvider = provider;
-  const configuredBaseUrl = resolveBaseUrl(provider, entry?.baseUrl ?? (provider === cfg.provider ? cfg.baseUrl : undefined));
+  const configuredBaseUrl = resolveBaseUrl(provider, entry?.baseUrl ?? targetCfg.baseUrl, connection);
   let baseUrl = configuredBaseUrl;
-  const cred = resolveEntryCredential(entry, { vaultIsLocked: vaultExists() && !vaultUnlocked() });
+  const cred = resolveEntryCredential(entry ?? { provider, connection: targetCfg.connection }, { vaultIsLocked: vaultExists() && !vaultUnlocked() });
   if (!cred.ok) {
     process.stderr.write(
       lc.red(
@@ -865,7 +1035,7 @@ async function runDoctorModel(name: string | undefined, cwd: string): Promise<vo
   try {
     probeProvider = createProvider({
       // F10-01: probe with the entry's real wire contract (idle knobs + capability block).
-      ...entryStreamContract(entry ?? undefined, cfg.stream),
+      ...entryStreamContract(entry ?? { connection: targetCfg.connection }, targetCfg.stream),
       provider: startProvider,
       model,
       apiKey,
@@ -876,7 +1046,7 @@ async function runDoctorModel(name: string | undefined, cwd: string): Promise<vo
       wire: isLocal ? undefined : providerCred.wire,
       // A named remote preset must opt in itself. The top-level marker applies only when no
       // preset owns this diagnostic target, so testing a cloud preset cannot inherit it.
-      selfHosted: entry?.selfHosted ?? (!entry ? cfg.selfHosted : undefined),
+      selfHosted: entry?.selfHosted ?? (!entry ? targetCfg.selfHosted : undefined),
     });
   } catch (e) {
     process.stderr.write(lc.red(`✗ ${(e as Error).message}`) + '\n');
@@ -904,18 +1074,8 @@ async function runDoctorModel(name: string | undefined, cwd: string): Promise<vo
 
 async function runLogin(args: string[]): Promise<void> {
   const provider = args[0] ?? 'status';
-  const nowSec = Math.floor(Date.now() / 1000);
-
-  if (provider === 'status' || provider === 'show') {
-    stdout.write('Subscription credentials (~/.shadow/subscription-auth.json):\n');
-    for (const line of subscriptionAuthLines(nowSec)) stdout.write(`  ${line}\n`);
-    stdout.write('\nAPI keys live in the vault — `shadow onboard` (or `shadow onboard --web`) to set them.\n');
-    return;
-  }
-
   if (provider === 'import') {
-    // The lowest-ToS-exposure route, and the one that works today: reuse the credential the
-    // official CLI already minted rather than driving an OAuth dance of our own.
+    // Explicit legacy import remains available for existing installations.
     const target = args[1] ?? 'all';
     const providers: SubProvider[] =
       target === 'all' ? ['codex', 'grok'] : target === 'codex' || target === 'grok' ? [target] : [];
@@ -942,30 +1102,12 @@ async function runLogin(args: string[]): Promise<void> {
     return;
   }
 
-  if (provider === 'codex') {
-    // Honest status: Shadow does NOT drive the interactive ChatGPT login. `exchangeCodexCode` and
-    // the localhost redirect are declared, but nothing serves the callback, so printing the URL
-    // alone would promise a flow that cannot complete. The import path reaches the same credential
-    // without impersonating the first-party client, so point there.
-    stdout.write('Codex: Shadow does not run the interactive ChatGPT OAuth exchange.\n\n');
-    stdout.write('Use the credential your official Codex CLI already minted:\n');
-    stdout.write(`  1. sign in with the official CLI (its auth file: ${codexAuthPath()})\n`);
-    stdout.write('  2. shadow login import codex\n');
-    stdout.write('  3. SHADOW_ALLOW_IMPORT=1 shadow --model <a codex/gpt-5 model>\n\n');
-    stdout.write('The subscription token is bound to https://chatgpt.com/backend-api/codex and is\n');
-    stdout.write('never sent anywhere else. It is refreshed automatically when it nears expiry.\n');
-    stdout.write('\nCurrent state:\n');
-    for (const line of subscriptionAuthLines(nowSec)) stdout.write(`  ${line}\n`);
-    return;
-  }
-
   if (provider === 'grok') {
     stdout.write('Grok consumer OAuth is not supported (ToS). Use an xAI API key via `shadow onboard`.\n');
     return;
   }
 
-  process.stderr.write('usage: shadow login [status|codex|grok|import [codex|grok|all]]\n');
-  process.exit(1);
+  process.exitCode = await runAccountLogin(args);
 }
 
 /**
@@ -993,8 +1135,16 @@ function runFromClaudeImport(workspaceRoot: string): void {
     const label = [s.projectPath, s.title ? `"${s.title}"` : ''].filter(Boolean).join(' — ');
     switch (r.status) {
       case 'imported':
-        imported++;
-        stdout.write(`  imported          ${r.sessionId}${label ? ` (${label})` : ''}\n`);
+        try {
+          // The importer just durably created this exact target from the owner-side Claude store.
+          // Issue its legacy receipt now; duplicates are deliberately not auto-trusted below.
+          trustLegacySession(r.targetPath!);
+          imported++;
+          stdout.write(`  imported          ${r.sessionId}${label ? ` (${label})` : ''}\n`);
+        } catch (error) {
+          failed++;
+          stdout.write(`  failed            ${r.sessionId}: could not bind imported session: ${(error as Error).message}\n`);
+        }
         break;
       case 'skipped-duplicate':
         duplicates++;
@@ -1041,6 +1191,7 @@ async function main(): Promise<void> {
   }
   let argv = process.argv.slice(2);
   let resumeSessionPath: string | undefined;
+  let trustLegacyResume = false;
 
   if (argv[0] === 'login') {
     await runLogin(argv.slice(1));
@@ -1056,7 +1207,9 @@ async function main(): Promise<void> {
         resumeQuery = argv[++i]!;
       } else if (a === '--from-claude') {
         fromClaude = true;
-      } else if (i === 1 && !a.startsWith('-')) {
+      } else if (a === '--trust-legacy') {
+        trustLegacyResume = true;
+      } else if (!a.startsWith('-') && (i === 1 || argv[i - 1] === '--trust-legacy')) {
         resumeQuery = a;
       } else {
         rest.push(a);
@@ -1080,6 +1233,22 @@ async function main(): Promise<void> {
     if (!resumeSessionPath) {
       process.stderr.write('No resumable session found. Pass --session <path>.\n');
       process.exit(1);
+    }
+    if (trustLegacyResume) {
+      if (!resumeQuery) {
+        process.stderr.write('--trust-legacy requires an explicit session id or --session <path>; it never trusts the newest log implicitly.\n');
+        process.exit(1);
+      }
+      try {
+        trustLegacySession(resumeSessionPath);
+        stdout.write(
+          `Trusted one legacy session: ${SessionLog.sessionIdFromPath(resumeSessionPath)}. ` +
+            'The owner-only receipt is bound to this absolute path and exact file content.\n',
+        );
+      } catch (error) {
+        process.stderr.write(`Cannot trust legacy session: ${(error as Error).message}\n`);
+        process.exit(1);
+      }
     }
     argv = rest;
   }
@@ -1161,9 +1330,10 @@ async function main(): Promise<void> {
       const endpoint = effectiveSessionEndpoint(view, {
         envModel: process.env.SHADOW_MODEL,
         envProvider: process.env.SHADOW_PROVIDER,
+        envBaseUrl: process.env.SHADOW_BASE_URL,
       });
       const report = buildPrivacyReport(
-        { ...view, provider: endpoint.provider, model: endpoint.model, baseUrl: endpoint.baseUrl },
+        { ...view, provider: endpoint.provider, model: endpoint.model, baseUrl: endpoint.baseUrl, connection: endpoint.connection },
         gatherPrivacyEnv(argv.includes('--offline')),
       );
       // P3-08: the zero-telemetry claim backed by its RUNTIME receipt — aggregate the egress journal
@@ -1201,6 +1371,10 @@ async function main(): Promise<void> {
     await runPlugin(argv.slice(1), argv.includes('--offline'));
     return;
   }
+  if (argv[0] === 'harness' || argv[0] === 'harnesses') {
+    runHarnessCommand(argv.slice(1));
+    return;
+  }
   const flags = parseArgs(argv);
   if (flags.help) {
     stdout.write(helpText() + '\n');
@@ -1225,6 +1399,11 @@ async function main(): Promise<void> {
   const overrides: Record<string, unknown> = {
     provider: flags.provider,
     model: flags.model,
+    // `--base-url` is a trusted one-run endpoint selection and must participate in the
+    // pre-onboarding config view. Bootstrap also receives the raw flag so it can preserve
+    // endpoint-bound credential checks (for example, subscription connections cannot be
+    // redirected), but omitting it here made a fresh self-hosted launch look unconfigured.
+    baseUrl: flags.baseUrl,
     autonomy: flags.autonomy,
     logLevel: flags.logLevel,
     dryRun: flags.dryRun,
@@ -1235,34 +1414,28 @@ async function main(): Promise<void> {
     maxOutputTokens: flags.maxOutputTokens,
     maxIterations: flags.maxIterations,
     contextBudget: flags.contextBudget,
+    harnesses: flags.harnesses,
   };
   if (flags.maxWallSec != null) overrides.budget = { maxWallClockSec: flags.maxWallSec };
   // `flags.profile` falls back to SHADOW_PROFILE inside loadConfig (P2-11 named profiles).
   let cfg = loadConfig(cwd, overrides, flags.profile);
 
-  // Unlock the encrypted credential vault (or migrate a legacy plaintext credentials.json into it)
-  // BEFORE any credential is resolved — needsOnboarding() below and the provider build later both
-  // call getCredential(), which reads from the unlocked vault once this runs. No vault + no legacy
-  // file → no-op, so env-var / fresh-install flows are unaffected.
-  const vaultOk = await ensureVaultReady((s) => stdout.write(s));
-  if (!vaultOk) {
-    process.stderr.write('Could not unlock your credential vault. Set SHADOW_VAULT_PASSWORD or re-run to retry.\n');
-    process.exit(1);
-  }
-
   // Default to the last model picked via `/model`, unless the user explicitly
-  // chose one this run (--model / SHADOW_MODEL always win), an active profile declares a
-  // model (P2-11: the profile switch must stay atomic — a stale lastModel recall must not
+  // chose one this run (--model / SHADOW_MODEL or any explicit endpoint override always win),
+  // an active profile declares a model (P2-11: the profile switch must stay atomic — a stale
+  // lastModel recall must not
   // silently win the model key back from the profile), or the saved label no longer matches
   // a configured entry (ignore it gracefully).
   const lastPicked =
     !flags.model &&
     !flags.provider &&
+    !flags.baseUrl &&
     !process.env.SHADOW_MODEL &&
     !process.env.SHADOW_PROVIDER &&
+    !process.env.SHADOW_BASE_URL &&
     cfg.profile?.model == null &&
     cfg.lastModel
-      ? cfg.models.find((m) => m.label === cfg.lastModel)
+      ? findRememberedModelPreset(cfg)
       : undefined;
   if (lastPicked) {
     cfg = {
@@ -1273,14 +1446,25 @@ async function main(): Promise<void> {
       // Scope the top-level marker to the direct top-level target. A remembered cloud preset
       // must not inherit `selfHosted: true` from a different endpoint.
       selfHosted: lastPicked.selfHosted,
+      connection: lastPicked.connection,
     };
+  }
+
+  // Resolve billing identity before touching the API vault. A subscription session must not
+  // stall on an unrelated encrypted API key; API selections still unlock before resolution.
+  if (!resolveActiveModelPreset(cfg, { lastPicked })?.connection) {
+    const vaultOk = await ensureVaultReady((line) => stdout.write(line));
+    if (!vaultOk) {
+      process.stderr.write('Could not unlock your credential vault. Set SHADOW_VAULT_PASSWORD or re-run to retry.\n');
+      process.exit(1);
+    }
   }
 
   const log = new Logger(cfg.logLevel);
   if (flags.reducedMotion) cfg.reducedMotion = true;
 
   // First run with no provider configured → guide the user through setup.
-  if (needsOnboarding(cfg)) {
+  if (needsOnboarding(cfg, lastPicked)) {
     // T2 Phase 2 — first-run hint: an empty config.json means no one knows which knobs exist
     // (that's the Windows "blank config" report). One line on stderr; disappears once
     // `shadow config init` seeds defaults.
@@ -1355,6 +1539,7 @@ async function main(): Promise<void> {
     unrestricted,
     lastPicked,
     resumeSessionPath,
+    deferredHarnessTools: CLI_LATE_NATIVE_HARNESS_TOOLS,
     write: (s) => stdout.write(s),
     fail: (message) => {
       process.stderr.write(message);
@@ -1403,6 +1588,10 @@ async function main(): Promise<void> {
     },
   });
 
+  // Bind harness-aware snapshots outside the workspace before this session can write one. Agent
+  // file tools cannot rewrite this owner-only receipt under the normal workspace jail.
+  recordSessionHarnessBinding(session.sessionLog.path, session.harnessState);
+
   // Destructured so the rest of main() reads exactly as it did before the extraction.
   cfg = session.cfg;
   const { provider, registry, bg, memory, todoList, planMode, mission, wakeup, skills, facts, sessionLog, offline, context } =
@@ -1426,7 +1615,7 @@ async function main(): Promise<void> {
   workCenter.subscribe(bus);
   workCenter.restore(resumeSessionPath ? readSessionState(resumeSessionPath).workCenter ?? null : readLatestWorkCenterSnapshot(sessionLog.path));
   workCenter.syncTodos(todoList.snapshot());
-  const stateOwners = { mission, planMode, todoList, workCenter };
+  const stateOwners = { mission, planMode, todoList, workCenter, harness: session.harnessState };
   sessionLog.bindSessionState(context, () => captureSessionState(stateOwners));
   // Coalesce synchronous restore/update notifications into one coherent state. Mutations remain
   // journal data only: loading this bundle never restarts tools or background workers.
@@ -1787,12 +1976,9 @@ async function main(): Promise<void> {
   consultations.adopt(sessionLog, resumeSessionPath);
   // Classification is deliberately separate from execution: interrupted work is
   // offered for inspection and explicit retry, never automatically replayed.
-  const jobRecovery = new JobStore(workspaceRoot);
-  try {
-    const interrupted = jobRecovery.recoverOrphans();
-    if (interrupted.length) bus.emit({ type: 'finding', severity: 'warn', title: 'Interrupted project jobs',
-      body: `${interrupted.length} job(s) lost their owning process. Inspect /jobs and /work artifacts before explicitly retrying.` });
-  } finally { jobRecovery.close(); }
+  const interrupted = recoverOrphanJobsIfPresent(workspaceRoot);
+  if (interrupted.length) bus.emit({ type: 'finding', severity: 'warn', title: 'Interrupted project jobs',
+    body: `${interrupted.length} job(s) lost their owning process. Inspect /jobs and /work artifacts before explicitly retrying.` });
 
   // Interactive jobs and orchestration use the ordinary tool execution path.
   // In particular acceptance checks must authorize the underlying shell command
@@ -1810,14 +1996,24 @@ async function main(): Promise<void> {
   };
   const gatedAgent: typeof agentTool = { ...agentTool,
     run: (input, ctx) => executeNativeTool('agent', input, ctx) as ReturnType<typeof agentTool.run> };
-  const configuredShell = registry.get('run_shell')!;
+  const configuredShell = registry.getUnscoped('run_shell')!;
   const checkedShell: Tool<unknown, RunShellData> = { ...configuredShell,
     run: (input, ctx) => executeNativeTool('run_shell', input, ctx) as Promise<ToolResult<RunShellData>> };
   const acceptanceTool = makeAcceptanceCheckTool(checkedShell);
   registry.register(makeProjectJobsTool());
   registry.register(makeProjectRoomTool());
   registry.register(acceptanceTool);
-  registry.register(makeCollaborationTool({ agentTool: gatedAgent, runCheck: (input, ctx) => acceptanceTool.run(input, ctx) }));
+  registry.register(makeCollaborationTool(
+    registry.isDenied('run_shell')
+      ? { agentTool: gatedAgent }
+      : { agentTool: gatedAgent, runCheck: (input, ctx) => acceptanceTool.run(input, ctx) },
+  ));
+  try {
+    session.assertHarnessRuntimeReady();
+  } catch (error) {
+    process.stderr.write(`Cannot load harness add-ons: ${(error as Error).message}\n`);
+    process.exit(1);
+  }
 
   // Sub-agents and their budgets must use the WIRE model too — an `autoModel` entry's identity and
   // the id its endpoint actually serves are deliberately different strings.
@@ -2127,6 +2323,8 @@ async function main(): Promise<void> {
       workHistory: (sessionId) => queryWorkHistory(workspaceRoot, sessionId),
       planMode,
       mission,
+      harness: session.harnessState,
+      skills: session.skills,
       // bg sub-agent results: the TUI drains these into its NEXT user turn (8.4 fix —
       // they previously accumulated forever in TUI sessions; only headless drained).
       pendingNotifications,

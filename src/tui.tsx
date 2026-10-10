@@ -53,6 +53,8 @@ import { isLocalBaseUrl, isLocalModelTarget } from './safety/offline.js';
 import { clampLocalContextBudget, keepLastTurnsForBudget, triggerRatioForBudget } from './util/contextBudget.js';
 import { familyProfile } from './config/familyProfiles.js';
 import { SessionLog } from './state/session.js';
+import type { SessionHarnessSnapshot } from './state/sessionState.js';
+import type { SkillEntry } from './skills/loader.js';
 import { sessionTerminalTitle } from './state/sessionTitle.js';
 import { createProvider, entryStreamContract, type ProviderName } from './provider/index.js';
 import { subProviderFor } from './auth/spec.js';
@@ -69,6 +71,7 @@ import { type OutputStyle } from './styles.js';
 import { firstSelectableRow, modelRows } from './util/modelGroups.js';
 
 import { saveGlobalConfig, vaultUnlocked } from './state/globalStore.js';
+import { assertAccountPresetCompatible } from './config/modelPresets.js';
 
 import { listResumableSessions } from './state/resume.js';
 import { listRewindableTurns, type RewindableTurn } from './state/rewind.js';
@@ -325,6 +328,12 @@ export interface TuiOpts {
   planMode?: PlanModeState;
   /** Session /goal mission — drives the pinned HUD row and the /goal slash trio. */
   mission?: MissionState;
+  /** Immutable harness identity persisted across /fork, /rewind and renderer snapshots. */
+  harness?: SessionHarnessSnapshot;
+  /** Test/embedding override for owner-only session harness bindings. */
+  harnessBindingsDir?: string;
+  /** Skill catalog frozen with the selected harness stack at session start. */
+  skills?: SkillEntry[];
   /** bg sub-agent results drained into the NEXT user turn (index.ts attachBgAgentDelivery). */
   pendingNotifications?: { drain(): string[]; size(): number };
   wakeupHandler?: { fire: (task: string, reason: string) => void };
@@ -1588,7 +1597,12 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     // (Key delivery for Ctrl+T is fixed in eventToKeystroke: C0 bytes map to letter+ctrl.)
     if (todoItemsRef.current.length === 0) {
       // Visible feedback so "does nothing" isn't silent when the model never wrote todos.
-      pushLine({ text: '  no task list yet — the model creates one with todo_write', dimColor: true });
+      pushLine({
+        text: opts.registry.get('todo_write')
+          ? '  no task list yet — the model creates one with todo_write'
+          : '  no task list — this harness hides todo_write',
+        dimColor: true,
+      });
       return;
     }
     setTodoCollapsed((v) => !v);
@@ -1597,7 +1611,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     // `reflow('soft')` that used to sit here wrote a 2J+H, bumped staticEpoch and re-emitted the
     // ENTIRE committed transcript, i.e. a visible screen clear plus O(transcript) I/O, for a
     // one-line height toggle — the exact behavior the `reflow` doc above says Ctrl-T must not do.
-  }), [kbRegister, pushLine]);
+  }), [kbRegister, opts.registry, pushLine]);
 
   // Re-run the /statusline command (if any) and stash its output for the footer.
   const refreshStatusLine = useCallback(() => {
@@ -1658,6 +1672,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   useEffect(() => kbRegister('chat:cycleMode', () => {
     const pm = opts.planMode;
     if (!pm) return;
+    if (!pm.active && !pm.available) {
+      showToast(`Plan mode unavailable: ${pm.unavailableReason}.`, 'error');
+      return;
+    }
     if (pm.active) {
       pm.exit();
       setAutonomy('manual'); // leaving plan restarts at the cautious end of the ring
@@ -1665,7 +1683,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     } else {
       pm.enter();
     }
-  }), [kbRegister, opts.planMode, setAutonomy]);
+  }), [kbRegister, opts.planMode, setAutonomy, showToast]);
 
   // Ctrl+X M (leader chord): open the model picker — the one-key switch (1.3). Mirrors the
   // idle path of /model exactly (same guard, same active-row focus) so key and command can't
@@ -1913,8 +1931,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         }
       | { ok: false; error: string; fatal?: boolean }
     > => {
+      try { assertAccountPresetCompatible(entry); }
+      catch (error) { return { ok: false, error: error instanceof Error ? error.message : 'The subscription preset is invalid.', fatal: false }; }
       let provider = entry.provider;
-      const configuredBaseUrl = resolveBaseUrl(entry.provider, entry.baseUrl);
+      const configuredBaseUrl = resolveBaseUrl(entry.provider, entry.baseUrl, entry.connection);
       let baseUrl = configuredBaseUrl;
       let detectedWindow: number | undefined;
       const cred = resolveEntryCredential(entry, { vaultIsLocked: vaultExists() && !vaultUnlocked() });
@@ -1933,7 +1953,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       // credential must carry that credential's base URL, headers and wire, or it would send the
       // token to the previous model's endpoint. The refresh runs first for the same reason it does
       // at boot — a switch is a natural moment to notice the token aged out.
-      const allowImport = process.env.SHADOW_ALLOW_IMPORT === '1';
+      const allowImport = !entry.connection && process.env.SHADOW_ALLOW_IMPORT === '1';
       if (allowImport) {
         const subForEntry = subProviderFor(entry.provider, entry.model);
         if (subForEntry) {
@@ -2092,6 +2112,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         // Set HERE rather than only in /model's handler, because `/local use` reaches selectModel
         // without touching it — which left cfg.model pointing at the previous preset.
         opts.cfg.model = built.entryModel;
+        opts.cfg.connection = entry.connection;
         const prof = familyProfile(entry.model);
         if (prof?.note) pushLine({ text: `  ${prof.family}: ${prof.note}`, dimColor: true });
       } finally {
@@ -2792,6 +2813,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
           // The entry IDENTITY, never the wire model: writing the detected id here would leave
           // `cfg.model` unable to match its own preset on the next lookup.
           opts.cfg.model = built.entryModel;
+          opts.cfg.connection = entry.connection;
           setCurrent({ provider: built.provider, model: built.model });
           opts.onModelSwitch?.(built.client, built.model);
           return { provider: built.client, model: built.model };

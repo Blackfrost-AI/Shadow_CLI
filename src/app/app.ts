@@ -75,7 +75,8 @@ import { redactString } from '../util/redact.js';
 import { GLOBAL_DIR, saveGlobalConfig, vaultUnlocked } from '../state/globalStore.js';
 import { exportSession } from '../state/chatExport.js';
 import { listResumableSessions, resolveSessionMatches, resumeSession } from '../state/resume.js';
-import { captureSessionState, restoreSessionState } from '../state/sessionState.js';
+import { captureSessionState, inProcessResumeHarnessMessage, restoreSessionState } from '../state/sessionState.js';
+import { recordSessionHarnessBinding } from '../state/sessionHarnessBinding.js';
 import { sessionReplay } from '../state/sessionReplay.js';
 import { listRewindableTurns, previewRewind, rewindToTurn } from '../state/rewind.js';
 import { forkSession } from '../state/fork.js';
@@ -126,6 +127,15 @@ import {
   type McpServers,
 } from '../mcp/manage.js';
 import { PLUGIN_CONTENT_DIRS, displaySafe, enabledPluginDirs, listPlugins, setPluginEnabled } from '../plugins/manager.js';
+import { harnessDetailLines, harnessInventoryLines, updateHarnessSelection } from '../harness/manage.js';
+import {
+  activateSkillCandidate,
+  inspectSkillCandidateLines,
+  pendingSkillLines,
+  rejectSkillCandidate,
+  rollbackActiveSkill,
+  validateSkillCandidateLines,
+} from '../skills/manage.js';
 import { isSecretKey, maskSecret, redactConfig } from '../util/redact.js';
 import { sandboxConfinement, sandboxToolAvailable } from '../safety/sandbox.js';
 import { vaultExists } from '../auth/vault.js';
@@ -261,6 +271,9 @@ export class ShadowApp {
   private ctrlCArmed = false;
   /** Every tool call this session, for the /activity sub-window. */
   private details: ToolDetail[] = [];
+  // The loop emits findings synchronously after tool_end. Keep only the latest captured
+  // preview so an unrelated or standalone finding can never be mistaken for a duplicate.
+  private capturedGrepFindings: { callId: string; bodies: string[] } | null = null;
   /** 1-based turn counter — /activity groups calls per turn. */
   private turnNo = 0;
   private activityHandle: OverlayHandle | null = null;
@@ -390,6 +403,11 @@ export class ShadowApp {
   }
 
   private adoptSessionLog(log: SessionLog): void {
+    if (this.opts.harness) {
+      recordSessionHarnessBinding(log.path, this.opts.harness, {
+        bindingsDir: this.opts.harnessBindingsDir,
+      });
+    }
     log.bindSessionState(this.opts.context, () => captureSessionState(this.opts));
     this.opts.sessionLog = log;
     if (this.opts.sessionLogBox) this.opts.sessionLogBox.current = log;
@@ -717,6 +735,8 @@ export class ShadowApp {
   private onThinkingDelta(delta: string): void {
     if (!delta || !this.running || this.controller?.signal.aborted) return;
     if (!this.reasoning) {
+      // Empty reasoning from an endpoint is not a transcript boundary or a tool-run break.
+      if (!delta.trim()) return;
       this.flushStreamToTranscript();
       const item: FlattenItem = { id: this.lineId++, kind: 'reasoning', text: '', reasoningState: 'streaming', durationMs: 0 };
       this.reasoning = { item, startedAt: Date.now(), elapsedMs: 0 };
@@ -807,7 +827,7 @@ export class ShadowApp {
           this.updateSubAgent(sub, (a) => ({ ...a, tool: undefined, argPreview: undefined }));
           break;
         }
-        const call = e.call as { name: string; input?: unknown };
+        const call = e.call as { id?: string; name: string; input?: unknown };
         const result = e.result as { ok: boolean; summary?: string; images?: { mediaType: string; data: string }[] } | undefined;
         this.toolLine = null;
         this.pushTool(call, result);
@@ -829,15 +849,28 @@ export class ShadowApp {
         });
         break;
       }
-      case 'finding':
+      case 'finding': {
+        // Grep's informational findings are already captured on its tool result. Keeping a
+        // second card here would duplicate the matches and split consecutive tool groups.
+        // Only fold explicitly attributed tool output; standalone findings and warnings stay.
+        const captured = this.capturedGrepFindings;
+        if (captured && !sub && e.toolName === 'grep' && e.toolCallId === captured.callId &&
+            (e.severity ?? 'info') === 'info') {
+          const index = captured.bodies.indexOf(String(e.body ?? ''));
+          if (index >= 0) {
+            captured.bodies.splice(index, 1);
+            if (!captured.bodies.length) this.capturedGrepFindings = null;
+            break;
+          }
+        }
         this.pushLine({
           kind: 'finding',
-          text: '',
+          text: String(e.body ?? ''),
           title: String(e.title ?? ''),
           severity: String(e.severity ?? 'info'),
-          lines: [{ text: String(e.body ?? '') }],
         });
         break;
+      }
       case 'usage':
         {
           const usage = {
@@ -959,9 +992,14 @@ export class ShadowApp {
   }
 
   private pushTool(
-    call: { name: string; input?: unknown },
-    result: { ok: boolean; summary?: string; data?: unknown; meta?: { durationMs?: number; diff?: { tag: string; text: string }[] } } | undefined,
+    call: { id?: string; name: string; input?: unknown },
+    result: { ok: boolean; summary?: string; data?: unknown; meta?: {
+      durationMs?: number;
+      diff?: { tag: string; text: string }[];
+      findings?: { body: string; severity?: 'info' | 'warn' | 'error' }[];
+    } } | undefined,
   ): void {
+    this.capturedGrepFindings = null;
     const input = (call.input ?? {}) as Record<string, unknown>;
     const arg =
       typeof input.command === 'string'
@@ -993,6 +1031,15 @@ export class ShadowApp {
     } else if (call.name === 'agent' && sd?.answer?.trim()) {
       meta = 'answer';
       body = capBody(sd.answer.split('\n'));
+    } else if (call.name === 'grep') {
+      const findings = (result?.meta?.findings ?? [])
+        .filter((finding) => (finding.severity ?? 'info') === 'info' && finding.body.trim())
+        .map((finding) => finding.body);
+      if (findings.length) {
+        meta = 'output';
+        body = capBody(findings.flatMap((finding) => finding.split('\n')));
+        if (call.id) this.capturedGrepFindings = { callId: call.id, bodies: findings };
+      }
     }
 
     // Input JSON for the panel (8.7's toolDetail carries it; capped to keep the doc bounded).
@@ -1463,6 +1510,7 @@ export class ShadowApp {
     this.lineId = 1;
     this.brandCommitted = true; // the restored conversation predates this shell — no banner inside it
     this.details = [];
+    this.capturedGrepFindings = null;
     this.turnNo = 0;
     for (const item of sessionReplay(this.opts.context.messages())) {
       if (item.kind === 'reasoning') {
@@ -1542,7 +1590,13 @@ export class ShadowApp {
         contextBudget: this.opts.cfg.contextBudget,
         triggerRatio: this.opts.cfg.summarizeTriggerRatio,
         keepLastTurns: this.opts.cfg.keepLastTurns,
+        bindingsDir: this.opts.harnessBindingsDir,
       });
+      const harnessBoundary = inProcessResumeHarnessMessage(this.opts.harness, state.harness, pick.id);
+      if (harnessBoundary) {
+        this.pushLine({ kind: 'error', text: `  ${approvalText(harnessBoundary)}`, color: C.red });
+        return;
+      }
       const previous = this.sessionLog;
       const log = SessionLog.open(this.opts.workspaceRoot);
       log.setTitle(SessionLog.titleFor(pick.path));
@@ -2041,6 +2095,14 @@ export class ShadowApp {
           this.pushLine({ kind: 'error', text: '  Mission state unavailable in this session.', color: C.red });
           return;
         }
+        if (!this.opts.mission.available || (this.opts.planMode && !this.opts.planMode.available)) {
+          this.pushLine({
+            kind: 'error',
+            text: `  Mission mode is unavailable because this harness hides required controls (${this.opts.mission.unavailableReason ?? this.opts.planMode?.unavailableReason ?? 'mission controls unavailable'}).`,
+            color: C.red,
+          });
+          return;
+        }
         this.mission = this.opts.mission.begin(arg);
         // Missions start with an approved plan; drive the state object (the bus event updates
         // the HUD, so UI and truth cannot disagree — the /plan lesson).
@@ -2209,6 +2271,32 @@ export class ShadowApp {
       case '/plugins':
         this.doPlugins(arg);
         return;
+      case '/harness': {
+        const [sub = 'list', id = ''] = arg.trim().split(/\s+/, 2);
+        try {
+          if (sub === 'enable' || sub === 'disable' || sub === 'use') {
+            const next = updateHarnessSelection(sub, id);
+            this.pushLine({
+              text:
+                `  Harness add-ons for new sessions: ${next.join(', ') || '(Security foundation only)'}. ` +
+                'The current session is unchanged.',
+              color: C.green,
+            });
+            return;
+          }
+          const rows = sub === 'show'
+            ? harnessDetailLines(id)
+            : harnessInventoryLines(this.opts.harness?.addons.map((addon) => addon.id) ?? []);
+          this.pushLine({
+            kind: 'system',
+            text: '',
+            lines: rows.map((text) => ({ text: `  ${text}`, dimColor: true })),
+          });
+        } catch (error) {
+          this.pushLine({ kind: 'error', text: `  ${(error as Error).message}`, color: C.red });
+        }
+        return;
+      }
       case '/provider':
         this.doProvider();
         return;
@@ -2395,6 +2483,10 @@ export class ShadowApp {
           return;
         }
         if (req === 'status') {
+          if (!pm.available && !pm.active) {
+            this.pushLine({ text: `  Plan mode unavailable — ${pm.unavailableReason}.`, dimColor: true });
+            return;
+          }
           const snap = pm.snapshot();
           this.pushLine({
             text:
@@ -2406,6 +2498,10 @@ export class ShadowApp {
           return;
         }
         const want = req === 'on' ? true : req === 'off' ? false : !pm.active;
+        if (want && !pm.available) {
+          this.pushLine({ kind: 'error', text: `  Plan mode is unavailable because ${pm.unavailableReason}.`, color: C.red });
+          return;
+        }
         if (want === pm.active) {
           this.pushLine({ text: want ? '  Plan mode is already on.' : '  Plan mode is already off.', dimColor: true });
           return;
@@ -2521,7 +2617,43 @@ export class ShadowApp {
         return;
       }
       case '/skills': {
-        const { skills, conflicts } = discoverSkillCatalog(this.opts.workspaceRoot);
+        const [sub = '', name = '', ...rest] = arg.trim().split(/\s+/);
+        try {
+          if (sub === 'pending') {
+            this.pushLine({ kind: 'system', text: '', lines: pendingSkillLines().map((text) => ({ text: `  ${text}`, dimColor: true })) });
+            return;
+          }
+          if (sub === 'show' || sub === 'validate') {
+            if (!name) throw new Error(`usage: /skills ${sub} <name>`);
+            const rows = sub === 'show' ? inspectSkillCandidateLines(name) : validateSkillCandidateLines(name);
+            this.pushLine({ kind: 'system', text: '', lines: rows.map((text) => ({ text: `  ${text}`, dimColor: true })) });
+            return;
+          }
+          if (sub === 'activate') {
+            if (!name) throw new Error('usage: /skills activate <name>');
+            this.pushLine({ text: `  ${activateSkillCandidate(name)}`, color: C.green });
+            return;
+          }
+          if (sub === 'reject') {
+            if (!name) throw new Error('usage: /skills reject <name> <reason>');
+            this.pushLine({ text: `  ${rejectSkillCandidate(name, rest.join(' '))}`, color: C.yellow });
+            return;
+          }
+          if (sub === 'rollback') {
+            const generation = Number(rest[0]);
+            if (!name || !Number.isSafeInteger(generation) || generation < 1) {
+              throw new Error('usage: /skills rollback <name> <generation>');
+            }
+            this.pushLine({ text: `  ${rollbackActiveSkill(name, generation)}`, color: C.yellow });
+            return;
+          }
+        } catch (error) {
+          this.pushLine({ kind: 'error', text: `  ${(error as Error).message}`, color: C.red });
+          return;
+        }
+        const discovered = discoverSkillCatalog(this.opts.workspaceRoot);
+        const skills = this.opts.skills ?? discovered.skills;
+        const conflicts = this.opts.skills ? [] : discovered.conflicts;
         this.pushLine({
           kind: 'system',
           text: '',
@@ -2530,6 +2662,22 @@ export class ShadowApp {
               ...conflicts.map((conflict) => ({ text: `  Precedence: ${JSON.stringify(conflict)}`, dimColor: true }))]
             : [{ text: 'No skills discovered (workspace .shadow/skills or ~/.shadow/skills).', dimColor: true }],
         });
+        return;
+      }
+      case '/learn': {
+        if (!this.opts.registry.get('skill_manage')) {
+          this.pushLine({ kind: 'error', text: '  Learning is unavailable because this harness hides skill_manage.', color: C.red });
+          return;
+        }
+        const focus = arg.trim() || 'the reusable workflow that just succeeded in this session';
+        const prompt =
+          `Review ${focus}. Extract only reusable procedure supported by local session/artifact/test evidence. ` +
+          'Separate observations, operator choices, inferences, and untested claims. If the evidence is sufficient, ' +
+          'use skill_manage to draft or update a concise SKILL.md candidate with evidence-backed claims and a real ' +
+          'validation or replay receipt. Do not activate it; activation belongs to the user through /skills activate. ' +
+          'If evidence is insufficient, state what validation is still needed instead of inventing a skill.';
+        if (this.running || this.compacting || this.modelChecking || this.switcher.isSwitching) this.queue(prompt);
+        else this.startTurn(prompt);
         return;
       }
       case '/workflows': {

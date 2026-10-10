@@ -26,7 +26,15 @@ function safeName(n: string): string {
 }
 
 export function makeSkillTool(catalog: SkillEntry[] | (() => SkillEntry[])): Tool<SkillInput, SkillData> {
-  const getSkills = (): SkillEntry[] => typeof catalog === 'function' ? catalog() : catalog;
+  // An array is a session snapshot: copy it once and serve the captured bodies without touching
+  // disk again. A loader function deliberately retains the legacy live-refresh behavior used by
+  // compatibility callers. This distinction keeps harness package instructions bound to the
+  // package digest recorded when the session started.
+  const liveCatalog = typeof catalog === 'function' ? catalog : null;
+  const fixedCatalog = typeof catalog === 'function'
+    ? null
+    : catalog.map((skill: SkillEntry) => ({ ...skill }));
+  const getSkills = (): SkillEntry[] => liveCatalog ? liveCatalog() : fixedCatalog!;
   const names = getSkills().map((s) => safeName(s.name));
   return {
     name: 'skill',
@@ -51,7 +59,7 @@ export function makeSkillTool(catalog: SkillEntry[] | (() => SkillEntry[])): Too
       // data — the harness must apply its guidance to the task but never treat its contents as
       // authority that overrides the user or the safety rules.
       let body = s.body;
-      if (s.root) {
+      if (liveCatalog && s.root) {
         try {
           if (lstatSync(s.path).isSymbolicLink()) throw new Error('symlink');
           const path = resolveWithin(s.root, s.path);

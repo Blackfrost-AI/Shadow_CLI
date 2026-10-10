@@ -6,9 +6,9 @@
 
 > **A true gift of freedom and privacy.**
 > Zero-telemetry · provider-neutral · phone home to no one.
-> Current build: **`v10.0.3`** — recoverable jobs, independent consultations and bounded collaboration in the full-width retro terminal.
+> Current build: **`v10.0.4`** — subscription accounts, security harness add-ons, and hardened self-hosting in the full-width retro terminal.
 
-**Shadow is a zero-telemetry, provider-neutral coding agent that runs on your terms.** Point it at any model — Anthropic, any OpenAI-compatible endpoint, Gemini, or a local model on your own box — and it works as a coding / sysadmin agent over your workspace. **No Shadow account, no signup, no phone-home:** network access follows your provider, tool and update choices. Your config stays local and readable (`~/.shadow/config.json`), credentials are sent to their configured services, and you can switch models mid-session **without losing context**.
+**Shadow is a zero-telemetry, provider-neutral security engineering agent that runs on your terms.** Point it at any model — Anthropic, any OpenAI-compatible endpoint, Gemini, or a local model on your own box. Its built-in Security foundation covers investigation, hardening, incident response, defensive automation, secure coding, and supporting systems work. **No Shadow account, no signup, no phone-home:** network access follows your provider, tool and update choices. Your config stays local and readable (`~/.shadow/config.json`), credentials are sent to their configured services, and you can switch models mid-session **without losing context**.
 
 We're not competing for "coding-tool" mindshare — we're handing you back control: local-first autonomy, real guardrails, and full ownership of your workspace and your data.
 
@@ -16,7 +16,18 @@ Under the hood it's a **tool-calling agentic runtime**: the model reasons, emits
 
 This is **not a chat app** — it is a tool-calling runtime.
 
-## What's new in v10.0.3
+## What's new in v10.0.4
+
+- **Subscription accounts:** sign in with ChatGPT directly or connect the official Claude Code CLI. Account identity survives model/profile changes and never silently falls back to API billing.
+- **Reliable onboarding:** choose a subscription, cloud provider, local model server, or local file through one keyboard-driven flow. Endpoint checks are bounded and retryable, and failed entries remain editable.
+- **Security foundation and harness add-ons:** every session starts from Shadow's provider-neutral Security foundation. Trusted packages under `~/.shadow/harnesses` can add scoped instructions, skills, and tools for new sessions without choosing your model, endpoint, credentials, permissions, or sandbox.
+- **Local skill learning:** `/learn` creates evidence-linked skill candidates; `/skills` supports explicit review, activation, revision history, and rollback. Shadow adds no telemetry or callback service.
+- **Hardened self-hosting:** trusted profiles can pair a model preset with a harness and runtime limits. Self-hosted SGLang/Qwen presets can explicitly control chat-template thinking without leaking that extension to cloud providers.
+- **Cleaner terminal output:** completed reasoning collapses into one expandable row, models that emit no reasoning create no empty panel, and repeated grep activity is grouped. Escape interruption remains covered during text, first-token, and thinking streams.
+
+Harness selection is fixed when a session starts; mid-session harness switching remains future work. See the [user guide](USER_GUIDE.md), [terminal contract](TERMINAL_RENDERERS.md), and [release notes](CHANGELOG.md).
+
+## Previous highlights: v10.0.3
 
 - **Recoverable work:** browse active workers through `/work`, inspect persistent attempts and blockers in `/jobs`, and exchange local project messages through `/room`. Restarting a session never automatically repeats commands or edits.
 - **Review and retain changes:** `/review` browses working changes, branch comparisons and commits. Worker worktrees and patches remain available to inspect, apply, keep or discard explicitly.
@@ -474,8 +485,7 @@ Per workspace, under `<workspace>/.shadow/`:
 ## Security model
 
 > **The full picture — including what Shadow does *not* protect against — lives in
-> [THREAT_MODEL.md](THREAT_MODEL.md)** (also shipped as a print-ready
-> [PDF](THREAT_MODEL.pdf)). Limits are stated with the same prominence as guarantees.
+> [THREAT_MODEL.md](THREAT_MODEL.md).** Limits are stated with the same prominence as guarantees.
 
 
 - **Workspace jail** — every file path resolves to an absolute path contained within the workspace root; `..` traversal, absolute-outside paths, and symlinks pointing outside the root are rejected (including for not-yet-created files).

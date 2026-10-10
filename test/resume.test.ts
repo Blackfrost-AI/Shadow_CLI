@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { Context } from '../src/agent/context.js';
 import { SessionLog } from '../src/state/session.js';
 import { serializeContext, hydrateContext } from '../src/state/snapshot.js';
-import { listResumableSessions, resumeSession } from '../src/state/resume.js';
+import { listResumableSessions, resumeSession, trustLegacySession } from '../src/state/resume.js';
 import { rewindToTurn } from '../src/state/rewind.js';
 import { saveCheckpoint } from '../src/state/checkpoints.js';
 
@@ -38,7 +38,9 @@ test('resumeSession hydrates from latest context_snapshot', () => {
     assert.equal(sessions.length, 1);
     assert.equal(sessions[0]!.id, SessionLog.sessionIdFromPath(log.path));
 
-    const { context, meta } = resumeSession(log.path, opts);
+    const bindingsDir = join(root, 'owner-bindings');
+    trustLegacySession(log.path, { bindingsDir });
+    const { context, meta } = resumeSession(log.path, { ...opts, bindingsDir });
     assert.equal(meta.sessionId, sessions[0]!.id);
     assert.equal(context.messages().length, 1);
   } finally {
@@ -85,7 +87,9 @@ test('subAgentTasks roundtrips through serialize + resumeSession (observable aft
     tasks.push({ taskId: 'bg1', prompt: 'do thing', subagentType: 'explore', ts: new Date().toISOString() });
     log.recordSnapshot(mainCtx, 0);
 
-    const { context, meta } = resumeSession(log.path, opts);
+    const bindingsDir = join(root, 'owner-bindings');
+    trustLegacySession(log.path, { bindingsDir });
+    const { context, meta } = resumeSession(log.path, { ...opts, bindingsDir });
     assert.ok(meta.subAgentTasks && meta.subAgentTasks.length === 1);
     assert.equal((context as any)._subAgentTasks.length, 1);
     assert.equal((context as any)._subAgentTasks[0].taskId, 'bg1');

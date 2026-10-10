@@ -77,6 +77,10 @@ const FULL_AFTER_DELTA_BYTES = 2 * 1024 * 1024;
 const FULL_EVERY_N_SNAPSHOTS = 512;
 /** Reconstruction walk cap — a corrupted/cyclic baseOffset chain must terminate, not loop. */
 const MAX_CHAIN_DEPTH = FULL_EVERY_N_SNAPSHOTS + 16;
+/** One workspace snapshot record may not monopolize the Node heap during listing or resume. */
+const MAX_SNAPSHOT_LINE_BYTES = 64 * 1024 * 1024;
+/** Far above any real context, but bounds Array allocation from crafted legacy message counts. */
+const MAX_AUTHENTICATED_MESSAGES = 1_000_000;
 
 /** Lineage-identity digest over one message's JSON — decides whether the new snapshot is a
  *  clean append onto the previous one (delta) or a divergence (full). Two INDEPENDENT FNV-1a
@@ -175,34 +179,69 @@ function tailScanLatestSnapshot(
     const size = fstatSync(fd).size;
     if (size === 0) return null;
     let pos = size;
-    // Bytes of a line whose start lies BELOW `pos` (i.e. in a not-yet-read, earlier chunk),
-    // carried down so a snapshot line spanning chunk boundaries is reassembled intact.
-    let pending = Buffer.alloc(0);
+    // Fragments of the line that crosses the current chunk boundary. Chunks arrive from right
+    // to left, so fragments are joined once in reverse order when the preceding newline is
+    // found. Keeping fragments avoids the quadratic repeated Buffer.concat() that a long line
+    // used to trigger. If a boundary-crossing line exceeds the per-record cap, reject this
+    // session file immediately: searching across the rest of a huge sparse hole would still let
+    // an untrusted workspace stall `/resume`, even though memory use was bounded.
+    let pending: Buffer[] = [];
+    let pendingBytes = 0;
+    let pendingOversized = false;
+
+    const addPending = (part: Buffer): void => {
+      if (pendingOversized || part.length === 0) return;
+      if (part.length > MAX_SNAPSHOT_LINE_BYTES - pendingBytes) {
+        pending = [];
+        pendingBytes = 0;
+        pendingOversized = true;
+        return;
+      }
+      pending.push(part);
+      pendingBytes += part.length;
+    };
+
+    const inspectPending = (
+      offset: number,
+    ): { record: Record<string, unknown>; offset: number } | null => {
+      if (pendingOversized) {
+        pending = [];
+        pendingBytes = 0;
+        pendingOversized = false;
+        return null;
+      }
+      const line = pending.length <= 1
+        ? (pending[0] ?? Buffer.alloc(0))
+        : Buffer.concat([...pending].reverse(), pendingBytes);
+      pending = [];
+      pendingBytes = 0;
+      inspectTitle(line);
+      const rec = parseSnapshotLine(line);
+      return rec && (!accept || accept(rec, offset)) ? { record: rec, offset } : null;
+    };
+
     while (pos > 0) {
       const readSize = Math.min(TAIL_CHUNK, pos);
       pos -= readSize;
       const buf = Buffer.alloc(readSize);
       readSync(fd, buf, 0, readSize, pos);
-      // combined[i] === file byte (pos + i): the freshly read chunk, then the carried tail.
-      const combined = pending.length ? Buffer.concat([buf, pending]) : buf;
-      let end = combined.length;
-      let nl = combined.lastIndexOf(NL, end - 1);
+      let end = buf.length;
+      let nl = buf.lastIndexOf(NL, end - 1);
       while (nl !== -1) {
-        const line = combined.subarray(nl + 1, end);
-        inspectTitle(line);
-        const rec = parseSnapshotLine(line);
-        if (rec && (!accept || accept(rec, pos + nl + 1))) return { record: rec, offset: pos + nl + 1 };
+        addPending(buf.subarray(nl + 1, end));
+        const found = inspectPending(pos + nl + 1);
+        if (found) return found;
         end = nl;
         if (end === 0) break;
-        nl = combined.lastIndexOf(NL, end - 1);
+        nl = buf.lastIndexOf(NL, end - 1);
       }
-      // combined[0, end) starts at file offset `pos`. Complete only once pos === 0.
+      addPending(buf.subarray(0, end));
+      if (pendingOversized) return null;
+      // The prefix starts at file offset zero only in the final chunk, so it is now a complete
+      // first line. Otherwise it remains a bounded set of fragments for the next chunk.
       if (pos === 0) {
-        inspectTitle(combined.subarray(0, end));
-        const rec = parseSnapshotLine(combined.subarray(0, end));
-        if (rec && (!accept || accept(rec, 0))) return { record: rec, offset: 0 };
-      } else {
-        pending = Buffer.from(combined.subarray(0, end));
+        const found = inspectPending(0);
+        if (found) return found;
       }
     }
     return null;
@@ -256,7 +295,8 @@ function readSnapshotLineFd(fd: number, size: number, offset: number): Record<st
   // A fractional or NaN offset would read at a mid-character byte boundary (or throw) — a
   // corrupt baseOffset is treated as a broken chain link, never an exception.
   if (!Number.isInteger(offset) || offset < 0 || offset >= size) return null;
-  let acc = Buffer.alloc(0);
+  const parts: Buffer[] = [];
+  let length = 0;
   let pos = offset;
   while (pos < size) {
     const readSize = Math.min(TAIL_CHUNK, size - pos);
@@ -265,14 +305,22 @@ function readSnapshotLineFd(fd: number, size: number, offset: number): Record<st
     if (n <= 0) break;
     const slice = buf.subarray(0, n);
     const nl = slice.indexOf(NL);
-    if (nl !== -1) {
-      acc = acc.length ? Buffer.concat([acc, slice.subarray(0, nl)]) : Buffer.from(slice.subarray(0, nl));
-      return parseSnapshotLine(acc);
+    const part = nl === -1 ? slice : slice.subarray(0, nl);
+    if (part.length > MAX_SNAPSHOT_LINE_BYTES - length) return null;
+    if (part.length > 0) {
+      parts.push(part);
+      length += part.length;
     }
-    acc = acc.length ? Buffer.concat([acc, slice]) : Buffer.from(slice);
+    if (nl !== -1) {
+      return parseSnapshotLine(parts.length <= 1
+        ? (parts[0] ?? Buffer.alloc(0))
+        : Buffer.concat(parts, length));
+    }
     pos += n;
   }
-  return parseSnapshotLine(acc);
+  return parseSnapshotLine(parts.length <= 1
+    ? (parts[0] ?? Buffer.alloc(0))
+    : Buffer.concat(parts, length));
 }
 
 /** Read the single JSONL line beginning at `offset` and parse it as a snapshot record. */
@@ -688,6 +736,120 @@ export class SessionLog {
   }
 
   /**
+   * Latest snapshot reconstructed from one caller-owned immutable byte view. Used when the bytes
+   * themselves are authenticated (legacy migration/resume), so parsing can never race a second
+   * path read.
+   */
+  static findLatestSnapshotRecordFromBytes(bytes: Buffer): Record<string, unknown> | null {
+    const parseAt = (offset: number): Record<string, unknown> | null => {
+      if (offset < 0 || offset >= bytes.length || (offset > 0 && bytes[offset - 1] !== NL)) return null;
+      const newline = bytes.indexOf(NL, offset);
+      const end = newline === -1 ? bytes.length : newline;
+      if (end - offset > MAX_SNAPSHOT_LINE_BYTES) return null;
+      return parseSnapshotLine(bytes.subarray(offset, end));
+    };
+    // Walk candidate lines backward, retaining only one bounded delta chain. A workspace can put
+    // millions of tiny snapshot-looking lines in 256 MiB; materializing them all as JS objects is
+    // far larger than the byte cap and can OOM before the digest mismatch is reported.
+    let lineEnd = bytes.length;
+    while (lineEnd > 0) {
+      if (bytes[lineEnd - 1] === NL) lineEnd--;
+      const previousNewline = bytes.lastIndexOf(NL, lineEnd - 1);
+      const candidateOffset = previousNewline + 1;
+      const candidateLength = lineEnd - candidateOffset;
+      const candidate = candidateLength <= MAX_SNAPSHOT_LINE_BYTES
+        ? parseSnapshotLine(bytes.subarray(candidateOffset, lineEnd))
+        : null;
+      lineEnd = previousNewline < 0 ? 0 : previousNewline;
+      if (!candidate) continue;
+      if (candidate.format !== 'delta') {
+        const data = candidate.data as Record<string, unknown> | undefined;
+        const messages = Array.isArray(data?.messages) ? data.messages : null;
+        if (!messages || messages.length > MAX_AUTHENTICATED_MESSAGES) continue;
+        return candidate;
+      }
+      const chain: Array<Record<string, unknown>> = [candidate];
+      let current = candidate;
+      let below = candidateOffset;
+      let valid = true;
+      while (current.format === 'delta') {
+        if (chain.length > MAX_CHAIN_DEPTH) {
+          valid = false;
+          break;
+        }
+        const offset = typeof current.baseOffset === 'number' && Number.isInteger(current.baseOffset)
+          ? current.baseOffset
+          : -1;
+        const base = offset >= 0 && offset < below ? parseAt(offset) : null;
+        if (!base) {
+          valid = false;
+          break;
+        }
+        chain.push(base);
+        current = base;
+        below = offset;
+      }
+      if (!valid) continue;
+      const base = chain[chain.length - 1]!;
+      const baseData = base.data as Record<string, unknown> | undefined;
+      const baseMessages = Array.isArray(baseData?.messages) ? baseData.messages : null;
+      if (!baseData || !baseMessages || baseMessages.length > MAX_AUTHENTICATED_MESSAGES) continue;
+      const parts: unknown[][] = [baseMessages];
+      let messageCount = baseMessages.length;
+      for (let index = chain.length - 2; index >= 0; index--) {
+        const delta = chain[index]!;
+        const deltaData = delta.data as Record<string, unknown> | undefined;
+        const appended = Array.isArray(deltaData?.appended) ? deltaData.appended : null;
+        if (!deltaData || !appended) {
+          valid = false;
+          break;
+        }
+        if (appended.length > MAX_AUTHENTICATED_MESSAGES - messageCount) {
+          valid = false;
+          break;
+        }
+        messageCount += appended.length;
+        if (typeof delta.messageCount === 'number' && delta.messageCount !== messageCount) {
+          valid = false;
+          break;
+        }
+        parts.push(appended);
+      }
+      if (!valid) continue;
+      const messages = new Array<unknown>(messageCount);
+      let cursor = 0;
+      for (const part of parts) {
+        for (const message of part) messages[cursor++] = message;
+      }
+      const latestData = candidate.data as Record<string, unknown>;
+      const data: Record<string, unknown> = { ...latestData, messages };
+      delete data.appended;
+      return { ...candidate, format: 'full', data };
+    }
+    return null;
+  }
+
+  /** Lightweight lineage scan used to prevent a v2 log with a forged legacy tail being migrated. */
+  static hasSnapshotStateVersionFromBytes(bytes: Buffer, version: number): boolean {
+    let start = 0;
+    for (let index = 0; index <= bytes.length; index++) {
+      if (index < bytes.length && bytes[index] !== NL) continue;
+      const line = bytes.subarray(start, index);
+      if (line.length > MAX_SNAPSHOT_LINE_BYTES && line.includes(SNAPSHOT_MARKER)) {
+        throw new Error('session contains a snapshot line too large for safe legacy migration');
+      }
+      const record = line.length <= MAX_SNAPSHOT_LINE_BYTES ? parseSnapshotLine(line) : null;
+      start = index + 1;
+      const data = record?.data as { sessionState?: unknown } | undefined;
+      const state = data?.sessionState;
+      if (state && typeof state === 'object' && (state as { version?: unknown }).version === version) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
    * Assemble a full-form record from an already-full-form base plus a delta record (pure).
    * The delta's scalar state (pinnedPrefix/lastActualTokens/subAgentTasks/…) wins; its
    * `appended` messages concatenate onto the base array.
@@ -772,6 +934,11 @@ export class SessionLog {
     } catch {
       return [];
     }
+    return SessionLog.loadSnapshotRecordsFromBytes(buf);
+  }
+
+  /** Parse all snapshots from one immutable byte view without reopening its source path. */
+  static loadSnapshotRecordsFromBytes(buf: Buffer): Array<{ record: Record<string, unknown>; offset: number }> {
     const out: Array<{ record: Record<string, unknown>; offset: number }> = [];
     const byOffset = new Map<number, Record<string, unknown>>(); // offset → full-form record
     let start = 0;

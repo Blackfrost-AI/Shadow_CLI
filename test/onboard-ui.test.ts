@@ -1,7 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { stripVTControlCharacters } from 'node:util';
+import { mkdtempSync, readFileSync, rmSync, existsSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { setTimeout as delay } from 'node:timers/promises';
 import { visibleWidth } from '@earendil-works/pi-tui';
+import { runClaudeCode } from '../src/auth/claudeCode.js';
 import { isolateHome } from './helpers/isolateHome.js';
 isolateHome('onboard-ui');
 const { HeadlessTerminal } = await import('./helpers/snowfallTerminal.js');
@@ -119,3 +124,60 @@ test('Escape cancels an active check and aborts its request without closing setu
     terminal.screen.dispose();
   }
 });
+
+test('external login restores the wizard after completion and passes a cancellation signal', async () => {
+  const terminal = new HeadlessTerminal();
+  const ui = new TerminalOnboardUI(terminal);
+  try {
+    assert.equal(await ui.external(async (signal) => {
+      assert.ok(signal instanceof AbortSignal);
+      assert.equal(signal.aborted, false);
+      assert.equal(terminal.stopped, true);
+      return 'signed in';
+    }), 'signed in');
+    assert.equal(terminal.stopped, false);
+    const next = ui.choose({ stage: 2, title: 'Continue' }, [{ id: 'yes', label: 'Continue' }]);
+    terminal.input('\r');
+    assert.deepEqual(await next, ['yes']);
+  } finally {
+    ui.close();
+    terminal.screen.dispose();
+  }
+});
+
+for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+  test(`external login awaits child cleanup on ${signal} and releases its signal handlers`, async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'shadow-external-login-'));
+    const ready = join(directory, 'ready');
+    const cleaned = join(directory, 'cleaned');
+    const terminal = new HeadlessTerminal();
+    const before = process.listeners(signal);
+    const ui = new TerminalOnboardUI(terminal);
+    const normalHandlers = process.listeners(signal);
+    let settled = false;
+    try {
+      // A real inherited-stdio process models official login; it needs time to
+      // clean up after termination. No credentials, browser or network is used.
+      const script = `const fs=require('node:fs');process.on('SIGTERM',()=>setTimeout(()=>{fs.writeFileSync(process.argv[2],'done');process.exit(0)},30));fs.writeFileSync(process.argv[1],String(process.pid));setInterval(()=>{},1000);`;
+      const pending = ui.external((abortSignal) => runClaudeCode(process.execPath,
+        ['-e', script, ready, cleaned], { signal: abortSignal, timeoutMs: 5000, inheritStdio: true }))
+        .finally(() => { settled = true; });
+      const rejected = assert.rejects(pending, OnboardCancelled);
+      for (let attempt = 0; !existsSync(ready) && attempt < 200; attempt++) await delay(10);
+      assert.ok(existsSync(ready), 'fixture login started');
+      assert.equal(terminal.stopped, true);
+      process.emit(signal);
+      assert.equal(settled, false, 'cancellation must await the child');
+      await rejected;
+      if (process.platform !== 'win32') assert.equal(readFileSync(cleaned, 'utf8'), 'done');
+      const pid = Number(readFileSync(ready, 'utf8'));
+      assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
+      assert.deepEqual(process.listeners(signal), normalHandlers, 'wizard handlers restored');
+    } finally {
+      ui.close();
+      terminal.screen.dispose();
+      rmSync(directory, { recursive: true, force: true });
+    }
+    assert.deepEqual(process.listeners(signal), before, 'no external-login signal handler leaked');
+  });
+}

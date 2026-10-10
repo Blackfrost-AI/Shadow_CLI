@@ -83,6 +83,21 @@ test('/permissions offers its real verbs — no invented ones', async (t) => {
   }
 });
 
+test('/harness and /skills expose their review and selection verbs', async (t) => {
+  const harness = await mount(t);
+  const harnessFrame = await harness.type('/harness ');
+  for (const verb of ['list', 'show', 'enable', 'disable', 'use']) {
+    assert.match(harnessFrame, new RegExp(`/harness ${verb}\\b`), `offers harness ${verb}`);
+  }
+  assert.match(harnessFrame, /\/harness use security/, 'offers the foundation-only selection');
+
+  const skills = await mount(t);
+  const skillsFrame = await skills.type('/skills ');
+  for (const verb of ['pending', 'show', 'validate', 'activate', 'reject', 'rollback']) {
+    assert.match(skillsFrame, new RegExp(`/skills ${verb}\\b`), `offers skills ${verb}`);
+  }
+});
+
 test('/model lists your configured presets, and hides disabled ones', async (t) => {
   const { type } = await mount(t);
   const frame = await type('/model ');

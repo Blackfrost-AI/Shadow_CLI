@@ -3,11 +3,14 @@ import { demoMock, dialectMock, errorMock, recoveryMock } from './mock.js';
 import { AnthropicProvider } from './anthropic.js';
 import { OpenAIProvider } from './openai.js';
 import { ResponsesProvider, useResponsesWire } from './responses.js';
-import type { ModelCapabilities, ModelEntry } from '../config.js';
+import { ChatGPTProvider } from './chatgpt.js';
+import { ClaudeCodeProvider } from './claudeCode.js';
+import type { AccountConnection, ModelCapabilities, ModelEntry } from '../config.js';
 
 export type ProviderName = 'anthropic' | 'openai' | 'mock';
 
 export interface ProviderOptions {
+  connection?: AccountConnection;
   provider: ProviderName;
   model: string;
   apiKey?: string;
@@ -66,14 +69,15 @@ export interface StreamDefaults {
 }
 
 export function entryStreamContract(
-  entry?: Pick<ModelEntry, 'idleTimeoutMs' | 'firstByteTimeoutMs' | 'streamRetries' | 'capabilities'>,
+  entry?: Pick<ModelEntry, 'idleTimeoutMs' | 'firstByteTimeoutMs' | 'streamRetries' | 'capabilities' | 'connection'>,
   defaults?: StreamDefaults,
-): Pick<ProviderOptions, 'idleTimeoutMs' | 'firstByteTimeoutMs' | 'streamRetries' | 'capabilities'> {
+): Pick<ProviderOptions, 'idleTimeoutMs' | 'firstByteTimeoutMs' | 'streamRetries' | 'capabilities' | 'connection'> {
   const raw = process.env.SHADOW_IDLE_MS;
   const trimmed = raw?.trim();
   const envIdleMs =
     trimmed != null && /^\d+$/.test(trimmed) && Number(trimmed) > 0 ? Number(trimmed) : undefined;
   return {
+    ...(entry?.connection ? { connection: entry.connection } : {}),
     idleTimeoutMs: envIdleMs ?? entry?.idleTimeoutMs ?? defaults?.idleTimeoutMs,
     firstByteTimeoutMs: entry?.firstByteTimeoutMs ?? defaults?.firstByteTimeoutMs,
     streamRetries: entry?.streamRetries ?? defaults?.retries,
@@ -86,6 +90,20 @@ export function entryStreamContract(
  * Messages API and OpenAI-compatible Chat Completions. Callers are unchanged.
  */
 export function createProvider(opts: ProviderOptions): Provider {
+  // Account selection is explicit. Never send these requests with an API key, a configured
+  // gateway, or a different transport just because one exists in the environment.
+  if (opts.connection) {
+    if (opts.baseUrl && opts.connection.kind === 'chatgpt' && opts.baseUrl.replace(/\/+$/, '') !== 'https://api.openai.com/v1') {
+      throw new Error('ChatGPT account connections use the official OpenAI endpoint. Remove the custom base URL.');
+    }
+    if (opts.connection.kind === 'chatgpt' && opts.provider === 'openai') {
+      return new ChatGPTProvider({ profileId: opts.connection.profileId, model: opts.model });
+    }
+    if (opts.connection.kind === 'claude-code' && opts.provider === 'anthropic' && !opts.baseUrl) {
+      return new ClaudeCodeProvider({ model: opts.model });
+    }
+    throw new Error('The selected subscription connection does not match this provider or endpoint. Run shadow onboard.');
+  }
   switch (opts.provider) {
     case 'mock':
       if (process.env.SHADOW_MOCK_ERROR === '1') return errorMock();

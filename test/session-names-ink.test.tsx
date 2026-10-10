@@ -20,6 +20,7 @@ const { Context } = await import('../src/agent/context.js');
 const { EventBus } = await import('../src/agent/events.js');
 const { ToolRegistry } = await import('../src/tools/registry.js');
 const { SessionLog } = await import('../src/state/session.js');
+const { trustLegacySession } = await import('../src/state/resume.js');
 after(() => {
   if (previousSessionDir === undefined) delete process.env.SHADOW_SESSION_DIR;
   else process.env.SHADOW_SESSION_DIR = previousSessionDir;
@@ -39,12 +40,14 @@ test('Ink renames its title, preserves names on /new and resumes from a name-fil
   context.pinTask({ role: 'user', content: [{ type: 'text', text: 'Fix the website header' }] });
   const first = SessionLog.open(root);
   first.recordSnapshot(context, 0);
+  const bindingsDir = join(root, 'owner-bindings');
   const box = { current: first };
   const opts: TuiOpts = {
     provider: { name: 'mock', estimateTokens: () => 1, async *send() { yield { type: 'done', stopReason: 'end_turn' }; } },
     cfg: loadConfig(root, { provider: 'mock', model: 'fixture', mouse: false, notify: 'off', resumeRecap: false }),
     registry: new ToolRegistry(), bus: new EventBus(), context, sessionLog: first, sessionLogBox: box,
     system: 'Session names fixture.', workspaceRoot: root, autonomy: 'manual', bypass: false, offline: true, version: '10.0.0-test',
+    harnessBindingsDir: bindingsDir,
   };
   const view = render(<TuiApp opts={opts} />);
   Object.defineProperty(view.stdout, 'isTTY', { value: true });
@@ -53,6 +56,7 @@ test('Ink renames its title, preserves names on /new and resumes from a name-fil
     await pause();
     await submit('/rename Frontend README.md');
     await until(() => box.current.title === 'Frontend README.md');
+    trustLegacySession(first.path, { bindingsDir });
     assert.ok(view.frames.some((frame) => frame.includes('\x1b]2;Frontend README.md — Shadow\x07')));
     await submit('/new');
     await until(() => box.current.path !== first.path);

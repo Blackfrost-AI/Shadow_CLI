@@ -12,7 +12,8 @@ import { execFile } from 'node:child_process';
  */
 export function openBrowser(url: string): void {
   try {
-    if (process.platform === 'win32') execFile('cmd', ['/c', 'start', '', url], () => {});
+    // OAuth query strings contain '&'. Avoid cmd.exe, which interprets them as commands.
+    if (process.platform === 'win32') execFile('rundll32.exe', ['url.dll,FileProtocolHandler', url], () => {});
     else if (process.platform === 'darwin') execFile('open', [url], () => {});
     else execFile('xdg-open', [url], () => {});
   } catch {

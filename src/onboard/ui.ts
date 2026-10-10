@@ -52,6 +52,9 @@ export interface OnboardUI {
   ): Promise<string[] | typeof BACK>;
   text(screen: Screen, options?: TextOptions): Promise<string | typeof BACK>;
   busy<T>(screen: Screen, work: (signal: AbortSignal) => Promise<T>): Promise<T | typeof BACK>;
+  /** Give an official account-login CLI the terminal, then restore this wizard. */
+  external?<T>(work: (signal?: AbortSignal) => Promise<T>): Promise<T>;
+  updateBusy?(screen: Partial<Screen>): void;
   close(): void;
 }
 
@@ -401,6 +404,41 @@ export class TerminalOnboardUI implements OnboardUI {
     process.removeListener('exit', this.restore);
     process.removeListener('uncaughtExceptionMonitor', this.restore);
   }
+  updateBusy(screen: Partial<Screen>): void {
+    if (this.closed || this.view.kind !== 'busy') return;
+    this.view.screen = { ...this.view.screen, ...screen };
+    this.tui.requestRender();
+  }
+  async external<T>(work: (signal?: AbortSignal) => Promise<T>): Promise<T> {
+    if (this.closed) throw new OnboardCancelled();
+    const controller = new AbortController();
+    const cancel = () => controller.abort();
+    // The normal handlers re-raise immediately. While a child owns the terminal,
+    // first let its abort handler finish terminating it and restoring its state.
+    for (const [signal, handler] of this.signals) {
+      process.removeListener(signal, handler);
+      process.on(signal, cancel);
+    }
+    try {
+      this.tui.stop({ preserveScreen: true });
+      const result = await work(controller.signal);
+      if (controller.signal.aborted) throw new OnboardCancelled();
+      return result;
+    } catch (error) {
+      if (controller.signal.aborted) throw new OnboardCancelled();
+      throw error;
+    } finally {
+      for (const [signal, handler] of this.signals) {
+        process.removeListener(signal, cancel);
+        if (!this.closed) process.on(signal, handler);
+      }
+      if (!this.closed) {
+        this.tui.start();
+        this.tui.setFocus(this.view);
+        this.tui.renderNow(true);
+      }
+    }
+  }
 }
 
 /** Pipe/accessible fallback: one readline, queued lines, explicit EOF, no secret echo. */
@@ -438,6 +476,10 @@ export class PlainOnboardUI implements OnboardUI {
   }
   private show(screen: Screen) {
     stdout.write(`\nSHADOW · ${screen.stage + 1}/5 · ${safe(screen.title)}\n`);
+    for (const line of [screen.description, ...(screen.details ?? []), screen.error])
+      if (line) stdout.write(safe(line) + '\n');
+  }
+  updateBusy(screen: Partial<Screen>): void {
     for (const line of [screen.description, ...(screen.details ?? []), screen.error])
       if (line) stdout.write(safe(line) + '\n');
   }

@@ -219,6 +219,10 @@ function handleComposer(env: KeyEnv, ch: string, key: InkKey): boolean {
   if (SHIFT_TAB.test(env.rawKeyRef.current)) {
     const pm = env.planMode;
     if (pm) {
+      if (!pm.active && !pm.available) {
+        env.pushLine({ text: `  plan mode unavailable — ${pm.unavailableReason}`, dimColor: true });
+        return true;
+      }
       if (pm.active) {
         pm.exit(); // leaving plan restarts at the cautious end of the ring
         env.setAutonomy('manual');
@@ -240,7 +244,7 @@ function handleComposer(env: KeyEnv, ch: string, key: InkKey): boolean {
       pm.exit(); // leave plan mode → back to the start of the autonomy ring
       env.setAutonomy('manual');
       env.loopRef.current?.setAutonomy('manual');
-    } else if (pm && env.autonomyRef.current === 'full') {
+    } else if (pm?.available && env.autonomyRef.current === 'full') {
       pm.enter(); // top of the autonomy ring → step into plan mode
     } else {
       const next = cycleAutonomy(env.autonomyRef.current);

@@ -1,4 +1,4 @@
-import type { CompletionRequest, ContentBlock, Effort, ImageBlock, Message, Provider, ToolCall, ToolUseBlock } from '../provider/provider.js';
+import type { CompletionRequest, ContentBlock, Effort, ImageBlock, Message, Provider, ResponsesReasoningItem, ToolCall, ToolUseBlock } from '../provider/provider.js';
 import type { ToolRegistry } from '../tools/registry.js';
 import type { ToolContext, ToolResult, ToolRisk } from '../tools/types.js';
 import { fail } from '../tools/types.js';
@@ -206,6 +206,11 @@ const MAX_EMPTY_RESPONSE_ATTEMPTS = 3;
 const EMPTY_RESPONSE_BACKOFF_MS = [100, 250];
 /** Nth CONSECUTIVE identical (tool+args) call that gets a loop-guard nudge instead of running. */
 const LOOP_GUARD_LIMIT = 3;
+// A compact or degraded model can ignore the recoverable guard message forever. The 3rd-5th
+// identical calls are refused and fed back so the provider still gets a bounded final chance to
+// answer or choose a different action; the 6th identical attempt proves it ignored that recovery
+// window and stops the turn instead of burning the whole iteration budget.
+const LOOP_GUARD_FATAL_LIMIT = 6;
 /** Synthetic tool_result content for a tool_use orphaned by an interrupt (ESC/Ctrl-C). */
 const INTERRUPTED_RESULT = 'Tool execution was interrupted (ESC / Ctrl-C) before this call produced a result.';
 const STEERED_RESULT = 'Tool execution was skipped because the user sent a new message before this call started.';
@@ -384,6 +389,20 @@ export class AgentLoop {
     this.deps.permissionRules = rules;
   }
 
+  /**
+   * Render harness-owned live state against the effective registry, after immutable capability
+   * subtraction. A removed control must never survive as a fresh per-turn recommendation, and a
+   * persisted todo list is hidden when the model has no way to update it.
+   */
+  private controlStateBlocks(): string[] {
+    const capabilities = { has: (name: string): boolean => this.deps.registry.get(name) !== undefined };
+    return [
+      this.deps.planMode?.block(capabilities) ?? '',
+      this.deps.mission?.block(capabilities) ?? '',
+      capabilities.has('todo_write') ? (this.deps.todoList?.block() ?? '') : '',
+    ];
+  }
+
   private async maybeCompact(
     provider: Provider,
     model: string,
@@ -405,9 +424,7 @@ export class AgentLoop {
       temperature: this.deps.temperature,
       continuity: [
         this.deps.continuityState ?? '',
-        this.deps.planMode?.block() ?? '',
-        this.deps.mission?.block() ?? '',
-        this.deps.todoList?.block() ?? '',
+        ...this.controlStateBlocks(),
       ].filter((s) => s.trim()).join('\n\n'),
       beforeCompact: () => {
         if (this.deps.hooks?.pre_compact?.length) {
@@ -509,9 +526,7 @@ export class AgentLoop {
       const sys = [
         this.deps.system,
         effortDirective(this.effort),
-        this.deps.planMode?.block() ?? '',
-        this.deps.mission?.block() ?? '',
-        this.deps.todoList?.block() ?? '',
+        ...this.controlStateBlocks(),
       ]
         .filter((s) => s && s.trim())
         .join('\n\n');
@@ -715,6 +730,9 @@ export class AgentLoop {
         } else if (turn.providerReasoning) {
           assistantMessage.providerReasoning = { ...turn.providerReasoning, model: this.deps.model };
         }
+        if (!turnIncomplete && turn.responsesReasoning?.length) {
+          assistantMessage.responsesReasoning = { model: this.deps.model, items: turn.responsesReasoning };
+        }
         context.append(assistantMessage);
         if (!turnIncomplete && turn.thinkingText.trim()) {
           bus.emit({ type: 'reasoning_done', text: turn.thinkingText });
@@ -793,11 +811,18 @@ export class AgentLoop {
           return this.stop('fatal_tool_error', finalAnswer);
         }
 
-        // Hit the output cap before emitting any answer (common on reasoning models that
-        // spend the whole budget thinking) — say so rather than returning empty success.
-        if (turn.stopReason === 'max_tokens' && !finalAnswer) {
-          bus.emit({ type: 'error', message: 'Model hit the output-token cap before producing an answer — raise --max-output-tokens (reasoning models need headroom).' });
-          return this.stop('max_tokens', finalAnswer);
+        // A max_tokens stop belongs to THIS provider turn. `finalAnswer` deliberately retains
+        // useful visible progress across tool turns so a later budget/interrupt can report it,
+        // but reusing that cumulative value here turns an earlier "let me inspect..." narration
+        // into the final answer when a reasoning-only turn spends its whole cap thinking. That
+        // also hides the empty stop from headless exit handling. Keep prior progress in history,
+        // while reporting only visible text from the turn that actually hit the cap.
+        if (turn.stopReason === 'max_tokens') {
+          const currentTurnAnswer = turn.text;
+          if (!currentTurnAnswer.trim()) {
+            bus.emit({ type: 'error', message: 'Model hit the output-token cap before producing an answer — raise --max-output-tokens (reasoning models need headroom).' });
+          }
+          return this.stop('max_tokens', currentTurnAnswer);
         }
 
         // A paused long turn (server `pause_turn`): the partial assistant turn is
@@ -963,7 +988,18 @@ export class AgentLoop {
       // line 341). Report it as the user's interrupt, not a tool error, so the stop event/hook + telemetry
       // are correct (the parallel path already re-checks aborted at the top of the loop).
       if (fatal && this.deps.signal.aborted) return this.stop('interrupted', finalAnswer);
-      if (fatal) return this.stop('fatal_tool_error', finalAnswer);
+      if (fatal) {
+        // A ceiling reached by this provider turn owns the stop reason. In particular, spend
+        // guard steps are recorded immediately after each provider response, so an identical
+        // call on the last allowed step must end as `budget` (and retain its ordinary
+        // continue/deny flow), not be reclassified as a loop-guard tool error merely because
+        // tool admission happens before the next top-of-loop budget check.
+        const budgetStop = budget.check(this.now());
+        if (budgetStop) return this.stop(budgetStop, finalAnswer);
+        const guardStop = await this.checkSpendGuard(finalAnswer);
+        if (guardStop) return guardStop;
+        return this.stop('fatal_tool_error', finalAnswer);
+      }
       if (this.steerRequested) return this.stop('interrupted', finalAnswer);
 
       const stop2 = budget.check(this.now());
@@ -982,6 +1018,7 @@ export class AgentLoop {
     thinkingBlocks: Array<{ thinking: string; signature: string } | { redactedData: string }>;
     thinkingText: string;
     providerReasoning?: { text: string; field: 'reasoning_content' | 'reasoning' };
+    responsesReasoning?: ResponsesReasoningItem[];
     stopReason?: 'end_turn' | 'tool_use' | 'max_tokens' | 'pause_turn';
     badJsonMsg?: string;
     badCalls: string[];
@@ -1066,7 +1103,7 @@ export class AgentLoop {
         // that consumed attempt 0 buys a 4th request INSIDE the loop so the rung-2-reclaimed
         // context is actually sent (fresh messages, healing, and overflow handling all intact —
         // the old after-loop fall-through re-sent the pre-ladder req.messages instead).
-        if (err && !turn.text && turn.toolCalls.length === 0 && looksLikeTokenOverflow(err.message)) {
+        if (activeProvider.allowAutomaticFallback !== false && err && !turn.text && turn.toolCalls.length === 0 && looksLikeTokenOverflow(err.message)) {
           let recovered = false;
           let why = '';
           const warnLadderThrow = (ladderErr: unknown): void => {
@@ -1128,6 +1165,7 @@ export class AgentLoop {
         }
         if (
           attempt === 0 &&
+          activeProvider.allowAutomaticFallback !== false &&
           err &&
           !turn.text &&
           turn.toolCalls.length === 0 &&
@@ -1168,6 +1206,7 @@ export class AgentLoop {
         const fb = resolveFallbackEntry(model, this.deps.models ?? [], this.deps.fallbackModel);
         if (
           attempt === 0 &&
+          activeProvider.allowAutomaticFallback !== false &&
           !req.signal?.aborted &&
           !this.fallbackUsed &&
           fb &&
@@ -1214,6 +1253,7 @@ export class AgentLoop {
     thinkingBlocks: Array<{ thinking: string; signature: string } | { redactedData: string }>;
     thinkingText: string;
     providerReasoning?: { text: string; field: 'reasoning_content' | 'reasoning' };
+    responsesReasoning?: ResponsesReasoningItem[];
     stopReason?: 'end_turn' | 'tool_use' | 'max_tokens' | 'pause_turn';
     badJsonMsg?: string;
     badCalls: string[];
@@ -1226,6 +1266,7 @@ export class AgentLoop {
     const thinkingBlocks: Array<{ thinking: string; signature: string } | { redactedData: string }> = [];
     let thinkingText = '';
     let providerReasoning: { text: string; field: 'reasoning_content' | 'reasoning' } | undefined;
+    const responsesReasoning: ResponsesReasoningItem[] = [];
     let stopReason: 'end_turn' | 'tool_use' | 'max_tokens' | 'pause_turn' | undefined;
     let badJsonMsg: string | undefined;
     let namelessCall = false;
@@ -1264,6 +1305,11 @@ export class AgentLoop {
             break;
           case 'reasoning_block':
             providerReasoning = { text: ev.text, field: ev.field };
+            break;
+          case 'response_reasoning_item':
+            // Opaque continuation state belongs only in the committed local context, never bus
+            // text/diagnostics. Failed and interrupted turns drop it alongside signed thinking.
+            responsesReasoning.push(ev.item);
             break;
           case 'thinking_block':
             // Stash the signed reasoning block; run() prepends it to the assistant
@@ -1352,7 +1398,7 @@ export class AgentLoop {
     } finally {
       this.deps.bus.emit({ type: 'latency', ms: this.now() - t0 });
     }
-    return { text, toolCalls, thinkingBlocks, thinkingText, providerReasoning, stopReason, badJsonMsg, badCalls, namelessCall, providerError };
+    return { text, toolCalls, thinkingBlocks, thinkingText, providerReasoning, responsesReasoning, stopReason, badJsonMsg, badCalls, namelessCall, providerError };
   }
 
   /** Gate, validate, and run one tool call; return its result block. */
@@ -1426,15 +1472,25 @@ export class AgentLoop {
       this.consecutiveRepeats = 1;
     }
     if (this.consecutiveRepeats >= LOOP_GUARD_LIMIT) {
-      bus.emit({ type: 'tool_denied', call, reason: 'repeated identical call (loop guard)' });
+      const fatal = this.consecutiveRepeats >= LOOP_GUARD_FATAL_LIMIT;
+      bus.emit({
+        type: 'tool_denied',
+        call,
+        reason: fatal
+          ? 'repeated identical call persisted after loop guard'
+          : 'repeated identical call (loop guard)',
+      });
       return {
         block: this.resultBlock(
           call.id,
           false,
           `You have called ${call.name} with these exact arguments ${this.consecutiveRepeats} times in a row ` +
-            `with no other action between. Take a different action, or stop if the task is complete.`,
+            `with no other action between. ` +
+            (fatal
+              ? 'Shadow stopped this repeated-call loop; report the missing evidence or choose a different approach on the next user turn.'
+              : 'Take a different action, or stop if the task is complete.'),
         ),
-        isFatal: false,
+        isFatal: fatal,
       };
     }
 
@@ -1749,6 +1805,7 @@ export class AgentLoop {
       log: () => {},
       dryRun: this.deps.dryRun,
       maxToolResultChars: this.deps.maxToolResultChars,
+      systemPrompt: this.deps.system,
       readTracker: this.readTracker,
       streamShell: this.deps.streamShell !== false,
       toolCallId: call.id,
@@ -1881,14 +1938,15 @@ export class AgentLoop {
 
   private emitToolEnd(call: ToolCall, result: ToolResult): void {
     this.deps.bus.emit({ type: 'tool_end', call, result });
-    this.emitFindings(result);
+    this.emitFindings(result, call);
   }
 
-  private emitFindings(result: ToolResult): void {
+  private emitFindings(result: ToolResult, call: ToolCall): void {
     // meta is required by the ToolResult type, but runtime-registered (plugin/adapter) tools
     // sit outside TS's sight — a missing meta must not throw here, outside the tool try/catch.
     for (const f of result.meta?.findings ?? []) {
-      this.deps.bus.emit({ type: 'finding', title: f.title, body: f.body, severity: f.severity });
+      this.deps.bus.emit({ type: 'finding', title: f.title, body: f.body, severity: f.severity,
+        toolCallId: call.id, toolName: call.name });
     }
   }
 

@@ -89,13 +89,14 @@ export class Budget {
   }
 
 
-  /** Record one provider call's usage and accrue cost. */
+  /** Record every call's tokens; accrue API dollar cost only for API-billed usage. */
   recordUsage(
     u: {
       inputTokens: number;
       outputTokens: number;
       cacheReadTokens?: number;
       cacheWriteTokens?: number;
+      billing?: 'subscription';
     },
     now: number,
   ): void {
@@ -105,7 +106,7 @@ export class Budget {
     this.cacheWriteTokens += u.cacheWriteTokens ?? 0;
 
     const p = this.prices[this.model];
-    if (p) {
+    if (p && u.billing !== 'subscription') {
       const M = 1_000_000;
       const cacheRead = (u.cacheReadTokens ?? 0) * p.input * (p.cacheReadMult ?? 0.1);
       const cacheWrite = (u.cacheWriteTokens ?? 0) * p.input * (p.cacheWriteMult ?? 1.25);

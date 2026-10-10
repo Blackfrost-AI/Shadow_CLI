@@ -12,7 +12,7 @@ import {
   CLAUDE_MAX_IMPORT_BYTES,
 } from '../src/state/claudeImport.js';
 import { SessionLog } from '../src/state/session.js';
-import { listResumableSessions, resumeSession } from '../src/state/resume.js';
+import { listResumableSessions, resumeSession, trustLegacySession } from '../src/state/resume.js';
 import type { TextBlock, ThinkingBlock, ToolResultBlock, ToolUseBlock } from '../src/provider/provider.js';
 
 const CLAUDE_SESSION_ID = '9f3c1a2e-4b5d-4c6e-8f7a-0b1c2d3e4f5a';
@@ -227,7 +227,9 @@ test('importClaudeSession produces a Shadow session the existing reader resumes'
     assert.ok(listed, 'imported session must be listed as resumable');
     assert.ok(listed!.ts, 'snapshot record must carry a ts (filename is not an ISO stamp)');
 
-    const { context, meta } = resumeSession(listed!.path, opts);
+    const bindingsDir = join(ws, 'owner-bindings');
+    trustLegacySession(listed!.path, { bindingsDir });
+    const { context, meta } = resumeSession(listed!.path, { ...opts, bindingsDir });
     assert.equal(meta.sessionId, shadowSessionIdForClaude(CLAUDE_SESSION_ID));
     const msgs = context.messages();
     assert.equal(msgs.length, 6);

@@ -81,6 +81,16 @@ export type ContentBlock = TextBlock | ToolUseBlock | ToolResultBlock | Thinking
 /** Reasoning depth control. Maps to Anthropic `output_config.effort` on capable models. */
 export type Effort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
+/** Opaque Responses continuation state. Never render encrypted_content as text. */
+export interface ResponsesReasoningItem {
+  type: 'reasoning';
+  id: string;
+  summary: Array<{ type: 'summary_text'; text: string }>;
+  content?: Array<{ type: 'reasoning_text'; text: string }>;
+  encrypted_content?: string | null;
+  status?: 'in_progress' | 'completed' | 'incomplete';
+}
+
 export interface Message {
   role: Role;
   content: ContentBlock[]; // never a bare string internally
@@ -99,6 +109,8 @@ export interface Message {
     field: 'reasoning_content' | 'reasoning';
     model: string;
   };
+  /** Completed Responses reasoning prefix, replayed only to its producing model. */
+  responsesReasoning?: { model: string; items: ResponsesReasoningItem[] };
   /** A partial assistant turn retained for resume/export after interruption or stream failure. */
   interrupted?: boolean;
 }
@@ -125,6 +137,7 @@ export type ProviderEvent =
   | { type: 'text'; delta: string }
   | { type: 'thinking'; delta: string } // streamed reasoning text (display)
   | { type: 'reasoning_block'; text: string; field: 'reasoning_content' | 'reasoning' } // complete OpenAI-compat reasoning (echo-back)
+  | { type: 'response_reasoning_item'; item: ResponsesReasoningItem }
   | { type: 'thinking_block'; thinking: string; signature: string } // complete block (echo-back)
   | { type: 'redacted_thinking_block'; data: string } // encrypted reasoning to echo back verbatim
   | { type: 'tool_call_partial'; id: string; name: string; jsonDelta: string }
@@ -135,6 +148,8 @@ export type ProviderEvent =
       outputTokens: number;
       cacheReadTokens?: number;
       cacheWriteTokens?: number;
+      /** Plan allowance usage has no per-token API dollar charge in Shadow. */
+      billing?: 'subscription';
     }
   | { type: 'error'; recoverable: boolean; code: string; message: string }
   | { type: 'done'; stopReason: StopReason };
@@ -168,6 +183,8 @@ export type ToolChoice =
 
 export interface Provider {
   readonly name: string;
+  /** Account-backed inference must not silently retry error recovery or switch billing connections. */
+  readonly allowAutomaticFallback?: boolean;
   send(req: CompletionRequest): AsyncIterable<ProviderEvent>;
   /** LOCAL, synchronous token estimate for budget + summarization (never a network call). */
   estimateTokens(messages: Message[]): number;
@@ -207,6 +224,7 @@ export function estimateTokensFromMessages(messages: Message[]): number {
   let chars = 0;
   for (const m of messages) {
     if (m.providerReasoning) chars += m.providerReasoning.text.length;
+    if (m.responsesReasoning) chars += JSON.stringify(m.responsesReasoning.items).length;
     for (const b of m.content) {
       if (b.type === 'text') chars += b.text.length;
       else if (b.type === 'thinking') chars += b.thinking.length;

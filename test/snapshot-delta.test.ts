@@ -17,7 +17,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Context } from '../src/agent/context.js';
 import { SessionLog } from '../src/state/session.js';
-import { resumeSession } from '../src/state/resume.js';
+import { resumeSession, trustLegacySession } from '../src/state/resume.js';
 import { rewindToTurn, listRewindableTurns } from '../src/state/rewind.js';
 
 // P2-13: chained delta snapshots. Before this change, two FULL context snapshots per turn made
@@ -168,7 +168,9 @@ test('resume hydrates the latest state through the delta chain', () => {
   try {
     const log = SessionLog.open(root);
     const { ctx } = runSession(log, 5);
-    const { context, meta } = resumeSession(log.path, opts);
+    const bindingsDir = join(root, 'owner-bindings');
+    trustLegacySession(log.path, { bindingsDir });
+    const { context, meta } = resumeSession(log.path, { ...opts, bindingsDir });
     assert.deepEqual(
       context.messages().map((m) => JSON.stringify(m)),
       ctx.messages().map((m) => JSON.stringify(m)),
@@ -372,7 +374,9 @@ test('legacy full-only logs (no format field) keep working everywhere', () => {
     const turns = listRewindableTurns(path);
     assert.deepEqual(turns.map((t) => t.turn), [1, 0]);
     assert.ok(turns[0]!.prompt.includes('hello legacy'));
-    const { context } = resumeSession(path, opts);
+    const bindingsDir = join(root, 'owner-bindings');
+    trustLegacySession(path, { bindingsDir });
+    const { context } = resumeSession(path, { ...opts, bindingsDir });
     assert.equal(context.messages().length, 2);
   } finally {
     rmSync(root, { recursive: true, force: true });

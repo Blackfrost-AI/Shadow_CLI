@@ -132,7 +132,10 @@ Setting `SHADOW_WIRE_API=responses` switches OpenAI-class endpoints from Chat Co
   GGUF):** Shadow sends `stream_options: { include_usage: true }` for usage accounting, the
   `temperature` contract above, and full tool-call payloads. Servers that reject any of these get
   the recovery ladder — on this wire stripped params are remembered, so the second request
-  onward is clean.
+  onward is clean. A model preset may explicitly set
+  `capabilities.chatTemplateEnableThinking` to send SGLang/Qwen's
+  `chat_template_kwargs.enable_thinking` control. Shadow never infers that extension from the
+  model name and sends it only to a self-hosted Chat Completions endpoint.
 - **Anthropic:** native Messages wire; prompt caching markers; thinking blocks round-trip.
 - **Gemini (via the OpenAI-compatible wire):** `thought_signature` round-trip for thinking
   models.

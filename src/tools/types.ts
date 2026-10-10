@@ -41,6 +41,9 @@ export interface ToolContext {
    *  enveloping so the envelope's END marker always survives into the context (a downstream
    *  truncation that severed it would hand a forged END marker its escape wedge). */
   maxToolResultChars?: number;
+  /** Exact system prompt for this loop. Read-only tools use it to avoid re-attaching unchanged
+   * project instruction blocks that are already present; it is never returned to the model. */
+  systemPrompt?: string;
   readTracker?: ReadTracker; // read-before-edit guard (present in the real loop, optional in tests)
   /** When true, run_shell emits live stdout/stderr chunks via onShellOutput. */
   streamShell?: boolean;

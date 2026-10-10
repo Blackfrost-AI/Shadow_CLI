@@ -738,6 +738,9 @@ export function flattenItem(
    *  collapses to one header row (pos 0 draws it; pos>0 is absorbed). Undefined = render normally. */
   toolRun?: ToolRun,
 ): ViewportLine[] {
+  // Some endpoints stream whitespace in the reasoning channel. It must not create an empty
+  // panel (or even a blank separator); keep the original text for any later meaningful delta.
+  if (item.kind === 'reasoning' && !item.text.trim()) return [];
   const kp = `i${item.id}`;
   const out: ViewportLine[] = [];
   const color = item.color ?? kindColor(item.kind, theme);
@@ -840,12 +843,18 @@ export function flattenItem(
   // ── reasoning (v2: ∴ thought for Ns + fold child / expanded body) ──
   if (item.kind === 'reasoning') {
     if (item.reasoningState) {
-      // Keep a visible tail even in compact mode. Thinking has its own boundary and never
-      // borrows the answer's bullet or disappears behind a line-count-only fold.
+      // Show the live tail while thinking, then fold it away when an answer or tool starts.
+      // The complete original stays on the item for Ctrl+O, including interrupted reasoning.
       const duration = formatDuration((item.durationMs ?? 0) / 1000);
       const label = item.reasoningState === 'streaming' ? `Thinking · ${duration}`
         : item.reasoningState === 'complete' ? item.durationMs === undefined ? 'Thinking · complete' : `Thought for ${duration}`
           : `Thinking ${item.reasoningState} · ${duration}`;
+      if (collapsed && item.reasoningState !== 'streaming') {
+        out.push({ key: `${kp}rh`, spans: truncateSpans([
+          { text: `∴ ${label} · Ctrl+O expand`, color: theme.dim },
+        ], cols) });
+        return out;
+      }
       const edge = (key: string, left: string, title: string, right: string): ViewportLine => {
         const head = takeByWidth(` ${title} `, Math.max(0, cols - 2)).head;
         return { key, spans: [{ text: left + head + BORDER.horizontal.repeat(Math.max(0, cols - 2 - displayWidth(head))) + right, color: theme.dim }] };

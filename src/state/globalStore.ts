@@ -18,7 +18,7 @@ export function configPath(): string {
   return CONFIG_PATH;
 }
 
-const LAYOUT_DIRS = ['agents', 'commands', 'rules', 'workflows', 'projects', 'tasks', 'checkpoints', 'memories', 'plugins'] as const; // deeper ~/.shadow for Claude parity + recovery; plugins = P3-07 install root
+const LAYOUT_DIRS = ['agents', 'commands', 'rules', 'workflows', 'projects', 'tasks', 'checkpoints', 'memories', 'plugins'] as const; // deeper ~/.shadow for Claude parity + recovery; harness/skill stores create their roots only when explicitly used
 
 /** Ensure the extended `~/.shadow` layout exists (idempotent). */
 export function ensureShadowLayout(): void {

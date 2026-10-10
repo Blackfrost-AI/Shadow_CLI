@@ -26,7 +26,11 @@ export type LoopEvent =
   | { type: 'thinking'; delta: string } // streamed extended-reasoning text
   | { type: 'reasoning_done'; text: string } // committed collapsible reasoning block
   | { type: 'assistant_done'; text: string } // a full assistant turn committed
-  | { type: 'finding'; title: string; body: string; severity?: 'info' | 'warn' | 'error' }
+  | {
+      type: 'finding'; title: string; body: string; severity?: 'info' | 'warn' | 'error';
+      /** Present for tool-result findings; standalone notices have no tool origin. */
+      toolCallId?: string; toolName?: string;
+    }
   | { type: 'tool_start'; call: ToolCall; risk: ToolRisk; subagent?: string }
   | { type: 'tool_end'; call: ToolCall; result: ToolResult; subagent?: string }
   | { type: 'tool_denied'; call: ToolCall; reason: string; subagent?: string }

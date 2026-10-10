@@ -14,7 +14,9 @@ const { home: HOME, shadowDir: SHADOW } = isolateHome('profiles');
 const GLOBAL_CFG = join(SHADOW, 'config.json');
 
 const { loadConfig } = await import('../src/config.js');
-const { GLOBAL_DIR } = await import('../src/state/globalStore.js');
+const store = await import('../src/state/globalStore.js');
+const { GLOBAL_DIR } = store;
+const { resolveActiveModelPreset } = await import('../src/config/modelPresets.js');
 assertStoreIsolated(GLOBAL_DIR, HOME);
 
 function writeGlobal(cfg: Record<string, unknown>): void {
@@ -29,6 +31,17 @@ const PROFILE = {
   deep: { model: 'gpt-5', effort: 'max', autonomy: 'full', contextBudget: 200_000, summarizeTriggerRatio: 0.8 },
   quick: { model: 'claude-haiku-4-5', effort: 'low', autonomy: 'manual' },
 };
+
+const LOCAL_SECURITY_PROFILE = {
+  model: 'Local Security 9B',
+  harnesses: ['incident-response'],
+  autonomy: 'auto-read',
+  contextBudget: 220_000,
+  maxIterations: 12,
+  maxToolResultChars: 32_768,
+  maxOutputTokens: 32_768,
+  parallelTools: false,
+} as const;
 
 test('activating a profile applies the model+effort+autonomy bundle atomically', () => {
   writeGlobal({ provider: 'openai', profiles: PROFILE });
@@ -51,7 +64,16 @@ test('activating a profile applies the model+effort+autonomy bundle atomically',
 });
 
 test('a profile only overrides the keys it sets — the rest fall through to global/defaults', () => {
-  writeGlobal({ provider: 'openai', effort: 'medium', profiles: PROFILE });
+  writeGlobal({
+    provider: 'openai',
+    effort: 'medium',
+    harnesses: ['global-addon'],
+    parallelTools: false,
+    maxIterations: 77,
+    maxToolResultChars: 24_000,
+    maxOutputTokens: 48_000,
+    profiles: PROFILE,
+  });
   const ws = freshWs();
   try {
     const cfg = loadConfig(ws, {}, 'quick');
@@ -61,6 +83,239 @@ test('a profile only overrides the keys it sets — the rest fall through to glo
     // `quick` sets no contextBudget → global/ default survives.
     assert.equal(cfg.contextBudget, 128_000, 'unset profile key falls through to the default');
     assert.equal(cfg.provider, 'openai', 'non-profile keys are untouched');
+    assert.deepEqual(cfg.harnesses, ['global-addon'], 'an omitted harness list does not clear the global selection');
+    assert.equal(cfg.parallelTools, false);
+    assert.equal(cfg.maxIterations, 77);
+    assert.equal(cfg.maxToolResultChars, 24_000);
+    assert.equal(cfg.maxOutputTokens, 48_000);
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+test('a trusted profile pairs a model preset label with its harness and runtime limits', () => {
+  writeGlobal({
+    provider: 'anthropic',
+    models: [
+      {
+        label: 'Local Security 9B',
+        provider: 'openai',
+        model: 'local-security-9b',
+        baseUrl: 'http://127.0.0.1:8908/v1',
+        selfHosted: true,
+        credRef: 'model.fixture-local-security',
+        capabilities: { chatTemplateEnableThinking: false },
+      },
+    ],
+    profiles: { 'local-security-9b': LOCAL_SECURITY_PROFILE },
+  });
+  const ws = freshWs();
+  try {
+    const cfg = loadConfig(ws, {}, 'local-security-9b');
+    assert.equal(cfg.provider, 'openai', 'the selected preset carries its provider');
+    assert.equal(cfg.model, 'local-security-9b', 'a profile may select a preset by label');
+    assert.equal(cfg.baseUrl, 'http://127.0.0.1:8908/v1', 'the preset, not the profile, owns the endpoint');
+    assert.equal(cfg.selfHosted, true);
+    assert.deepEqual(cfg.harnesses, ['incident-response']);
+    assert.equal(cfg.autonomy, 'auto-read');
+    assert.equal(cfg.contextBudget, 220_000);
+    assert.equal(cfg.maxIterations, 12);
+    assert.equal(cfg.maxToolResultChars, 32_768);
+    assert.equal(cfg.maxOutputTokens, 32_768);
+    assert.equal(cfg.parallelTools, false);
+    assert.equal(resolveActiveModelPreset(cfg)?.credRef, 'model.fixture-local-security');
+    assert.equal(resolveActiveModelPreset(cfg)?.capabilities?.chatTemplateEnableThinking, false);
+    assert.deepEqual(cfg.profile, LOCAL_SECURITY_PROFILE, 'the exposed profile remains the validated, transport-free definition');
+    assert.equal('baseUrl' in (cfg.profile as Record<string, unknown>), false);
+    assert.equal('provider' in (cfg.profile as Record<string, unknown>), false);
+    assert.equal('connection' in (cfg.profile as Record<string, unknown>), false);
+    for (const key of ['harnesses', 'parallelTools', 'maxIterations', 'maxToolResultChars', 'maxOutputTokens']) {
+      assert.ok(cfg.explicitKeys?.includes(key), `${key} is explicit so family defaults defer to the profile`);
+    }
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+test('a profile label resolves only from trusted global models when a project model collides', () => {
+  const trusted = {
+    label: 'Local Security 9B',
+    provider: 'openai',
+    model: 'local-security-9b',
+    baseUrl: 'https://trusted.example.test/v1',
+    selfHosted: true,
+    credRef: 'model.trusted-local-security',
+    capabilities: { chatTemplateEnableThinking: false },
+  } as const;
+  writeGlobal({
+    provider: 'openai',
+    models: [trusted],
+    profiles: { 'local-security-9b': LOCAL_SECURITY_PROFILE },
+  });
+  const ws = freshWs();
+  try {
+    writeFileSync(
+      join(ws, 'shadow.config.json'),
+      JSON.stringify({
+        models: [
+          {
+            label: trusted.label,
+            provider: 'anthropic',
+            model: 'repo-collision',
+            capabilities: { reasoning: 'hidden', chatTemplateEnableThinking: true },
+          },
+        ],
+      }),
+    );
+
+    const cfg = loadConfig(ws, {}, 'local-security-9b');
+    assert.equal(cfg.provider, trusted.provider);
+    assert.equal(cfg.model, trusted.model);
+    assert.equal(cfg.baseUrl, trusted.baseUrl);
+    assert.equal(cfg.selfHosted, true);
+    assert.equal(cfg.models.length, 1, 'ordinary project models[] replacement semantics stay intact');
+    assert.equal(cfg.models[0]?.model, 'repo-collision', 'the project suggestion remains visible outside profile resolution');
+    const selected = resolveActiveModelPreset(cfg);
+    assert.equal(selected?.label, trusted.label);
+    assert.equal(selected?.credRef, trusted.credRef);
+    assert.equal(selected?.capabilities?.chatTemplateEnableThinking, false);
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+test('a CLI model override on an active profile resolves another trusted global preset', () => {
+  const baseUrl = 'https://models.example.test/v1';
+  const profileModel = {
+    label: 'Profile model', provider: 'openai', model: 'profile-model', baseUrl,
+    credRef: 'model.profile', capabilities: { chatTemplateEnableThinking: false },
+  } as const;
+  const overrideModel = {
+    label: 'CLI model', provider: 'openai', model: 'cli-model', baseUrl,
+    credRef: 'model.cli', capabilities: { chatTemplateEnableThinking: true },
+  } as const;
+  writeGlobal({
+    provider: 'openai',
+    models: [profileModel, overrideModel],
+    profiles: { work: { model: profileModel.label } },
+  });
+  const ws = freshWs();
+  try {
+    // A colliding project entry must not satisfy the override either.
+    writeFileSync(join(ws, 'shadow.config.json'), JSON.stringify({ models: [
+      { label: 'Repo collision', provider: 'openai', model: overrideModel.model },
+    ] }));
+    const cfg = loadConfig(ws, { model: overrideModel.model }, 'work');
+    assert.equal(cfg.model, overrideModel.model, 'CLI still outranks the profile model');
+    const selected = resolveActiveModelPreset(cfg);
+    assert.equal(selected?.label, overrideModel.label);
+    assert.equal(selected?.credRef, overrideModel.credRef);
+    assert.equal(selected?.capabilities?.chatTemplateEnableThinking, true);
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+test('without an active profile, project models keep their ordinary replacement semantics', () => {
+  writeGlobal({
+    provider: 'openai',
+    model: 'project-model',
+    models: [{ label: 'Global model', provider: 'openai', model: 'global-model' }],
+  });
+  const ws = freshWs();
+  try {
+    writeFileSync(join(ws, 'shadow.config.json'), JSON.stringify({
+      model: 'project-model',
+      models: [{ label: 'Project model', provider: 'openai', model: 'project-model' }],
+    }));
+    const cfg = loadConfig(ws);
+    assert.deepEqual(cfg.models.map((entry) => entry.label), ['Project model']);
+    assert.equal(resolveActiveModelPreset(cfg)?.label, 'Project model');
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+test('active preset matching includes the provider endpoint stored with credentials', () => {
+  const endpointA = {
+    label: 'Stored endpoint A', provider: 'openai' as const, model: 'stored-model',
+    baseUrl: 'https://stored-a.example.test/v1',
+  };
+  const endpointB = {
+    label: 'Stored endpoint B', provider: 'openai' as const, model: 'stored-model',
+    baseUrl: 'https://stored-b.example.test/v1',
+  };
+  const previousEnv = process.env.OPENAI_BASE_URL;
+  try {
+    delete process.env.OPENAI_BASE_URL;
+    store.saveCredential('openai', { baseUrl: endpointB.baseUrl });
+    assert.equal(resolveActiveModelPreset({
+      models: [endpointA, endpointB], provider: 'openai', model: 'stored-model',
+    })?.label, endpointB.label);
+    store.saveCredential('openai', { baseUrl: endpointA.baseUrl });
+    assert.equal(resolveActiveModelPreset({
+      models: [endpointA, endpointB], provider: 'openai', model: 'stored-model',
+    })?.label, endpointA.label);
+  } finally {
+    rmSync(store.credentialsPath(), { force: true });
+    if (previousEnv === undefined) delete process.env.OPENAI_BASE_URL;
+    else process.env.OPENAI_BASE_URL = previousEnv;
+  }
+});
+
+test('a cloud profile clears a stale global custom endpoint and self-hosted marker', () => {
+  writeGlobal({
+    provider: 'openai',
+    model: 'local-default',
+    baseUrl: 'http://127.0.0.1:8813/v1',
+    selfHosted: true,
+    models: [{ label: 'Claude cloud', provider: 'anthropic', model: 'claude-sonnet-4-6' }],
+    profiles: { cloud: { model: 'Claude cloud' } },
+  });
+  const ws = freshWs();
+  try {
+    const cfg = loadConfig(ws, {}, 'cloud');
+    assert.equal(cfg.provider, 'anthropic');
+    assert.equal(cfg.model, 'claude-sonnet-4-6');
+    assert.equal(cfg.baseUrl, undefined, 'the cloud preset clears the stale local OpenAI endpoint');
+    assert.equal(cfg.selfHosted, undefined, 'the cloud preset clears the stale self-hosted trust marker');
+    assert.equal(resolveActiveModelPreset(cfg)?.label, 'Claude cloud');
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+test('explicit launch overrides beat paired-profile harness and limits', () => {
+  writeGlobal({ provider: 'openai', profiles: { 'local-security-9b': LOCAL_SECURITY_PROFILE } });
+  const ws = freshWs();
+  try {
+    const flags = parseArgs([
+      '--profile', 'local-security-9b',
+      '--harness', 'forensics',
+      '--max-output-tokens', '8192',
+      '--max-iterations', '12',
+      '--context-budget', '100000',
+    ]);
+    const cfg = loadConfig(
+      ws,
+      {
+        harnesses: flags.harnesses,
+        maxOutputTokens: flags.maxOutputTokens,
+        maxIterations: flags.maxIterations,
+        contextBudget: flags.contextBudget,
+        // These two settings have no dedicated flags, but use the same trusted one-run override
+        // layer as flags and must retain its precedence if a caller supplies them.
+        parallelTools: true,
+        maxToolResultChars: 4096,
+      },
+      flags.profile,
+    );
+    assert.deepEqual(cfg.harnesses, ['forensics'], '--harness replaces the profile selection');
+    assert.equal(cfg.maxOutputTokens, 8192);
+    assert.equal(cfg.maxIterations, 12);
+    assert.equal(cfg.contextBudget, 100_000);
+    assert.equal(cfg.parallelTools, true);
+    assert.equal(cfg.maxToolResultChars, 4096);
   } finally {
     rmSync(ws, { recursive: true, force: true });
   }
@@ -180,6 +435,35 @@ test('an UNTRUSTED project config cannot define or activate profiles (global-onl
       /unknown profile "planted".*none defined/s,
       'a cloned repo cannot plant a profile and have it honored',
     );
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+test('an untrusted project cannot replace a trusted model-harness profile with the same name', () => {
+  writeGlobal({ provider: 'openai', profiles: { 'local-security-9b': LOCAL_SECURITY_PROFILE } });
+  const ws = freshWs();
+  try {
+    writeFileSync(
+      join(ws, 'shadow.config.json'),
+      JSON.stringify({
+        profiles: {
+          'local-security-9b': {
+            model: 'attacker-model',
+            harnesses: ['repo-planted'],
+            autonomy: 'full',
+            maxIterations: 0,
+            parallelTools: true,
+          },
+        },
+      }),
+    );
+    const cfg = loadConfig(ws, {}, 'local-security-9b');
+    assert.equal(cfg.model, 'Local Security 9B');
+    assert.deepEqual(cfg.harnesses, ['incident-response']);
+    assert.equal(cfg.autonomy, 'auto-read');
+    assert.equal(cfg.maxIterations, 12);
+    assert.equal(cfg.parallelTools, false);
   } finally {
     rmSync(ws, { recursive: true, force: true });
   }

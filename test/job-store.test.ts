@@ -1,11 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { JobStore } from '../src/state/jobStore.js';
+import { JobStore, recoverOrphanJobsIfPresent } from '../src/state/jobStore.js';
 import { DatabaseSync } from 'node:sqlite';
 
 const moduleUrl = pathToFileURL(resolve('src/state/jobStore.ts')).href;
@@ -38,7 +38,7 @@ test('dead owner recovery never replays work; explicit retry links attempts and 
     const output = await child(ws, `const attempt=store.claimAttempt('crash');store.attachArtifacts('crash',attempt.ownerToken,['retained-fixture']);console.log(attempt.ownerToken);process.exit(0);`);
     assert.equal(output.code, 0);
     const token = store.get('crash')!.attempts[0]!.ownerToken;
-    assert.deepEqual(store.recoverOrphans(), ['crash']);
+    assert.deepEqual(recoverOrphanJobsIfPresent(ws), ['crash']);
     assert.equal(store.get('crash')?.status, 'interrupted');
     assert.equal(store.get('crash')?.attempts.length, 1, 'recovery classifies; it never executes');
     assert.deepEqual(store.get('crash')?.attempts[0]?.artifactIds, ['retained-fixture'], 'crash recovery retains the pre-announced output reference');
@@ -50,6 +50,15 @@ test('dead owner recovery never replays work; explicit retry links attempts and 
     assert.deepEqual(store.recoverOrphans(), [], 'a live owner is never stolen just because another app opened');
     store.finishAttempt('crash', retry.ownerToken, { status: 'cancelled' });
   } finally { store.close(); rmSync(ws, { recursive: true, force: true }); }
+});
+
+test('startup orphan recovery does not create scheduler state in an unused workspace', () => {
+  const ws = mkdtempSync(join(tmpdir(), 'shadow-job-pristine-'));
+  try {
+    assert.deepEqual(recoverOrphanJobsIfPresent(ws), []);
+    assert.equal(existsSync(join(ws, '.shadow', 'jobs.sqlite')), false);
+    assert.equal(existsSync(join(ws, '.shadow')), false, 'a read-only startup leaves no scheduler directory');
+  } finally { rmSync(ws, { recursive: true, force: true }); }
 });
 
 test('dependencies reject cycles and require accepted evidence before claiming work', () => {

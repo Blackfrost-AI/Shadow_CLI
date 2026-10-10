@@ -11,6 +11,8 @@ export interface Flags {
   effort?: string;
   /** --profile <name>: activate a named profile from ~/.shadow/config.json (P2-11). */
   profile?: string;
+  /** Provider-neutral harness add-ons selected for this new session. Repeatable/comma-separated. */
+  harnesses?: string[];
   maxOutputTokens?: number;
   maxIterations?: number;
   contextBudget?: number;
@@ -92,6 +94,12 @@ export function parseArgs(argv: string[]): Flags {
       case '--profile':
         f.profile = next();
         break;
+      case '--harness':
+      case '--addon': {
+        const ids = next().split(',').map((id) => id.trim()).filter(Boolean);
+        (f.harnesses ??= []).push(...ids);
+        break;
+      }
       case '--max-output-tokens':
         f.maxOutputTokens = Number(next());
         break;

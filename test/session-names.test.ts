@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { Context } from '../src/agent/context.js';
 import { SessionLog } from '../src/state/session.js';
 import { deriveSessionTitle, normalizeSessionTitle, sessionTerminalTitle } from '../src/state/sessionTitle.js';
-import { listResumableSessions, resumeSession } from '../src/state/resume.js';
+import { listResumableSessions, resumeSession, trustLegacySession } from '../src/state/resume.js';
 import { forkSession } from '../src/state/fork.js';
 import { serializeContext } from '../src/state/snapshot.js';
 import { registerSecret } from '../src/util/redact.js';
@@ -63,7 +63,9 @@ test('automatic names and explicit renames survive snapshots, reload, resume and
   { cwd: process.cwd(), encoding: 'utf8' }).trim();
   assert.equal(child, 'Release checklist', 'a new process recovers the newest rename');
   assert.equal(listResumableSessions(root)[0]!.title, 'Release checklist');
-  assert.equal(resumeSession(log.path, policy).meta.title, 'Release checklist');
+  const bindingsDir = join(root, 'owner-bindings');
+  trustLegacySession(log.path, { bindingsDir });
+  assert.equal(resumeSession(log.path, { ...policy, bindingsDir }).meta.title, 'Release checklist');
   assert.equal(SessionLog.countSnapshots(log.path), 2, 'naming does not alter turn offsets');
 
   const before = readFileSync(log.path);

@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { wrapSpansWord, truncateSpans, flattenItem, TOOL_BODY_EXPAND_CAP, itemIsCollapsible, computeToolRuns } from '../src/tui/flatten.js';
 import { renderToolResult } from '../src/tui/rows.js';
-import type { ViewportTheme } from '../src/tui/flatten.js';
+import type { FlattenItem, ViewportTheme } from '../src/tui/flatten.js';
 
 const T: ViewportTheme = {
   fg: '#ffffff', dim: '#b6bcc3', green: '#22c55e', cyan: '#38bdf8',
@@ -200,6 +200,65 @@ test('itemIsCollapsible: threshold 3, header-only tools never fold', () => {
   assert.equal(itemIsCollapsible({ kind: 'tool', tool: {}, lines: [{}, {}, {}] }), false, '3 lines stay inline');
   assert.equal(itemIsCollapsible({ kind: 'tool', tool: {}, lines: [{}, {}, {}, {}] }), true, '4+ folds');
   assert.equal(itemIsCollapsible({ kind: 'tool', tool: {}, text: 'ok' }), false, 'header-only (no lines) not collapsible');
+});
+
+test('finished reasoning collapses to one summary row while keeping its body available to expand', () => {
+  const body = Array.from({ length: 7 }, (_, i) => `Trace step ${i + 1}: inspect the result.`).join('\n');
+  for (const reasoningState of ['complete', 'interrupted', 'stopped'] as const) {
+    const item: FlattenItem = { id: reasoningState, kind: 'reasoning', text: body, reasoningState, durationMs: 65000 };
+    const compact = flattenItem(item, 80, true, T);
+    const visible = compact.map((row) => row.spans.map((span) => span.text).join('')).filter((line) => line.trim());
+    assert.equal(visible.length, 1, `${reasoningState}: one summary row`);
+    assert.match(visible[0]!, /1m/);
+    assert.match(visible[0]!, /Ctrl\+O expand/);
+    assert.doesNotMatch(visible[0]!, /Trace step|[╭╮╰╯│]/, `${reasoningState}: no preview or empty panel border`);
+    if (reasoningState !== 'complete') assert.ok(visible[0]!.includes(reasoningState));
+    const expanded = flattenItem(item, 80, false, T).map((row) => row.spans.map((span) => span.text).join('')).join('\n');
+    for (let i = 1; i <= 7; i++) assert.ok(expanded.includes(`Trace step ${i}:`), `${reasoningState}: expanded body keeps step ${i}`);
+    assert.match(expanded, /Ctrl\+O compact/);
+    assert.equal(item.text, body, 'collapsing does not discard the original reasoning');
+  }
+});
+
+test('streaming reasoning keeps a bounded four-row tail and expands to the full trace', () => {
+  const item: FlattenItem = {
+    id: 'live-trace', kind: 'reasoning', reasoningState: 'streaming', durationMs: 65000,
+    text: Array.from({ length: 7 }, (_, i) => `Live trace ${i + 1}: checking.`).join('\n'),
+  };
+  const compact = flattenItem(item, 80, true, T).map((row) => row.spans.map((span) => span.text).join(''));
+  const preview = compact.filter((line) => line.includes('Live trace'));
+  assert.equal(preview.length, 4);
+  for (let i = 4; i <= 7; i++) assert.ok(preview.some((line) => line.includes(`Live trace ${i}:`)));
+  assert.ok(!compact.some((line) => line.includes('Live trace 1:')));
+  assert.match(compact.join('\n'), /Thinking · 1m/);
+  assert.match(compact.join('\n'), /Ctrl\+O expand/);
+  const expanded = flattenItem(item, 80, false, T).map((row) => row.spans.map((span) => span.text).join('')).join('\n');
+  for (let i = 1; i <= 7; i++) assert.ok(expanded.includes(`Live trace ${i}:`));
+});
+
+test('empty or whitespace-only reasoning never emits a panel or even a gap row', () => {
+  for (const reasoningState of [undefined, 'streaming', 'complete', 'interrupted', 'stopped'] as const) {
+    for (const body of ['', ' \n\t\n\u2003 ']) {
+      for (const collapsed of [false, true]) {
+        assert.deepEqual(
+          flattenItem({ id: 'empty', kind: 'reasoning', text: body, reasoningState }, 80, collapsed, T),
+          [], `${reasoningState ?? 'legacy'} reasoning, collapsed=${collapsed}`,
+        );
+      }
+    }
+  }
+});
+
+test('ordinary findings retain every body line at info, warning and error severities', () => {
+  for (const severity of ['info', 'warn', 'error']) {
+    const rows = flattenItem({
+      id: severity, kind: 'finding', title: 'Review note', severity,
+      text: 'A useful first finding line.\nThe second line explains the result.',
+    }, 80, true, T);
+    const rendered = rows.map((row) => row.spans.map((span) => span.text).join('')).join('\n');
+    assert.match(rendered, /A useful first finding line\./);
+    assert.match(rendered, /The second line explains the result\./);
+  }
 });
 
 test('tool rows flatten to EXACTLY one content row, even with a huge URL', () => {

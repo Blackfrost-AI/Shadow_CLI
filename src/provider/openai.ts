@@ -568,6 +568,13 @@ export function buildOpenAIBody(
     stream,
   };
   if (stream) body.stream_options = { include_usage: true };
+  // SGLang/Qwen exposes chat-template thinking as a request-local template kwarg. This is an
+  // endpoint-specific extension, so require BOTH an explicit per-preset declaration and a
+  // self-hosted target. Model names never activate it, and cloud/OpenAI endpoints never receive
+  // the non-standard field even if a capability block was copied onto the wrong preset.
+  if (opts.selfHosted === true && caps?.chatTemplateEnableThinking !== undefined) {
+    body.chat_template_kwargs = { enable_thinking: caps.chatTemplateEnableThinking };
+  }
 
   // Output budget floor, resolved in precedence order:
   //   1. declared `capabilities.maxOutputTokens` (operator assertion — ALWAYS wins);

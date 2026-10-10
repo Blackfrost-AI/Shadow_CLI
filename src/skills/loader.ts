@@ -3,6 +3,7 @@ import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
 import { resolveWithin } from '../safety/workspaceJail.js';
 import { enabledPluginDirs } from '../plugins/manager.js';
+import { SkillCandidateStore } from './candidateStore.js';
 
 export interface SkillEntry {
   name: string;
@@ -10,7 +11,7 @@ export interface SkillEntry {
   description: string;
   body: string;
   /** Origin remains visible to callers and on-demand refreshes. */
-  source?: 'workspace' | 'global' | 'plugin';
+  source?: 'workspace' | 'global' | 'plugin' | 'harness';
   root?: string;
 }
 
@@ -21,6 +22,8 @@ export interface SkillCatalog {
 export interface DiscoverSkillsOptions {
   homedir?: string;
   pluginDirs?: string[];
+  /** Bodies captured by the validated harness scan selected at session start. */
+  harnessSkills?: ReadonlyArray<Pick<SkillEntry, 'name' | 'path' | 'root' | 'body'>>;
 }
 
 const SKILL_DIRS = ['skills', '.shadow/skills'];
@@ -48,22 +51,47 @@ function readCapped(file: string, max: number): string {
  * Roots come in two flavors: workspace roots are JAILED (untrusted repo — every path is
  * realpath'd + jail-checked against the workspace), while enabled-plugin roots (P3-07) are
  * already-complete paths inside ~/.shadow from data-only, user-enabled installs, so they skip
- * the workspace jail. Workspace roots are scanned FIRST and the first occurrence of a skill name
- * wins, so repo skills outrank plugin skills of the same name (the repo is where the user is
- * actually working).
+ * the workspace jail. Explicitly selected harness skills are immutable bodies captured by the
+ * package digest scan. They are inserted FIRST so an untrusted repository cannot replace a harness
+ * procedure by reusing its directory name. Without a harness, workspace roots retain their existing
+ * precedence over global and plugin skills.
  */
 export function discoverSkills(workspaceRoot: string, opts: DiscoverSkillsOptions = {}): SkillEntry[] {
   return discoverSkillCatalog(workspaceRoot, opts).skills;
 }
 
-/** Re-read every invocation: enable/disable, edits and deleted skills take effect immediately. */
+/**
+ * Re-read workspace/global/plugin roots on every invocation. Selected harness
+ * skills are already captured by package resolution and are never reopened.
+ */
 export function discoverSkillCatalog(workspaceRoot: string, opts: DiscoverSkillsOptions = {}): SkillCatalog {
   const out: SkillEntry[] = [];
   const seen = new Map<string, SkillEntry>();
   const conflicts: SkillCatalog['conflicts'] = [];
+  const globalSkillsRoot = resolve(opts.homedir ?? homedir(), '.shadow/skills');
+  // Activation spans an immutable candidate receipt and a discoverable skill directory. Finish
+  // any journaled publication interrupted by a process crash before advertising global skills.
+  new SkillCandidateStore({ skillsRoot: globalSkillsRoot }).recoverPendingActivations();
+  for (const captured of opts.harnessSkills ?? []) {
+    const selected = seen.get(captured.name);
+    if (selected) {
+      conflicts.push({ name: captured.name, selected: selected.path, shadowed: captured.path });
+      continue;
+    }
+    const skill: SkillEntry = {
+      name: captured.name,
+      path: captured.path,
+      root: captured.root,
+      body: captured.body.trim(),
+      description: parseDescription(captured.body) ?? captured.name,
+      source: 'harness',
+    };
+    seen.set(skill.name, skill);
+    out.push(skill);
+  }
   const roots: Array<{ root: string; source: NonNullable<SkillEntry['source']> }> = [
     ...SKILL_DIRS.map((dir) => ({ root: resolve(workspaceRoot, dir), source: 'workspace' as const })),
-    { root: resolve(opts.homedir ?? homedir(), '.shadow/skills'), source: 'global' },
+    { root: globalSkillsRoot, source: 'global' },
     ...(opts.pluginDirs ?? enabledPluginDirs('skills')).map((dir) => ({ root: dir, source: 'plugin' as const })),
   ];
   for (const { root, source } of roots) {

@@ -27,7 +27,8 @@ import { vaultExists } from '../auth/vault.js';
 import { legacyCredentialsExist } from '../state/globalStore.js';
 import { available as keychainAvailable } from '../auth/keychain.js';
 import { detectLspServers } from '../agent/lsp/detect.js';
-import { resolveBaseUrl } from '../config.js';
+import { resolveBaseUrl, type AccountConnection, type ModelEntry } from '../config.js';
+import { findRememberedModelPreset, resolveActiveModelPreset } from '../config/modelPresets.js';
 import { BINARY_RELEASE_BASE } from '../update/release.js';
 
 const UPDATE_HOST = 'raw.githubusercontent.com';
@@ -54,7 +55,7 @@ export interface PrivacyReport {
   effectiveBaseUrl: string;
   providerIsLocal: boolean;
   egress: EgressPath[];
-  credentials: { store: 'vault' | 'plaintext' | 'env-only' | 'none'; keychainAvailable: boolean; detail: string };
+  credentials: { store: 'vault' | 'plaintext' | 'env-only' | 'none' | 'account' | 'external'; keychainAvailable: boolean; detail: string };
   offlineEligible: { eligible: boolean; reason: string };
   telemetry: string;
   /** 8.4: which local LSP servers would auto-spawn after writes (honest, machine-specific). */
@@ -70,6 +71,7 @@ export interface PrivacyConfigView {
   provider: string;
   model?: string;
   baseUrl?: string;
+  connection?: AccountConnection;
   updateCheck?: boolean;
   pluginIndexUrl?: string;
   pluginIndexKey?: string;
@@ -79,6 +81,18 @@ export interface PrivacyConfigView {
     provider?: string;
     model?: string;
     baseUrl?: string;
+    connection?: AccountConnection;
+    gguf?: string;
+    mlx?: string;
+    vllm?: string;
+  }>;
+  /** Trusted ~/.shadow presets retained by loadConfig before project models[] replacement. */
+  trustedGlobalModelPresets?: Array<{
+    label?: string;
+    provider?: string;
+    model?: string;
+    baseUrl?: string;
+    connection?: AccountConnection;
     gguf?: string;
     mlx?: string;
     vllm?: string;
@@ -139,20 +153,54 @@ export function effectiveSessionEndpoint(
   opts: {
     envModel?: string;
     envProvider?: string;
-    resolveBase?: (provider: string, configured?: string) => string | undefined;
+    /** Generic one-run endpoint override (`SHADOW_BASE_URL`). Provider-relative fallbacks are
+     * resolved only after a remembered label has selected its provider. */
+    envBaseUrl?: string;
+    resolveBase?: (provider: string, configured?: string, connection?: AccountConnection) => string | undefined;
   } = {},
-): { provider: string; model: string | undefined; baseUrl: string | undefined } {
+): { provider: string; model: string | undefined; baseUrl: string | undefined; connection?: AccountConnection } {
   const resolveBase = opts.resolveBase ?? resolveBaseUrl;
-  const preset =
-    !opts.envModel && !opts.envProvider && cfg.profile?.model == null && cfg.lastModel
-      ? cfg.models?.find((m) => m.label === cfg.lastModel)
-      : undefined;
-  const provider = preset?.provider ?? cfg.provider;
+  const recallLast = !opts.envModel && !opts.envProvider && !opts.envBaseUrl && cfg.profile?.model == null;
+  const models = (cfg.models ?? []).filter((entry) => !!entry.provider && !!entry.model).map((entry) => ({
+    ...entry, label: entry.label ?? entry.model!, provider: entry.provider as ModelEntry['provider'], model: entry.model!,
+  }));
+  const trustedModels = (cfg.trustedGlobalModelPresets ?? [])
+    .filter((entry) => !!entry.provider && !!entry.model)
+    .map((entry) => ({
+      ...entry,
+      label: entry.label ?? entry.model!,
+      provider: entry.provider as ModelEntry['provider'],
+      model: entry.model!,
+    }));
+  const remembered = recallLast
+    ? findRememberedModelPreset({ models, trustedGlobalModelPresets: trustedModels, lastModel: cfg.lastModel })
+    : undefined;
+  // A remembered label is an atomic target selection. Apply its provider/model/endpoint/account
+  // before asking the endpoint-bound resolver whether the preset's metadata may attach. This is
+  // also what main() does before bootstrap. If a provider-relative environment URL changes the
+  // endpoint, resolveActiveModelPreset deliberately detaches endpoint-specific metadata; the
+  // privacy target still reports the provider/model the user selected and the URL it will use.
+  const selected = remembered ? {
+    ...cfg,
+    provider: remembered.provider,
+    model: remembered.model,
+    baseUrl: remembered.baseUrl,
+    connection: remembered.connection,
+  } : cfg;
+  const preset = resolveActiveModelPreset({
+    ...selected,
+    provider: selected.provider as ModelEntry['provider'],
+    model: selected.model ?? '',
+    models,
+    trustedGlobalModelPresets: trustedModels,
+  }, { lastPicked: remembered });
+  const provider = remembered?.provider ?? preset?.provider ?? cfg.provider;
   // The recall replaces the whole provider/model/baseUrl triple, so an absent preset baseUrl is
   // NOT backfilled from the old top-level key: resolution falls through to env / credential store
   // for the RECALLED provider — exactly what a session does after the same recall.
-  const baseUrl = resolveBase(provider, preset ? preset.baseUrl : cfg.baseUrl);
-  return { provider, model: preset?.model ?? cfg.model, baseUrl };
+  const connection = remembered ? remembered.connection : preset ? preset.connection : cfg.connection;
+  const baseUrl = resolveBase(provider, remembered ? remembered.baseUrl : cfg.baseUrl, connection);
+  return { provider, model: remembered?.model ?? preset?.model ?? cfg.model, baseUrl, connection };
 }
 
 /** Build the report — pure. `env` carries the observed local state so it stays no-network and testable. */
@@ -160,11 +208,21 @@ export function buildPrivacyReport(cfg: PrivacyConfigView, env: PrivacyEnv): Pri
   const provider = cfg.provider;
   const model = cfg.model ?? '(unset)';
   const offline = env.offline;
-  const effectiveBaseUrl = cfg.baseUrl || PROVIDER_DEFAULT_BASE[provider] || '(provider default)';
+  const effectiveBaseUrl = cfg.connection?.kind === 'chatgpt' ? 'https://api.openai.com/v1'
+    : cfg.connection?.kind === 'claude-code' ? 'Claude Code (official account service)'
+    : cfg.baseUrl || PROVIDER_DEFAULT_BASE[provider] || '(provider default)';
   const providerIsLocal = isLocalBaseUrl(effectiveBaseUrl);
 
   const egress: EgressPath[] = [];
   const warnings: string[] = [];
+  if (cfg.connection?.kind === 'chatgpt') {
+    egress.push({ name: 'ChatGPT authentication', target: 'auth.openai.com', active: !offline,
+      scope: 'on-connect', note: 'Shadow-owned sign-in, token refresh, key discovery and revocation; no API billing fallback' });
+  } else if (cfg.connection?.kind === 'claude-code') {
+    egress.push({ name: 'Official Claude Code engine', target: 'local Claude Code process → Anthropic account services', active: !offline,
+      scope: 'on-connect', note: 'Provider traffic uses the installed CLI; its network sockets are outside Shadow’s fetch receipt. Nonessential traffic is disabled through official settings.' });
+    warnings.push('Claude Code keeps its own account credentials. Safe mode disables ordinary hooks/plugins; administrator-managed policy hooks can still run.');
+  }
 
   // (a) The model provider — the one egress that always happens on a turn.
   egress.push({
@@ -334,6 +392,10 @@ export function buildPrivacyReport(cfg: PrivacyConfigView, env: PrivacyEnv): Pri
 
   // Credentials at rest.
   const credential = ((): PrivacyReport['credentials'] => {
+    if (cfg.connection?.kind === 'chatgpt') return { store: 'account', keychainAvailable: env.keychainAvailable,
+      detail: '~/.shadow/chatgpt-auth — account tokens in owner-only files (0600), directory 0700; not encrypted by the API-key vault.' };
+    if (cfg.connection?.kind === 'claude-code') return { store: 'external', keychainAvailable: env.keychainAvailable,
+      detail: 'Official Claude Code owns its account storage. Shadow does not read, copy or store Claude login tokens.' };
     switch (env.credStore) {
       case 'vault':
         return { store: 'vault', keychainAvailable: env.keychainAvailable, detail: `~/.shadow/vault.enc — encrypted (scrypt → AES-256-GCM)${env.keychainAvailable ? '; OS keychain available for silent unlock' : '; no keychain — unlocks by password each session'}` };
@@ -426,7 +488,7 @@ export function formatPrivacyReport(r: PrivacyReport, color = true): string {
     L.push(`  ${dot(e.active)} ${e.name} ${c.dim}→${c.reset} ${e.target} ${scope}`);
     if (e.note) L.push(`      ${c.dim}${e.note}${c.reset}`);
   }
-  L.push(`  ${c.dim}Setup checks contact only the selected endpoint. Provider key-creation links are displayed, not fetched.${c.reset}`);
+  L.push(`  ${c.dim}Setup checks use the selected provider; account sign-in also uses that provider’s authentication service. Help/key-creation links are displayed, not fetched.${c.reset}`);
   L.push('');
   const credColor = r.credentials.store === 'plaintext' ? c.red : r.credentials.store === 'vault' ? c.green : c.dim;
   L.push(`${c.bold}Credentials at rest${c.reset}  ${credColor}${r.credentials.store}${c.reset}`);
@@ -435,7 +497,7 @@ export function formatPrivacyReport(r: PrivacyReport, color = true): string {
   L.push(`${c.bold}Offline mode${c.reset}  ${r.offlineEligible.eligible ? c.green + 'eligible' : c.yellow + 'not yet eligible'}${c.reset}`);
   L.push(`  ${c.dim}${r.offlineEligible.reason}${c.reset}`);
   L.push('');
-  L.push(`${c.bold}Telemetry${c.reset}  ${c.green}none${c.reset}`);
+  L.push(`${c.bold}Shadow telemetry${c.reset}  ${c.green}none${c.reset}`);
   L.push(`  ${c.dim}${r.telemetry}${c.reset}`);
   L.push('');
   L.push(`${c.bold}Code intelligence${c.reset} ${c.dim}(LSP diagnostics after writes)${c.reset}`);

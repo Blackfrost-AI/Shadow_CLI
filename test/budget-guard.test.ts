@@ -242,20 +242,22 @@ const findings = (events: LoopEvent[]): FindingEvent[] =>
   events.filter((e): e is FindingEvent => e.type === 'finding');
 
 test('loop: warn-once, then deny at the gate ends the run gracefully (reason=budget)', async () => {
-  const provider = makeEventProvider([noopTurn(), noopTurn(), noopTurn(), noopTurn(), noopTurn()]);
+  // Six identical turns deliberately collide with the repeated-call fatal ceiling. The spend
+  // guard owns the stop reason when both ceilings are reached by the same provider response.
+  const provider = makeEventProvider([noopTurn(), noopTurn(), noopTurn(), noopTurn(), noopTurn(), noopTurn()]);
   const gate = new RecordingGate(['deny']);
-  const { loop, events } = buildGuardLoop({ provider, gate, spendGuard: { maxSteps: 5 } });
+  const { loop, events } = buildGuardLoop({ provider, gate, spendGuard: { maxSteps: 6 } });
   const result = await loop.run();
 
   assert.equal(result.stopReason, 'budget');
-  assert.equal(provider.calls(), 5); // exactly 5 model calls, guard caught the 6th
+  assert.equal(provider.calls(), 6); // exactly 6 model calls; no seventh request after the collision
   const warns = findings(events).filter((e) => e.type === 'finding' && e.severity === 'warn');
   assert.equal(warns.length, 2); // one threshold warning + the graceful-stop summary
-  assert.match(warns[0]!.title, /^Budget 80%: 4\/5 steps$/);
-  assert.match(warns[1]!.title, /^Budget exhausted — run stopped \(5\/5 steps\)$/);
+  assert.match(warns[0]!.title, /^Budget 80%: 5\/6 steps$/);
+  assert.match(warns[1]!.title, /^Budget exhausted — run stopped \(6\/6 steps\)$/);
   assert.equal(gate.requests.length, 1);
   assert.equal(gate.requests[0]!.kind, 'user_question');
-  assert.match(gate.requests[0]!.questions![0]!.question, /Budget reached \(5\/5 steps\)\. Continue this task\?/);
+  assert.match(gate.requests[0]!.questions![0]!.question, /Budget reached \(6\/6 steps\)\. Continue this task\?/);
 });
 
 test('loop: approving continue grants one more window, then the guard asks again', async () => {
@@ -304,6 +306,23 @@ test('loop: headless gate (AutoDenyGate) stops cleanly at the budget', async () 
   assert.equal(result.stopReason, 'budget');
   assert.equal(provider.calls(), 1);
   assert.ok(findings(events).some((e) => e.type === 'finding' && /^Budget exhausted/.test(e.title)));
+});
+
+test('loop: subscription usage does not charge the dollar guard, later API usage still does', async () => {
+  const subscriptionTurn = noopTurnWithUsage().map((event): ProviderEvent =>
+    event.type === 'usage' ? { ...event, billing: 'subscription' } : event);
+  const provider = makeEventProvider([subscriptionTurn, noopTurnWithUsage(), noopTurnWithUsage()]);
+  const gate = new RecordingGate(['deny']);
+  const { loop, events } = buildGuardLoop({ provider, gate,
+    spendGuard: { maxCostUsd: 0.3 }, priceTable: { mock: { input: 1000, output: 1000 } } });
+  const result = await loop.run();
+  assert.equal(result.stopReason, 'budget');
+  assert.equal(provider.calls(), 3, 'subscription turn leaves the API allowance intact');
+  assert.equal(gate.requests.length, 1);
+  const usage = events.filter((event) => event.type === 'usage');
+  assert.deepEqual(usage.map((event) => event.costUSD), [0, 0.2, 0.4]);
+  assert.equal(usage.at(-1)?.inputTokens, 300);
+  assert.equal(usage.at(-1)?.outputTokens, 300);
 });
 
 test('loop: no spend guard (or empty config) → unaffected run', async () => {

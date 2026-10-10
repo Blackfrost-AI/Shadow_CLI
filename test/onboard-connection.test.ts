@@ -79,10 +79,17 @@ test('connection success, empty output, HTTP errors and stalled requests settle 
       return;
     }
     res.writeHead(200, { 'content-type': 'text/event-stream' });
-    if (mode === 'success')
+    if (['success', 'late-error', 'incomplete', 'invalid'].includes(mode))
       res.write(
-        'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { content: 'ok' } }] }) + '\n\n',
+        'data: ' + JSON.stringify({ choices: [{ index: 0, delta: {
+          tool_calls: [{ index: 0, id: 'setup-call', type: 'function', function: {
+            name: 'shadow_connection_test', arguments: mode === 'invalid' ? '{"ok":false}' : '{"ok":true}',
+          } }],
+        } }] }) + '\n\n',
       );
+    if (mode === 'usage-only') res.write('data: ' + JSON.stringify({ usage: { prompt_tokens: 10, completion_tokens: 1 }, choices: [] }) + '\n\n');
+    if (mode !== 'incomplete') res.write('data: ' + JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] }) + '\n\n');
+    if (mode === 'late-error') res.write('data: ' + JSON.stringify({ error: { code: 'quota_exceeded', message: 'Quota exceeded' } }) + '\n\n');
     res.end('data: [DONE]\n\n');
   });
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -96,6 +103,9 @@ test('connection success, empty output, HTTP errors and stalled requests settle 
       wire: 'chat' as const,
     };
     assert.equal((await testConnection(options, undefined, 2000)).ok, true);
+    for (mode of ['late-error', 'incomplete', 'invalid', 'usage-only']) {
+      assert.equal((await testConnection(options, undefined, 2000)).ok, false, mode);
+    }
     mode = 'empty';
     assert.equal((await testConnection(options, undefined, 2000)).ok, false);
     mode = 'error';
@@ -108,7 +118,7 @@ test('connection success, empty output, HTTP errors and stalled requests settle 
     assert.equal(timeout.ok, false);
     assert.match(timeout.error!, /No response within/);
     assert.ok(Date.now() - start < 1000);
-    assert.equal(requests, 4, 'setup checks do not retry behind the UI');
+    assert.equal(requests, 8, 'setup checks do not retry behind the UI');
   } finally {
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));

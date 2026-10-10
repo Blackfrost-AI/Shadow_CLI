@@ -10,7 +10,7 @@ import { TodoList } from '../src/agent/todo.js';
 import { WorkCenter } from '../src/app/workCenter.js';
 import { SessionLog } from '../src/state/session.js';
 import { captureSessionState, restoreSessionState } from '../src/state/sessionState.js';
-import { resumeSession, resolveSessionMatches } from '../src/state/resume.js';
+import { resumeSession, resolveSessionMatches, trustLegacySession } from '../src/state/resume.js';
 import { sessionReplay, HISTORICAL_OUTPUT_UNAVAILABLE } from '../src/state/sessionReplay.js';
 import { previewRewind, rewindToTurn } from '../src/state/rewind.js';
 import { saveCheckpoint, saveCheckpointAbsent } from '../src/state/checkpoints.js';
@@ -43,7 +43,12 @@ test('restart restores one versioned context/mission/plan/task/work bundle and n
     child.append({ role: 'user', content: [{ type: 'text', text: 'private child prompt' }] });
     log.recordSnapshot(child, 22);
     log.close();
-    const resumed = resumeSession(log.path, options);
+    // A torn latest record leaves the previous coherent bundle recoverable; the explicit legacy
+    // receipt authenticates the complete file, including that inert torn tail.
+    appendFileSync(log.path, '{"kind":"context_snapshot","data":');
+    const bindingsDir = join(root, 'owner-bindings');
+    trustLegacySession(log.path, { bindingsDir });
+    const resumed = resumeSession(log.path, { ...options, bindingsDir });
     assert.equal(resumed.context.messages().length, 2);
     assert.equal(resumed.meta.turn, 1);
     assert.equal(resumed.state.version, 1);
@@ -57,9 +62,7 @@ test('restart restores one versioned context/mission/plan/task/work bundle and n
     assert.equal(target.workCenter.get('worker-1')?.owner, 'todo-7');
     assert.equal(target.workCenter.get('worker-1')?.status, 'interrupted');
     assert.equal(SessionLog.countSnapshots(log.path), 2);
-    // A torn latest record leaves the previous coherent bundle recoverable.
-    appendFileSync(log.path, '{"kind":"context_snapshot","data":');
-    assert.equal(resumeSession(log.path, options).state.mission.phase, 'verifying');
+    assert.equal(resumed.state.mission.phase, 'verifying');
   } finally { log.close(); rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -80,6 +83,18 @@ test('inactive restoration clears the previous session and preserves plan mode w
   assert.deepEqual(target.planMode.snapshot().tasks, ['Read']);
 });
 
+test('session state carries the immutable harness package identity and digest', () => {
+  const harness = {
+    foundation: { id: 'shadow-security', version: '1', digest: 'foundation-digest' },
+    addons: [{ id: 'incident-response', version: '1.0.0', digest: 'addon-digest' }],
+    digest: 'stack-digest',
+  };
+  const state = captureSessionState({ harness });
+  assert.deepEqual(state.harness, harness);
+  harness.addons[0]!.id = 'mutated';
+  assert.equal(state.harness?.addons[0]?.id, 'incident-response');
+});
+
 test('legacy journals recover recorded plan/tasks and respect a later mission clear', () => {
   const root = mkdtempSync(join(tmpdir(), 'shadow-legacy-continuity-'));
   const log = SessionLog.open(root);
@@ -92,7 +107,9 @@ test('legacy journals recover recorded plan/tasks and respect a later mission cl
     const context = new Context(options);
     context.append({ role: 'user', content: [{ type: 'text', text: 'Resume' }] });
     log.recordSnapshot(context, 0);
-    const resumed = resumeSession(log.path, options);
+    const bindingsDir = join(root, 'owner-bindings');
+    trustLegacySession(log.path, { bindingsDir });
+    const resumed = resumeSession(log.path, { ...options, bindingsDir });
     assert.equal(resumed.state.mission.active, false);
     assert.equal(resumed.state.plan.path, 'old-plan.md');
     assert.equal(resumed.state.todos[0]?.id, 'todo-9');

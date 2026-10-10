@@ -105,12 +105,14 @@ test('P0-12 loop guard: an intervening different call resets the consecutive cou
   assert.ok(!events.some((e) => e.type === 'tool_denied'), 'loop guard never fired on alternating calls');
 });
 
-test('P0-12 loop guard: still trips on three back-to-back identical calls', async () => {
+test('P0-12 loop guard: still trips on repeated back-to-back identical calls and terminates the loop', async () => {
   let ran = 0;
+  let turns = 0;
   const sameCall: Provider = {
     name: 'stuck',
     estimateTokens: () => 0,
     async *send(): AsyncIterable<ProviderEvent> {
+      turns += 1;
       yield { type: 'tool_call', call: { id: 's', name: 'echo', input: { msg: 'same' } } };
       yield { type: 'done', stopReason: 'tool_use' };
     },
@@ -120,7 +122,8 @@ test('P0-12 loop guard: still trips on three back-to-back identical calls', asyn
 
   assert.equal(ran, 2, 'first two consecutive identical calls run; the 3rd+ are guarded');
   assert.ok(events.some((e) => e.type === 'tool_denied'), 'loop guard surfaces as tool_denied');
-  assert.equal(res.stopReason, 'max_iterations');
+  assert.equal(res.stopReason, 'fatal_tool_error', 'an ignored guard ends before the general iteration cap');
+  assert.equal(turns, 6, 'three recoverable denials are followed by one fatal repeated attempt');
 });
 
 // ---- P0-11: an interrupted tool turn must never leave a dangling tool_use ----

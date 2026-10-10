@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Context } from '../src/agent/context.js';
 import { SessionLog } from '../src/state/session.js';
-import { listResumableSessions, resumeSession } from '../src/state/resume.js';
+import { listResumableSessions, resumeSession, trustLegacySession } from '../src/state/resume.js';
 import { sessionToMarkdown } from '../src/state/chatExport.js';
 
 const opts = { contextBudget: 10_000, triggerRatio: 0.75, keepLastTurns: 4 };
@@ -224,7 +224,9 @@ test('countSnapshots + listResumableSessions match multi-snapshot logs', () => {
     // ts comes from the latest snapshot record
     assert.equal(typeof sessions[0]!.ts, 'string');
 
-    const { context, meta } = resumeSession(log.path, opts);
+    const bindingsDir = join(root, 'owner-bindings');
+    trustLegacySession(log.path, { bindingsDir });
+    const { context, meta } = resumeSession(log.path, { ...opts, bindingsDir });
     assert.equal(meta.turn, 2);
     assert.equal(context.messages().length, 2);
   } finally {

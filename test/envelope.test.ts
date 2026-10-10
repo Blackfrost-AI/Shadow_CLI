@@ -379,7 +379,11 @@ test('source pins: every untrusted surface clamps before enveloping and dropped 
   assert.ok(!/\{ content: body \}/.test(mcp) && !/\{ content: text \}/.test(mcp), 'no unwrapped data duplicate remains');
 
   const sys = readFileSync(new URL('../src/system/resolveSystem.ts', import.meta.url), 'utf8');
-  assert.match(sys, /HARNESS_PREAMBLE, UNTRUSTED_ENVELOPE_POLICY, base/, 'policy joins the glue');
+  assert.match(
+    sys,
+    /harnessPreamble\(capabilities\),[\s\S]*UNTRUSTED_ENVELOPE_POLICY,[\s\S]*base/,
+    'policy joins the capability-aware harness glue',
+  );
 
   const ctx = readFileSync(new URL('../src/agent/context.ts', import.meta.url), 'utf8');
   assert.match(ctx, /envelopeSafeSlice\(b\.content, KEPT_TOOL_RESULT_CAP\)/, 'post-compact trim never leaves an envelope open');

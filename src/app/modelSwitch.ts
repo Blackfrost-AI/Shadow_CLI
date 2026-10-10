@@ -30,6 +30,7 @@ import {
 import { clampLocalContextBudget, keepLastTurnsForBudget, triggerRatioForBudget } from '../util/contextBudget.js';
 import { isLocalBaseUrl, isLocalModelTarget } from '../safety/offline.js';
 import { familyProfile } from '../config/familyProfiles.js';
+import { assertAccountPresetCompatible } from '../config/modelPresets.js';
 import type { Context } from '../agent/context.js';
 import type { Provider } from '../provider/provider.js';
 import type { AgentLoop } from '../agent/loop.js';
@@ -84,10 +85,12 @@ export class ModelSwitcher {
   }
 
   async buildProvider(entry: ModelEntry, opts: BuildOpts = {}): Promise<BuildResult> {
+    try { assertAccountPresetCompatible(entry); }
+    catch (error) { return { ok: false, error: error instanceof Error ? error.message : 'The subscription preset is invalid.', fatal: false }; }
     const { host } = this;
     const pushLine = host.pushLine.bind(host);
     let provider = entry.provider;
-    const configuredBaseUrl = resolveBaseUrl(entry.provider, entry.baseUrl);
+    const configuredBaseUrl = resolveBaseUrl(entry.provider, entry.baseUrl, entry.connection);
     let baseUrl = configuredBaseUrl;
     let detectedWindow: number | undefined;
     const cred = resolveEntryCredential(entry, { vaultIsLocked: vaultExists() && !vaultUnlocked() });
@@ -106,7 +109,7 @@ export class ModelSwitcher {
     // credential must carry that credential's base URL, headers and wire, or it would send the
     // token to the previous model's endpoint. The refresh runs first for the same reason it does
     // at boot — a switch is a natural moment to notice the token aged out.
-    const allowImport = process.env.SHADOW_ALLOW_IMPORT === '1';
+    const allowImport = !entry.connection && process.env.SHADOW_ALLOW_IMPORT === '1';
     if (allowImport) {
       const subForEntry = subProviderFor(entry.provider, entry.model);
       if (subForEntry) {
@@ -265,6 +268,7 @@ export class ModelSwitcher {
       // such as `/provider` use this label to select the right credential when presets share a
       // provider/model/endpoint tuple.
       host.cfg.lastModel = entry.label;
+      host.cfg.connection = entry.connection;
       host.pushLine({ text: `Model → ${entry.label} (${built.provider}/${built.model})`, color: C.cyan });
       // `entryModel`, never `built.model`: an autoModel entry's identity is the preset, and that is
       // what `cfg.models.find(m => m.model === cfg.model)` and the picker's active row are keyed on.

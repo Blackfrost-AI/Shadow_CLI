@@ -37,6 +37,12 @@ export interface MissionSnapshot {
 
 export type MissionListener = (snapshot: MissionSnapshot) => void;
 
+export interface MissionCapabilities {
+  has(name: string): boolean;
+}
+
+const ALL_MISSION_CAPABILITIES: MissionCapabilities = Object.freeze({ has: () => true });
+
 /** Matches plan_write's `tasks` cap — the two must move together. */
 export const MISSION_TASK_LIMIT = 24;
 
@@ -77,12 +83,28 @@ export class MissionState {
   private snap: MissionSnapshot = { active: false, mission: '', phase: 'planning', tasks: [], updatedAt: new Date().toISOString() };
   private readonly listeners = new Set<MissionListener>();
 
+  constructor(private readonly capabilities: MissionCapabilities = ALL_MISSION_CAPABILITIES) {}
+
   get active(): boolean {
     return this.snap.active;
   }
 
+  /** Starting a mission enters plan mode and then needs a writable mission state. */
+  get available(): boolean {
+    return this.capabilities.has('mission_update') &&
+      this.capabilities.has('plan_write') &&
+      this.capabilities.has('exit_plan_mode');
+  }
+
+  get unavailableReason(): string | undefined {
+    const missing = ['mission_update', 'plan_write', 'exit_plan_mode']
+      .filter((name) => !this.capabilities.has(name));
+    return missing.length > 0 ? `required controls are hidden: ${missing.join(', ')}` : undefined;
+  }
+
   /** `/goal <text>` — begin a mission in the planning phase (the caller enters plan mode). */
   begin(text: string): MissionSnapshot {
+    if (!this.available) return this.snapshot();
     const mission = text.trim();
     this.snap = {
       active: mission.length > 0,
@@ -156,7 +178,25 @@ export class MissionState {
    * same coerce the log scan uses — a corrupt record restores nothing rather than a
    * half-shape. Inactive snapshots restore the cleared state.
    */
+  assertRestorable(candidate: MissionSnapshot): void {
+    if (candidate?.active === false) return;
+    const snap = coerceSnapshot(candidate);
+    if (snap) {
+      if (snap.phase !== 'done' && snap.phase !== 'failed' && !this.capabilities.has('mission_update')) {
+        throw new Error('cannot restore an active mission; required control is hidden: mission_update');
+      }
+      if (
+        snap.phase === 'planning' &&
+        (!this.capabilities.has('plan_write') || !this.capabilities.has('exit_plan_mode'))
+      ) {
+        const missing = ['plan_write', 'exit_plan_mode'].filter((name) => !this.capabilities.has(name));
+        throw new Error(`cannot restore a planning mission; required controls are hidden: ${missing.join(', ')}`);
+      }
+    }
+  }
+
   restore(candidate: MissionSnapshot): MissionSnapshot {
+    this.assertRestorable(candidate);
     if (candidate?.active === false) return this.clear();
     const snap = coerceSnapshot(candidate);
     if (snap) {
@@ -180,8 +220,12 @@ export class MissionState {
    * The block pinned into the system prompt every turn while a mission is active ('' when
    * inactive — no placeholder noise, TodoList.block() parity).
    */
-  block(): string {
+  block(capabilities: MissionCapabilities = this.capabilities): string {
     if (!this.snap.active) return '';
+    const canUpdate = capabilities.has('mission_update');
+    const canPlan = capabilities.has('plan_write');
+    const canExitPlan = capabilities.has('exit_plan_mode');
+    const canDelegate = capabilities.has('agent');
     const lines = [
       '',
       '',
@@ -198,16 +242,45 @@ export class MissionState {
         lines.push(`${t.id}. [${t.status}] ${t.subject}${detail}`);
       }
       const rest = this.snap.tasks.length - shown.length;
-      if (rest > 0) lines.push(`(+${rest} more — keep them moving with mission_update)`);
+      if (rest > 0) {
+        lines.push(canUpdate
+          ? `(+${rest} more — keep them moving with mission_update)`
+          : `(+${rest} more tasks are recorded)`);
+      }
     } else {
       lines.push('Tasks: none recorded (phase-only mission).');
     }
-    lines.push(PHASE_INSTRUCTIONS[this.snap.phase]);
-    lines.push(
-      'Rules: never call mission_update from a sub-agent (the lead agent manages the mission); ' +
-        'the mission is not complete while tasks remain incomplete or the end state is unverified; ' +
-        'report outcomes honestly.',
-    );
+    if (this.snap.phase === 'planning' && (!canPlan || !canExitPlan)) {
+      if (canExitPlan) {
+        lines.push('You are in the PLANNING phase. Explore and read freely, then call exit_plan_mode for user approval. Do not begin implementation until the plan is approved.');
+      } else {
+        lines.push('You are in the PLANNING phase, but required plan controls are unavailable. Report that limitation to the user without beginning implementation.');
+      }
+    } else if (this.snap.phase === 'executing' && (!canDelegate || !canUpdate)) {
+      const parts = ['You are in the EXECUTING phase. Work the tasks in order.'];
+      if (canDelegate) parts.push('Dispatch independent subtasks to sub-agents when useful; they inherit session autonomy and budget ceilings and never escalate.');
+      if (canUpdate) parts.push('Keep mission task statuses current with mission_update as work completes or fails.');
+      else parts.push('Mission state is read-only in this session; report progress and limitations directly.');
+      lines.push(parts.join(' '));
+    } else if (this.snap.phase === 'verifying' && !canUpdate) {
+      lines.push('You are in the VERIFYING phase. Implementation has stopped. Verify each task against real evidence before reporting the result; mission state is read-only in this session.');
+    } else {
+      lines.push(PHASE_INSTRUCTIONS[this.snap.phase]);
+    }
+    if (canUpdate && canDelegate) {
+      lines.push(
+        'Rules: never call mission_update from a sub-agent (the lead agent manages the mission); ' +
+          'the mission is not complete while tasks remain incomplete or the end state is unverified; ' +
+          'report outcomes honestly.',
+      );
+    } else if (canUpdate) {
+      lines.push(
+        'Rules: keep mission state current with mission_update; the mission is not complete while ' +
+          'tasks remain incomplete or the end state is unverified; report outcomes honestly.',
+      );
+    } else {
+      lines.push('Rules: the mission is not complete while tasks remain incomplete or the end state is unverified; report outcomes honestly.');
+    }
     return lines.join('\n');
   }
 

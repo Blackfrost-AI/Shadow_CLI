@@ -1,9 +1,9 @@
 /**
  * Subscription / OAuth auth for Shadow — public surface.
  *
- * Tiers (see resolve.ts): env/store API key → imported official-CLI credential →
- * opt-in OAuth. Anthropic is API-key-only by policy (ToS); only `codex` and `grok`
- * participate in import/OAuth. Background: shared-docs/SUBSCRIPTION-OAUTH-AND-TOS.md.
+ * Legacy imported-credential surface (explicit SHADOW_ALLOW_IMPORT opt-in).
+ * Native ChatGPT account access lives in chatgpt.ts. Claude subscriptions use the
+ * unmodified official engine through claudeCode.ts; Shadow never imports Claude tokens.
  */
 export type { SubProvider, AuthSource, ImportedCredential, ResolvedAuth } from './types.js';
 export { SPECS, subProviderFor, type ProviderAuthSpec } from './spec.js';

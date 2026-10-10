@@ -7,17 +7,25 @@ instructions, and security model, see the [README](README.md); this guide is the
 - [Connect a model](#connect-a-model)
 - [Qwen 3.8: hosted or self-hosted](#qwen-38-hosted-or-self-hosted)
 - [Output length (`maxOutputTokens`)](#output-length-maxoutputtokens)
+- [Self-hosted Qwen chat-template thinking](#self-hosted-qwen-chat-template-thinking)
 - [Self-hosted model temperature](#self-hosted-model-temperature)
 - [Reasoning effort](#reasoning-effort)
 - [Autonomy & safety](#autonomy--safety)
+- [Security foundation & harness add-ons](#security-foundation--harness-add-ons)
+- [Learn reusable skills](#learn-reusable-skills)
 - [Everyday use](#everyday-use)
-- [Collaboration and recoverable jobs](#collaboration-and-recoverable-jobs)
 - [The config file](#the-config-file)
+- [Mission mode (`/goal`)](#mission-mode-goal)
+- [Code intelligence (LSP + diagnostics)](#code-intelligence-lsp--diagnostics)
 - [Troubleshooting](#troubleshooting)
 
 ---
 
 ## Install & update
+
+The signed 8.7.1 transition release uses Blackfrost hosting. Existing standalone users can run
+`shadow update` once through the legacy host; subsequent updates use Blackfrost. Windows installs
+support built-in PowerShell 5.1, with no PowerShell 7 requirement.
 
 ```bash
 # macOS / Linux
@@ -30,11 +38,10 @@ shadow --version
 ```
 
 Shadow is a single self-contained binary — no Node or npm needed to run it. It reads your config from
-`~/.shadow/config.json` and has no analytics service or crash uploads. Requests use your configured
-model providers, enabled MCP connections and invoked tools. Plugin operations, model downloads,
-manual updates and programs you configure have their own network behavior. Background update
-discovery is off by default; see [the config file](#the-config-file) for its trusted-user opt-in.
-Restart Shadow after updating to load the new executable.
+`~/.shadow/config.json`. It sends no analytics or crash reports. Model providers, web tools,
+configured MCP servers, plugin operations, and explicit updates can make network requests;
+`shadow doctor --privacy` shows those paths. Published binaries built before the hosting move
+need a bridge update or a reinstall before the legacy download host is retired.
 
 ---
 
@@ -47,10 +54,14 @@ shadow onboard
 ```
 
 It walks you through picking a provider (Anthropic, any OpenAI-compatible endpoint, Gemini, a local
-llama.cpp/Ollama server, …), entering a base URL + key, and saves a model preset.
+llama.cpp/Ollama server, …) and entering a base URL + key. Shadow then probes the endpoint's model
+catalog, detects local/self-hosted endpoints where it can do so honestly, and shows the model IDs the
+key can access. Select one or several; only those become presets in `/model`, and you choose which is
+the default. If discovery is unsupported, Shadow shows current agentic recommendations and keeps an
+exact-ID escape hatch.
 
 The terminal wizard uses the same retro banner and theme as your session. Start with **Local file**,
-**Model server**, or **Cloud provider**. Each provider menu shows five shortcuts, **Browse all providers**,
+**Model server**, **Cloud provider**, or **Subscription account**. Each API provider menu shows five shortcuts, **Browse all providers**,
 and **Custom endpoint**. The full list scrolls and supports search; no provider is hidden permanently.
 
 - **↑/↓**, then **Enter**: choose an item. A typed number also requires Enter.
@@ -60,7 +71,8 @@ and **Custom endpoint**. The full list scrolls and supports search; no provider 
 - **Ctrl+C**: quit. Configuration changes happen only at **Save and finish**.
 
 Keys remain masked when pasted or edited. Endpoint discovery has one six-second deadline, and the
-connection check has a thirty-second deadline. Failed checks keep your entries and offer retry,
+connection check has a thirty-second deadline (sixty seconds for subscriptions). Verification waits
+for a completed, valid tool response; a text fragment or usage count alone does not pass. Failed checks keep your entries and offer retry,
 endpoint/key editing, another model, or an explicitly unverified save. The review screen shows the
 endpoint, default model, model count, and connection status. It never displays your key.
 
@@ -80,9 +92,63 @@ be retired. Server choices also include [vLLM](https://docs.vllm.ai/en/stable/se
 [SGLang](https://github.com/sgl-project/sglang/blob/main/docs/docs/get-started/quickstart.mdx), and
 [llama.cpp](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md).
 
+For Z.ai's Coding Plan, the curated fallback is `glm-5.3` plus `glm-5.3-flash`; legacy `glm-4.6` is
+not selected unless the live API lists it and you explicitly choose it.
+
 Once you have presets, switch between them live in the HUD with **`/model`** (↑/↓ to select, Enter to
 switch). Each preset can carry its **own** base URL and key, so you can keep a local model and a cloud
 model side by side and hop between them mid-session without losing context.
+
+### Subscription accounts
+
+Run `shadow onboard` → **Subscription account**, then choose:
+
+- **Continue with ChatGPT**: browser sign-in using OpenAI’s native
+  [Sign in with ChatGPT for open-source apps](https://developers.openai.com/siwc/token-sharing-open-source).
+  Allow plan usage, choose an account/workspace and a model from that account’s live catalog, then
+  verify and save. Your plan’s eligibility and usage limits apply; manage connections in
+  [ChatGPT Settings → Usage](https://chatgpt.com/settings/usage).
+- **Claude Code subscription**: install the official [Claude Code CLI](https://code.claude.com/docs/en/setup).
+  Shadow checks your existing sign-in or hands the terminal to Claude’s official login. Choose
+  Sonnet, Opus or Haiku, then verify availability on your plan. The unmodified official engine
+  returns validated proposals; Shadow continues to own its tools, approvals and session history.
+  This follows the [current Claude subscription integration path](https://support.claude.com/en/articles/15036540-use-the-claude-agent-sdk-with-your-claude-plan).
+
+The verification consumes a small amount of plan allowance. Failed or cancelled verification keeps
+your active model unchanged. API keys in the environment cannot override a subscription selection;
+quota/authentication errors do not automatically switch to paid API billing. Explicitly choosing an
+API preset with `/model` does switch billing paths.
+Subscription tokens still count toward Shadow’s token/time limits, but Shadow does not price them
+using API rates. Its dollar counter does not measure provider-side plan or extra-usage charges.
+
+```sh
+shadow login status
+shadow login chatgpt                 # authenticate; then onboard to select/verify a model
+shadow login chatgpt <profile-id>     # reconnect a saved account
+shadow login chatgpt --no-open       # print the browser link for manual opening
+shadow login claude                  # official Claude Code sign-in
+shadow login logout <profile-id>     # ChatGPT: revoke and clear local credentials
+```
+
+`shadow login codex` is an alias for native ChatGPT sign-in. Claude sign-out remains
+`claude auth logout`. Browser setup (`shadow onboard --web`) supports API keys/endpoints and links
+back to terminal setup for subscriptions. A browser sign-in link returns to Shadow on the same
+machine; a remote terminal requires forwarding its printed loopback port.
+
+Shadow stores native ChatGPT tokens under `~/.shadow/chatgpt-auth` in owner-only files (0600,
+directory 0700); they are **not encrypted by the API-key vault**. Account registrations remain after
+logout for reconnection. Logout reports if server revocation could not be confirmed. Login links omit
+retained identity-token hints, so reconnecting may ask you to choose the account again. Shadow never
+reads or copies Claude Code’s login tokens.
+
+Claude connection limits: final answer text appears after structured validation;
+text and tool calls are supported, while images and custom stop sequences are rejected explicitly.
+Ordinary engine tools, MCP, plugins and hooks are disabled; managed administrator hooks can still
+apply. Shadow requests that the official engine disable nonessential traffic. Its sockets remain
+outside Shadow’s fetch receipt, and the engine’s own account/privacy policies apply. Both account
+connections are blocked in offline mode.
+
+### Manual API presets
 
 To add a preset without the wizard:
 
@@ -98,8 +164,8 @@ the server itself.
 ## Qwen 3.8: hosted or self-hosted
 
 For hosted Qwen, run `shadow onboard`, choose **Cloud**, then **Alibaba Qwen (DashScope)**. The
-wizard starts with `qwen3.8-max` and the official OpenAI-compatible endpoint; you can edit the model
-ID before the connection test.
+wizard starts with `qwen3.8-max` and the official OpenAI-compatible endpoint; live discovery is used
+when DashScope exposes it, with exact model entry available before the connection test.
 
 For the forthcoming open-weight release, use the exact served model ID published with the weights —
 Shadow does not maintain an allowlist or rewrite it:
@@ -123,6 +189,20 @@ reasoning stays separate from visible content and is sent back on later turns. T
 reasoning counts toward input tokens and billing. Unknown open-weight variants remain
 capability-neutral until their server documents its actual wire behavior.
 
+A separate `reasoning_content` or `reasoning` field makes the answer's `content` literal text,
+including when the reasoning field is empty or null. Known inline-reasoning models instead split
+only a leading `<think>…</think>` block; tags later in an answer or code example remain intact.
+A model capability of `reasoning: "hidden"` disables tag guessing entirely, while an explicit
+`"interleaved"` declaration allows both reasoning channels. If a server introduces its structured
+field only after sending a leading tag, declare `"hidden"` to avoid that initial ambiguity.
+
+Valid native tool calls are processed even when the response ends with `finish_reason: "length"`;
+malformed arguments use the existing correction flow. Completed main-session Chat Completions
+streams also save an `openai_stream_summary` debug record in the session log: frame and fragment
+counts, bounded call indexes, argument lengths, parsed-call outcomes, finish reason, and requested
+token limit. This diagnostic contains no raw prompts, reasoning, call names/IDs, or arguments.
+Interrupted streams and subagent requests do not guarantee this summary.
+
 ---
 
 ## Secure your keys (encrypted vault)
@@ -135,8 +215,9 @@ shadow onboard --web
 ```
 
 This opens a small form in your browser served **only** on `127.0.0.1` (a one-time token guards it and a
-strict CSP blocks every outbound request — a key typed there physically cannot leave your machine). You
-pick a provider, paste your key, and set a **master password**. Shadow seals the key into
+strict CSP prevents the page from contacting anything except that loopback server). You pick a
+provider, paste your key, optionally click **Discover models** (Shadow then sends the key only to the
+endpoint you selected), choose the model allowlist, and set a **master password**. Shadow seals the key into
 `~/.shadow/vault.enc` — **scrypt → AES-256-GCM** (authenticated: a wrong password or a tampered file
 simply won't open). No plaintext key file is written.
 
@@ -187,6 +268,36 @@ Shadow's automatic shrink-and-retry handles the overflow case for you, but setti
 the wasted first attempt.
 
 Check the current value any time with **`/config get maxOutputTokens`**.
+
+---
+
+## Self-hosted Qwen chat-template thinking
+
+Some SGLang/Qwen servers accept a request-local chat-template switch. Configure it on the exact
+model preset in `~/.shadow/config.json`; for example, to disable template-generated thinking for
+an agent-tuned model:
+
+```json
+{
+  "models": [
+    {
+      "label": "Local Security 9B",
+      "provider": "openai",
+      "model": "local-security-9b",
+      "baseUrl": "http://192.0.2.10:8908/v1",
+      "selfHosted": true,
+      "capabilities": {
+        "chatTemplateEnableThinking": false
+      }
+    }
+  ]
+}
+```
+
+On the OpenAI Chat Completions wire this adds
+`"chat_template_kwargs": { "enable_thinking": false }`. Shadow does not infer the option from a
+Qwen-like model name. It is omitted when the capability is unset and from cloud, Anthropic, and
+OpenAI Responses requests.
 
 ---
 
@@ -254,18 +365,45 @@ instead of five edits. Define profiles in your global `~/.shadow/config.json` un
 
 ```json
 {
+  "models": [
+    {
+      "label": "Local Security 9B",
+      "provider": "openai",
+      "model": "local-security-9b",
+      "baseUrl": "http://192.0.2.10:8908/v1",
+      "selfHosted": true,
+      "capabilities": { "chatTemplateEnableThinking": false }
+    }
+  ],
   "profiles": {
     "deep":  { "model": "gpt-5",             "effort": "max",  "autonomy": "auto-edit", "contextBudget": 200000 },
     "quick": { "model": "claude-haiku-4-5",  "effort": "low",  "autonomy": "manual" },
-    "local": { "model": "qwen3-8b-local",    "sandbox": "off", "summarizeTriggerRatio": 0.8 }
+    "local": { "model": "qwen3-8b-local",    "sandbox": "off", "summarizeTriggerRatio": 0.8 },
+    "local-security-9b": {
+      "model": "Local Security 9B",
+      "harnesses": ["incident-response"],
+      "autonomy": "auto-read",
+      "contextBudget": 220000,
+      "maxIterations": 12,
+      "maxToolResultChars": 32768,
+      "maxOutputTokens": 32768,
+      "parallelTools": false
+    }
   }
 }
 ```
 
 Every field is optional — a profile can be just a `model`, or the full bundle. Fields a profile omits
 fall through to your normal config. A profile may set: `model`, `effort`, `autonomy`, `sandbox`,
-`contextBudget`, `summarizeTriggerRatio`. It deliberately **cannot** carry a `baseUrl`, keys, hooks, or
-anything else that runs code or redirects a credential — those stay top-level, global-only.
+`contextBudget`, `summarizeTriggerRatio`, `harnesses`, `parallelTools`, `maxIterations`,
+`maxToolResultChars`, and `maxOutputTokens`. `model` may be a model-preset label, as in
+`Local Security 9B`; the preset owns its provider, endpoint, credentials, and endpoint capabilities. A
+profile deliberately **cannot** carry a `provider`, `baseUrl`, credentials, keys, hooks, or anything
+else that runs code or redirects a credential.
+
+`harnesses` binds trusted add-ons when a new session starts. An empty array explicitly clears a
+global harness selection for that profile, while an explicit `--harness` replaces the profile list
+for that invocation. A resumed session keeps the harness receipt it started with.
 
 Activate a profile at launch:
 
@@ -285,7 +423,9 @@ plant one. `/status` shows the active profile and exactly which keys it contribu
 
 ## Autonomy & safety
 
-Shadow gates tool calls by autonomy level (cycle live with **Shift+Tab**):
+Shadow gates tool calls by autonomy level. `/autonomy` works in both renderers; Ink also cycles the
+levels with **Tab** when completion does not own the key. **Shift+Tab** toggles plan mode directly in
+both renderers.
 
 | Level | Behavior |
 |---|---|
@@ -340,34 +480,177 @@ web tools + a sensitive workspace remains a risk combination you are choosing.
 
 ---
 
+## Terminal renderer support
+
+Snowfall is the v10 development candidate's default terminal. Run `shadow`, or `npm start`
+from a built source checkout. It owns a full-width conversation with a persistent composer
+and a compact footer for task, agent, context and cost totals. Use `/tasks`, `/agents`,
+`/context` and `/cost` for details. Saved themes still apply; use
+`/theme snowfall` for the new ice palette.
+
+```sh
+SHADOW_TUI=ink shadow
+```
+
+This fallback retains Vim editing, experimental round-table `/table`, custom shell status lines,
+and `~/.shadow/keybindings.json` mappings for the v10 cycle. Custom slash commands work in both
+renderers. See the generated [command and key matrix](TERMINAL_RENDERERS.md) and the
+[candidate verification record](docs/V10_VERIFICATION.md).
+
+## Security foundation & harness add-ons
+
+Every Shadow session starts with the built-in **Shadow Security** foundation. It gives the agent an
+evidence-first security engineering baseline: keep scope and authority explicit, preserve material
+evidence, separate observations from conclusions, prefer reversible actions, and prove the result
+before calling work complete. Coding and systems work remain available when the task needs them.
+
+The foundation is provider-neutral. It never selects or restricts a model, provider, endpoint,
+credential, or deployment environment. Your onboarding choice, `/model` selection, or CLI override
+still determines where inference runs. A harness also cannot widen autonomy, permissions, or the
+sandbox.
+
+Trusted local add-ons live directly under `~/.shadow/harnesses/<id>/`. They can add ordered
+instructions and skills, require existing Shadow tools, or hide tools from the effective session.
+The strict manifest rejects provider settings, credentials, hooks, MCP servers, script or executable
+entry points, and other runtime-control fields. The package loader rejects symlinks, path escapes,
+special files, and content over its size/count limits. Every accepted regular file contributes to the
+package digest, but only declared Markdown instructions and recognized `skills/` entries are exposed
+to the session. Files under `references/` and other extra regular files are inert: Shadow does not
+inject, execute, or expose them as tools. If an add-on needs a native capability, its manifest may
+require an adapter compiled into the installed Shadow binary.
+
+A minimal package looks like this:
+
+```text
+~/.shadow/harnesses/example-sec/
+├── harness.json
+├── instructions/root.md
+└── skills/example-workflow/SKILL.md
+```
+
+```json
+{
+  "schemaVersion": 1,
+  "id": "example-sec",
+  "version": "1.0.0",
+  "title": "Example Security Workflow",
+  "description": "An internal evidence and review workflow.",
+  "instructions": ["instructions/root.md"],
+  "requiredAdapters": [],
+  "tools": {
+    "add": ["read_file", "grep", "run_shell"],
+    "remove": []
+  }
+}
+```
+
+Manage installed add-ons from the shell:
+
+```bash
+shadow harness list
+shadow harness show example-sec
+shadow harness validate example-sec
+shadow harness enable example-sec       # add it to the configured stack
+shadow harness disable example-sec
+shadow harness use example-sec          # replace the configured stack with this add-on
+shadow harness use security             # built-in foundation only
+shadow --harness example-sec            # select it for this new session only
+```
+
+Inside Shadow, `/harness` and `/harness list` show the foundation, installed packages, the current
+stack, and the next-session selection. `/harness show <id>`, `enable <id>`, `disable <id>`,
+`use <id>`, and `use security` mirror the local management commands.
+
+The stack resolves once when a new session starts. Changing the selection does not alter the
+current session. Each session records the exact add-on IDs, versions, and content digests; resuming
+fails closed if one of those packages was changed or removed instead of silently running a
+different harness. An invalid package, missing required tool, conflicting tool policy, or missing
+compiled adapter also stops startup with a concrete error.
+
+Harness discovery, validation, and selection are local operations. They add no analytics,
+telemetry, callback service, or remote catalog lookup. When a session uses an add-on, its selected
+instructions and skill metadata become part of the normal model request and therefore go to the
+provider or endpoint you configured.
+
+`shadow harness validate` checks the package manifest, paths, files, and computed digest. Tool
+readiness is host-specific, so a new session checks it against the tools that host actually exposes.
+Unknown or unavailable requirements fail before startup hooks or provider work; terminal-only
+orchestration requirements are rejected by web sessions instead of being advertised and then dropped.
+
+## Learn reusable skills
+
+`/learn [focus]` asks the active model to inspect a workflow and prepare a reusable skill with
+references to available local session, artifact, test, or review evidence. This is a normal model
+turn, so it uses the endpoint you already selected. The resulting draft stays local under
+`~/.shadow/skills/.candidates/`; it does not enter the active skill catalog automatically.
+
+Review and control the lifecycle explicitly:
+
+```text
+/skills pending
+/skills show <name>
+/skills validate <name>
+/skills activate <name>
+/skills reject <name> <reason>
+/skills rollback <name> <generation>
+```
+
+Activation requires a structurally valid `SKILL.md`, at least one reusable claim tied to evidence,
+and a recorded passing validation or replay receipt linked to evidence for every claim. Shadow checks
+the receipt shape, identifiers, references, and digests; it does not rerun the named validation or
+replay or authenticate the underlying evidence. Explicit local operator activation is the trust
+gate. The model-facing `skill_manage` tool can draft, update, inspect, and validate candidates, but
+it cannot activate, reject, or roll back one. Those decisions require the local operator commands
+above. Activation writes the skill under `~/.shadow/skills/<name>/`; prior active generations remain
+under `~/.shadow/skills/.revisions/`, and a new session loads the updated skill catalog.
+
+The candidate store, evidence references, and decision receipts are local files. This lifecycle adds
+no telemetry or callback upload for that store. `/learn` is a normal model turn, and `skill_manage`
+inputs and results become model-visible conversation data, so that material is sent to the provider
+or endpoint you selected just like other prompts and tool results.
+
 ## Everyday use
 
-Snowfall is the default terminal in v10: a full-width scrollable conversation, pinned composer,
-compact footer and retro SHADOW banner. Unset `SHADOW_TUI` or set it to `pi` to use Snowfall.
-`SHADOW_TUI=ink shadow` selects the compatibility renderer for Vim mode, round-table mode,
-custom status lines and custom key mappings. See [Terminal renderers](TERMINAL_RENDERERS.md)
-for the complete command and key inventory.
-
-In Snowfall, **Ctrl+G** opens your external editor while idle; **Ctrl+T** shows tasks;
-**Ctrl+Shift+F** searches the transcript if your terminal forwards that chord; **Home/End**
-go to the first/latest output. Drag to select and copy text. Press Enter while busy to queue
-a follow-up. The normal terminal paste command inserts a draft without submitting it.
-Thinking appears separately from answers and tool output. The footer gives longer runs elapsed
-time in minutes, and `/effort` shows its available choices.
-
-- **`/help`** lists every slash command; **`/model`**, **`/effort`**, **`/theme`**, **`/context`**,
-  **`/copy`**, **`/export`**, **`/resume`**, **`/fork`**, **`/mcp`** are the common ones.
+- **`/help`** describes the active renderer; **`/model`**, **`/effort`**, **`/theme`**, **`/context`**,
+  **`/copy`**, **`/export`**, **`/resume`**, **`/fork`**, **`/compact`**, **`/harness`**, and **`/mcp`**
+  are common. Use **`/learn`** and **`/skills`** to prepare and review evidence-backed local skills.
 - **Branch a session with `/fork`**: copies the transcript so far into a new session id and switches
   to it, leaving the original untouched — try a risky refactor on the fork, keep exploring on the
   original. New turns and `/rewind` live in the fork, and pre-fork file checkpoints come with it.
+- **Run a mission with `/goal <text>`**: starts a plan-gated orchestrator session — see
+  [Mission mode](#mission-mode-goal). `/goal` alone prints status; `/goal clear` ends it.
+- **Inspect execution with `/work`**: lists subagents, background shells, and planning items in
+  one ownership-aware view in both Ink and pi. Use `/work show <id>` for timestamps, ownership,
+  token/tool counts, safe file/tool facets, final output, and bounded recent activity; filter with
+  `--type`, `--status`, `--tool`, or `--file`. Completed history is durable. Use
+  `/work --all-sessions` or `/work --session <id>` for read-only cross-session queries, and
+  `show <session-suffix>::<work-id>` to inspect a historical row.
+  `/work cancel <id>` safely cancels a live background subagent through the existing agent
+  cancellation path, and `/work kill <id>` terminates a live background shell. Background
+  subagents can pause cooperatively at the next safe model/tool boundary with `/work pause <id>`
+  and continue with `/work resume <id>`. Change a queued agent with
+  `/work priority <id> low|normal|high`; running work with no activity for five minutes is marked
+  stalled. `/work retry <id> --confirm` starts a linked new background run after exponential
+  backoff; it never replays in place, is limited to three attempts, and requires the explicit flag
+  because external effects may repeat. Foreground agents and historical rows are inspect-only.
+  `/tasks` remains the model's planning checklist and does not mean executable background work.
+  Activity history is capped at 100 records per item by default; set
+  `SHADOW_WORK_TRANSCRIPT_LIMIT` to a positive value (capped at 10,000) when a different bound is
+  required.
+- **Use Work Center from the web console or ACP**: the authenticated loopback console Inspector
+  lists live work, opens bounded detail, and exposes only valid per-item controls. ACP v1 now
+  advertises and implements session loading and permission modes, exposes model selection through
+  `session/set_config_option`, and keeps the older `session/set_model` compatibility method.
+  Editors can discover Work Center support through `agentCapabilities._meta.shadowWorkExtension`
+  and use the versioned `_shadow/work/list` and `_shadow/work/control` extension methods. Loaded
+  history and cross-session Work Center data remain read-only; client-supplied MCP launch commands
+  are refused during load.
 - **Rewind with `/rewind`**: bare `/rewind` opens a picker that lists every rewindable turn with the
   prompt you sent; `/rewind <n>` jumps straight to turn `n`. By default a rewind restores BOTH the
   conversation and that turn's file checkpoints — **`--chat-only`** rewinds only the conversation
   (files untouched), **`--code-only`** restores only the files (conversation untouched). After a
   rewind the composer is prefilled with the first undone prompt, so you can rephrase and resubmit.
-  Snowfall previews affected files before applying a rewind. `/resume` restores the prior
-  conversation with its plan, tasks, work history and recorded tool activity; it does not rerun
-  commands or edits. An interrupted job needs an explicit retry.
+  `/resume` loads a prior session from its last snapshot.
 - **Keep track of named sessions**: the opening prompt becomes a short session name, generated
   locally without another model request. It appears in the terminal title (`Website launch — Shadow`),
   `/session`, `/sessions`, and `/resume`. Type `/resume ` followed by part of a name to filter the
@@ -375,93 +658,84 @@ time in minutes, and `/effort` shows its available choices.
   name yourself. Names survive restarts, resumes and forks. `/new` (or `/clear`) starts a separate
   conversation so the previous named session stays available. Older logs get a name from their
   first readable prompt when available. Closing Shadow restores the terminal's previous title.
-- **Vim editing (`/vim`, Ink only)**: the composer gets a vim NORMAL/INSERT model — **Esc** enters NORMAL;
+  Sessions created before harness-bound snapshots require a one-time explicit migration because an
+  absent receipt cannot distinguish an old log from a copied or downgraded current log. Inspect the
+  exact file, then run `shadow resume <id-or-path> --trust-legacy`. Shadow requires an explicit
+  target and writes an owner-only receipt bound to that absolute path and the complete file digest;
+  moving, copying, or changing the log invalidates it. The flag refuses current-format v2 sessions.
+  This detects workspace-only replacement; it is not a cryptographic defense against another local
+  process running as you that can rewrite both the session and its receipt under `~/.shadow/`.
+- **Export the current transcript with `/export [path]`** for Markdown or `/export html [path]` for
+  standalone HTML. A missing path creates a timestamped file under `exports/`; supplied paths stay
+  confined to the workspace. Resumed history is read from the latest durable context snapshot.
+- **Vim editing in Ink (`/vim`)**: the composer gets a vim NORMAL/INSERT model — **Esc** enters NORMAL;
   `i` `a` `I` `A` (and `o`/`O`, which open a new line) enter INSERT. Motions: `h l 0 $ w b e j k`
   plus in-line finds `f`/`F`/`t`/`T` — repeat the last find with `;`, reverse it with `,`. Edits:
   `x s d c y D C` with the usual operator+motion combos (`dw`, `c$`, `yy`, `d2w`, `2dd`…), paste
   with `p`/`P` (deletes and yanks share one unnamed register), `r` replace a char, `J` join lines.
   Numeric counts work everywhere (`3w`, `d2w`, `2fl` finds the second `l`). Every key stays inside
   the caret's hard line — `0`/`$`/`dd` never cross a newline — and every vim edit goes through the
-  normal undo stack (**Ctrl-Z**). `/vim off` returns to the usual emacs-style editing.
+  normal undo stack (**Ctrl-Z**). `/vim off` returns to the usual emacs-style editing. Pi's editor
+  uses fixed editing keys in v10; start `SHADOW_TUI=ink shadow` when Vim mode is required.
 - **Workspace memory**: the agent can save durable facts about your project (the build command,
   conventions, where key modules live) with its `memory` tool instead of re-discovering them each
   session. Only a one-line **index** of stored facts rides in the system prompt; the agent recalls
-  a key's full value on demand. In Snowfall, use `/memory list`, `/memory show <key>`,
-  `/memory set <key> <value>` and `/memory delete <key>` to inspect and manage facts with their
-  user/generated/legacy origin. Unknown legacy dates stay unknown. The store lives at
-  `.shadow/memory.json`; never put secrets in it.
-- **Ctrl-O** expands a collapsed reasoning / tool-output block; **PageUp/PageDown** scroll the
-  transcript. Mouse input is opt-in with `"mouse": true` or `SHADOW_MOUSE=1`.
-- **Copy & paste**: paste multi-line text straight into the composer (it inserts atomically — newlines
-  never fire a send); **`/copy`** copies the last answer, **`/copy code`** just its last fenced
-  code block. Ink additionally supports **Ctrl-V** clipboard paste and **Alt-C** answer copy. Huge pastes condense to a
-  `[Pasted text #N]` chip and expand again on send.
+  a key's full value on demand. The store lives at `.shadow/memory.json` — inspect or hand-edit it
+  there, and never put secrets in it.
+- **Transcript navigation**: **Ctrl-O** opens or toggles activity detail in both terminals. In Ink,
+  **PageUp/PageDown** navigate the transcript and optional mouse handling is enabled with
+  `"mouse": true` or `SHADOW_MOUSE=1`. In Snowfall, PageUp/PageDown and the wheel scroll the transcript. Home/End jump
+  to its start/latest output; Ctrl+Up/Down jump between prompts; Ctrl+Shift+F searches.
+  On exit the complete conversation is printed into native terminal scrollback.
+- **Copy & paste**: paste multi-line text straight into either composer (it inserts atomically —
+  newlines never fire a send). Ink also provides **Ctrl-V** for the system clipboard and **Alt-C**
+  for the last answer. `/copy` works in both terminals, and **`/copy code`** copies only the last
+  fenced code block. Huge pastes condense to a `[Pasted text #N]` chip and expand again on send.
 - **Accessibility**: `/theme colorblind` switches to an Okabe–Ito palette (safe under deuteranopia,
-  protanopia, and tritanopia); `/theme high-contrast` is a louder mode. Your turns have a filled
-  background band, and failed tools carry a `✗` marker.
+  protanopia, and tritanopia); `/theme high-contrast` is a WCAG-AAA loud mode. Your turns start with `◇`,
+  assistant turns with `✻`, and failed tools with `✗ FAILED`; state never rides on color alone.
 - **Tables & charts**: GFM tables render as rounded grids with numeric columns right-aligned; a fenced
   ` ```chart ` block (`label: value` lines, `type: bar|line|spark`) renders as a real unicode chart.
 - **Ctrl-C twice** quits; **Esc** interrupts the current turn.
 - Pipe a one-shot task non-interactively: `shadow --task "summarize README.md"` (scriptable, plain output).
 
-### Work Center
+---
 
-`/work` gives one view of agents, background shells and plan items. It reports state, ownership,
-elapsed time, recent activity and results; the terminal, web companion and ACP extension share
-the same work state. Inspect without launching anything:
+## The web console (`shadow web`)
 
-```text
-/work
-/work show <id>
-/work --type subagent,bgshell --status running,paused
-/work --tool <name>
-/work --file <path>
-/work --all-sessions
-/work --session <session-id>
-/work show <session-suffix>::<id>
-```
+`shadow web` starts a local server and prints a launch URL — open it in a browser. The token in
+the URL fragment is the credential: it is never transmitted to the server (the shell document is
+served without auth precisely because it never sees the token), it lives in `sessionStorage`
+(scoped to the port, so other local services cannot read it), and the address bar is scrubbed
+after load. Refreshing keeps you signed in; copying the link to another browser on the same
+machine works; the token stops working when the server exits.
 
-Cross-session history is read-only. It does not grant authority to resume or repeat old work.
-Current-session background controls are explicit:
+The layout is three panes:
 
-```text
-/work pause <agent-id>
-/work resume <agent-id>
-/work priority <queued-agent-id> high
-/work cancel <background-agent-id>
-/work kill <running-shell-id>
-/work retry <agent-id> --confirm
-```
+- **Sessions** (left) — one row per web session with a live status dot and relative time.
+  `✎ New session` starts one in the project of your choice; `⚙` opens Settings. Under
+  `shadow --web` the terminal's own session appears as a read-only mirror (composer disabled,
+  live transcript streaming in).
+- **Chat** (center) — the transcript streams live: markdown answers, thinking rows, tool cards
+  that expand to full output and diffs. When a tool needs approval a dock slides in with
+  **Allow once / Allow for session / Reject**; `ask_user_question` prompts render as answerable
+  forms. Typing mid-turn queues the message — queued prompts drain one per completed turn, in
+  order. The autonomy pill (bottom-left of the composer) sets the session's approval level and
+  persists server-side. The **Trajectory** tab swaps the transcript for a timestamped timeline of
+  everything that happened — same data, different lens.
+- **Inspector** (right, `▤` to toggle) — session facts, usage accounting (turns, tokens, cache
+  hit, cost), the last 12 requests with latency/TTFT, sub-agents, pending asks, and the raw last
+  turn as a collapsible JSON tree.
 
-Pause takes effect at the next safe model/tool boundary. Priority accepts `low`, `normal` or `high`
-only while queued. Active foreground agents are inspect-only. Retry creates a linked new background run,
-may repeat external effects, requires confirmation and an in-memory retry specification, and is
-limited to three retries. Persisted historical items cannot be retried. Web/ACP controls apply
-the same restrictions.
+**Settings** (`⚙`, either pane) is one sheet with five panes: **General** (light/dark/auto
+theme), **Models** (add a preset, set default, enable/disable, delete — the vault-locked case
+explains itself), **Agents** (built-ins are read-only; create your own), **MCP** (add/remove
+servers; spawns happen at boot, so a new one applies on the next `shadow web` start), and
+**Projects** — the allowlist itself. Removing a project closes its open web sessions; files on
+disk are never touched.
 
-### Collaboration and recoverable jobs
-
-Shadow 10.0.3 adds these Snowfall workflows:
-
-| Command | Use it to |
-|---|---|
-| `/jobs` | Inspect persistent jobs, attempts, dependencies and acceptance; prepare an explicit retry. |
-| `/room` | Read or post local project messages, including replies and unread history. |
-| `/work artifacts` | Inspect retained worktrees and patches, then apply, keep or discard them explicitly. |
-| `/review` | Review working changes, a branch comparison or a commit, with file and hunk navigation. |
-| `/consult` | Select a model profile for an independent read-only conversation. |
-| `/team` | Choose a bounded collaboration preset, then add a task in the composer. |
-| `/map` and `/instructions` | Inspect repository context and the origins of scoped instructions. |
-
-Use arrows and Enter to select a row, a number followed by Enter for a shortcut, or `/` to filter.
-Escape clears a search and then closes the picker; with overlays closed, Escape interrupts work.
-Consultation follow-ups survive session resume and keep the lead session's model unchanged.
-
-Jobs and rooms are stored in the workspace's `.shadow/jobs.sqlite`. Work records survive exit;
-workers do not. Restoring a session never automatically repeats a command or edit. Check evidence
-and acceptance remain separate from whether execution finished and what a model said. Missing
-provider usage remains unknown. See the [collaboration guide](docs/COLLABORATION.md) for presets,
-budgets, recovery, connector controls and their limits.
+Everything the console does goes through the same gated `/api` routes with the same project
+allowlist jail as terminal sessions — it is a second face on the same agent, not a second agent.
 
 ---
 
@@ -475,18 +749,15 @@ shadow mcp enable browser       # from your shell
 ```
 
 Shadow pins the official `@playwright/mcp@0.0.79` server and launches a visible Chrome window with
-an isolated profile, separate from your everyday Chrome cookies and logins. Snowfall applies its
-`/mcp` enable/disable commands to the live connection. Restart after changing configuration from
-the shell or Ink's compatibility menu. Every browser tool is treated as executable:
+an isolated profile, separate from your everyday Chrome cookies and logins. Restart Shadow after
+enabling it; MCP servers connect when a session starts. Every browser tool is treated as executable:
 at the default `auto-edit` level Shadow asks before it runs, unless you approve that tool for the
 session or choose `full` autonomy.
 
 Profile isolation prevents browser state from carrying between sessions; it is **not a security
 boundary**. The MCP server and Chrome still run as your OS user and retain network access, so treat
 visited pages as untrusted and do not use this profile for sensitive accounts. Disable the opt-in with
-`shadow mcp disable playwright` and restart, or use Snowfall's `/mcp disable playwright` to
-disconnect immediately. Snowfall's additional connector controls are in the
-[collaboration guide](docs/COLLABORATION.md#extensions-and-repository-context).
+`shadow mcp disable playwright` (or `/mcp disable playwright`) and restart again.
 
 ---
 
@@ -540,17 +811,21 @@ signature-verified. See [THREAT_MODEL.md](THREAT_MODEL.md) for the full trust mo
 |---|---|
 | `provider` / `model` | the active provider + model id |
 | `models[]` | your `/model` picker presets (each may carry `baseUrl`, `apiKey`, and remote `selfHosted`) |
-| `profiles` | named bundles of model + effort + autonomy + sandbox + context — activate with `--profile <name>` (see [Named profiles](#named-profiles)) |
+| `profiles` | global-only named bundles of model + harness + runtime settings — activate with `--profile <name>` (see [Named profiles](#named-profiles)) |
 | `maxOutputTokens` | per-call output cap (default `65536`) |
 | `temperature` | self-hosted model sampling temperature, `0`–`2` (default `1.0`; omitted from unmarked cloud APIs) |
 | `effort` | reasoning effort (default `high`) |
 | `autonomy` | default autonomy level (default `auto-edit`) |
 | `lastTheme` | color theme |
 | `mcpServers` | MCP servers to auto-connect |
+| `web.token` | stable token for the `shadow web` console — ≥ 16 chars, no whitespace/control chars; default is a fresh random token each boot |
 | `notify` | terminal ping on a long turn / waiting approval (default `auto`) — see below |
-| `updateCheck` | trusted-user opt-in update notice (default `false`; ignored in project config) — see below |
+| `updateCheck` | opt-in update notice (default `false`) — see below |
 | `diagnostics` | extension → linter/compiler command run after each successful file write — see below |
+| `lsp` | LSP server diagnostics appended to write results (tsserver/pyright/gopls/rust-analyzer; detected, never installed) — see [Code intelligence](#code-intelligence-lsp--diagnostics) |
+| `formatters` | auto-format after agent writes (prettier/biome/ruff/gofmt/rustfmt/shfmt; detected, never installed) |
 | `hooks` | your own commands at lifecycle points (`pre_tool_use`, `stop`, …) — see below |
+| `harnesses` | trusted add-on IDs loaded with the always-on Security foundation when a new session starts |
 | `pluginIndexUrl` | optional plugin-index JSON for `shadow plugin search` / `add <name>` (off unless set; global-only) |
 | `pluginIndexKey` | optional ECDSA P-256 public key (PEM) — require a valid detached signature on the index (fail-closed) |
 
@@ -574,15 +849,11 @@ inactive, where your keys live (encrypted vault vs plaintext), and whether offli
 > custom command? A `stop` hook runs at every turn end: `{"hooks": {"stop": ["printf '\\a'"]}}` (or any
 > notifier you like, e.g. `terminal-notifier -message done`).
 
-> **Update discovery (opt-in, off by default).** Set `"updateCheck": true` in your trusted global
-> `~/.shadow/config.json` to enable a version check on launch. A local cache limits checks to once
-> per day when its timestamp can be saved. A project-local `shadow.config.json` cannot enable or
-> override this choice. The request reads the public repository's `package.json` and may display
-> an update notice; it does not install a release. It sends no analytics payload, persistent
-> identifier or credentials, but GitHub receives ordinary connection metadata such as your IP
-> address. With this setting off, no discovery request is made. `shadow update` remains a separate
-> explicit download, and offline mode blocks both network paths. Other configured integrations
-> and invoked tools retain their documented network behavior.
+> **Update check (opt-in, off by default).** Set `"updateCheck": true` and Shadow will, at most **once a
+> day**, do a single payload-free `GET` of the public `package.json` version and print a one-line notice if
+> a newer release exists. It sends **no** identifiers, usage data, or key material, and never downloads
+> anything on its own. Left at the default it makes **zero** network calls — this is the only outbound
+> traffic Shadow can ever originate beyond your chosen model endpoint and the explicit web tools.
 
 > **Diagnostics (`diagnostics`, off until you set it).** Map a file extension to a command and Shadow
 > runs it after every **successful** `write_file` / `edit_file` / `multi_edit`, folding the output into
@@ -641,9 +912,8 @@ inactive, where your keys live (encrypted vault vs plaintext), and whether offli
 > ```
 
 > **Trust boundary:** your global `~/.shadow/config.json` is trusted. A project-local config inside a repo
-> cannot set base URLs, keys, hooks, diagnostics, MCP servers or `updateCheck`. These settings must
-> come from trusted user configuration. Project content is still untrusted input; review requested
-> commands and tool approvals before granting them access.
+> is **de-fanged** — it cannot set base URLs, keys, hooks, diagnostics, or MCP command servers — so cloning
+> an untrusted repo can't redirect your key or run code.
 
 ---
 
@@ -691,24 +961,91 @@ permission before running tools — all inside the editor.
 - **Delegation.** When Shadow spins up sub-agents, their events are tagged `[subagent <id>]` so you
   can see delegated work in the stream.
 
-### ACP v1 support and limits
-
-- **Persisted sessions and controls.** `session/load` restores a session within an allowlisted
-  project. Modes are editor-selectable; model presets can change only before the first prompt.
-  `session/close` closes an active session. The versioned `_shadow/work/list` and
-  `_shadow/work/control` extensions expose Work Center state and explicit controls.
+### v0 limitations (by design)
 
 - **Text-only prompts.** Images and other non-text blocks aren't accepted yet — the editor sends
   text, Shadow replies with text.
-- **Credential and workspace boundaries.** The adapter uses Shadow's configured credentials rather
-  than editor-supplied authentication; client-supplied MCP servers and additional directories are
-  refused. Persisted history does not restore old approval authority.
+- **No session restore, mode, or model switching.** `session/load`, `session/set_mode`, and
+  `session/set_model` return a clear "not supported" error rather than silently doing nothing.
+  Each new editor session starts fresh.
 - **Shell output is delivered when the command finishes,** not streamed live. Long-running commands
   report their result in the final tool-call update.
 - **Unsaved editor buffers.** Shadow reads files from disk. If you have unsaved changes in an editor
   buffer, save first — Shadow sees what's on disk, not what's in your editor's memory.
 
 ---
+
+## Mission mode (`/goal`)
+
+`/goal <text>` turns a vague objective into a tracked mission: Shadow enters **plan mode**
+automatically, the agent explores and writes the plan with `plan_write` (including a concrete
+`tasks` list — the plan file renders them as checkboxes), and `exit_plan_mode` asks for your
+approval as usual. Approve, and the harness seeds the task list: the mission moves to
+**executing** and the HUD pins one line — `🎯 <mission> · executing 1/5` — in the status row
+while turns run, and in the pinned block while idle.
+
+From there the agent works the list: it advances tasks and phases with `mission_update`
+(`executing → verifying → done` or `failed`), dispatches sub-tasks to background agents when
+that helps, and is instructed to **verify with real evidence before calling anything done** —
+a mission is not complete while tasks remain or the end state is unverified, and the agent
+must report failures honestly. The mission block is pinned into every lead-agent turn
+(summarization can't lose it), and it survives `/resume` — mission state journals with the
+session and rehydrates on the way back in.
+
+- `/goal` — full status: mission, phase, plan file, and every task with its evidence.
+- `/goal clear` — end the mission (the plan file stays on disk).
+- `/goal <text>` while a turn is running is safe: the mission begins immediately, its kickoff
+  turn queues behind the current one.
+
+Two deliberate limits: **sub-agents never see the mission** (only the lead agent orchestrates —
+their `mission_update` calls are inert), and **a mission inherits your session autonomy** —
+nothing about a mission softens a permission gate, budget, or the sandbox.
+
+---
+
+## Code intelligence (LSP + diagnostics)
+
+After the agent successfully writes or edits a file, Shadow gives the model a compiler's view of
+its own work, in three advisory layers (none can fail the write or widen permissions):
+
+1. **Auto-format** (`formatters`) — the project's detected formatter rewrites the file
+   (prettier/biome/ruff/gofmt/rustfmt/shfmt). Kill switch: `SHADOW_NO_FORMAT=1`.
+2. **Diagnostics command** (`diagnostics`) — a configured per-extension command (e.g.
+   `"ts": "tsc --noEmit"`) runs and its verdict rides the result.
+3. **LSP diagnostics** (`lsp`, 8.4) — the richest layer: a real language server diagnoses the
+   file, so the model sees `src/foo.ts:12:5 — Property 'bar' does not exist (error, TS2339)`
+   inside the tool result and can fix it on the next turn — no extra prompt, no round-trip.
+
+**Which servers?** Only ones already on your machine — Shadow never installs anything:
+- TypeScript: `typescript-language-server` on PATH — or the project's own
+  `node_modules/typescript` (tsserver) **if you opt in** with `"trustNodeModules": true` below
+  (that file is repo content; a cloned repo must never be able to make Shadow run it on its own.
+  Without the opt-in Shadow skips it and tells you once per session).
+- Python: `pyright-langserver` · Go: `gopls` · Rust: `rust-analyzer` (each on PATH)
+
+Nothing relevant detected → the feature is silently dormant.
+
+**Tuning** (`~/.shadow/config.json`, global — a cloned repo cannot touch this block):
+
+```json
+{
+  "lsp": {
+    "enabled": true,
+    "timeoutMs": 3000,
+    "trustNodeModules": false,
+    "notes": { "maxTurnChars": 8000, "maxSessionChars": 60000 }
+  }
+}
+```
+
+Notes are deduped (an identical diagnostic never repeats) and budget-capped, so a broken file
+can't flood the context — the #1 complaint about LSP-rich agents. When the session budget trips,
+notes pause for the session and one notice says so. Kill switch: `SHADOW_NO_LSP=1`.
+
+**Privacy:** servers run as local stdio children with a scrubbed environment (no credentials
+inherited), reading only workspace files; Shadow makes no network request for them. They run as
+your user, like any dev tool — `shadow doctor --privacy` lists exactly which servers would spawn
+in the current directory.
 
 ## Troubleshooting
 
@@ -729,9 +1066,11 @@ quotes and fix or delete it.
 **Web search / fetch fails.** Make sure you're not in `--offline` mode (which drops the web tools by
 design), and update to the current build before troubleshooting an older installation.
 
-**Can't scroll with the mouse.** Mouse tracking is off by default so Shadow does not take over normal
-terminal selection. Use PageUp/PageDown, or opt in with `"mouse": true` in config (or
-`SHADOW_MOUSE=1` for one run).
+**Can't scroll with the mouse.** In Ink, mouse tracking is off by default so Shadow does not take
+over normal terminal selection. Use PageUp/PageDown, or opt in with `"mouse": true` in config (or
+`SHADOW_MOUSE=1` for one run). Snowfall scrolls the pane under the pointer; PageUp/PageDown scroll
+the conversation and End returns to the latest output. Use your terminal's mouse-bypass modifier
+for native selection. The complete conversation enters native scrollback when Snowfall exits.
 
 **Text looks too dim / low-contrast.** Update — recent builds use a WCAG-AA palette with white primary
 text and a readable secondary gray.

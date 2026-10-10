@@ -20,23 +20,41 @@ export async function testConnection(
     return await withDeadline(
       async (signal) => {
         const provider = createProvider({ ...options, streamRetries: 0 });
+        let validTool = false;
+        let completed = false;
+        let incompleteStream = false;
         for await (const event of provider.send({
           model: options.model,
           system: '',
-          tools: [],
-          maxOutputTokens: 16,
+          tools: [{ name: 'shadow_connection_test', description: 'Return this setup check. It performs no actions.',
+            parameters: { type: 'object', properties: { ok: { type: 'boolean', const: true } }, required: ['ok'], additionalProperties: false } }],
+          toolChoice: { type: 'tool', name: 'shadow_connection_test' },
+          maxOutputTokens: 1024,
+          effort: 'low',
           signal,
-          messages: [{ role: 'user', content: [{ type: 'text', text: 'Reply with: ok' }] }],
+          messages: [{ role: 'user', content: [{ type: 'text', text: 'Call shadow_connection_test with {"ok":true}. This only verifies the connection; no tool will be executed.' }] }],
         })) {
           if (event.type === 'error')
             return { ok: false, error: safeError(`${event.code}: ${event.message}`) };
-          if (event.type === 'text' && event.delta.trim()) return { ok: true };
-          if (event.type === 'tool_call') return { ok: true };
-          if (event.type === 'usage' && event.outputTokens > 0) return { ok: true };
+          if (event.type === 'diagnostic' && event.code === 'openai_stream_summary') {
+            incompleteStream = !['tool_calls', 'function_call', 'stop'].includes(event.data.finishReason);
+          }
+          if (event.type === 'tool_call') {
+            const input = event.call.input;
+            if (event.call.name !== 'shadow_connection_test' || !input || typeof input !== 'object' ||
+                Array.isArray(input) || (input as Record<string, unknown>).ok !== true || Object.keys(input).length !== 1) {
+              return { ok: false, error: 'The model returned an invalid setup tool call. Choose a model with tool support.' };
+            }
+            validTool = true;
+          }
+          if (event.type === 'done') completed = event.stopReason === 'tool_use' || event.stopReason === 'end_turn';
         }
+        if (completed && validTool && !incompleteStream) return { ok: true };
         return {
           ok: false,
-          error: 'The endpoint returned no output. Check the model ID and streaming support.',
+          error: completed && !incompleteStream
+            ? 'The model did not return the requested tool call. Choose a model with tool support.'
+            : 'The endpoint did not complete its response. Check the model ID, output budget and streaming support.',
         };
       },
       timeoutMs,

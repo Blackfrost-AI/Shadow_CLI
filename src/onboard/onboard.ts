@@ -27,6 +27,7 @@ import { registerSecret, redactString } from '../util/redact.js';
 import { persistOnboardTarget, type OnboardTargetInput } from './persistTarget.js';
 import { probeModelEndpoint, type EndpointProbeResult } from './probe.js';
 import { testConnection, type ConnectionResult } from './connection.js';
+import { runAccountOnboard, type AccountOnboardOptions } from './accounts.js';
 import {
   BACK,
   OnboardCancelled,
@@ -114,6 +115,7 @@ const credentials = (draft: Draft) =>
 
 /** Test seams replace only network/UI boundaries; production uses the same state machine. */
 export interface OnboardOptions {
+  accounts?: AccountOnboardOptions;
   ui?: OnboardUI;
   probe?: typeof probeModelEndpoint;
   test?: typeof testConnection;
@@ -165,10 +167,17 @@ export async function runOnboard(options: OnboardOptions = {}): Promise<boolean>
                 ['file', 'Local file', 'A GGUF file or MLX model, served on this machine'],
                 ['server', 'Model server', 'Ollama, LM Studio, vLLM, or your own endpoint'],
                 ['cloud', 'Cloud provider', 'Connect with a provider API key'],
+                ['account', 'Subscription account', 'Continue with ChatGPT or use your Claude Code sign-in'],
               ]),
               mode,
             );
             if (answer === BACK) continue;
+            if (answer === 'account') {
+              const result = await runAccountOnboard(ui, options.accounts);
+              if (result === BACK) break;
+              finale = result;
+              return true;
+            }
             mode = answer as OnboardMode;
             step = mode === 'file' ? 'file' : 'provider';
             break;
@@ -622,7 +631,7 @@ export async function runOnboard(options: OnboardOptions = {}): Promise<boolean>
               {
                 stage: 3,
                 title: 'Test connection',
-                description: 'Requesting a short reply · up to 30 seconds',
+                description: 'Verifying a completed tool response · up to 30 seconds',
                 details: [...details(), d.model!],
               },
               (signal) =>

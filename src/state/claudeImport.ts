@@ -21,13 +21,15 @@ import {
   chmodSync,
   closeSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
   openSync,
   readdirSync,
   readFileSync,
   readSync,
   statSync,
-  writeFileSync,
+  unlinkSync,
+  writeSync,
 } from 'node:fs';
 import { basename, join } from 'node:path';
 import { redact } from '../util/redact.js';
@@ -452,7 +454,37 @@ export function importClaudeSession(file: string, targetStore: string): ClaudeIm
     } catch {
       /* best-effort */
     }
-    writeFileSync(targetPath, lines.join('\n') + '\n', { encoding: 'utf8', mode: 0o600 });
+    const body = Buffer.from(lines.join('\n') + '\n', 'utf8');
+    let targetFd: number | undefined;
+    try {
+      // Claim the imported path atomically, persist every byte, then issue the owner-side legacy
+      // receipt in the CLI caller. A receipt must never be created for a partial import.
+      targetFd = openSync(targetPath, 'wx', 0o600);
+      let written = 0;
+      while (written < body.length) {
+        const count = writeSync(targetFd, body, written, body.length - written);
+        if (count <= 0) throw new Error('short write while importing Claude session');
+        written += count;
+      }
+      fsyncSync(targetFd);
+    } catch (error) {
+      if (targetFd !== undefined) {
+        try { closeSync(targetFd); } catch { /* best effort */ }
+        targetFd = undefined;
+      }
+      try { unlinkSync(targetPath); } catch { /* best effort */ }
+      throw error;
+    } finally {
+      if (targetFd !== undefined) closeSync(targetFd);
+    }
+    // Persist the new directory entry where supported. The content receipt is written only after
+    // this function returns success, so a power-loss cannot bless an incomplete target.
+    try {
+      const dirFd = openSync(targetStore, 'r');
+      try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
+    } catch {
+      /* directory fsync is unavailable on some platforms */
+    }
     try {
       chmodSync(targetPath, 0o600); // match SessionLog's owner-only hygiene
     } catch {

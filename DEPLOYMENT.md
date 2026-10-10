@@ -5,7 +5,7 @@ process — everything here runs against this repository alone, with no private 
 
 **Audience:** contributors and anyone building their own artifacts.
 
-**Release version:** `v10.0.3`. The commands below are required checks, not a record that they passed.
+**Release version:** `v10.0.4`. The commands below are required checks, not a record that they passed.
 
 > **Maintainer note:** the *official* release pipeline (binary hosting, signing keys) is private
 > and intentionally not part of this repo. This guide covers the parts that are.

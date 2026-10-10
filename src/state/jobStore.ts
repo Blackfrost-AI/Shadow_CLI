@@ -1,6 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import { randomUUID } from 'node:crypto';
-import { chmodSync, mkdirSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync } from 'node:fs';
 import { resolveWithin } from '../safety/workspaceJail.js';
 
 export type JobStatus = 'pending' | 'running' | 'completed' | 'partial' | 'failed' | 'cancelled' | 'interrupted';
@@ -291,5 +291,20 @@ export class JobStore {
       this.db.prepare('INSERT INTO cursors(room,reader,last_id) VALUES(?,?,?) ON CONFLICT(room,reader) DO UPDATE SET last_id=max(last_id,excluded.last_id)')
         .run(room, reader, Math.max(0, throughId));
     });
+  }
+}
+
+/** Classify interrupted work at startup without manufacturing project state in a workspace that
+ * has never used collaboration. Opening SQLite creates the database, schema, and `.shadow/`
+ * directory, so the absence check must happen before constructing JobStore. Tool calls still use
+ * `new JobStore(...)` directly and create the store on first real scheduler use. */
+export function recoverOrphanJobsIfPresent(workspaceRoot: string): string[] {
+  const path = resolveWithin(workspaceRoot, '.shadow/jobs.sqlite');
+  if (!existsSync(path)) return [];
+  const store = new JobStore(workspaceRoot);
+  try {
+    return store.recoverOrphans();
+  } finally {
+    store.close();
   }
 }

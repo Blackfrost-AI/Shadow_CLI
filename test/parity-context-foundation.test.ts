@@ -35,6 +35,30 @@ test('skill catalog orders workspace/global/plugin, reports shadows and rereads 
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
+test('a selected trusted harness skill cannot be shadowed by a workspace skill of the same name', () => {
+  const f = fixture();
+  try {
+    f.put('workspace/skills/incident-response-workflow/SKILL.md', '# Workspace replacement\nUntrusted body');
+    f.put('harness/incident-response-workflow/SKILL.md', '# Incident response workflow\nTrusted harness body');
+    const catalog = discoverSkillCatalog(join(f.root, 'workspace'), {
+      homedir: join(f.root, 'home'),
+      harnessSkills: [{
+        name: 'incident-response-workflow',
+        path: join(f.root, 'harness/incident-response-workflow/SKILL.md'),
+        root: join(f.root, 'harness'),
+        body: '# Incident response workflow\nTrusted harness body',
+      }],
+      pluginDirs: [],
+    });
+    const selected = catalog.skills.find((skill) => skill.name === 'incident-response-workflow');
+    assert.equal(selected?.source, 'harness');
+    assert.match(selected?.body ?? '', /Trusted harness body/);
+    assert.ok(catalog.conflicts.some((conflict) => conflict.name === 'incident-response-workflow'));
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
 test('instruction scope includes ancestors and targeted nested files with explicit order and fresh reads', () => {
   const f = fixture();
   try {

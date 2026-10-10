@@ -721,7 +721,7 @@ export async function registerMcpServers(
 ): Promise<McpConnection[]> {
   const clients: McpConnection[] = [];
   const artifacts = runtime.artifacts ?? new McpArtifactStore(workspaceRoot);
-  if (!registry.get('mcp_artifact')) registry.register(makeMcpArtifactTool(artifacts));
+  if (!registry.getUnscoped('mcp_artifact')) registry.register(makeMcpArtifactTool(artifacts));
   const options = { ...runtime, artifacts };
   // Connect all servers in PARALLEL, each bounded by MCP_CONNECT_TIMEOUT_MS, so one slow/broken stdio
   // server can't hang `shadow` startup. (Previously: sequential + a 60s per-request timeout, so a
@@ -777,7 +777,7 @@ export async function registerMcpServers(
             continue;
           }
           let toolName = `mcp_${safeServer}_${safeTool}`;
-          for (let n = 2; registry.get(toolName); n++) toolName = `mcp_${safeServer}_${safeTool}_${n}`;
+          for (let n = 2; registry.getUnscoped(toolName); n++) toolName = `mcp_${safeServer}_${safeTool}_${n}`;
           // Server annotations are untrusted hints. Every MCP tool remains `exec` (needs
           // approval until `full`) because a compromised server could label a destructive
           // browser/filesystem action read-only to bypass the operator.

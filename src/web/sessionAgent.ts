@@ -8,6 +8,7 @@ import { defaultModelPatch } from '../config/modelPresets.js';
 import { resolveJail } from './projects.js';
 import { SessionStartupError, type AgentBuilder, type WebSession } from './registry.js';
 import { readLatestWorkCenterSnapshot, recordWorkCenterSnapshot } from '../state/workCenterPersistence.js';
+import { recordSessionHarnessBinding } from '../state/sessionHarnessBinding.js';
 
 /**
  * The real `AgentBuilder` for browser sessions — the ONLY web file that imports bootstrap.ts.
@@ -88,9 +89,29 @@ export function makeAgentBuilder(deps: { bootConfig: ShadowConfig; installDir: s
       },
     });
 
+    try {
+      recordSessionHarnessBinding(agent.sessionLog.path, agent.harnessState);
+    } catch (error) {
+      agent.bg.killAll();
+      agent.wakeup.clear();
+      agent.sessionLog.close();
+      throw new SessionStartupError(redactString(stripAnsi((error as Error).message)));
+    }
+
     // connectMcp's FIRST production consumer (dead code until now). Uses the snapshot config, so
     // the servers are the boot set — never whatever a later POST /api/mcp wrote.
     const mcp = await agent.connectMcp();
+    try {
+      // Web intentionally exposes only the shared session tools plus its configured connectors.
+      // Prove the package against that real registry before accepting the first browser turn.
+      agent.assertHarnessRuntimeReady();
+    } catch (error) {
+      for (const client of mcp) client.stop();
+      agent.bg.killAll();
+      agent.wakeup.clear();
+      agent.sessionLog.close();
+      throw new SessionStartupError(redactString(stripAnsi((error as Error).message)));
+    }
 
     // Live task list on the wire (index.ts:todoList.onUpdate parity for the TUI). Without this
     // the browser todo dock never fills: the tool runs, "List updated" lands, but no `todo` event

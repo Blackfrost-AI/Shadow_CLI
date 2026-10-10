@@ -9,6 +9,7 @@ import { canonicalToolName } from './aliases.js';
  */
 export class ToolRegistry {
   private readonly tools = new Map<string, Tool>();
+  private denied = new Set<string>();
 
   register(tool: Tool): void {
     if (this.tools.has(tool.name)) {
@@ -22,20 +23,39 @@ export class ToolRegistry {
     return this.tools.delete(name);
   }
 
-  get(name: string): Tool | undefined {
-    // Exact match wins; otherwise map a known foreign name (bash → run_shell, etc.).
+  /**
+   * Apply the immutable capability subtraction selected for this session. Registration remains
+   * host-owned, but denied tools disappear from schemas, aliases, deferred search and dispatch.
+   * Provider/model/auth configuration is deliberately outside this boundary.
+   */
+  setDenied(names: Iterable<string>): void {
+    this.denied = new Set([...names].map((name) => canonicalToolName(name)));
+  }
+
+  isDenied(name: string): boolean {
+    return this.denied.has(canonicalToolName(name));
+  }
+
+  /** Host-only lookup for wiring wrappers around a compiled tool hidden from model dispatch. */
+  getUnscoped(name: string): Tool | undefined {
     return this.tools.get(name) ?? this.tools.get(canonicalToolName(name));
   }
 
+  get(name: string): Tool | undefined {
+    // Exact match wins; otherwise map a known foreign name (bash → run_shell, etc.).
+    if (this.isDenied(name)) return undefined;
+    return this.getUnscoped(name);
+  }
+
   list(opts?: { includeDeferred?: boolean }): Tool[] {
-    const all = [...this.tools.values()];
+    const all = [...this.tools.values()].filter((tool) => !this.isDenied(tool.name));
     if (opts?.includeDeferred) return all;
     return all.filter((t) => !t.deferred);
   }
 
   /** Deferred tools (excluded from the default schema). */
   listDeferred(): Tool[] {
-    return [...this.tools.values()].filter((t) => t.deferred);
+    return this.list({ includeDeferred: true }).filter((t) => t.deferred);
   }
 
   /** Case-insensitive substring search over deferred tool names. */

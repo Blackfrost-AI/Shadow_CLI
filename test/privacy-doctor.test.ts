@@ -277,12 +277,14 @@ test('empty cfg.baseUrl + a provider env var: the resolved host is what a sessio
 });
 
 test('a remembered /model pick carries its own provider + endpoint past the stale saved keys', () => {
+  const presets = [{ label: 'glm', provider: 'openai', model: 'glm-4.6', baseUrl: 'https://api.z.ai/api/coding/paas/v4' }];
   const cfg: PrivacyConfigView = {
     provider: 'anthropic',
     model: 'claude-opus',
     baseUrl: 'https://api.anthropic.com',
     lastModel: 'glm',
-    models: [{ label: 'glm', provider: 'openai', model: 'glm-4.6', baseUrl: 'https://api.z.ai/api/coding/paas/v4' }],
+    models: presets,
+    trustedGlobalModelPresets: presets,
   };
   const e = effectiveSessionEndpoint(cfg, { resolveBase: (_p, configured) => configured });
   assert.equal(e.provider, 'openai');
@@ -292,15 +294,54 @@ test('a remembered /model pick carries its own provider + endpoint past the stal
   assert.equal(find(r, 'Model provider').target, 'api.z.ai');
 });
 
+test('privacy recall ignores a project preset that collides with the trusted remembered label', () => {
+  const trusted = {
+    label: 'shared-label',
+    provider: 'openai',
+    model: 'trusted-model',
+    baseUrl: 'https://trusted.example.test/v1',
+  };
+  const e = effectiveSessionEndpoint({
+    provider: 'anthropic',
+    model: 'stale-model',
+    lastModel: trusted.label,
+    models: [{ label: trusted.label, provider: 'mock', model: 'project-collision' }],
+    trustedGlobalModelPresets: [trusted],
+  }, { resolveBase: (_provider, configured) => configured });
+  assert.equal(e.provider, trusted.provider);
+  assert.equal(e.model, trusted.model);
+  assert.equal(e.baseUrl, trusted.baseUrl);
+});
+
+test('privacy recall does not auto-activate a project-only remembered label', () => {
+  const e = effectiveSessionEndpoint({
+    provider: 'anthropic',
+    model: 'safe-global-model',
+    baseUrl: 'https://safe.example.test',
+    lastModel: 'project-only',
+    models: [{
+      label: 'project-only',
+      provider: 'openai',
+      model: 'project-model',
+      baseUrl: 'https://project.example.test/v1',
+    }],
+  }, { resolveBase: (_provider, configured) => configured });
+  assert.equal(e.provider, 'anthropic');
+  assert.equal(e.model, 'safe-global-model');
+  assert.equal(e.baseUrl, 'https://safe.example.test');
+});
+
 test('a recalled preset without its own baseUrl resolves against the RECALLED provider', () => {
   // lastModel names an anthropic preset while the saved top-level keys say openai: after the
   // recall it is ANTHROPIC_BASE_URL (not OPENAI_BASE_URL) a session would consult.
   withProviderEnv({ anthropic: 'https://anthropic-proxy.example' }, () => {
+    const presets = [{ label: 'sonnet', provider: 'anthropic', model: 'claude-sonnet' }];
     const e = effectiveSessionEndpoint({
       provider: 'openai',
       baseUrl: 'https://api.openai.com/v1',
       lastModel: 'sonnet',
-      models: [{ label: 'sonnet', provider: 'anthropic', model: 'claude-sonnet' }],
+      models: presets,
+      trustedGlobalModelPresets: presets,
     });
     assert.equal(e.provider, 'anthropic');
     assert.equal(e.baseUrl, 'https://anthropic-proxy.example');

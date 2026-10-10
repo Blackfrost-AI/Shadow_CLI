@@ -99,6 +99,22 @@ const SLASH_ARG_COMPLETIONS: Record<string, ArgProvider> = {
     { value: 'enable', desc: 'Enable an installed plugin: /plugins enable <name>' },
     { value: 'disable', desc: 'Disable a plugin: /plugins disable <name>' },
   ],
+  '/harness': [
+    { value: 'list', desc: 'Show the Security foundation and installed add-ons' },
+    { value: 'show', desc: 'Inspect an add-on: /harness show <id>' },
+    { value: 'enable', desc: 'Add an add-on to future new sessions' },
+    { value: 'disable', desc: 'Remove an add-on from future new sessions' },
+    { value: 'use', desc: 'Use one add-on: /harness use <id>' },
+    { value: 'use security', desc: 'Use the Security foundation by itself' },
+  ],
+  '/skills': [
+    { value: 'pending', desc: 'List learned-skill candidates awaiting review' },
+    { value: 'show', desc: 'Inspect a candidate: /skills show <name>' },
+    { value: 'validate', desc: 'Check a candidate and its evidence receipts' },
+    { value: 'activate', desc: 'Explicitly activate a validated candidate' },
+    { value: 'reject', desc: 'Reject a candidate with a reason' },
+    { value: 'rollback', desc: 'Restore an archived active generation' },
+  ],
   '/config': [
     { value: 'show', desc: 'Show safe runtime settings (secrets hidden)' },
     { value: 'get temperature', desc: 'Show self-hosted sampling temperature' },

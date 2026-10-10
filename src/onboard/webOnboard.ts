@@ -9,12 +9,13 @@
  * go to config.json.
  *
  * Security model (same as an OAuth loopback flow): bind to 127.0.0.1 ONLY, a one-time token guards
- * /save, the server dies on completion or a 5-minute idle timeout. The page can only talk to the
- * loopback server; an explicit Discover action uses the key solely against the selected endpoint.
+ * requests, the server dies on completion or a 5-minute authenticated-activity idle timeout.
+ * The page only talks to the loopback server; Discover and Save use the key solely against the
+ * selected endpoint. Save requires a completed, valid setup tool response before persistence.
  */
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import {
   createVault,
@@ -29,6 +30,10 @@ import { shredLegacyCredentials, loadLegacyCredentials } from '../state/globalSt
 import { persistOnboardTarget } from './persistTarget.js';
 import { PROVIDERS, findPreset } from './catalog.js';
 import { probeModelEndpoint } from './probe.js';
+import { testConnection } from './connection.js';
+import { withDeadline } from './deadline.js';
+import { registerSecret, redactString } from '../util/redact.js';
+import { stripVTControlCharacters } from 'node:util';
 
 export interface PersistResult {
   /** true = added to an existing vault; false = a new vault was created. */
@@ -47,8 +52,17 @@ export function persistOnboardSecret(input: {
   provider: 'anthropic' | 'openai';
   apiKey: string;
   password?: string;
+  credentialRef?: string;
+  baseUrl?: string;
+  bearer?: boolean;
 }): PersistResult {
-  const entry = { apiKey: input.apiKey, kind: 'apiKey' as const };
+  const slot = input.credentialRef ?? input.provider;
+  const entry = {
+    ...(input.bearer ? { authToken: input.apiKey } : { apiKey: input.apiKey }),
+    kind: 'apiKey' as const,
+    ...(input.baseUrl ? { baseUrl: input.baseUrl } : {}),
+    ...(input.credentialRef && !input.apiKey ? { noAuth: true } : {}),
+  };
   if (vaultExists()) {
     // Merge — unlock, add/replace this provider, re-seal with the SAME key (keeps other providers).
     let data: VaultData | undefined;
@@ -80,7 +94,7 @@ export function persistOnboardSecret(input: {
     for (const [slot, cred] of Object.entries(legacy ?? {})) {
       if (!data[slot]) data[slot] = cred; // vault wins on conflict — it is the newer, deliberate store
     }
-    data[input.provider] = entry;
+    data[slot] = entry;
     saveSecrets(data, key);
     const cached = keychainAvailable() ? storeKey(key.toString('base64')) : Boolean(cachedB64);
     // The key is sealed — drop any plaintext copy, but only after a verified re-open proves the
@@ -98,7 +112,7 @@ export function persistOnboardSecret(input: {
   if (!input.password || input.password.length < 8) throw new Error('weak-password');
   // Legacy plaintext credentials ride along into the new vault (the new provider wins on conflict),
   // so creating a vault never orphans the keys the plaintext file already held.
-  const initial: VaultData = { ...loadLegacyCredentials(), [input.provider]: entry };
+  const initial: VaultData = { ...loadLegacyCredentials(), [slot]: entry };
   const key = createVault(input.password, initial);
   const cached = keychainAvailable() ? storeKey(key.toString('base64')) : false;
   try {
@@ -131,8 +145,14 @@ export function persistWebOnboardTarget(input: {
   entryExtras?: import('./persistTarget.js').OnboardTargetInput['entryExtras'];
   selectedModels?: string[];
   entryGroup?: string;
+  credentialRef?: string;
 }): void {
   persistOnboardTarget(input);
+}
+
+/** Matches terminal onboarding's endpoint-specific slot; never aliases a provider-wide key. */
+export function webOnboardCredentialRef(provider: 'anthropic' | 'openai', baseUrl: string): string {
+  return `onboard-${provider}-${createHash('sha256').update(baseUrl).digest('hex').slice(0, 20)}`;
 }
 
 function openBrowser(url: string): void {
@@ -205,7 +225,8 @@ export function page(token: string, hasVault = false): string {
 </style></head><body>
 <div class="card">
  <h1>THE <span>SHADOW</span> vault</h1>
- <p class="sub">${hasVault ? 'This machine already has a vault — add another provider to it. Your existing keys are kept.' : 'Your keys are encrypted at rest with a master password and never leave this machine.'}</p>
+ <p class="sub">${hasVault ? 'This machine already has a vault — add another provider to it. Your existing keys are kept.' : 'Your keys are encrypted at rest with a master password and used only with your selected endpoint.'}</p>
+ <p class="sub">For ChatGPT or Claude subscriptions, run <code>shadow onboard</code> and choose <strong>Subscription account</strong>.</p>
  <form id="f" autocomplete="off">
   <label>Provider</label>
   <select id="provider">
@@ -242,12 +263,16 @@ export function page(token: string, hasVault = false): string {
   }
   <button id="go" type="submit">${hasVault ? 'Unlock &amp; add' : 'Encrypt &amp; save'}</button>
   <div id="msg" class="msg"></div>
-  <p class="note">This page only talks to Shadow on your machine. “Discover” checks the selected provider; keys are never sent anywhere else.</p>
+  <p class="note">This page talks to Shadow on your machine. Discover and Save check the selected endpoint; Save verifies a completed tool response before storing your setup.</p>
  </form>
 </div>
 <script>
  var TOKEN=${JSON.stringify(token)};
  var HASVAULT=${JSON.stringify(hasVault)};
+ var lastActivity=0;
+ function activity(){var now=Date.now();if(now-lastActivity<15000)return;lastActivity=now;fetch('/activity',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:TOKEN})}).catch(function(){});}
+ document.getElementById('f').addEventListener('input',activity);
+ document.getElementById('f').addEventListener('change',activity);
  var sel=document.getElementById('provider'),base=document.getElementById('baseUrl'),model=document.getElementById('model');
  var choices=document.getElementById('modelChoices'),filter=document.getElementById('modelFilter'),manual=document.getElementById('manualModel');
  var endpointStatus=document.getElementById('endpointStatus'),detectedProvider='openai';
@@ -271,7 +296,7 @@ export function page(token: string, hasVault = false): string {
    if(pw.length<8){msg.className='msg err';msg.textContent='Master password must be at least 8 characters.';return;}
    if(pw!==pw2){msg.className='msg err';msg.textContent='Passwords do not match.';return;}
   }
-  var btn=document.getElementById('go');btn.disabled=true;btn.textContent=HASVAULT?'Unlocking…':'Encrypting…';
+  var btn=document.getElementById('go');btn.disabled=true;btn.textContent='Checking model and tool support…';
   var picked=selectedModels();var exact=manual.value.trim();if(exact&&picked.indexOf(exact)<0)picked.push(exact);if(!picked.length){msg.className='msg err';msg.textContent='Select a model or enter an exact model ID.';btn.disabled=false;btn.textContent=HASVAULT?'Unlock & add':'Encrypt & save';return;}var defaultModel=model.value||picked[0];if(picked.indexOf(defaultModel)<0)defaultModel=picked[0];
   fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
    token:TOKEN,provider:detectedProvider,label:sel.value,apiKey:document.getElementById('apiKey').value,
@@ -285,190 +310,356 @@ export function page(token: string, hasVault = false): string {
 </script></body></html>`;
 }
 
-/** Run the browser onboarding flow; resolves once the vault is created (or the flow is abandoned). */
-export async function runWebOnboard(write: (s: string) => void): Promise<WebOnboardResult> {
+export interface WebOnboardOptions {
+  signal?: AbortSignal;
+  /** Test seams; production uses the shared connection check and protected stores. */
+  test?: typeof testConnection;
+  probe?: typeof probeModelEndpoint;
+  persistSecret?: (
+    input: Parameters<typeof persistOnboardSecret>[0],
+  ) => PersistResult | Promise<PersistResult>;
+  persistTarget?: (input: Parameters<typeof persistWebOnboardTarget>[0]) => void | Promise<void>;
+  hasVault?: () => boolean;
+  openBrowser?: (url: string) => void;
+  idleTimeoutMs?: number;
+  operationTimeoutMs?: number;
+  /** Injectable idle scheduler for deterministic activity/timeout tests. Returns cancellation. */
+  scheduleIdle?: (expire: () => void, timeoutMs: number) => () => void;
+}
+
+const browserSafeError = (error: unknown): string =>
+  stripVTControlCharacters(
+    redactString(error instanceof Error ? error.message : String(error)),
+  ).slice(0, 400);
+
+/** Run API-key browser onboarding; account subscription flows live in the terminal wizard. */
+export async function runWebOnboard(
+  write: (s: string) => void,
+  options: WebOnboardOptions = {},
+): Promise<WebOnboardResult> {
   return new Promise<WebOnboardResult>((resolve) => {
     const token = randomBytes(24).toString('base64url');
+    const controller = new AbortController();
+    const idleMs = options.idleTimeoutMs ?? 5 * 60 * 1000;
+    const operationMs = options.operationTimeoutMs ?? 30_000;
     let settled = false;
+    let saving = false;
+    let origin = '';
+    let cancelIdle: (() => void) | undefined;
+    let forcedClose: ReturnType<typeof setTimeout> | undefined;
+    const onAbort = (): void => finish({ ok: false, reason: 'cancelled' });
     const finish = (r: WebOnboardResult): void => {
       if (settled) return;
       settled = true;
-      server.close(() => resolve(r));
+      cancelIdle?.();
+      options.signal?.removeEventListener('abort', onAbort);
+      controller.abort();
+      server.close(() => {
+        clearTimeout(forcedClose);
+        resolve(r);
+      });
+      server.closeIdleConnections();
+      // Abandoned request bodies must not keep a timed-out wizard alive indefinitely.
+      forcedClose = setTimeout(() => server.closeAllConnections(), 100);
+      forcedClose.unref();
     };
-
+    const touch = (): void => {
+      if (settled) return;
+      cancelIdle?.();
+      const expire = (): void =>
+        finish({ ok: false, reason: 'timed out (no authenticated activity in 5 minutes)' });
+      cancelIdle = options.scheduleIdle
+        ? options.scheduleIdle(expire, idleMs)
+        : (() => {
+            const timer = setTimeout(expire, idleMs);
+            return () => clearTimeout(timer);
+          })();
+    };
+    const validToken = (candidate: unknown): boolean => {
+      if (typeof candidate !== 'string') return false;
+      const got = Buffer.from(candidate);
+      const expected = Buffer.from(token);
+      return got.length === expected.length && timingSafeEqual(got, expected);
+    };
     const server = createServer((req, res) => {
-      if (req.method === 'GET' && (req.url === '/' || req.url?.startsWith('/?'))) {
+      const reply = (status: number, data: unknown): void => {
+        if (res.destroyed || res.writableEnded) return;
+        res.writeHead(status, { 'Content-Type': 'application/json', ...SEC_HEADERS });
+        res.end(JSON.stringify(data));
+      };
+      // Loopback binding alone does not prevent DNS rebinding. Never disclose the page's
+      // token to a foreign Host, or accept cross-origin authenticated POSTs.
+      if (
+        !origin ||
+        req.headers.host !== new URL(origin).host ||
+        (req.headers.origin !== undefined && req.headers.origin !== origin)
+      ) {
+        reply(403, { ok: false, error: 'invalid setup origin' });
+        return;
+      }
+      let url: URL;
+      try {
+        url = new URL(req.url ?? '', origin);
+      } catch {
+        reply(400, { ok: false, error: 'invalid setup request' });
+        return;
+      }
+      if (req.method === 'GET' && url.pathname === '/') {
+        if (!validToken(url.searchParams.get('t'))) {
+          reply(403, { ok: false, error: 'invalid session token' });
+          return;
+        }
+        touch();
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', ...SEC_HEADERS });
-        res.end(page(token, vaultExists()));
+        res.end(page(token, (options.hasVault ?? vaultExists)()));
         return;
       }
-      if (req.method === 'POST' && req.url === '/probe') {
-        let body = '';
-        req.on('data', (chunk) => {
-          body += chunk;
-          if (body.length > 1_000_000) req.destroy();
-        });
-        req.on('end', async () => {
-          try {
-            const d = JSON.parse(body) as {
-              token?: string;
-              provider?: string;
-              label?: string;
-              apiKey?: string;
-              baseUrl?: string;
-            };
-            const got = Buffer.from(d.token ?? '');
-            const exp = Buffer.from(token);
-            if (got.length !== exp.length || !timingSafeEqual(got, exp)) {
-              res.writeHead(403, { 'Content-Type': 'application/json', ...SEC_HEADERS });
-              res.end(
-                JSON.stringify({ ok: false, source: 'none', error: 'invalid session token' }),
-              );
-              return;
-            }
-            const preset = findPreset(String(d.label ?? ''));
-            const adapter =
-              preset?.kind === 'custom'
-                ? 'auto'
-                : d.provider === 'anthropic'
-                  ? 'anthropic'
-                  : 'openai';
-            const probe = await probeModelEndpoint({
-              adapter,
-              baseUrl: d.baseUrl,
-              apiKey: d.apiKey,
-              fallbackModels:
-                preset?.recommendedModels ?? (preset?.defaultModel ? [preset.defaultModel] : []),
-              hostingHint:
-                preset?.kind === 'cloud'
-                  ? 'hosted'
-                  : preset?.kind === 'local'
-                    ? 'self-hosted'
-                    : undefined,
-            });
-            res.writeHead(200, { 'Content-Type': 'application/json', ...SEC_HEADERS });
-            res.end(JSON.stringify({ ...probe, provider: probe.compatibility }));
-          } catch (error) {
-            res.writeHead(400, { 'Content-Type': 'application/json', ...SEC_HEADERS });
-            res.end(JSON.stringify({ ok: false, source: 'none', error: (error as Error).message }));
-          }
-        });
+      if (
+        req.method !== 'POST' ||
+        !['/save', '/probe', '/activity'].includes(url.pathname) ||
+        url.search
+      ) {
+        reply(404, { ok: false, error: 'not found' });
         return;
       }
-      if (req.method === 'POST' && req.url === '/save') {
-        let body = '';
-        req.on('data', (c) => {
-          body += c;
-          if (body.length > 1_000_000) req.destroy(); // no giant bodies
-        });
-        req.on('end', () => {
+      if (req.headers['content-type']?.split(';')[0]?.trim().toLowerCase() !== 'application/json') {
+        reply(415, { ok: false, error: 'JSON setup request required' });
+        return;
+      }
+      let body = '';
+      let oversized = false;
+      req.on('data', (chunk: Buffer) => {
+        body += chunk.toString();
+        if (body.length > 1_000_000) {
+          oversized = true;
+          req.destroy();
+        }
+      });
+      req.on('end', async () => {
+        if (oversized || settled) return;
+        let d: Record<string, unknown>;
+        try {
+          const parsed: unknown = JSON.parse(body);
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error();
+          d = parsed as Record<string, unknown>;
+        } catch {
+          reply(400, { ok: false, error: 'invalid setup request' });
+          return;
+        }
+        if (!validToken(d.token)) {
+          reply(403, { ok: false, error: 'invalid session token' });
+          return;
+        }
+        touch();
+        if (url.pathname === '/activity') {
+          reply(200, { ok: true });
+          return;
+        }
+        const apiKey = typeof d.apiKey === 'string' ? d.apiKey : '';
+        const password = typeof d.password === 'string' ? d.password : undefined;
+        registerSecret(apiKey);
+        registerSecret(password);
+        if (apiKey.length > 16_384 || (password?.length ?? 0) > 16_384) {
+          reply(400, { ok: false, error: 'A setup field is too long.' });
+          return;
+        }
+        const chosenPreset = findPreset(typeof d.label === 'string' ? d.label : '');
+        const provider =
+          d.provider === 'anthropic' ? 'anthropic' : d.provider === 'openai' ? 'openai' : undefined;
+        if (!provider) {
+          reply(400, { ok: false, error: 'Choose a supported API adapter.' });
+          return;
+        }
+        const enteredBase = typeof d.baseUrl === 'string' ? d.baseUrl.trim() : '';
+        const baseUrl =
+          enteredBase ||
+          chosenPreset?.baseUrl ||
+          (provider === 'anthropic' ? 'https://api.anthropic.com' : 'https://api.openai.com/v1');
+        try {
+          const endpoint = new URL(baseUrl);
+          if (
+            !['http:', 'https:'].includes(endpoint.protocol) ||
+            endpoint.username ||
+            endpoint.password ||
+            endpoint.search ||
+            endpoint.hash ||
+            /\/(?:chat\/completions|messages|models)\/?$/i.test(endpoint.pathname)
+          )
+            throw new Error();
+        } catch {
+          reply(400, {
+            ok: false,
+            error:
+              'Enter an HTTP(S) API base URL without credentials, query, or an inference path.',
+          });
+          return;
+        }
+        if (url.pathname === '/probe') {
           try {
-            const d = JSON.parse(body) as {
-              token?: string;
-              provider?: string;
-              label?: string;
-              apiKey?: string;
-              baseUrl?: string;
-              model?: string;
-              models?: unknown[];
-              selfHosted?: boolean;
-              password?: string;
-            };
-            const got = Buffer.from(d.token ?? '');
-            const exp = Buffer.from(token);
-            if (got.length !== exp.length || !timingSafeEqual(got, exp)) {
-              res.writeHead(403, { 'Content-Type': 'application/json', ...SEC_HEADERS });
-              res.end(JSON.stringify({ ok: false, error: 'invalid session token' }));
-              return;
-            }
-            const provider = d.provider === 'anthropic' ? 'anthropic' : 'openai';
-            const model = typeof d.model === 'string' ? d.model.trim() : '';
-            if (!model) {
-              res.writeHead(400, { 'Content-Type': 'application/json', ...SEC_HEADERS });
-              res.end(JSON.stringify({ ok: false, error: 'Choose or enter a model.' }));
-              return;
-            }
-            const selectedModels = [
-              ...new Set(
-                (Array.isArray(d.models) ? d.models : [])
-                  .filter((value): value is string => typeof value === 'string')
-                  .map((value) => value.trim())
-                  .filter((value) => value.length > 0 && value.length <= 256),
-              ),
-            ];
-            if (!selectedModels.includes(model)) selectedModels.unshift(model);
-            // Seal the key into the vault — MERGING into an existing vault so multiple providers coexist
-            // (adding Z.ai no longer wipes an Anthropic key). Keyed by Shadow provider — the same shape
-            // the credential resolver reads.
-            let result;
-            try {
-              result = persistOnboardSecret({
-                provider,
-                apiKey: d.apiKey ?? '',
-                password: d.password,
+            const probe = await withDeadline(
+              (signal) =>
+                (options.probe ?? probeModelEndpoint)({
+                  adapter: chosenPreset?.kind === 'custom' ? 'auto' : provider,
+                  baseUrl,
+                  apiKey,
+                  fallbackModels:
+                    chosenPreset?.recommendedModels ??
+                    (chosenPreset?.defaultModel ? [chosenPreset.defaultModel] : []),
+                  hostingHint:
+                    chosenPreset?.kind === 'cloud'
+                      ? 'hosted'
+                      : chosenPreset?.kind === 'local'
+                        ? 'self-hosted'
+                        : undefined,
+                  signal,
+                }),
+              operationMs,
+              controller.signal,
+            );
+            if (!settled) {
+              touch();
+              reply(200, {
+                ...probe,
+                ...(probe.error ? { error: browserSafeError(probe.error) } : {}),
+                provider: probe.compatibility,
               });
-            } catch (e) {
-              const code = (e as Error).message;
-              const msg =
-                code === 'need-password'
-                  ? 'This machine already has a vault — enter its master password to add this key.'
-                  : code === 'bad-password'
-                    ? 'Incorrect master password for your existing vault.'
-                    : code === 'weak-password'
-                      ? 'Master password must be at least 8 characters.'
-                      : 'Could not save the key.';
-              res.writeHead(400, { 'Content-Type': 'application/json', ...SEC_HEADERS });
-              res.end(JSON.stringify({ ok: false, error: msg }));
-              return;
             }
-            // Non-secret prefs → config.json (provider / model / baseUrl / selfHosted). Replace a
-            // stale lastModel with this run's explicit default entry so endpoint+model stay atomic.
-            // P1A-06 step 4: same contract threading as the terminal wizard — a preset shipping
-            // entry extras persists them as a ModelEntry (keeps both onboarding doors identical).
-            const chosenPreset = findPreset(String(d.label ?? ''));
-            persistWebOnboardTarget({
-              provider,
-              model,
-              baseUrl: d.baseUrl,
-              customEndpoint: d.label === 'custom',
-              // Strict boolean check prevents a crafted string such as "false" from
-              // opting a public provider into self-host-only request parameters.
-              selfHosted: d.selfHosted === true,
-              entryExtras: chosenPreset?.entry
-                ? { label: chosenPreset.label, ...chosenPreset.entry }
-                : undefined,
-              selectedModels,
-              entryGroup: chosenPreset?.label ?? 'Custom endpoint',
-            });
-            res.writeHead(200, { 'Content-Type': 'application/json', ...SEC_HEADERS });
-            res.end(JSON.stringify({ ok: true, cached: result.cached, merged: result.merged }));
-            finish({ ok: true, provider, cached: result.cached, merged: result.merged });
-          } catch (e) {
-            res.writeHead(400, { 'Content-Type': 'application/json', ...SEC_HEADERS });
-            res.end(JSON.stringify({ ok: false, error: (e as Error).message }));
+          } catch (error) {
+            if (!settled) {
+              touch();
+              reply(400, { ok: false, source: 'none', error: browserSafeError(error) });
+            }
           }
-        });
-        return;
-      }
-      res.writeHead(404, SEC_HEADERS);
-      res.end();
+          return;
+        }
+        if (saving) {
+          reply(409, { ok: false, error: 'A setup check is already running. Your form is kept.' });
+          return;
+        }
+        const model = typeof d.model === 'string' ? d.model.trim() : '';
+        if (!model || model.length > 256 || /[\s\u0000-\u001f\u007f]/.test(model)) {
+          reply(400, { ok: false, error: 'Choose or enter one exact model ID.' });
+          return;
+        }
+        const selectedModels = [
+          ...new Set(
+            (Array.isArray(d.models) ? d.models : [])
+              .filter((value): value is string => typeof value === 'string')
+              .map((value) => value.trim())
+              .filter(
+                (value) =>
+                  value.length > 0 && value.length <= 256 && !/[\s\u0000-\u001f\u007f]/.test(value),
+              ),
+          ),
+        ].slice(0, 1000);
+        if (!selectedModels.includes(model)) selectedModels.unshift(model);
+        saving = true;
+        try {
+          const bearer = provider === 'anthropic' && chosenPreset?.bearer === true;
+          const checked = await withDeadline(
+            (signal) =>
+              (options.test ?? testConnection)(
+                {
+                  provider,
+                  model,
+                  baseUrl,
+                  ...(bearer ? { authToken: apiKey } : { apiKey }),
+                  selfHosted: d.selfHosted === true,
+                  ...(chosenPreset?.entry ?? {}),
+                },
+                signal,
+                operationMs,
+              ),
+            operationMs,
+            controller.signal,
+          );
+          if (settled) return;
+          if (!checked.ok) {
+            reply(400, {
+              ok: false,
+              error: `Connection check failed: ${browserSafeError(checked.error ?? 'The model did not complete a valid tool response.')}. Your entries are kept; edit or retry.`,
+            });
+            return;
+          }
+          const credentialRef = webOnboardCredentialRef(provider, baseUrl);
+          let result: PersistResult;
+          try {
+            result = await (options.persistSecret ?? persistOnboardSecret)({
+              provider,
+              apiKey,
+              password,
+              credentialRef,
+              baseUrl,
+              bearer,
+            });
+          } catch (error) {
+            const code = error instanceof Error ? error.message : '';
+            const message =
+              code === 'need-password'
+                ? 'Enter your existing vault’s master password to add this key.'
+                : code === 'bad-password'
+                  ? 'Incorrect master password for your existing vault.'
+                  : code === 'weak-password'
+                    ? 'Master password must be at least 8 characters.'
+                    : 'Could not save the key. Your entries are kept.';
+            reply(400, { ok: false, error: message });
+            return;
+          }
+          if (settled) return;
+          await (options.persistTarget ?? persistWebOnboardTarget)({
+            provider,
+            model,
+            baseUrl,
+            customEndpoint: d.label === 'custom',
+            selfHosted: d.selfHosted === true,
+            entryExtras: chosenPreset?.entry
+              ? { label: chosenPreset.label, ...chosenPreset.entry }
+              : undefined,
+            selectedModels,
+            entryGroup: chosenPreset?.label ?? 'Custom endpoint',
+            credentialRef,
+          });
+          if (settled) return;
+          // Do not close before the complete success response is handed to the socket.
+          res.once('finish', () =>
+            finish({ ok: true, provider, cached: result.cached, merged: result.merged }),
+          );
+          reply(200, { ok: true, cached: result.cached, merged: result.merged });
+        } catch (error) {
+          if (!settled)
+            reply(400, {
+              ok: false,
+              error: `Setup was not completed: ${browserSafeError(error)}. Your entries are kept.`,
+            });
+        } finally {
+          saving = false;
+          if (!settled) touch();
+        }
+      });
     });
-
+    server.headersTimeout = 10_000;
+    server.requestTimeout = 30_000;
     server.on('error', () => finish({ ok: false, reason: 'server error' }));
+    server.on('close', () => {
+      cancelIdle?.();
+      clearTimeout(forcedClose);
+    });
+    options.signal?.addEventListener('abort', onAbort, { once: true });
+    if (options.signal?.aborted) {
+      finish({ ok: false, reason: 'cancelled' });
+      return;
+    }
     server.listen(0, '127.0.0.1', () => {
+      if (settled) return;
       const port = (server.address() as AddressInfo).port;
-      const url = `http://127.0.0.1:${port}/?t=${token}`;
+      origin = `http://127.0.0.1:${port}`;
+      const url = `${origin}/?t=${token}`;
       write(`\nOpening secure onboarding in your browser…\n  ${url}\n`);
       write(
-        'If it does not open, paste that URL into any browser. Your keys stay on this machine.\n',
+        'If it does not open, paste that URL into your browser. API keys are checked only against the selected endpoint.\n',
       );
-      openBrowser(url);
+      touch();
+      (options.openBrowser ?? openBrowser)(url);
     });
-    // Abandon after 5 minutes so a forgotten tab doesn't leave the server up.
-    const timer = setTimeout(
-      () => finish({ ok: false, reason: 'timed out (no submission in 5 minutes)' }),
-      5 * 60 * 1000,
-    );
-    server.on('close', () => clearTimeout(timer));
   });
 }

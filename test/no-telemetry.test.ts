@@ -84,11 +84,12 @@ const HOST_SNAPSHOT = [
   'api.x.ai', // catalog preset
   'api.z.ai', // catalog preset (GLM)
   'app.fireworks.ai', // catalog key-creation link, not fetched
-  'auth.openai.com', // opt-in `shadow login codex` OAuth
+  'auth.openai.com', // explicit native ChatGPT sign-in/refresh/revocation
   'bailian.console.aliyun.com', // catalog preset console link
   'build.nvidia.com', // catalog key-creation link, not fetched
   'chatgpt.com', // Codex OAuth client origin
   'cloud.cerebras.ai', // catalog key-creation link, not fetched
+  'code.claude.com', // official CLI installation help link, displayed only
   'console.anthropic.com', // catalog preset console link
   'console.groq.com', // catalog preset console link
   'console.mistral.ai', // catalog preset console link

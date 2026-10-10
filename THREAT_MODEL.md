@@ -1,6 +1,8 @@
 # Shadow — Threat Model
 
-**Status:** living document · **v3 re-cut (P3-12)** · matches Shadow **v7.0.0** (2026-08-16)
+**Status:** living document · v7.0.0 baseline (2026-08-16), with later 8.x–10.x amendments;
+the 10.0.4 release has not received a complete replacement review of the whole document.
+The historical v7 PDF is not shipped as a current security statement.
 **Companion:** run `shadow doctor --privacy` to verify the egress posture of *your* config at any time.
 
 Shadow is a coding agent: it runs a language model in a loop with tools that read files, write files,
@@ -34,6 +36,8 @@ Shadow's safety story depends on the model being well-behaved.
 | A configured plugin index | **Untrusted listings** | Display-only entries; `add <name>` URLs re-pass the git scheme allowlist; optional fail-closed signature (§4.13) |
 | Your global `~/.shadow/` config | **Trusted by design** | It is *your* file on *your* machine (§4.9) |
 | Configured MCP servers | **Trusted once added** | Stdio children jailed on macOS/Linux (network off unless granted); your user on Windows; vet before adding (§3.8, §4.7) |
+| Auto-detected LSP servers (tsserver/pyright/gopls/rust-analyzer) | **Trusted binaries already on your machine** | Spawned stdio-only with a scrubbed env after the agent writes a file; never installed by Shadow; project config cannot name them, and the project's own `node_modules` tsserver needs your global `lsp.trustNodeModules` opt-in (repo content ≠ spawn target); `SHADOW_NO_LSP=1` kills the feature (§3.8) |
+| A `/goal` mission (8.4) | **Harness state, not a privilege** | Mission mode adds NO authority: the mission block is pinned only into the lead agent's turns, sub-agents never see it and their `mission_update` calls are inert, the plan gate is the SAME plan mode (writes denied until you approve), and autonomy/budget/sandbox are inherited, never raised (§3.13) |
 | An ACP editor that spawns `shadow acp` (Zed et al.) | **Trusted local process** | It spawns Shadow and exchanges JSON-RPC over stdio; tool approval is bridged to it, but the jail, run lock, and fail-closed floor still apply (§3.12). A trojaned editor is out of scope, like the local-model runtime (§4.8) |
 | The provider endpoint you configure | **Fully trusted with your data** | The conversation goes there — that is the product working as designed (§4.8) |
 | The local model runtime (llama.cpp, Ollama) | **Trusted infrastructure** | A trojaned runtime is out of scope (§4.8) |
@@ -183,6 +187,22 @@ in-process egress broker cannot see sockets a child opens itself — the jail is
 (network off ⇒ no sockets; a granted child's traffic is not journaled). **Windows has no OS jail** —
 stdio children there run unconfined, and Shadow says so at startup.
 
+**LSP children (8.4):** after a successful write, Shadow may spawn a language server it *found on
+your machine* — pyright/gopls/rust-analyzer (or `typescript-language-server`) already on PATH, or
+the workspace's own `node_modules/typescript` tsserver **only after you opt in** with
+`lsp.trustNodeModules: true` in global config (a repo-controlled `tsserver.js` is repo-controlled
+code — a cloned repo must not be able to make Shadow execute it by merely existing; before the
+opt-in Shadow skips it and says so once). Posture, stated plainly: these children are **not**
+OS-jailed (same class as the auto-formatter, not MCP stdio): they run as your user with a
+scrubbed environment (no provider creds inherited — scrubbedEnv), speak stdio only, and Shadow
+itself makes no network request for them — anything they do beyond the pipes carries the same
+residual as any dev tool you already run. They are never installed by Shadow, only detected; a
+cloned repo cannot name one (`lsp` is in PROJECT_UNTRUSTED_KEYS, §3.7) and cannot trigger the
+node_modules one without your global opt-in; diagnostics flow back as a
+deduped, budget-capped note on the tool result and never widen permissions. `SHADOW_NO_LSP=1`
+(or `lsp.enabled: false`) disables the feature outright; `shadow doctor --privacy` reports exactly
+which servers would spawn.
+
 **Pinned browser preset (5.5.1):** the opt-in Playwright MCP preset (`shadow mcp enable browser`)
 runs the official `@playwright/mcp` server with an isolated Chrome profile; its output goes to
 `~/.shadow/playwright-output` (capped), never the workspace. First connect resolves the pinned
@@ -212,7 +232,7 @@ No analytics, crash reporting, or phone-home. The **on-turn** egress: your provi
 onboarding connection test to the host you are configuring), the web tools when invoked, and the
 MCP servers you configure. Everything else is **user-initiated only**: (opt-in, off by default,
 once daily, payload-free) the update check; `shadow update`'s signed-manifest + binary download;
-the `shadow login codex` OAuth scaffold (token exchange unwired); MLX/vLLM first-serve weight
+native ChatGPT account sign-in, key discovery, refresh, model listing and revocation; MLX/vLLM first-serve weight
 downloads; and the plugin paths — an index lookup that exists ONLY if you set `pluginIndexUrl`, and the `shadow plugin add <git-url>` clone
 that runs only when you run it. Appendix A inventories every one.
 `shadow doctor --privacy` prints every egress path for the active config, live vs inactive, with **no
@@ -220,6 +240,23 @@ network calls**. A source-level test (`no-telemetry`) pins the absence of instal
 the exact snapshot of hardcoded remote hosts in `src/` — any new destination fails the build until
 somebody deliberately reviews it and re-pins the snapshot. **Appendix A** inventories every byte that
 leaves the machine; the runtime proof is the receipt (`shadow egress` / `/connections`).
+
+Subscription connections (reviewed 2026-10-09) are explicit billing identities. Native ChatGPT
+uses Shadow’s own public-client registration with PKCE/state/nonce, a loopback callback and verified
+OpenID identity; it never borrows a Codex client ID. Tokens stay in owner-only files under
+`~/.shadow/chatgpt-auth` (0600, directory 0700), not in the encrypted API-key vault. Refresh rotation
+is serialized across processes. Logout clears tokens while retaining registration identity and
+reports unconfirmed remote revocation. API credentials cannot override this connection, and provider
+errors cannot automatically switch it to API billing.
+
+Claude subscription access launches the installed, unmodified official CLI with its own sign-in.
+Shadow never reads or intermediates Claude login tokens. The engine has ordinary tools/MCP/plugins
+and hooks disabled and must return a validated structured response before Shadow accepts tool
+proposals. Administrator-managed policy hooks can still apply. Shadow requests the engine’s
+documented nonessential-traffic suppression; that subprocess owns its network sockets, which are
+outside Shadow’s fetch broker/receipt. It is not a sandboxed Shadow tool child. Offline mode refuses
+to launch subscription inference. The privacy report names this boundary rather than implying
+that the local receipt inventories the official engine’s traffic.
 
 ### 3.11 Untrusted-content envelopes — web + MCP results (P3-05)
 Everything Shadow fetches from outside the workspace — `web_fetch` pages, `web_search` snippets,
@@ -316,6 +353,15 @@ skills outrank plugin skills.
 **Limit:** an `auto-read`+ session therefore runs repo-authored sub-agent prompts without an
 approval seam — treat `.shadow/` in an untrusted clone the way you treat `shadow.config.json`
 (§3.7 de-fangs the config; the agents/skills dirs are markdown by design and load as content).
+
+**Mission mode (8.4):** `/goal` missions orchestrate THROUGH this same fan-out — they grant
+nothing. The mission block (goal, phase, task list) is pinned into the LEAD agent's system
+prompt only; the sub-agent factory deliberately omits it, so a delegated agent cannot masquerade
+as the orchestrator, and `mission_update` is inert under `ctx.nestedAgent` (the tool registry is
+shared — the same class of clobber the todo list guards against). A mission's plan gate is
+ordinary plan mode (§3.5 class): writes are denied until the plan is approved, and approval
+seeds the task list — it does not unlock anything. Missions inherit session autonomy and
+budget ceilings; a mission never softens a gate.
 
 ## 4. What Shadow does NOT protect against
 
@@ -420,6 +466,21 @@ Onboarding catalog update reviewed 2026-10-05:
 | `cloud.cerebras.ai`, `app.fireworks.ai`, `deepinfra.com`, `huggingface.co`, `build.nvidia.com` | Display-only key-creation links. The wizard does not fetch or open these URLs. |
 | User-supplied vLLM, SGLang, llama.cpp, and custom endpoints | The same explicit setup checks and provider traffic; the server address remains editable. |
 
+Subscription/onboarding update reviewed 2026-10-09:
+
+| Destination | Trigger and payload |
+| --- | --- |
+| `auth.openai.com` | Explicit native ChatGPT sign-in opens the provider authorization page. Brokered token exchange/refresh, OpenID/JWKS discovery and logout revocation send the protocol’s account credentials only to the fixed official service. The callback listens only on `127.0.0.1` with an ephemeral port. |
+| `api.openai.com` | An explicitly selected ChatGPT account lists available models and sends Responses requests with `store:false` and streaming enabled. Requests use that account’s plan grant; no automatic API-key fallback. |
+| Official Claude Code process / Anthropic account services | Explicit Claude subscription selection runs the installed official CLI. Prompt/history/tool schemas reach the provider through that engine; Shadow neither reads its tokens nor journals its sockets. Nonessential traffic is disabled through official settings; managed policy hooks remain possible. |
+| `code.claude.com` | Display-only installation/help link. Shadow does not fetch or open it during setup. |
+
+Native ChatGPT needs a persistent, local host registration ID for its OAuth protocol. That ID lives
+only in the opt-in account store and is sent to OpenAI authentication, not to any Shadow analytics
+service. API-only installations create no such identifier. Browser API onboarding now validates a
+completed tool call before save, preserves the form on failure, gives every endpoint its own
+credential reference and renews its idle timeout only after authenticated loopback activity.
+
 Terminal discovery has one six-second budget across all URL variants and response bodies;
 connection checks have a thirty-second budget, with request abortion on timeout or cancellation.
 The terminal has one input owner through key prompts. Per-endpoint credential references prevent
@@ -460,7 +521,12 @@ Playwright preset (`network: true, sandbox: false`) runs `npx -y @playwright/mcp
 registry at first connect (skipped under --offline).
 **OPT-IN/USER-INITIATED:** (9) update check (`checkUpdate.ts:84`) — default FALSE, once/day, plain GET
 of public package.json, no params/headers/body, 3s cap, TUI-only. (10) `shadow update` binary
-(`binary.ts:40`) — signed-manifest-first; asset path reveals OS/arch to storage.googleapis.com/blackfrost-ai-prod-shadow-releases/bin.
+(`update/binary.ts`) — signed-manifest-first; asset path reveals OS/arch to
+`storage.googleapis.com/blackfrost-ai-prod-shadow-releases/bin` (Blackfrost's public release
+bucket). No redirects or environment-selected update mirrors are accepted. The offline broker,
+pinned ECDSA key, response-size limits, and SHA-256 check still apply. The website and installer
+entrypoints are at `blackfrostai.com/shadow`; older binaries require a signed bridge release
+at their original origin or a reinstall before the original origin can be retired.
 (11) OAuth scaffold (`oauth.ts:62`) — auth.openai.com, only via explicit `shadow login codex`; token
 exchange unwired. (12) onboarding connection test (`onboard/connection.ts`) — user-chosen host via the
 provider stream path, key registered with the redactor BEFORE the test. (13) Context Cooler
@@ -491,7 +557,3 @@ review or delete exports before committing a workspace.
 
 *If you find a gap between this document and the code, that's a bug in one of them — please report
 it. Honesty here is a feature we ship.*
-
-## Hosting transition in 8.7.1
-
-Manual binary updates use the Blackfrost release bucket named above. Signed-manifest-first verification, the pinned ECDSA key, response-size limits, SHA-256 verification, offline enforcement, redirect refusal, and rejection of environment-selected update mirrors are unchanged. This download path is listed by `shadow doctor --privacy`. The installer entrypoints are at `https://blackfrostai.com/shadow`.

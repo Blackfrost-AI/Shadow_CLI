@@ -49,7 +49,7 @@ class Provider(BaseHTTPRequestHandler):
             self.send_response(401)
             self.send_header('Content-Type', 'application/json')
         else:
-            body = b'data: {"choices":[{"index":0,"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'
+            body = ('data: ' + json.dumps({'choices': [{'index': 0, 'delta': {'tool_calls': [{'index': 0, 'id': 'setup', 'type': 'function', 'function': {'name': 'shadow_connection_test', 'arguments': '{"ok":true}'}}]}, 'finish_reason': 'tool_calls'}]}) + '\n\ndata: [DONE]\n\n').encode()
             self.send_response(200)
             self.send_header('Content-Type', 'text/event-stream')
         self.send_header('Content-Length', str(len(body)))
@@ -98,37 +98,49 @@ def exercise(command, ending, port):
 
         try:
             expect(b'How do you want to run Shadow?')
-            send(b'\r')  # Default: model server.
-            expect(b'Choose a model server')
-            send(b'7\r')  # Custom endpoint.
-            expect(b'Endpoint URL')
-            send(f'\x1b[200~http://127.0.0.1:{port}/v1\x1b[201~'.encode())
-            read_for(0.15)
-            send(b'\r')
-            expect(b'API key')
-            send(b'\x1b[200~fixture-secret-onboard\x1b[201~')
-            read_for(0.15)
-            check(b'fixture-secret-onboard' not in output, 'secret was echoed')
-            if ending == 'save':
+            if ending == 'subscription':
+                send(b'4\r')
+                expect(b'Choose a subscription')
                 send(b'\r')
-                expect(b'Choose models')
-                for columns, rows in [(80, 24), (28, 8), (200, 40), (120, 36)]:
-                    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', rows, columns, 0, 0))
-                    os.kill(proc.pid, signal.SIGWINCH)
-                    read_for(0.15)
-                    check(proc.poll() is None, f'exited at {columns}x{rows}')
-                send(b' \x1b[B \r')
-                expect(b'Default model')
-                send(b'\x1b[B\r')
-                expect(b'Connection needs attention')
-                send(b'\r')  # Retry.
-                expect(b'Review and save')
-                send(b'\r')
-                expect(b'Saved Custom endpoint')
-            elif ending == 'Ctrl+C':
+                expect(b'ChatGPT accounts')
+                offset = send(b'\x1b')
+                expect(b'Choose a subscription', offset)
+                offset = send(b'\x1b')
+                expect(b'How do you want to run Shadow?', offset)
+                check(b'auth.openai.com' not in output, 'navigation started authentication')
                 send(b'\x03')
             else:
-                os.kill(proc.pid, signal.SIGTERM)
+                send(b'\r')  # Default: model server.
+                expect(b'Choose a model server')
+                send(b'7\r')  # Custom endpoint.
+                expect(b'Endpoint URL')
+                send(f'\x1b[200~http://127.0.0.1:{port}/v1\x1b[201~'.encode())
+                read_for(0.15)
+                send(b'\r')
+                expect(b'API key')
+                send(b'\x1b[200~fixture-secret-onboard\x1b[201~')
+                read_for(0.15)
+                check(b'fixture-secret-onboard' not in output, 'secret was echoed')
+                if ending == 'save':
+                    send(b'\r')
+                    expect(b'Choose models')
+                    for columns, rows in [(80, 24), (28, 8), (200, 40), (120, 36)]:
+                        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', rows, columns, 0, 0))
+                        os.kill(proc.pid, signal.SIGWINCH)
+                        read_for(0.15)
+                        check(proc.poll() is None, f'exited at {columns}x{rows}')
+                    send(b' \x1b[B \r')
+                    expect(b'Default model')
+                    send(b'\x1b[B\r')
+                    expect(b'Connection needs attention')
+                    send(b'\r')  # Retry.
+                    expect(b'Review and save')
+                    send(b'\r')
+                    expect(b'Saved Custom endpoint')
+                elif ending == 'Ctrl+C':
+                    send(b'\x03')
+                else:
+                    os.kill(proc.pid, signal.SIGTERM)
             end = time.monotonic() + 5
             while proc.poll() is None and time.monotonic() < end:
                 read_for(0.1)
@@ -165,7 +177,7 @@ if __name__ == '__main__':
     server = ThreadingHTTPServer(('127.0.0.1', 0), Provider)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        checks = [exercise(sys.argv[1:], ending, server.server_port) for ending in ['save', 'Ctrl+C', 'SIGTERM']]
+        checks = [exercise(sys.argv[1:], ending, server.server_port) for ending in ['save', 'Ctrl+C', 'SIGTERM', 'subscription']]
         # A pipe may deliver every answer in one chunk. No reader swap may discard later lines.
         with tempfile.TemporaryDirectory(prefix='shadow-onboard-pipe-') as profile:
             env = dict(os.environ, HOME=profile, USERPROFILE=profile, TERM='dumb')

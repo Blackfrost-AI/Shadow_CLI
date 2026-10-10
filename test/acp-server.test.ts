@@ -12,9 +12,11 @@ import type { StopReasonExt } from '../src/agent/events.js';
 import type { ToolResult } from '../src/tools/types.js';
 import type { RequestPermissionResult } from '../src/acp/protocol.js';
 import { SessionLog } from '../src/state/session.js';
+import { trustLegacySession } from '../src/state/resume.js';
 import { Context } from '../src/agent/context.js';
 import { recordWorkCenterSnapshot } from '../src/state/workCenterPersistence.js';
-import { mkdirSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 /**
@@ -210,7 +212,15 @@ test('ACP mode switching and the versioned Work Center extension operate on the 
   await h.close();
 });
 
-test('session/load restores transcript history and persisted Work Center state without running a model', async () => {
+test('session/load restores transcript history and persisted Work Center state without running a model', async (t) => {
+  const ownerHome = mkdtempSync(join(tmpdir(), 'shadow-acp-session-owner-'));
+  const previousHome = process.env.HOME;
+  process.env.HOME = ownerHome;
+  t.after(() => {
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    rmSync(ownerHome, { recursive: true, force: true });
+  });
   mkdirSync(ALLOWED, { recursive: true });
   const log = SessionLog.open(ALLOWED);
   const context = new Context({ contextBudget: 10000, triggerRatio: 0.75, keepLastTurns: 2 });
@@ -222,6 +232,8 @@ test('session/load restores transcript history and persisted Work Center state w
     capturedAt: Date.now(),
     items: [{ id: 'old-work', type: 'subagent', status: 'completed', description: 'restored work', depth: 0, startedAt: 1, lastActivityAt: 2, activities: [] }],
   });
+  log.close();
+  trustLegacySession(log.path);
   const storedId = SessionLog.sessionIdFromPath(log.path);
   const h = makeHarness(scripted(() => { throw new Error('load must not run a model'); }));
   try {

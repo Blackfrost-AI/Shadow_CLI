@@ -352,12 +352,15 @@ test('B4: a stuck loop that retries in identical pairs cannot evade the loop gua
   const res = await loop.run();
 
   // Uniform pairs: turn 1 → repeats 1, turn 2 → repeats 2 (both calls still run), turns 3-5 →
-  // every sibling counts to ≥3 inside the frozen snapshot and is denied. Under the pre-fix
-  // restore this exact pattern ran to the iteration cap with ZERO denials.
+  // every sibling counts to ≥3 inside the frozen snapshot and is denied. The fifth denial is
+  // still fed back once, so the provider's already-queued final answer can recover on turn 6;
+  // another identical pair there would cross the fatal ceiling. Under the pre-fix restore this
+  // exact pattern ran to the iteration cap with ZERO denials.
   assert.equal(ran, 4);
   const denied = events.filter((e) => e.type === 'tool_denied');
   assert.equal(denied.length, 6, 'three pair-turns × two denials');
   assert.equal(res.stopReason, 'end_turn');
+  assert.equal(res.finalAnswer, 'gave up', 'a bounded final recovery answer wins over loop escalation');
 });
 
 // ─────────────────────────────────────────────────────────────────────────────────────

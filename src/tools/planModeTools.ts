@@ -12,19 +12,23 @@ export interface PlanData {
   planMode: PlanSnapshot;
 }
 
-const planSchema = z.object({
-  title: z.string().min(1),
-  body: z.string().optional(),
-  tasks: z
-    .array(z.string().min(1))
-    .max(24)
-    .optional()
-    .describe(
-      'Concrete implementation steps for this plan — on plan approval these become the mission ' +
-        'task list (/goal missions) the lead agent tracks with mission_update. Keep each step a ' +
-        'single verifiable action.',
-    ),
-});
+function planSchema(missionUpdatesAvailable = true) {
+  return z.object({
+    title: z.string().min(1),
+    body: z.string().optional(),
+    tasks: z
+      .array(z.string().min(1))
+      .max(24)
+      .optional()
+      .describe(
+        missionUpdatesAvailable
+          ? 'Concrete implementation steps for this plan — on plan approval these become the mission ' +
+              'task list (/goal missions) the lead agent tracks with mission_update. Keep each step a ' +
+              'single verifiable action.'
+          : 'Concrete implementation steps for this plan. Keep each step a single verifiable action.',
+      ),
+  });
+}
 
 const enterSchema = z.object({
   reason: z
@@ -57,12 +61,15 @@ export function makeEnterPlanModeTool(planMode: PlanModeState): Tool<z.infer<typ
   };
 }
 
-export function makePlanWriteTool(planMode: PlanModeState): Tool<{ title: string; body?: string; tasks?: string[] }, PlanData> {
+export function makePlanWriteTool(
+  planMode: PlanModeState,
+  opts: { missionUpdatesAvailable?: boolean } = {},
+): Tool<{ title: string; body?: string; tasks?: string[] }, PlanData> {
   return {
     name: 'plan_write',
     description: 'Write the current plan to disk and keep exploring until user approval exits plan mode.',
     risk: 'write',
-    inputSchema: planSchema,
+    inputSchema: planSchema(opts.missionUpdatesAvailable !== false),
     async run(input, ctx) {
       const slug = slugify(input.title) || 'plan';
       const path = ctx.dryRun ? `plans/${slug}.md` : resolve(ctx.workspaceRoot, `plans/${slug}.md`);

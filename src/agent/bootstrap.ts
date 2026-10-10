@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import {
+  normalizeBaseUrl,
   resolveBaseUrl,
   resolveEntryCredential,
   resolveProviderCredential,
@@ -9,6 +10,7 @@ import {
 } from '../config.js';
 import { subProviderFor } from '../auth/spec.js';
 import { ensureFreshSubscriptionCredential } from '../auth/refresh.js';
+import { assertAccountPresetCompatible, resolveActiveModelPreset } from '../config/modelPresets.js';
 import { resolveAutoModel } from '../local/autoEndpoint.js';
 import { vaultExists } from '../auth/vault.js';
 import { vaultUnlocked } from '../state/globalStore.js';
@@ -22,6 +24,7 @@ import {
   makeExitPlanModeTool,
   makePlanWriteTool,
   makeSkillTool,
+  makeSkillManageTool,
   makeRepositoryContextTool,
   makeToolSearch,
   makeDescribeMediaTool,
@@ -46,13 +49,18 @@ import { registerSecret } from '../util/redact.js';
 import { lc } from '../util/lc.js';
 import { ProjectMemory } from '../state/memory.js';
 import { SessionLog } from '../state/session.js';
-import { resumeSession } from '../state/resume.js';
+import { readSessionState, resumeSession } from '../state/resume.js';
 import { applyRetention } from '../state/retention.js';
 import { makeMemoryTool } from '../tools/memory.js';
 import { TodoList } from './todo.js';
 import { PlanModeState } from './planMode.js';
 import { MissionState } from './mission.js';
-import { captureSessionState, restoreSessionState } from '../state/sessionState.js';
+import {
+  captureSessionState,
+  restoreSessionState,
+  type SessionHarnessSnapshot,
+  type SessionStateSnapshot,
+} from '../state/sessionState.js';
 import { buildStyledSystem } from './system.js';
 import { setCustomStyles } from './styles.js';
 import { discoverCustomStyles } from './outputStyles.js';
@@ -63,9 +71,21 @@ import {
 } from '../util/contextBudget.js';
 import { makeTodoTool } from '../tools/todo.js';
 import { type OutputStyle } from '../styles.js';
-import { resolveSystem } from '../system/resolveSystem.js';
+import {
+  promptCapabilitiesWithout,
+  resolveSystem,
+  type PromptCapabilityView,
+} from '../system/resolveSystem.js';
 import { runHookPhaseDetached } from '../hooks/runner.js';
 import type { Flags } from '../cli/flags.js';
+import {
+  assertHarnessRuntimeReady,
+  evaluateHarnessRuntimeReadiness,
+  plannedSessionHarnessTools,
+  resolveHarnessStack,
+  type HarnessRuntimeReadiness,
+  type ResolvedHarnessStack,
+} from '../harness/index.js';
 
 /**
  * Assembling an agent session: provider, tools, memory, prompt, context, session log.
@@ -108,6 +128,12 @@ export interface CreateAgentSessionOptions {
    *  WebSession id so a browser session's hooks aren't all fired under the same literal. */
   sessionId?: string;
   /**
+   * Trusted native tool names this host registers after shared bootstrap. Unknown names are
+   * rejected before hooks/provider work; these promises are verified against the real registry
+   * before the host accepts a turn.
+   */
+  deferredHarnessTools?: readonly string[];
+  /**
    * Start a local gguf/MLX server for `entry` and return the connection overrides. Returns
    * null when the entry is not locally served. Supplied by the caller because the CLI path
    * offers an interactive install prompt.
@@ -133,6 +159,14 @@ export interface AgentSession {
   mission: MissionState;
   wakeup: WakeupScheduler;
   skills: SkillEntry[];
+  /** Immutable Security foundation + local add-ons selected before this session started. */
+  harness: ResolvedHarnessStack;
+  /** Compact identity persisted with every coherent session snapshot. */
+  harnessState: SessionHarnessSnapshot;
+  /** Evaluate required capabilities against this host's registry as it exists now. */
+  harnessRuntimeReadiness: () => HarnessRuntimeReadiness;
+  /** Fail closed after this host has registered its complete runtime tool surface. */
+  assertHarnessRuntimeReady: () => void;
   facts: string;
   system: string;
   systemForStyle: (style: OutputStyle) => string;
@@ -233,13 +267,24 @@ export function buildEnvBlock(
     /** Injectable OS-sandbox tool presence so both offline prompt states are testable. */
     sandboxToolPresent?: boolean;
   } = {},
+  capabilities: PromptCapabilityView = { has: () => true },
 ): string {
+  const canShell = capabilities.has('run_shell');
+  const canGlob = capabilities.has('glob');
+  const canRead = capabilities.has('read_file');
+  const canWrite = ['write_file', 'edit_file', 'apply_patch'].some((name) => capabilities.has(name));
+  const canAgent = capabilities.has('agent');
+  const canTodo = capabilities.has('todo_write');
   const lines = [
-    `- **working directory (cwd): ${workspaceRoot}** — run_shell runs here, relative paths resolve here, and scratch/output files belong here (NOT /tmp).`,
+    canShell
+      ? `- **working directory (cwd): ${workspaceRoot}** — run_shell runs here, relative paths resolve here, and scratch/output files belong here (NOT /tmp).`
+      : `- **working directory (cwd): ${workspaceRoot}** — relative paths resolve here, and scratch/output files belong here (NOT /tmp).`,
     `- os: ${process.platform} (${process.arch})`,
-    process.platform === 'win32'
-      ? `- shell: PowerShell — use PowerShell syntax.`
-      : `- shell: ${process.env.SHELL ?? '/bin/sh'} — a POSIX shell. Use bash/sh syntax (ls, cat, grep), NOT PowerShell/pwsh or cmdlets. Quote any path that contains spaces.`,
+    ...(canShell
+      ? [process.platform === 'win32'
+          ? `- shell: PowerShell — use PowerShell syntax.`
+          : `- shell: ${process.env.SHELL ?? '/bin/sh'} — a POSIX shell. Use bash/sh syntax (ls, cat, grep), NOT PowerShell/pwsh or cmdlets. Quote any path that contains spaces.`]
+      : []),
     `- date: ${new Date().toISOString()}`,
   ];
   if (additionalRoots.length) lines.push(`- also readable/writable (outside cwd): ${additionalRoots.join(', ')}`);
@@ -255,14 +300,37 @@ export function buildEnvBlock(
   } catch {
     // not a git repo, or git not installed — fine.
   }
-  lines.push(`- paths: the cwd above is your filesystem scope (plus any "also readable/writable" path). Before reading or writing any path you have NOT seen this session, confirm it exists with glob or run_shell ls/find — never guess a path or invent a /tmp location.`);
+  if (canGlob && canShell) {
+    lines.push(`- paths: the cwd above is your filesystem scope (plus any "also readable/writable" path). Before reading or writing any path you have NOT seen this session, confirm it exists with glob or run_shell ls/find — never guess a path or invent a /tmp location.`);
+  } else {
+    const operations = [canRead ? 'reading' : '', canWrite ? 'writing' : ''].filter(Boolean).join(' or ');
+    const discovery = [canGlob ? 'glob' : '', canShell ? 'the available shell discovery commands' : ''].filter(Boolean).join(' or ');
+    if (discovery) {
+      lines.push(`- paths: the cwd above is your filesystem scope (plus any "also readable/writable" path). Before ${operations || 'using'} any path you have NOT seen this session, confirm it exists with ${discovery} — never guess a path or invent a /tmp location.`);
+    } else {
+      lines.push(`- paths: the cwd above is your filesystem scope (plus any "also readable/writable" path). Use only paths supplied by the user or shown in available tool results — never guess a path or invent a /tmp location.`);
+    }
+  }
   // TUI renders GFM tables as a real grid and folds large ones; charts only look good as fenced ASCII.
   lines.push(
     `- Tables & charts (terminal): prefer GFM tables (\`| col | … |\` + separator) with ≤4 short columns; for trends use a fenced ASCII/Unicode bar chart (≤72 cols) or sparklines — not wide tab-separated walls or Mermaid/SVG.`,
   );
 
   // Shadow harness capabilities — tell the model how to drive the full system
-  lines.push(`- Shadow harness features: Use 'agent' tool with isolation:"worktree" for safe/parallel sub-work (auto-cleaned). Set run_in_background:true for long tasks; receive <task-notification> results. Externalize with todo_write (pinned fresh every turn in system) + plans/*.md + research/*.md. Call reviewer (agent type "reviewer") before major changes, when stuck, or before declaring done. Harness manages hooks (pre/post tool, compact, subagent_stop, notifications, session), permissions/classifier, compaction, and state. Follow disciplines in your profile to drive reliably.`);
+  if (canAgent && canTodo && canWrite) {
+    lines.push(`- Shadow harness features: Use 'agent' tool with isolation:"worktree" for safe/parallel sub-work (auto-cleaned). Set run_in_background:true for long tasks; receive <task-notification> results. Externalize with todo_write (pinned fresh every turn in system) + plans/*.md + research/*.md. Call reviewer (agent type "reviewer") before major changes, when stuck, or before declaring done. Harness manages hooks (pre/post tool, compact, subagent_stop, notifications, session), permissions/classifier, compaction, and state. Follow disciplines in your profile to drive reliably.`);
+  } else {
+    const features: string[] = [];
+    if (canAgent) {
+      features.push(`Use the 'agent' tool with isolation:"worktree" for safe/parallel sub-work, background long tasks when useful, and call its reviewer before major changes or declaring done.`);
+    } else if (canShell) {
+      features.push('Long shell tasks may run in the background and report completion through task notifications.');
+    }
+    if (canTodo) features.push('Use todo_write to pin a live checklist for multi-step work.');
+    if (canWrite) features.push('Keep durable plans and research notes in the workspace.');
+    features.push('Harness permissions, classification, compaction, hooks, and session state remain active.');
+    lines.push(`- Shadow harness features: ${features.join(' ')}`);
+  }
 
   // Guardrails / sandbox status — model must know the boundaries. The filesystem jail + OS
   // sandbox are dropped under --yolo (and aliases) OR full autonomy; --yolo additionally bypasses
@@ -270,27 +338,85 @@ export function buildEnvBlock(
   const yoloOn = !!guard.yolo;
   const sandboxOff = !!guard.noSandbox || yoloOn || !!guard.unrestricted;
   const jailOff = !!guard.unrestricted;
-  lines.push(
-    `- Guardrails: filesystem jail ${jailOff ? 'OFF (root granted via --yolo or full autonomy)' : 'ON'}. ` +
-    `OS sandbox for run_shell: ${osSandboxStatus(!sandboxOff)}. ` +
-    `Classifier and permission gates apply per autonomy level; the catastrophic-command denylist is active unless --yolo. The filesystem jail + OS sandbox are dropped under --yolo or full autonomy — outside either, writes stay inside the workspace.`
-  );
+  if (canShell) {
+    lines.push(
+      `- Guardrails: filesystem jail ${jailOff ? 'OFF (root granted via --yolo or full autonomy)' : 'ON'}. ` +
+      `OS sandbox for run_shell: ${osSandboxStatus(!sandboxOff)}. ` +
+      `Classifier and permission gates apply per autonomy level; the catastrophic-command denylist is active unless --yolo. The filesystem jail + OS sandbox are dropped under --yolo or full autonomy — outside either, writes stay inside the workspace.`
+    );
+  } else {
+    lines.push(
+      `- Guardrails: filesystem jail ${jailOff ? 'OFF (root granted via --yolo or full autonomy)' : 'ON'}. ` +
+      `No shell execution capability is exposed in this session. ` +
+      `Classifier and permission gates apply per autonomy level; the catastrophic-command denylist is active unless --yolo. Outside full autonomy, file writes stay inside the workspace.`,
+    );
+  }
 
   if (guard.offline) {
     // F07-04: the egress denial rides on the OS sandbox, which fails open when bwrap/seatbelt
     // are missing (and is dropped under --yolo / --no-sandbox / full autonomy) — never claim a
     // boundary the host cannot bind.
-    const egress = offlineEgressClaim(
-      offlineEgressEnforced(guard, guard.sandboxToolPresent ?? sandboxToolAvailable()),
-    );
-    lines.push(
-      `- Offline Shadow Mode: ACTIVE. No provider network beyond the local model server. ` +
-      `web_fetch, web_search, and MCP tools are NOT registered this session, and ${egress} ` +
-      `Do not attempt to reach the internet — those tools do not exist here. Work entirely from local files and the local model.`,
-    );
+    if (canShell) {
+      const egress = offlineEgressClaim(
+        offlineEgressEnforced(guard, guard.sandboxToolPresent ?? sandboxToolAvailable()),
+      );
+      lines.push(
+        `- Offline Shadow Mode: ACTIVE. No provider network beyond the local model server. ` +
+        `web_fetch, web_search, and MCP tools are NOT registered this session, and ${egress} ` +
+        `Do not attempt to reach the internet — those tools do not exist here. Work entirely from local files and the local model.`,
+      );
+    } else {
+      lines.push(
+        `- Offline Shadow Mode: ACTIVE. No provider network beyond the local model server. ` +
+        `web_fetch, web_search, MCP tools, and shell execution are NOT exposed in this session. ` +
+        `Do not attempt to reach the internet — work entirely from local files and the local model.`,
+      );
+    }
   }
 
   return `## Environment\n${lines.join('\n')}`;
+}
+
+/**
+ * Validate persisted/configured control state before hooks, provider construction, or network
+ * work. Tool removal is allowed while a control is inactive, but an already-active plan or
+ * mission must retain the tools required to make forward progress.
+ */
+export function sessionControlCapabilityIssue(input: {
+  capabilities: PromptCapabilityView;
+  initialPlanMode: boolean;
+  resumedState?: SessionStateSnapshot;
+}): string | undefined {
+  const planActive = input.initialPlanMode || input.resumedState?.plan.mode === 'planning';
+  const missingPlan = ['plan_write', 'exit_plan_mode'].filter((name) => !input.capabilities.has(name));
+  if (planActive && missingPlan.length > 0) {
+    return `active plan mode requires available controls: ${missingPlan.join(', ')}`;
+  }
+  const mission = input.resumedState?.mission;
+  const missionNeedsUpdates = mission?.active && mission.phase !== 'done' && mission.phase !== 'failed';
+  if (missionNeedsUpdates && !input.capabilities.has('mission_update')) {
+    return 'active mission requires available control: mission_update';
+  }
+  if (mission?.active && mission.phase === 'planning' && missingPlan.length > 0) {
+    return `planning mission requires available controls: ${missingPlan.join(', ')}`;
+  }
+  return undefined;
+}
+
+/** Skills are useful to the model only when its immutable session schema includes `skill`. */
+export function capabilityAwareSkillsIndex(
+  skills: SkillEntry[],
+  capabilities: PromptCapabilityView = { has: () => true },
+): string {
+  return capabilities.has('skill') ? skillsIndexBlock(skills) : '';
+}
+
+/** A facts index explicitly tells the model to call `memory`; hide it with that capability. */
+export function capabilityAwareFactsIndex(
+  facts: string,
+  capabilities: PromptCapabilityView = { has: () => true },
+): string {
+  return capabilities.has('memory') ? facts : '';
 }
 
 export async function createAgentSession(opts: CreateAgentSessionOptions): Promise<AgentSession> {
@@ -305,21 +431,108 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     keepLastTurns: cfg.keepLastTurns,
   };
 
-  const skills = discoverSkills(workspaceRoot);
-  const skillsBlock = skillsIndexBlock(skills);
+  // A resumed session reuses the exact package identities and digests it started with. Legacy
+  // snapshots predate harnesses and resume on the built-in Security foundation alone. This is
+  // resolved before provider construction, hooks, or any network work.
+  const persistedState = opts.resumeSessionPath ? readSessionState(opts.resumeSessionPath) : undefined;
+  const persistedHarness = persistedState?.harness;
+  const requestedHarnesses = persistedHarness
+    ? persistedHarness.addons.map((addon) => addon.id)
+    : opts.resumeSessionPath
+      ? []
+      : cfg.harnesses;
+  let harness: ResolvedHarnessStack;
+  try {
+    harness = resolveHarnessStack(requestedHarnesses, {
+      // No executable adapter is dynamically loaded from a dropped package. Internal builds may
+      // replace this registry with IDs compiled into that build.
+      adapterRegistry: { has: () => false },
+      // Tool implementations are verified against the actual registry below. Supplying a
+      // permissive discovery view here lets prompt/skill composition happen before registration.
+      availableTools: { has: () => true },
+    });
+  } catch (error) {
+    fail(`Cannot load harness add-ons: ${(error as Error).message}\n`);
+  }
+  if (harness.adapters.missing.length > 0) {
+    fail(`Cannot load harness add-ons: missing compiled adapters: ${harness.adapters.missing.join(', ')}\n`);
+  }
+  if (harness.tools.conflicts.length > 0) {
+    fail(`Cannot load harness add-ons: tools are both required and removed: ${harness.tools.conflicts.join(', ')}\n`);
+  }
+  const promptCapabilities = promptCapabilitiesWithout(harness.tools.remove);
+  // Resume owns its recorded control state. The ordinary config/style default only seeds a brand
+  // new session; applying it before restore can reject a perfectly valid inactive saved plan.
+  const initialPlanMode = !persistedState &&
+    (!!flags.planMode || !!cfg.planMode || activeStyle === 'procedural');
+  const controlIssue = sessionControlCapabilityIssue({
+    capabilities: promptCapabilities,
+    initialPlanMode,
+    resumedState: persistedState,
+  });
+  if (controlIssue) fail(`Cannot load harness add-ons: ${controlIssue}\n`);
+  // Fail unknown or conditionally unavailable requirements before session_start hooks, provider
+  // construction, or network work. The CLI may name only its fixed late-native tools here; the
+  // actual registry is still verified after those tools are registered and before the first turn.
+  const plannedHarnessRuntime = evaluateHarnessRuntimeReadiness(harness, {
+    availableTools: plannedSessionHarnessTools({
+      offline: !!flags.offline,
+      vision: !!cfg.vision?.baseUrl,
+      deferred: opts.deferredHarnessTools,
+    }),
+  });
+  if (plannedHarnessRuntime.tools.missing.length > 0) {
+    fail(
+      `Cannot load harness add-ons: required tools are unavailable in this host: ` +
+        `${plannedHarnessRuntime.tools.missing.join(', ')}\n`,
+    );
+  }
+  const harnessState: SessionHarnessSnapshot = {
+    foundation: {
+      id: harness.foundation.id,
+      version: harness.foundation.version,
+      digest: harness.foundation.digest,
+    },
+    addons: harness.addons.map((addon) => ({
+      id: addon.id,
+      version: addon.manifest.version,
+      digest: addon.digest,
+    })),
+    digest: harness.digest,
+  };
+  if (persistedHarness && JSON.stringify(persistedHarness) !== JSON.stringify(harnessState)) {
+    fail(
+      'Cannot resume this session because its harness package changed or is missing. ' +
+        'Restore the recorded add-on version/digest, or start a new session with the current package.\n',
+    );
+  }
+
+  const skills = discoverSkills(workspaceRoot, {
+    harnessSkills: harness.skills.map((skill) => ({
+      name: skill.name,
+      path: skill.absolutePath,
+      root: skill.root,
+      body: skill.body,
+    })),
+  });
+  const skillsBlock = capabilityAwareSkillsIndex(skills, promptCapabilities);
   const baseSystem = [
     resolveSystem(cwd, {
       installDir: opts.installDir,
       homedir: homedir(),
       systemPromptPath: cfg.systemPromptPath,
       model: cfg.model,
+      harnessInstructions: harness.instructions
+        .filter((instruction) => instruction.source === 'addon')
+        .map((instruction) => instruction.text),
+      capabilities: promptCapabilities,
     }),
     buildEnvBlock(workspaceRoot, additionalRoots, {
       yolo: !!flags.yolo,
       noSandbox: !!flags.noSandbox,
       unrestricted,
       offline: !!flags.offline,
-    }),
+    }, promptCapabilities),
     skillsBlock,
   ]
     .filter(Boolean)
@@ -334,8 +547,15 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   const allowImport = process.env.SHADOW_ALLOW_IMPORT === '1';
   // Per-model credentials: a model entry may carry its own apiKey/authToken so each
   // cloud model in the picker uses its OWN key; fall back to provider-level resolution.
-  const activeModelEntry =
-    opts.lastPicked ?? cfg.models.find((m) => m.provider === cfg.provider && m.model === cfg.model);
+  const activeModelEntry = resolveActiveModelPreset(cfg, { lastPicked: opts.lastPicked });
+  // Both endpoint override forms are the same trusted one-run choice. A subscription owns its
+  // backend, so neither the CLI flag nor SHADOW_BASE_URL may be silently ignored while an account
+  // token continues to the account service. The canonical ChatGPT URL is harmlessly equivalent.
+  const explicitBaseUrl = normalizeBaseUrl(flags.baseUrl ?? process.env.SHADOW_BASE_URL);
+  if (activeModelEntry?.connection && explicitBaseUrl &&
+      (activeModelEntry.connection.kind !== 'chatgpt' || explicitBaseUrl.replace(/\/+$/, '') !== 'https://api.openai.com/v1')) {
+    fail('The selected subscription connection cannot use --base-url or SHADOW_BASE_URL. Choose a separate API endpoint preset instead.\n');
+  }
   const activeCred = resolveEntryCredential(activeModelEntry, {
     vaultIsLocked: vaultExists() && !vaultUnlocked(),
   });
@@ -352,14 +572,14 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   // The base URL the operator configured (flag / config / env / store). Computed BEFORE the
   // credential because the resolver needs to see it: a subscription token is valid at exactly one
   // host, and pairing it with a different baseUrl would disclose it. See resolveProviderCredential.
-  const configuredBaseUrl = resolveBaseUrl(cfg.provider, flags.baseUrl ?? cfg.baseUrl);
+  const configuredBaseUrl = resolveBaseUrl(cfg.provider, flags.baseUrl ?? cfg.baseUrl, activeModelEntry?.connection);
   const offline = flags.offline ?? false;
 
   // Rotate an imported subscription access token BEFORE resolving it, so a session started after
   // the token aged out still works (these tokens live about an hour, and the refresh path had no
   // caller at all). Best-effort by design: a failure leaves the stored credential in place and is
   // reported as a warning rather than blocking boot.
-  if (allowImport) {
+  if (allowImport && !activeModelEntry?.connection) {
     const subForModel = subProviderFor(cfg.provider, cfg.model);
     if (subForModel) {
       const refreshed = await ensureFreshSubscriptionCredential(subForModel, {
@@ -542,19 +762,39 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   // the TUI render live progress.
   const todoList = new TodoList();
   registry.register(makeTodoTool(todoList));
-  const planMode = new PlanModeState(flags.planMode || cfg.planMode || activeStyle === 'procedural');
-  registry.register(makePlanWriteTool(planMode));
+  const planMode = new PlanModeState(
+    initialPlanMode,
+    promptCapabilities,
+  );
+  registry.register(makePlanWriteTool(planMode, {
+    missionUpdatesAvailable: promptCapabilities.has('mission_update'),
+  }));
   registry.register(makeExitPlanModeTool(planMode));
   registry.register(makeEnterPlanModeTool(planMode));
   // /goal mission state (Sprint 3 item 3.2): the lead agent's orchestrator view. The
   // loop pins mission.block() into the system prompt; mission_update is the only writer.
   // Registry-shared into sub-agent loops, but the ctx.nestedAgent guard makes it inert there.
-  const mission = new MissionState();
+  const mission = new MissionState(promptCapabilities);
   registry.register(makeMissionUpdateTool(mission));
   registry.register(makeAskUserQuestionTool());
-  registry.register(makeSkillTool(() => discoverSkills(workspaceRoot)));
+  // Bind discovery to this session's immutable package selection. A package added/removed on disk
+  // takes effect in a new session; it cannot leak new instructions into a running context.
+  registry.register(makeSkillTool(skills));
+  registry.register(makeSkillManageTool());
   registry.register(makeRepositoryContextTool(cfg.lsp));
+  registry.setDenied(harness.tools.remove);
   registry.register(makeToolSearch(registry));
+
+  // Runtime readiness is host-specific. The terminal registers agent/jobs/collaboration later;
+  // web has a deliberately smaller native surface and connects MCP before finalizing. Keep the
+  // structural package immutable here, then let each host fail closed once its registry is done.
+  const runtimeCapabilities = {
+    availableTools: { has: (name: string) => registry.get(name) !== undefined },
+  };
+  const harnessRuntimeReadiness = (): HarnessRuntimeReadiness =>
+    evaluateHarnessRuntimeReadiness(harness, runtimeCapabilities);
+  const assertSessionHarnessRuntimeReady = (): void =>
+    assertHarnessRuntimeReady(harness, runtimeCapabilities);
 
   const wakeup = new WakeupScheduler();
   // F08-12: register user-defined output styles so buildStyledSystem + the /style picker resolve
@@ -564,7 +804,8 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   } catch {
     setCustomStyles([]);
   }
-  const systemForStyle = (style: OutputStyle): string => buildStyledSystem(baseSystem, style, facts);
+  const modelFacts = capabilityAwareFactsIndex(facts, promptCapabilities);
+  const systemForStyle = (style: OutputStyle): string => buildStyledSystem(baseSystem, style, modelFacts);
   const system = systemForStyle(activeStyle);
 
   // P2-13: opt-in retention sweep — runs BEFORE this session's log is opened so a sweep can
@@ -614,7 +855,7 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   } else {
     context = new Context(contextOpts);
   }
-  sessionLog.bindSessionState(context, () => captureSessionState({ mission, planMode, todoList }));
+  sessionLog.bindSessionState(context, () => captureSessionState({ mission, planMode, todoList, harness: harnessState }));
 
   const connectMcp = async (): Promise<Array<{ stop(): void }>> => {
     // Offline mode: skip MCP servers entirely — they are outbound connectors (another egress
@@ -638,8 +879,9 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     signal?: AbortSignal,
   ): Promise<{ provider: ReturnType<typeof createProvider>; model: string }> => {
     signal?.throwIfAborted();
+    assertAccountPresetCompatible(entry);
     let nextProvider = entry.provider;
-    const configuredBaseUrl = resolveBaseUrl(entry.provider, entry.baseUrl);
+    const configuredBaseUrl = resolveBaseUrl(entry.provider, entry.baseUrl, entry.connection);
     let baseUrl = configuredBaseUrl;
     const cred = resolveEntryCredential(entry, { vaultIsLocked: vaultExists() && !vaultUnlocked() });
     if (!cred.ok) {
@@ -650,7 +892,7 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     // Same credential resolution as boot, including the endpoint binding: a live switch onto a
     // model that has an imported subscription credential must carry that credential's base URL,
     // headers and wire, or it would send the token to the previous model's endpoint.
-    if (allowImport) {
+    if (allowImport && !entry.connection) {
       const subForEntry = subProviderFor(entry.provider, entry.model);
       if (subForEntry) {
         await ensureFreshSubscriptionCredential(subForEntry, {
@@ -699,6 +941,7 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     signal?.throwIfAborted();
     context.setPolicy(policy, true);
     cfg.provider = nextProvider;
+    cfg.connection = entry.connection;
     cfg.model = entry.model;
     cfg.baseUrl = baseUrl;
     cfg.contextBudget = policy.contextBudget;
@@ -735,6 +978,10 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     mission,
     wakeup,
     skills,
+    harness,
+    harnessState,
+    harnessRuntimeReadiness,
+    assertHarnessRuntimeReady: assertSessionHarnessRuntimeReady,
     facts,
     system,
     systemForStyle,

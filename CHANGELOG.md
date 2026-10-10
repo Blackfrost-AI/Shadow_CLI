@@ -1,5 +1,24 @@
 # Shadow release notes
 
+## 10.0.4 — 2026-10-09
+
+- Add native ChatGPT subscription sign-in and an official Claude Code CLI connection. Preserve the
+  selected account across model/profile changes and refuse silent fallback to API billing.
+- Rework onboarding for subscription, cloud, self-hosted server and local-file connections with
+  bounded checks, cancellation, retry, editable failures and tool-response verification before save.
+- Make the default Shadow role a provider-neutral Security foundation. Add trusted local harness
+  packages whose instructions, skills, tool scope, version and digest are fixed per new session.
+- Add `/learn` and `/skills` for evidence-linked local skill candidates with explicit activation,
+  revision history and rollback. No telemetry or callback service is added.
+- Add trusted profiles that pair a global model preset with harnesses and runtime limits without
+  allowing a profile to carry endpoints or credentials.
+- Add an explicit self-hosted SGLang/Qwen chat-template thinking switch; never infer it from model
+  names or send it to cloud providers.
+- Collapse completed reasoning, omit empty reasoning panels and group repeated grep activity.
+- Harden tool-response fidelity, output-budget handling, read pagination and first-run `--base-url`.
+
+Harness selection applies to new sessions; live mid-session switching is not included in this release.
+
 ## 10.0.3 — 2026-10-09
 
 - Add Snowfall browsers for active work, persistent jobs and local project rooms, with attempts,

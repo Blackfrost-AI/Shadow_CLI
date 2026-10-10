@@ -46,6 +46,7 @@ import { assertUrlAllowed } from './netguard.js';
 export type EgressPurpose =
   | 'provider' // model completion stream / non-stream rescue
   | 'provider-count' // anthropic count_tokens
+  | 'model-list' // selected account's authenticated model catalog
   | 'mcp' // MCP Streamable-HTTP connector
   | 'oauth' // opt-in `shadow login codex`
   | 'vision' // describe_media endpoint

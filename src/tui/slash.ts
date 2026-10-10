@@ -27,7 +27,7 @@ import { missionStatusLines } from './missionHud.js';
 import type { TodoItem } from '../agent/todo.js';
 import { clearSubAuth, importOfficialCredential, subscriptionAuthLines, type SubProvider } from '../auth/index.js';
 import { vaultExists } from '../auth/vault.js';
-import { addModelPreset, defaultModelPatch, findModelPreset, parseModelAddArgs, removeModelPreset, setModelPresetEnabled, splitPresetArgs } from '../config/modelPresets.js';
+import { addModelPreset, assertAccountPresetCompatible, defaultModelPatch, findModelPreset, parseModelAddArgs, removeModelPreset, resolveActiveModelPreset, setModelPresetEnabled, splitPresetArgs } from '../config/modelPresets.js';
 import { persistPermissionRules, resolveBaseUrl, resolveEntryCredential, type ModelEntry } from '../config.js';
 import { formatDoctorReport, runDoctor } from '../doctor.js';
 import { runModelCheck } from '../doctor/modelCheck.js';
@@ -47,7 +47,8 @@ import { forkSession } from '../state/fork.js';
 import { GLOBAL_DIR, saveGlobalConfig, vaultUnlocked } from '../state/globalStore.js';
 import { ProjectMemory } from '../state/memory.js';
 import { listResumableSessions, resolveSessionMatches, resumeSession } from '../state/resume.js';
-import { captureSessionState, restoreSessionState } from '../state/sessionState.js';
+import { captureSessionState, inProcessResumeHarnessMessage, restoreSessionState } from '../state/sessionState.js';
+import { recordSessionHarnessBinding } from '../state/sessionHarnessBinding.js';
 import { rewindToTurn, type RewindableTurn } from '../state/rewind.js';
 import { SessionLog } from '../state/session.js';
 import { normalizeSessionTitle } from '../state/sessionTitle.js';
@@ -72,6 +73,15 @@ import type { TuiOpts } from '../tui.js';
 import { commandHandler, findTerminalCommand, terminalCommandsFor } from './commandCatalog.js';
 import { SAFE_CONFIG_KEYS, formatTemperature, parseSafeConfig } from '../config/safeInteractiveConfig.js';
 import { executeWorkCommand } from './workCommand.js';
+import { harnessDetailLines, harnessInventoryLines, updateHarnessSelection } from '../harness/manage.js';
+import {
+  activateSkillCandidate,
+  inspectSkillCandidateLines,
+  pendingSkillLines,
+  rejectSkillCandidate,
+  rollbackActiveSkill,
+  validateSkillCandidateLines,
+} from '../skills/manage.js';
 export { parseSafeConfig } from '../config/safeInteractiveConfig.js';
 
 export interface SlashCommand {
@@ -430,7 +440,13 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
       }
       try {
         const previous = sessionLogRef.current;
-        sessionLogRef.current = SessionLog.open(opts.workspaceRoot);
+        const next = SessionLog.open(opts.workspaceRoot);
+        if (opts.harness) {
+          recordSessionHarnessBinding(next.path, opts.harness, {
+            bindingsDir: opts.harnessBindingsDir,
+          });
+        }
+        sessionLogRef.current = next;
         previous.close?.();
       } catch {
         pushLine({ text: 'Could not start a new session.', color: C.red });
@@ -508,6 +524,13 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
       } else {
         if (!opts.mission) {
           pushLine({ text: 'Mission state unavailable in this session.', color: C.red });
+          break;
+        }
+        if (!opts.mission.available || (opts.planMode && !opts.planMode.available)) {
+          pushLine({
+            text: `Mission mode is unavailable because this harness hides required controls (${opts.mission.unavailableReason ?? opts.planMode?.unavailableReason ?? 'mission controls unavailable'}).`,
+            color: C.red,
+          });
           break;
         }
         opts.mission.begin(arg);
@@ -632,11 +655,12 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
                 pushLine({ text: `No model preset named "${targetName}".`, color: C.red });
                 return;
               }
+              assertAccountPresetCompatible(entry);
               label = entry.label;
               model = entry.model;
               isLocal = isLocalServedEntry(entry);
               let p = entry.provider;
-              let baseUrl = resolveBaseUrl(entry.provider, entry.baseUrl);
+              let baseUrl = resolveBaseUrl(entry.provider, entry.baseUrl, entry.connection);
               const testCred = resolveEntryCredential(entry, {
                 vaultIsLocked: vaultExists() && !vaultUnlocked(),
               });
@@ -680,7 +704,7 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
             try {
               const result = await runModelCheck(prov, {
                 model,
-                providerName: currentRef.current.provider,
+                providerName: prov.name,
                 isLocal,
                 temperature: opts.cfg.temperature,
                 log: (m) => pushLine({ text: m, dimColor: true }),
@@ -698,6 +722,8 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
             } catch (e) {
               pushLine({ text: `Model test failed: ${(e as Error).message}`, color: C.red });
             }
+          } catch (error) {
+            pushLine({ text: `Model test failed: ${error instanceof Error ? error.message : String(error)}`, color: C.red });
           } finally {
             asyncCommandRef.current = false;
             flushQueueRef.current?.();
@@ -833,14 +859,28 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
       // Entry IDENTITY (`opts.cfg.model`), not `currentRef.current.model` — the latter is the wire
       // model, which an autoModel entry re-reads from its endpoint.
       const matches = (m: ModelEntry) => m.provider === currentRef.current.provider && m.model === opts.cfg.model;
-      const entry = opts.cfg.models?.find((m) => matches(m) && m.label === opts.cfg.lastModel)
-        ?? opts.cfg.models?.find((m) => matches(m) && resolveBaseUrl(m.provider, m.baseUrl) === baseUrl);
-      const credential = resolveEntryCredential(entry ?? { provider: currentRef.current.provider }, { vaultIsLocked: vaultExists() && !vaultUnlocked() });
+      let entry: ModelEntry | undefined;
+      try {
+        const namedAccount = !opts.cfg.connection && !opts.cfg.profile?.model
+          ? opts.cfg.models?.find((m) => matches(m) && m.connection && m.label === opts.cfg.lastModel)
+          : undefined;
+        const selected = resolveActiveModelPreset({ ...opts.cfg, models: opts.cfg.models ?? [], provider: currentRef.current.provider as ModelEntry['provider'] }, { lastPicked: namedAccount });
+        entry = selected?.connection ? selected
+          : opts.cfg.models?.find((m) => matches(m) && !m.connection && m.label === opts.cfg.lastModel)
+            ?? opts.cfg.models?.find((m) => matches(m) && !m.connection && resolveBaseUrl(m.provider, m.baseUrl) === baseUrl)
+            ?? selected;
+      } catch (error) {
+        pushLine({ text: `Provider configuration: ${error instanceof Error ? error.message : String(error)}`, color: C.red });
+        break;
+      }
+      const connection = entry ? entry.connection : opts.cfg.connection;
+      const credential = resolveEntryCredential(entry ?? { provider: currentRef.current.provider, connection }, { vaultIsLocked: vaultExists() && !vaultUnlocked() });
       const hasApiKey = credential.ok && Boolean(credential.apiKey);
       const hasAuthToken = credential.ok && Boolean(credential.authToken);
       const envName = currentRef.current.provider === 'anthropic' ? 'ANTHROPIC_API_KEY' : 'OPENAI_API_KEY';
       const source = !credential.ok ? `model credential ${credential.reason}`
-        : credential.source === 'credRef' ? `model vault slot: ${entry?.credRef}`
+        : credential.source === 'connection' ? connection?.kind === 'chatgpt' ? `ChatGPT account: ${connection.profileId}` : 'official Claude Code subscription'
+          : credential.source === 'credRef' ? `model vault slot: ${entry?.credRef}`
           : credential.source === 'inline' ? 'model-specific key'
             : process.env[envName] ? envName : `shared provider slot: ${currentRef.current.provider} (check this key belongs to the endpoint)`;
       const total = opts.cfg.models?.length ?? 0;
@@ -850,11 +890,11 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
         text: 'provider',
         lines: [
           { text: `${currentRef.current.provider}/${currentRef.current.model}`, color: C.cyan },
-          { text: `endpoint: ${baseUrl || '(provider default)'}`, dimColor: true },
+          { text: `endpoint: ${connection?.kind === 'claude-code' ? 'official Claude Code account service' : baseUrl || '(provider default)'}`, dimColor: true },
           ...(target.selfHosted
             ? [{ text: `temperature: ${formatTemperature(opts.cfg.temperature ?? 1.0)} · self-hosted sampling`, dimColor: true }]
             : []),
-          { text: `auth: api key ${hasApiKey ? 'present' : 'missing'} · bearer ${hasAuthToken ? 'present' : 'missing'}`, dimColor: true },
+          { text: connection ? 'auth: subscription connection configured (sign-in not checked)' : `auth: api key ${hasApiKey ? 'present' : 'missing'} · bearer ${hasAuthToken ? 'present' : 'missing'}`, dimColor: true },
           { text: `configured credential source: ${source}`, dimColor: true },
           { text: `presets: ${total} configured${disabled ? ` · ${disabled} disabled` : ''}`, dimColor: true },
           { text: 'Commands: /model list · /model add · /model use <label> · /model default <label>', dimColor: true },
@@ -921,6 +961,10 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
         break;
       }
       if (req === 'status') {
+        if (!pm.available && !pm.active) {
+          pushLine({ text: `Plan mode unavailable — ${pm.unavailableReason}.`, dimColor: true });
+          break;
+        }
         const snap = pm.snapshot();
         pushLine({
           text: snap.mode === 'planning'
@@ -931,6 +975,10 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
         break;
       }
       const want = req === 'on' ? true : req === 'off' ? false : !pm.active;
+      if (want && !pm.available) {
+        pushLine({ text: `Plan mode is unavailable because ${pm.unavailableReason}.`, color: C.red });
+        break;
+      }
       if (want === pm.active) {
         pushLine({ text: want ? 'Plan mode is already on.' : 'Plan mode is already off.', dimColor: true });
         break;
@@ -1130,9 +1178,20 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
           contextBudget: opts.cfg.contextBudget,
           triggerRatio: opts.cfg.summarizeTriggerRatio,
           keepLastTurns: opts.cfg.keepLastTurns,
+          bindingsDir: opts.harnessBindingsDir,
         });
+        const harnessBoundary = inProcessResumeHarnessMessage(opts.harness, state.harness, pick.id);
+        if (harnessBoundary) {
+          pushLine({ text: harnessBoundary, color: C.red });
+          break;
+        }
         const previous = sessionLogRef.current;
         const log = SessionLog.open(opts.workspaceRoot);
+        if (opts.harness) {
+          recordSessionHarnessBinding(log.path, opts.harness, {
+            bindingsDir: opts.harnessBindingsDir,
+          });
+        }
         log.setTitle(SessionLog.titleFor(pick.path));
         log.bindSessionState(context, () => captureSessionState(opts));
         sessionLogRef.current = log;
@@ -1341,6 +1400,11 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
         const source = sessionLogRef.current;
         const sourceId = SessionLog.sessionIdFromPath(source.path);
         const { log, forkId } = forkSession(source, opts.workspaceRoot);
+        if (opts.harness) {
+          recordSessionHarnessBinding(log.path, opts.harness, {
+            bindingsDir: opts.harnessBindingsDir,
+          });
+        }
         sessionLogRef.current = log;
         if (opts.workCenter) recordWorkCenterSnapshot(log, opts.workCenter.snapshot());
         // A different session id is a different grant scope — /resume parity: "approve for
@@ -1459,7 +1523,41 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
       break;
     }
     case '/skills': {
-      const skills = discoverSkills(opts.workspaceRoot);
+      const [sub = '', name = '', ...rest] = arg.trim().split(/\s+/);
+      try {
+        if (sub === 'pending') {
+          pushLine({ kind: 'system', text: 'skill candidates', lines: pendingSkillLines().map((text) => ({ text: `  ${text}`, dimColor: true })) });
+          break;
+        }
+        if (sub === 'show' || sub === 'validate') {
+          if (!name) throw new Error(`usage: /skills ${sub} <name>`);
+          const rows = sub === 'show' ? inspectSkillCandidateLines(name) : validateSkillCandidateLines(name);
+          pushLine({ kind: 'system', text: `skill ${sub}`, lines: rows.map((text) => ({ text: `  ${text}`, dimColor: true })) });
+          break;
+        }
+        if (sub === 'activate') {
+          if (!name) throw new Error('usage: /skills activate <name>');
+          pushLine({ text: activateSkillCandidate(name), color: C.green });
+          break;
+        }
+        if (sub === 'reject') {
+          if (!name) throw new Error('usage: /skills reject <name> <reason>');
+          pushLine({ text: rejectSkillCandidate(name, rest.join(' ')), color: C.yellow });
+          break;
+        }
+        if (sub === 'rollback') {
+          const generation = Number(rest[0]);
+          if (!name || !Number.isSafeInteger(generation) || generation < 1) {
+            throw new Error('usage: /skills rollback <name> <generation>');
+          }
+          pushLine({ text: rollbackActiveSkill(name, generation), color: C.yellow });
+          break;
+        }
+      } catch (error) {
+        pushLine({ text: (error as Error).message, color: C.red });
+        break;
+      }
+      const skills = opts.skills ?? discoverSkills(opts.workspaceRoot);
       pushLine({
         kind: 'system',
         text: 'skills',
@@ -1470,6 +1568,22 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
             }))
           : [{ text: 'No repo skills found under skills/ or .shadow/skills/.', dimColor: true }],
       });
+      break;
+    }
+    case '/learn': {
+      if (!opts.registry.get('skill_manage')) {
+        pushLine({ text: 'Learning is unavailable because this harness hides skill_manage.', color: C.red });
+        break;
+      }
+      const focus = arg.trim() || 'the reusable workflow that just succeeded in this session';
+      const prompt =
+        `Review ${focus}. Extract only reusable procedure supported by local session/artifact/test evidence. ` +
+        'Separate observations, operator choices, inferences, and untested claims. If the evidence is sufficient, ' +
+        'use skill_manage to draft or update a concise SKILL.md candidate with evidence-backed claims and a real ' +
+        'validation or replay receipt. Do not activate it; activation belongs to the user through /skills activate. ' +
+        'If evidence is insufficient, state what validation is still needed instead of inventing a skill.';
+      if (runningRef.current) queueDeferred(prompt);
+      else startTurnRef.current?.(prompt);
       break;
     }
     case '/workflows': {
@@ -1535,6 +1649,32 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
       lines.push({ text: 'plugins are DATA-only bundles: commands · output-styles · skills · agents · workflows (never hooks/MCP).', dimColor: true });
       lines.push({ text: '/plugins enable <name> · /plugins disable <name> · CLI: shadow plugin add|list|remove|search', dimColor: true });
       pushLine({ kind: 'system', text: 'plugins', lines });
+      break;
+    }
+    case '/harness': {
+      const [sub = 'list', id = ''] = arg.trim().split(/\s+/, 2);
+      try {
+        if (sub === 'enable' || sub === 'disable' || sub === 'use') {
+          const next = updateHarnessSelection(sub, id);
+          pushLine({
+            text:
+              `Harness add-ons for new sessions: ${next.join(', ') || '(Security foundation only)'}. ` +
+              'The current session is unchanged.',
+            color: C.green,
+          });
+          break;
+        }
+        const rows = sub === 'show'
+          ? harnessDetailLines(id)
+          : harnessInventoryLines(opts.harness?.addons.map((addon) => addon.id) ?? []);
+        pushLine({
+          kind: 'system',
+          text: 'harness',
+          lines: rows.map((text) => ({ text: `  ${text}`, dimColor: true })),
+        });
+      } catch (error) {
+        pushLine({ text: (error as Error).message, color: C.red });
+      }
       break;
     }
     case '/memory': {

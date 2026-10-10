@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { isolateHome, assertStoreIsolated } from './helpers/isolateHome.js';
 // Type-only: the dynamic import below yields a VALUE binding (fine for `new`, not for type
@@ -141,6 +141,47 @@ test('the real builder builds end-to-end for an allowlisted project and connectM
     built.agent.bg.killAll();
     built.agent.wakeup.clear();
   } finally {
+    rmSync(proj, { recursive: true, force: true });
+  }
+});
+
+test('the web host rejects a terminal-only required tool before building a runnable session', async () => {
+  const projects = await import('../src/web/projects.js');
+  const proj = mkdtempSync(join(HOME, 'web-harness-proj-'));
+  const packageDir = join(HOME, '.shadow', 'harnesses', 'terminal-only');
+  try {
+    mkdirSync(packageDir, { recursive: true });
+    writeFileSync(
+      join(packageDir, 'harness.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        id: 'terminal-only',
+        version: '1.0.0',
+        title: 'Terminal only',
+        description: 'Requires the terminal orchestration tool.',
+        tools: { add: ['agent'], remove: [] },
+      }),
+    );
+    store.saveGlobalConfig({ projects: [] });
+    projects.addProject(proj);
+    const bootConfig = {
+      ...loadConfig(HOME),
+      provider: 'mock' as const,
+      model: 'mock',
+      mcpServers: {},
+      harnesses: ['terminal-only'],
+    };
+    const builder = makeAgentBuilder({ bootConfig, installDir: INSTALL_DIR });
+    const session = {
+      id: 'web-terminal-only',
+      displayPath: proj,
+      bus: new EventBus(),
+      model: () => '',
+    } as unknown as WebSession;
+
+    await assert.rejects(builder(session), /required tools are unavailable in this host: agent/);
+  } finally {
+    rmSync(packageDir, { recursive: true, force: true });
     rmSync(proj, { recursive: true, force: true });
   }
 });

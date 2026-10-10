@@ -44,6 +44,7 @@ export interface OnboardTargetInput {
  */
 export function onboardTargetPatch(input: OnboardTargetInput): Record<string, unknown> {
   return {
+    connection: undefined,
     provider: input.provider,
     lastModel: undefined,
     ...(input.model ? { model: input.model } : {}),
@@ -79,6 +80,7 @@ export function presetEntryUpsert(
   const selfHostedEntry = selfHosted === true || isLocalBaseUrl(input.baseUrl);
   const entry: ModelEntry = {
     label,
+    connection: undefined,
     provider: input.provider as ModelEntry['provider'],
     model: input.model,
     ...(input.baseUrl ? { baseUrl: input.baseUrl } : {}),
@@ -117,6 +119,7 @@ function selectedEntryLabel(
   const managed = models.find(
     (entry) =>
       entry.onboarded === true &&
+      !entry.connection &&
       entry.provider === input.provider &&
       entry.model === input.model &&
       sameEndpoint(entry.baseUrl, input.baseUrl),
@@ -127,7 +130,7 @@ function selectedEntryLabel(
   );
   if (
     !direct ||
-    (direct.provider === input.provider &&
+    (!direct.connection && direct.provider === input.provider &&
       direct.model === input.model &&
       sameEndpoint(direct.baseUrl, input.baseUrl))
   ) {
@@ -161,6 +164,7 @@ export function onboardModelSelectionUpsert(
     (entry) =>
       !(
         entry.onboarded === true &&
+        !entry.connection &&
         entry.provider === input.provider &&
         sameEndpoint(entry.baseUrl, input.baseUrl) &&
         !selected.includes(entry.model)
@@ -172,6 +176,7 @@ export function onboardModelSelectionUpsert(
     const manual = next.find(
       (entry) =>
         entry.onboarded !== true &&
+        !entry.connection &&
         entry.provider === input.provider &&
         entry.model === model &&
         sameEndpoint(entry.baseUrl, input.baseUrl),
@@ -213,7 +218,7 @@ export function persistOnboardTarget(input: OnboardTargetInput): void {
   const models = (loadGlobalConfig().models as ModelEntry[] | undefined) ?? [];
   if (input.selectedModels?.length) {
     const selectedEntries = onboardModelSelectionUpsert(models, input).map((entry) =>
-      input.credentialRef && entry.provider === input.provider &&
+      input.credentialRef && !entry.connection && entry.provider === input.provider &&
       input.selectedModels!.includes(entry.model) && sameEndpoint(entry.baseUrl, input.baseUrl)
         ? { ...entry, credRef: input.credentialRef }
         : entry,
@@ -223,6 +228,7 @@ export function persistOnboardTarget(input: OnboardTargetInput): void {
     // two custom endpoints expose the same id; lastModel carries the selected endpoint atomically.
     patch.lastModel = selectedEntries.find(
       (entry) =>
+        !entry.connection &&
         entry.provider === input.provider &&
         entry.model === input.model &&
         sameEndpoint(entry.baseUrl, input.baseUrl),

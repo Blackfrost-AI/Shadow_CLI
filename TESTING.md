@@ -1,5 +1,8 @@
 # Testing Shadow
 
+The current checkout is `10.0.4`. This guide describes test procedures; dated verification
+reports record measured results and known limits for each release.
+
 Thanks for kicking the tires. Shadow is an agentic CLI: it lets a tool-calling LLM drive
 your local workspace — read/edit files, run shell, search, plan, spawn sub-agents, use MCP.
 
@@ -21,6 +24,7 @@ npm link                      # then run: shadow --help
 ```
 
 Windows testers can use the signed PowerShell installer documented in `README.md`.
+
 
 Snowfall is the default terminal in v10; `SHADOW_TUI=ink shadow` selects the compatibility renderer. Use the
 [renderer contract](TERMINAL_RENDERERS.md) when checking command/key claims. The signed release
@@ -52,7 +56,7 @@ Responses). Cloud frontier models and local Ollama endpoints both work.
   - `--yolo` (aliases `--nuke`, `--dangerously-skip-permissions`): drops jail + sandbox **+**
     the catastrophic-command denylist **+** all approval prompts.
   - **Full autonomy** (`--autonomy full`): drops jail + sandbox, but **keeps** the denylist.
-- This is decided **at launch**. Switching to full mid-session (Shift+Tab) does **not**
+- This is decided **at launch**. Switching to full mid-session with `/autonomy full` does **not**
   retroactively drop the sandbox.
 - `--add-dir <path>` widens the jail to one extra directory without going fully unrestricted.
 
@@ -64,7 +68,9 @@ Responses). Cloud frontier models and local Ollama endpoints both work.
 - `run_shell`: confirm the sandbox engages; try writing **outside** the workspace and confirm
   the jail blocks it (it should, unless `--yolo`/full-auto).
 - Plan mode (`--plan-mode`), the todo list, sub-agents (`agent` tool), `web_search`/`web_fetch`.
-- TUI slash commands: `/help`, `/model`, `/diff`, `/status`, `/theme`, `/work`, `/image`, … (`/vim` uses the Ink fallback)
+- TUI slash commands: `/help`, `/model`, `/diff`, `/status`, `/theme`, `/image`, and the
+  renderer-specific cases in the [terminal support matrix](TERMINAL_RENDERERS.md). Exercise `/vim`
+  and `/statusline` under Ink; Snowfall must identify them as Ink-only rather than misroute them.
 - Multimodal: `/image <path>` to attach an image; or ask the model to call `view_image <path>`
   to load one itself (vision-capable models only).
 - Live steering: start a deliberately long answer, type a correction, and press Enter. Model
@@ -75,6 +81,38 @@ Responses). Cloud frontier models and local Ollama endpoints both work.
   test page with the registered `mcp_playwright_*` tools. This launches an isolated Chrome profile;
   it does not attach to your everyday signed-in browser. Disable it with
   `shadow mcp disable playwright` and restart.
+
+## Renderer qualification
+
+Snowfall is the supported, default v10 terminal. Ink remains available as a compatibility renderer:
+
+```sh
+shadow                    # default Snowfall renderer
+SHADOW_TUI=ink shadow     # Ink compatibility renderer
+```
+
+Use an isolated home and scratch workspace for both. Component tests alone do not qualify a
+release; the [renderer contract](TERMINAL_RENDERERS.md) lists the terminal release checks.
+
+For every command declared available in Snowfall, deterministic tests must cover the intended handler,
+aliases, malformed arguments, persistence failures, and running-turn guards. Model management,
+manual compact, provider/local configuration, plugins, MCP, memory, doctor, session resume/rewind,
+and fork need the same underlying state transitions as Ink. Session-changing tests must prove that
+context, session-log ownership, read tracking, approval grants, and future snapshots all move to the
+new session together.
+
+Live PTY checks for both renderers must cover at least:
+
+- mock response streaming, queued steering, interruption, and clean Ctrl-C exit;
+- approval and question dialogs, including hostile terminal controls and a visible command tail;
+- narrow terminals, resize, Unicode width, multiline paste, and terminal-state restoration;
+- model switching, manual compact, resume, rewind, fork, and failed configuration persistence;
+- active help text and the key behavior it advertises, especially Shift+Tab, prompt history,
+  external-editor ownership, completion, and PageUp/PageDown behavior.
+
+Snowfall's `/keybindings` output must describe its real fixed mapping and say that
+`~/.shadow/keybindings.json` applies only to Ink. `/vim`, `/table`, `/statusline`, and custom slash
+commands must follow the renderer contract; `/vim` and `/statusline` remain Ink-only in v10.
 
 ## Maintained functionality matrix
 
@@ -88,8 +126,8 @@ all three axes below and record any unsupported surface explicitly.
 | Browser control | MCP tool schemas remain provider-neutral | `enable browser` persists the pinned Playwright preset without replacing other MCP entries; tools register as `mcp_playwright_*` after restart; risk remains `exec` | isolated visible Chrome navigates/clicks/reads a deterministic local page; disable key is `playwright`; missing Chrome/npx fails actionably |
 | Self-hosted generation | OpenAI-compatible request shape and tool parsing | local/LAN endpoint, context budget, temperature, cancellation | configured temperature applies only to self-hosted models and is visible in `/config get temperature` |
 | Qwen open weights | native, Hermes/XML, JSON, and DeepSeek-style textual calls; self-hosted Qwen 3.5/3.8 `reasoning_content` survives multi-step tool turns | exact model id, local sampling, context-window clamp, abort-safe fallback | streamed tool scaffolding never appears in scrollback; capability probe completes against the target endpoint |
-| Surface parity | same history and safety invariants in each supported surface | TUI, headless/REPL, web session, editor (ACP) | divergences are named, never implied: live steering is currently TUI-only; web and ACP sessions reject a second prompt while busy; round-table mode asks the user to wait or interrupt; the ACP adapter accepts text only |
-| Editor integration (ACP) | JSON-RPC 2.0 / ACP v1 over stdio; streamed message/tool/plan updates, persisted session loading, modes, model options and versioned `_shadow/work/*` extension | sessions remain inside allowlisted project dirs (jail re-resolved every turn); editor-mediated approval fails closed; model changes are limited to before the first prompt | add-project is idempotent; prompt/load/close round-trips, cancellation, busy-prompt rejection and explicit Work Center controls are regression-tested |
+| Surface parity | same history and safety invariants in each supported surface | Snowfall TUI, Ink compatibility renderer, headless/REPL, web session, editor (ACP) | divergences are named, never implied: Snowfall is the supported/default v10 terminal; Ink is opt-in; live steering is terminal-only; web and ACP sessions reject a second prompt while busy; the legacy roundtable is Ink-only; ACP v0 is text-only with no session restore |
+| Editor integration (ACP) | JSON-RPC 2.0 / ACP v1 over stdio; `agent_message_chunk` / `tool_call` / `plan` updates; text-only prompts in v0 | `session/new` only inside allowlisted project dirs (jail re-resolved every turn); tool approval bridged to the editor's `session/request_permission`, fail-closed on any ambiguity; no new egress | `shadow acp --add-project` is repeatable/idempotent; a full prompt round-trip streams chunks + tool updates over a real wire; cancel → `cancelled`; a busy second prompt is rejected; a refusal names the remediation |
 | Egress / network posture | every outbound request flows the broker (`shadowFetch`): offline wall → SSRF tier → DNS pin-set → receipt | `--offline` denies below the broker — process-wide undici dispatcher on Node, `globalThis.fetch` wall in the Bun binary; local serves still pass; MCP HTTP honors deadline + caller abort | `shadow egress` prints the disk receipt from a fresh process; `/connections` shows the session aggregate; new hardcoded hosts fail the snapshot guard |
 
 Deterministic coverage belongs in the default suite:
@@ -137,6 +175,21 @@ local page so browser correctness is not confused with internet availability.
   (`shell`/`Bash`/`Read`/… → Shadow's tools).
 
 ## Known issues / caveats
+
+Shadow `10.0.4` source candidate (2026-10-09): 3,246 tests pass on Node 26.5.0,
+with full source/test typecheck, ESLint, production build and release gates clean. The Bun 1.4.2 macOS ARM64
+binary passes five onboarding checks (save/retry/resize, Ctrl+C, SIGTERM, subscription navigation,
+piped answers), three normal terminal exit checks, and four streaming/thinking interrupt checks.
+The five onboarding checks also pass against the Node build. A compiled startup fixture verifies
+that a missing account reports an account error without unlocking an unrelated API vault or
+falling back to an environment API key.
+
+Account transport tests use isolated OAuth/CLI fixtures, including key rotation, interrupted login,
+pending identity verification after restart, terminal stream errors, tool validation and mixed billing.
+No live ChatGPT or Claude sign-in/generation was performed. Onboarding runs a small real tool-response
+check after the user signs in; live account eligibility and model availability still require that check.
+The installed official Claude Code 2.1.277 was inspected offline to confirm structured output remains
+available when its ordinary tools are disabled. Windows browser launch has not been exercised on Windows.
 
 - `view_image` behavior varies with the selected model's actual vision support.
 - Reasoning models: if a turn comes back empty, raise `--max-output-tokens` (the model may have

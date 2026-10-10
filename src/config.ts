@@ -33,6 +33,9 @@ export interface ModelCapabilities {
   vision?: boolean;
   /** The endpoint requires `preserve_thinking:true` and round-trips preserved thinking (Qwen 3.8 Max). */
   preserveThinking?: boolean;
+  /** Explicit SGLang/Qwen chat-template control. On self-hosted OpenAI Chat Completions only,
+   *  maps to `chat_template_kwargs.enable_thinking`; it is never inferred from a model id. */
+  chatTemplateEnableThinking?: boolean;
 }
 
 const ModelPriceSchema = z.object({
@@ -131,9 +134,17 @@ export function normalizeBaseUrl(raw: string | undefined): string | undefined {
   }
 }
 
+/** Explicit account connections never fall through to API-key credentials. */
+export const AccountConnectionSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('chatgpt'), profileId: z.string().min(1).max(128) }),
+  z.object({ kind: z.literal('claude-code') }),
+]);
+export type AccountConnection = z.infer<typeof AccountConnectionSchema>;
+
 /** One selectable model in the `/model` picker. */
 export const ModelEntrySchema = z.object({
   label: z.string(),
+  connection: AccountConnectionSchema.optional(),
   /** Onboarding writes `openai-compat` for self-hosted/compat endpoints; the current wire enum
    *  is `openai`. Coerce so installs onboarded through that path keep parsing. */
   provider: z.enum(['anthropic', 'openai', 'openai-compat', 'mock']).transform((v) => (v === 'openai-compat' ? 'openai' : v)),
@@ -192,6 +203,7 @@ export const ModelEntrySchema = z.object({
       maxOutputTokens: z.number().int().positive().optional(),
       vision: z.boolean().optional(),
       preserveThinking: z.boolean().optional(),
+      chatTemplateEnableThinking: z.boolean().optional(),
     })
     .optional(),
   disabled: z.boolean().optional(),
@@ -255,10 +267,16 @@ const ProjectEntrySchema = z.object({
   addedAt: z.string().optional(),
 });
 
+/** Trusted harness add-on IDs selected for a session. Defaults belong on the top-level config,
+ * never on a profile: an omitted profile field must fall through instead of clearing a global list. */
+const HarnessSelectionSchema = z
+  .array(z.string().regex(/^[a-z0-9][a-z0-9._-]{0,63}$/))
+  .max(16);
+
 /**
  * P2-11 (F09-08) — a named profile: the handful of knobs a workload switch actually touches,
  * so "run the deep-reasoning box" is one flag, not five edits. Every field is optional —
- * a profile can be just `{ model }` or the full model+effort+autonomy+sandbox+context bundle;
+ * a profile can be just `{ model }` or a complete model+harness+runtime bundle;
  * unset fields fall through to the normal layered config. Keys are deliberately limited to
  * NON-exec, non-credential fields: a profile cannot carry `baseUrl`, `hooks`, `permissionRules`,
  * or anything else command-/key-bearing (those stay top-level, global/env/CLI-only).
@@ -270,9 +288,15 @@ const ProfileSchema = z.object({
   sandbox: z.enum(['auto', 'off']).optional(),
   contextBudget: z.number().int().positive().optional(),
   summarizeTriggerRatio: z.number().positive().max(1).optional(),
+  harnesses: HarnessSelectionSchema.optional(),
+  parallelTools: z.boolean().optional(),
+  maxIterations: z.number().int().nonnegative().optional(),
+  maxToolResultChars: z.number().int().positive().optional(),
+  maxOutputTokens: z.number().int().positive().optional(),
 });
 
 const ConfigSchema = z.object({
+  connection: AccountConnectionSchema.optional(),
   /** Same legacy coercion as ModelEntrySchema — onboarding writes `openai-compat`. */
   provider: z.enum(['anthropic', 'openai', 'openai-compat', 'mock']).default('anthropic').transform((v) => (v === 'openai-compat' ? 'openai' : v)),
   model: z.string().default('claude-opus-4-8'),
@@ -412,6 +436,11 @@ const ConfigSchema = z.object({
   pluginIndexUrl: z.string().optional(),
   pluginIndexKey: z.string().optional(),
 
+  // Provider-neutral native harness add-ons. These are trusted, local packages under
+  // ~/.shadow/harnesses and are resolved once when a new session starts. A project file cannot
+  // activate one: activation may change the tools and trusted instructions exposed to the model.
+  harnesses: HarnessSelectionSchema.default([]),
+
   maxIterations: z.number().int().nonnegative().default(200), // 0 = unlimited (dead-drop / long engagements); real backstop = tokens/cost/wall-clock
   // Generous default so reasoning models (incl. custom LOCAL reasoners that isReasoningModel
   // can't detect by name) don't burn the whole budget on hidden thinking and hit the cap before
@@ -479,7 +508,7 @@ const ConfigSchema = z.object({
     .optional(),
 
   // P2-11 (F09-08) — named profiles (Codex `[profiles.NAME]` parity). A profile bundles a model
-  // with its matching effort/autonomy/sandbox/context knobs; activate with `--profile <name>`
+  // with its matching harness/effort/autonomy/sandbox/context/runtime knobs; activate with `--profile <name>`
   // or `SHADOW_PROFILE=<name>`. GLOBAL-ONLY (`profiles` is in PROJECT_UNTRUSTED_KEYS): a profile
   // can raise autonomy and widen context, and a cloned repo must not be able to plant one —
   // definitions live in ~/.shadow/config.json, activation via flag/env. The active profile slots
@@ -578,6 +607,17 @@ export type ShadowConfig = z.infer<typeof ConfigSchema> & {
   activeProfile?: string;
   /** Activated profile definition (already validated), for display — e.g. /status (P2-11). */
   profile?: z.infer<typeof ProfileSchema>;
+  /** Trusted global preset selected by the active profile. Kept out of the public/profile schema:
+   *  bootstrap uses this exact entry even when an untrusted project replaces `models[]`. */
+  activeProfilePreset?: ModelEntry;
+  /** Validated trusted-global candidates retained while a profile is active. If CLI/env overrides
+   *  the profile model, preset resolution may use this list without consulting project models. */
+  activeProfileTrustedPresets?: ModelEntry[];
+  /** Validated presets from ~/.shadow/config.json before an untrusted project models[] layer can
+   *  replace or collide with them. Automatic lastModel recall must use this provenance; cfg.models
+   *  intentionally remains the visible picker list so project suggestions can still be selected
+   *  explicitly by the user. */
+  trustedGlobalModelPresets?: ModelEntry[];
 };
 export type ModelEntry = z.infer<typeof ModelEntrySchema>;
 
@@ -621,8 +661,10 @@ const CONFIG_FILE = 'shadow.config.json';
 // `web` carries the console's bearer token (`web.token`) — a repo-pinned token is known to
 // whoever wrote the repo, and the token is the last factor after Host/Origin, so it is
 // global-only alongside `projects` (the filesystem allowlist).
+// `lastModel` drives an automatic startup selection. Project model entries stay available for an
+// explicit picker action, but a cloned repo cannot plant or replace the remembered global choice.
 // Update discovery is an outbound request: only the user can enable it, not a project file.
-const PROJECT_UNTRUSTED_KEYS = ['baseUrl', 'selfHosted', 'shellEnvAllowlist', 'autonomy', 'denylistExtra', 'systemPromptPath', 'sandbox', 'sandboxNetwork', 'sandboxFailurePolicy', 'egress', 'additionalDirectories', 'projects', 'web', 'offline', 'hooks', 'statusLine', 'vision', 'permissionRules', 'diagnostics', 'lsp', 'updateCheck', 'pluginIndexUrl', 'pluginIndexKey', 'profiles', 'sessionRetentionDays', 'sessionRetentionKeep'];
+const PROJECT_UNTRUSTED_KEYS = ['connection', 'baseUrl', 'selfHosted', 'shellEnvAllowlist', 'autonomy', 'denylistExtra', 'systemPromptPath', 'sandbox', 'sandboxNetwork', 'sandboxFailurePolicy', 'egress', 'additionalDirectories', 'projects', 'web', 'offline', 'hooks', 'statusLine', 'vision', 'permissionRules', 'diagnostics', 'lsp', 'updateCheck', 'pluginIndexUrl', 'pluginIndexKey', 'profiles', 'harnesses', 'lastModel', 'sessionRetentionDays', 'sessionRetentionKeep'];
 
 /**
  * Layered precedence: CLI flags > env > active profile > project config file (de-fanged) >
@@ -679,7 +721,19 @@ export function loadConfig(
   // `credRef` is in this list for the same reason as `apiKey`: a project file that could name a
   // vault slot would let a cloned repo aim YOUR sealed credential at ITS `baseUrl`. The pointer is
   // not secret, but the ability to choose which secret gets sent is exactly the capability we deny.
-  const PRESET_UNTRUSTED_FIELDS = ['baseUrl', 'selfHosted', 'apiKey', 'authToken', 'credRef', 'gguf', 'ggufServer', 'ggufArgs', 'ggufPort', 'mlx', 'mlxServer', 'vllm', 'vllmArgs', 'vllmImage'];
+  const PRESET_UNTRUSTED_FIELDS = ['connection', 'baseUrl', 'selfHosted', 'apiKey', 'authToken', 'credRef', 'gguf', 'ggufServer', 'ggufArgs', 'ggufPort', 'mlx', 'mlxServer', 'vllm', 'vllmArgs', 'vllmImage'];
+  // These capability declarations alter the request wire: reasoningField/preserveThinking replay
+  // hidden reasoning and can emit preserve_thinking, effortScale emits reasoning_effort,
+  // maxOutputTokens changes the request cap, and chatTemplateEnableThinking emits an SGLang
+  // extension. A cloned repository cannot attach any of them to a globally configured endpoint
+  // merely by reusing a preset label; the operator must opt in from trusted global config.
+  const PRESET_UNTRUSTED_CAPABILITY_FIELDS = [
+    'reasoningField',
+    'effortScale',
+    'maxOutputTokens',
+    'preserveThinking',
+    'chatTemplateEnableThinking',
+  ];
   if (Array.isArray(fromFile.models)) {
     let redacted = 0;
     for (const m of fromFile.models as Array<Record<string, unknown>>) {
@@ -691,13 +745,25 @@ export function loadConfig(
             hit = true;
           }
         }
+        if (m.capabilities && typeof m.capabilities === 'object' && !Array.isArray(m.capabilities)) {
+          const capabilities = m.capabilities as Record<string, unknown>;
+          for (const k of PRESET_UNTRUSTED_CAPABILITY_FIELDS) {
+            if (k in capabilities) {
+              delete capabilities[k];
+              hit = true;
+            }
+          }
+        }
         if (hit) redacted++;
       }
     }
     if (redacted > 0) {
       process.stderr.write(
-        `shadow: stripped credential/exec fields (${PRESET_UNTRUSTED_FIELDS.join('/')}) from ${redacted} untrusted ${CONFIG_FILE} model preset(s) — ` +
-          `a project file cannot redirect your key or run shell.\n`,
+        `shadow: stripped trusted-only fields (${[
+          ...PRESET_UNTRUSTED_FIELDS,
+          ...PRESET_UNTRUSTED_CAPABILITY_FIELDS.map((k) => `capabilities.${k}`),
+        ].join('/')}) from ${redacted} untrusted ${CONFIG_FILE} model preset(s) — ` +
+          `a project file cannot redirect your key, run shell, or add endpoint-specific wire controls.\n`,
       );
     }
   }
@@ -729,6 +795,14 @@ export function loadConfig(
   // internally but cannot take --profile — so for env-sourced names we warn and run unprofiled.
   const explicitProfile = profileName != null && profileName !== '';
   let profileLayer: Record<string, unknown> = {};
+  let activeProfileDefinition: z.infer<typeof ProfileSchema> | undefined;
+  let activeProfilePreset: ModelEntry | undefined;
+  const trustedGlobalModelPresets = Array.isArray(fromGlobal.models)
+    ? fromGlobal.models.flatMap((raw) => {
+        const parsed = ModelEntrySchema.safeParse(raw);
+        return parsed.success ? [parsed.data] : [];
+      })
+    : [];
   let activeProfileName: string | undefined;
   if (requestedProfile != null && requestedProfile !== '') {
     // hasOwnProperty, not `in`: `in` sees the prototype chain, so `--profile toString` would
@@ -752,6 +826,10 @@ export function loadConfig(
         process.stderr.write(`shadow: ${msg}\nshadow: ignoring SHADOW_PROFILE.\n`);
       } else {
         profileLayer = prune(parsed.data as Record<string, unknown>);
+        // Keep the exposed definition exactly as the operator wrote it. The merge layer below may
+        // derive provider/endpoint/connection from a referenced model preset, but those trusted
+        // transport fields are not profile fields and must not appear in /status or cfg.profile.
+        activeProfileDefinition = parsed.data;
         activeProfileName = requestedProfile;
       }
     }
@@ -762,18 +840,25 @@ export function loadConfig(
   // Anthropic) leaves cfg.provider unchanged, the preset lookup at bootstrap misses, and the first
   // request 400s at the wrong API. Resolve the model against the effective preset list and apply
   // the same provider/model/baseUrl/selfHosted patch that lastModel-recall and `shadow local use`
-  // already apply — so the switch is atomic. A model that names no preset is left alone (it is
-  // served by whatever provider is already configured). This layer still sits BELOW env/CLI, so
-  // SHADOW_PROVIDER / --provider override it.
+  // already apply — so the switch is atomic. Only the TRUSTED GLOBAL model list may satisfy a
+  // trusted profile: a project-local `models[]` collision must never redirect the profile. Keep
+  // the selected full entry for bootstrap too, because the ordinary effective model list still
+  // follows the existing project-replaces-global semantics. A model that names no trusted preset
+  // is left alone (it is served by whatever provider is already configured). This layer still
+  // sits BELOW env/CLI, so SHADOW_PROVIDER / --provider override it.
   if (activeProfileName != null && typeof profileLayer.model === 'string' && profileLayer.model !== '') {
-    const entry = findProfileModelPreset(fromFile.models, fromGlobal.models, profileLayer.model);
+    const entry = findProfileModelPreset(trustedGlobalModelPresets, profileLayer.model);
     if (entry) {
+      activeProfilePreset = entry;
       profileLayer = {
         ...profileLayer,
         model: entry.model,
         provider: entry.provider,
-        ...(entry.baseUrl != null ? { baseUrl: entry.baseUrl } : {}),
-        ...(entry.selfHosted != null ? { selfHosted: entry.selfHosted } : {}),
+        connection: entry.connection,
+        // Deliberately include undefined. Selecting a canonical cloud preset must clear a stale
+        // global custom endpoint/self-hosted marker, exactly like defaultModelPatch does.
+        baseUrl: entry.baseUrl,
+        selfHosted: entry.selfHosted,
       };
     }
   }
@@ -803,9 +888,15 @@ export function loadConfig(
   (cfg as ShadowConfig).explicitKeys = Object.keys(
     deepMerge(deepMerge(deepMerge(fromGlobal, profileLayer), fromEnv), prune(cliOverrides)),
   );
+  // Keep the trusted source list even when there is no active profile. A project's models[] array
+  // is intentionally visible to the picker, but it must never replace or label-collide with the
+  // user's global presets during automatic lastModel recall at startup or in diagnostics.
+  (cfg as ShadowConfig).trustedGlobalModelPresets = trustedGlobalModelPresets;
   if (activeProfileName != null) {
     (cfg as ShadowConfig).activeProfile = activeProfileName;
-    (cfg as ShadowConfig).profile = profileLayer as ShadowConfig['profile'];
+    (cfg as ShadowConfig).profile = activeProfileDefinition;
+    (cfg as ShadowConfig).activeProfilePreset = activeProfilePreset;
+    (cfg as ShadowConfig).activeProfileTrustedPresets = trustedGlobalModelPresets;
   }
   // Safety backstop: `maxIterations: 0` ("unlimited") is only safe while SOME budget cap exists. If the
   // user opted into 0 with no token/cost/wall-clock limit, a model looping on slightly-varying tool args
@@ -853,6 +944,7 @@ function readEnvOverrides(): Record<string, unknown> {
   if (e.SHADOW_BASE_URL) out.baseUrl = e.SHADOW_BASE_URL;
   if (e.SHADOW_AUTONOMY) out.autonomy = e.SHADOW_AUTONOMY;
   if (e.SHADOW_LOG_LEVEL) out.logLevel = e.SHADOW_LOG_LEVEL;
+  if (e.SHADOW_HARNESSES) out.harnesses = e.SHADOW_HARNESSES.split(',').map((id) => id.trim()).filter(Boolean);
   return out;
 }
 
@@ -990,7 +1082,7 @@ export function resolveAuthToken(provider: string, slot?: string): string | unde
 }
 
 /** Where a resolved model credential came from — useful for `/provider` and doctor output. */
-export type CredSource = 'credRef' | 'inline' | 'provider';
+export type CredSource = 'credRef' | 'inline' | 'provider' | 'connection';
 
 export type EntryCredential =
   | { ok: true; apiKey?: string; authToken?: string; source: CredSource }
@@ -1010,9 +1102,10 @@ export type EntryCredential =
  *  3. The provider-level resolution (env, then adapter slot) for presets that carry no key.
  */
 export function resolveEntryCredential(
-  entry: { provider?: string; apiKey?: string; authToken?: string; credRef?: string } | undefined,
+  entry: { provider?: string; apiKey?: string; authToken?: string; credRef?: string; connection?: AccountConnection } | undefined,
   opts: { vaultIsLocked?: boolean } = {},
 ): EntryCredential {
+  if (entry?.connection) return { ok: true, source: 'connection' };
   const provider = entry?.provider ?? 'openai';
   if (entry?.credRef) {
     const slot = entry.credRef;
@@ -1034,7 +1127,8 @@ export function resolveEntryCredential(
 }
 
 /** Base URL precedence: explicit (flag/config/global) > env > credentials store. */
-export function resolveBaseUrl(provider: string, configured?: string): string | undefined {
+export function resolveBaseUrl(provider: string, configured?: string, connection?: AccountConnection): string | undefined {
+  if (connection) return connection.kind === 'chatgpt' ? 'https://api.openai.com/v1' : undefined;
   // Normalize so a poisoned value (e.g. bracket-wrapped from the onboarding hint) is
   // ignored rather than returned first and breaking every request.
   const clean = normalizeBaseUrl(configured);
@@ -1053,39 +1147,16 @@ function prune(obj: Record<string, unknown>): Record<string, unknown> {
 }
 
 /**
- * P2-11 (adversarial-review fix): resolve a profile's `model` against the effective model-preset
- * list so the profile switch can carry the model's provider/endpoint along. Mirrors the lookup the
- * /model picker's choices use (label OR model id, case-insensitive). The project file's `models`
- * array REPLACES the global one when present (arrays overwrite in deepMerge — same as the final
- * cfg.models), so search whichever list is effective. Returns undefined when nothing matches.
+ * Resolve a trusted profile's `model` against the trusted GLOBAL model-preset list. A project
+ * `models[]` array remains useful for ordinary project model suggestions, but it cannot satisfy a
+ * global profile label: otherwise a cloned repo could shadow that label and redirect the profile.
+ * Return the fully validated entry so bootstrap receives its credentials/capabilities too.
  */
-function findProfileModelPreset(
-  fileModels: unknown,
-  globalModels: unknown,
-  target: string,
-): { model: string; provider: string; baseUrl?: string; selfHosted?: boolean } | undefined {
+function findProfileModelPreset(globalModels: readonly ModelEntry[], target: string): ModelEntry | undefined {
   const want = target.trim().toLowerCase();
   if (!want) return undefined;
-  const effective: unknown[] = Array.isArray(fileModels)
-    ? fileModels
-    : Array.isArray(globalModels)
-      ? globalModels
-      : [];
-  for (const raw of effective) {
-    if (!raw || typeof raw !== 'object') continue;
-    const m = raw as Record<string, unknown>;
-    const provider = typeof m.provider === 'string' ? m.provider : '';
-    const model = typeof m.model === 'string' ? m.model : '';
-    if (!provider || !model) continue;
-    const label = typeof m.label === 'string' ? m.label : '';
-    if (model.trim().toLowerCase() === want || label.trim().toLowerCase() === want) {
-      return {
-        model,
-        provider,
-        ...(typeof m.baseUrl === 'string' && m.baseUrl !== '' ? { baseUrl: m.baseUrl } : {}),
-        ...(typeof m.selfHosted === 'boolean' ? { selfHosted: m.selfHosted } : {}),
-      };
-    }
+  for (const entry of globalModels) {
+    if (entry.model.trim().toLowerCase() === want || entry.label.trim().toLowerCase() === want) return entry;
   }
   return undefined;
 }

@@ -34,6 +34,7 @@ import { Context } from '../src/agent/context.js';
 import { ToolRegistry } from '../src/tools/registry.js';
 import { loadConfig } from '../src/config.js';
 import { SessionLog } from '../src/state/session.js';
+import { trustLegacySession } from '../src/state/resume.js';
 import type { Provider } from '../src/provider/provider.js';
 
 // ── F02-05: TERM=dumb classification ─────────────────────────────────────────
@@ -243,7 +244,7 @@ async function until(pred: () => boolean, ms = 3000): Promise<boolean> {
 }
 
 /** Seed one resumable session (enough messages + a snapshot) and return its id. */
-function seedSession(ws: string): string {
+function seedSession(ws: string, bindingsDir?: string): string {
   const log = SessionLog.open(ws);
   const ctx = new Context({ contextBudget: 100000, triggerRatio: 0.9, keepLastTurns: 4 });
   ctx.pinTask({ role: 'user', content: [{ type: 'text', text: 'Task for the seeded session' }] });
@@ -252,6 +253,8 @@ function seedSession(ws: string): string {
     ctx.append({ role: 'user', content: [{ type: 'text', text: `now step ${i + 1}` }] });
   }
   log.recordSnapshot(ctx, 0);
+  log.close();
+  if (bindingsDir) trustLegacySession(log.path, { bindingsDir });
   return SessionLog.sessionIdFromPath(log.path);
 }
 
@@ -263,7 +266,7 @@ const noopProvider: Provider = {
   },
 };
 
-function baseOpts(ws: string): TuiOpts {
+function baseOpts(ws: string, harnessBindingsDir?: string): TuiOpts {
   const cfg = loadConfig(ws, { provider: 'mock', model: 'm', resumeRecap: false });
   return {
     provider: noopProvider as unknown as TuiOpts['provider'],
@@ -277,6 +280,7 @@ function baseOpts(ws: string): TuiOpts {
     bypass: false,
     version: '0.0.0',
     workspaceRoot: ws,
+    harnessBindingsDir,
   };
 }
 
@@ -330,9 +334,10 @@ test('bare /resume with several candidates opens the picker instead of auto-pick
 
 test('bare /resume with exactly one candidate still resumes it directly (F02-04 keeps the fast path)', async () => {
   const ws = mkdtempSync(join(tmpdir(), 'p2-08-resume-one-'));
+  const bindingsDir = mkdtempSync(join(tmpdir(), 'p2-08-resume-owner-'));
   try {
-    const id = seedSession(ws);
-    const { stdin, lastFrame, unmount } = render(React.createElement(TuiApp, { opts: baseOpts(ws) }));
+    const id = seedSession(ws, bindingsDir);
+    const { stdin, lastFrame, unmount } = render(React.createElement(TuiApp, { opts: baseOpts(ws, bindingsDir) }));
     try {
       await tick();
       stdin.write('/resume');
@@ -347,5 +352,6 @@ test('bare /resume with exactly one candidate still resumes it directly (F02-04 
     }
   } finally {
     rmSync(ws, { recursive: true, force: true });
+    rmSync(bindingsDir, { recursive: true, force: true });
   }
 });

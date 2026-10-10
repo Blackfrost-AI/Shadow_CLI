@@ -10,14 +10,48 @@ export interface PlanSnapshot {
 
 export type PlanModeListener = (snapshot: PlanSnapshot) => void;
 
+/** Minimal effective-tool view shared with prompt composition without coupling this state to a registry. */
+export interface PlanModeCapabilities {
+  has(name: string): boolean;
+}
+
+const ALL_PLAN_CAPABILITIES: PlanModeCapabilities = Object.freeze({ has: () => true });
+export const PLAN_MODE_REQUIRED_TOOLS = Object.freeze(['plan_write', 'exit_plan_mode'] as const);
+
+export function missingPlanModeControls(
+  capabilities: PlanModeCapabilities = ALL_PLAN_CAPABILITIES,
+): string[] {
+  return PLAN_MODE_REQUIRED_TOOLS.filter((name) => !capabilities.has(name));
+}
+
 export class PlanModeState {
   private snapshotValue: PlanSnapshot;
   /** Set by a non-approved exit() (Shift+Tab, /clear); the loop consumes it once. */
   private exitedUnapproved = false;
   private readonly listeners = new Set<PlanModeListener>();
 
-  constructor(enabled = false) {
+  constructor(
+    enabled = false,
+    private readonly capabilities: PlanModeCapabilities = ALL_PLAN_CAPABILITIES,
+  ) {
+    if (enabled && !this.available) {
+      throw new Error(`plan mode requires available controls: ${this.missingControls.join(', ')}`);
+    }
     this.snapshotValue = { mode: enabled ? 'planning' : 'implement' };
+  }
+
+  /** Plan mode cannot be entered unless the model can both write and submit its plan. */
+  get available(): boolean {
+    return this.missingControls.length === 0;
+  }
+
+  get missingControls(): string[] {
+    return missingPlanModeControls(this.capabilities);
+  }
+
+  get unavailableReason(): string | undefined {
+    const missing = this.missingControls;
+    return missing.length > 0 ? `required controls are hidden: ${missing.join(', ')}` : undefined;
   }
 
   get active(): boolean {
@@ -29,7 +63,15 @@ export class PlanModeState {
   }
 
   /** Resume a recorded mode without synthesizing a user approval or side-door exit. */
+  assertRestorable(raw: PlanSnapshot): void {
+    if (raw?.mode === 'planning' && !this.available) {
+      throw new Error(`cannot restore active plan mode; ${this.unavailableReason}`);
+    }
+  }
+
+  /** Resume a recorded mode without synthesizing a user approval or side-door exit. */
   restore(raw: PlanSnapshot): PlanSnapshot {
+    this.assertRestorable(raw);
     this.exitedUnapproved = false;
     this.snapshotValue = {
       mode: raw?.mode === 'planning' ? 'planning' : 'implement',
@@ -51,6 +93,9 @@ export class PlanModeState {
    *  included, so a `/goal` begun after a plan_write still seeds its mission task list on
    *  approval (the toggle must never silently drop recorded work). */
   enter(): PlanSnapshot {
+    // Defense in depth for embedders and UI paths: a harness may intentionally hide the
+    // control pair. Entering anyway would pin an instruction the model can never complete.
+    if (!this.available) return this.snapshot();
     this.exitedUnapproved = false; // re-entering re-arms the planning phase cleanly
     this.snapshotValue = {
       mode: 'planning',
@@ -87,17 +132,32 @@ export class PlanModeState {
     return this.snapshot();
   }
 
-  block(): string {
+  block(capabilities: PlanModeCapabilities = this.capabilities): string {
     if (!this.active) return '';
     const planLine = this.snapshotValue.path
       ? `\nCurrent plan file: ${this.snapshotValue.path}`
       : '';
+    const canWritePlan = capabilities.has('plan_write');
+    const canExitPlan = capabilities.has('exit_plan_mode');
+    const blocked = ['write_file', 'edit_file', 'run_shell', 'web_fetch', 'web_search']
+      .filter((name) => capabilities.has(name));
+    const action = canWritePlan && canExitPlan
+      ? 'Explore and read freely, write or update the plan with plan_write, then call exit_plan_mode when the plan is ready for user approval.'
+      : canExitPlan
+        ? 'Explore and read freely, then call exit_plan_mode when the plan is ready for user approval.'
+        : 'Plan-mode exit is unavailable. Tell the user that this session cannot continue in plan mode.';
+    const blockedList = blocked.length > 1
+      ? `${blocked.slice(0, -1).join(', ')}, or ${blocked.at(-1)}`
+      : blocked[0];
+    const restriction = blockedList
+      ? `Do not call ${blockedList} until plan mode exits.`
+      : 'Do not begin implementation until plan mode exits.';
     return [
       '',
       '',
       '## Plan mode',
-      'You are currently in plan mode. Explore and read freely, write or update the plan with plan_write, then call exit_plan_mode when the plan is ready for user approval.',
-      'Do not call write_file, edit_file, run_shell, web_fetch, or web_search until plan mode exits.',
+      `You are currently in plan mode. ${action}`,
+      restriction,
       planLine,
     ].join('\n');
   }

@@ -1,5 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { makeSkillTool } from '../src/tools/skillTool.js';
 import type { SkillEntry } from '../src/skills/loader.js';
 import type { ToolContext } from '../src/tools/types.js';
@@ -23,4 +26,22 @@ test('skill tool fails clearly for an unknown skill and lists what exists', asyn
   const r = await tool.run({ name: 'nope' }, ctx);
   assert.equal(r.ok, false);
   assert.match(r.summary, /deploy/, 'lists available skills');
+});
+
+test('an array catalog keeps the session-start skill body after its source changes', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'shadow-fixed-skill-'));
+  const path = join(root, 'fixed', 'SKILL.md');
+  try {
+    mkdirSync(join(root, 'fixed'), { recursive: true });
+    writeFileSync(path, '# Captured\nSession-start body');
+    const tool = makeSkillTool([
+      { name: 'fixed', path, root, description: 'fixed session skill', body: '# Captured\nSession-start body' },
+    ]);
+    writeFileSync(path, '# Changed\nMust wait for a new session');
+    const result = await tool.run({ name: 'fixed' }, ctx);
+    assert.equal(result.ok, true);
+    assert.equal(result.data?.body, '# Captured\nSession-start body');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

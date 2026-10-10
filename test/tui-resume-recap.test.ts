@@ -16,6 +16,7 @@ import { Context } from '../src/agent/context.js';
 import { ToolRegistry } from '../src/tools/registry.js';
 import { loadConfig } from '../src/config.js';
 import { SessionLog } from '../src/state/session.js';
+import { trustLegacySession } from '../src/state/resume.js';
 import type { Provider, ProviderEvent } from '../src/provider/provider.js';
 
 const tick = (ms = 80) => new Promise((r) => setTimeout(r, ms));
@@ -28,7 +29,7 @@ async function until(pred: () => boolean, ms = 3000): Promise<boolean> {
 }
 
 /** Seed a resumable session (≥6 messages + a snapshot) under the workspace's sessions dir. */
-function seedSession(ws: string): void {
+function seedSession(ws: string, bindingsDir: string): void {
   const log = SessionLog.open(ws);
   const ctx = new Context({ contextBudget: 100000, triggerRatio: 0.9, keepLastTurns: 4 });
   ctx.pinTask({ role: 'user', content: [{ type: 'text', text: 'Refactor the auth module' }] });
@@ -37,6 +38,7 @@ function seedSession(ws: string): void {
     ctx.append({ role: 'user', content: [{ type: 'text', text: `now do step ${i + 1}` }] });
   }
   log.recordSnapshot(ctx, 0);
+  trustLegacySession(log.path, { bindingsDir });
 }
 
 function recapProvider(text: string): Provider {
@@ -50,7 +52,7 @@ function recapProvider(text: string): Provider {
   };
 }
 
-function baseOpts(ws: string, provider: TuiOpts['provider'], resumeRecap: boolean): TuiOpts {
+function baseOpts(ws: string, provider: TuiOpts['provider'], resumeRecap: boolean, bindingsDir: string): TuiOpts {
   const cfg = loadConfig(ws, { provider: 'mock', model: 'm', resumeRecap });
   return {
     provider,
@@ -64,13 +66,15 @@ function baseOpts(ws: string, provider: TuiOpts['provider'], resumeRecap: boolea
     bypass: false,
     version: '0.0.0',
     workspaceRoot: ws,
+    harnessBindingsDir: bindingsDir,
   };
 }
 
 test('resumeRecap ON: /resume shows a "while you were away" summary from the provider', async () => {
   const ws = mkdtempSync(join(tmpdir(), 'recap-'));
-  seedSession(ws);
-  const opts = baseOpts(ws, recapProvider('- Refactoring auth\n- Next: finish step 3') as unknown as TuiOpts['provider'], true);
+  const bindingsDir = join(ws, 'owner-bindings');
+  seedSession(ws, bindingsDir);
+  const opts = baseOpts(ws, recapProvider('- Refactoring auth\n- Next: finish step 3') as unknown as TuiOpts['provider'], true, bindingsDir);
   const { stdin, lastFrame, unmount } = render(React.createElement(TuiApp, { opts }));
   try {
     await tick();
@@ -87,10 +91,11 @@ test('resumeRecap ON: /resume shows a "while you were away" summary from the pro
 
 test('resumeRecap OFF (default): /resume shows no recap', async () => {
   const ws = mkdtempSync(join(tmpdir(), 'recap-off-'));
-  seedSession(ws);
+  const bindingsDir = join(ws, 'owner-bindings');
+  seedSession(ws, bindingsDir);
   let called = false;
   const provider: Provider = { name: 'x', estimateTokens: () => 1, async *send() { called = true; yield { type: 'done', stopReason: 'end_turn' }; } };
-  const opts = baseOpts(ws, provider as unknown as TuiOpts['provider'], false);
+  const opts = baseOpts(ws, provider as unknown as TuiOpts['provider'], false, bindingsDir);
   const { stdin, lastFrame, unmount } = render(React.createElement(TuiApp, { opts }));
   try {
     await tick();

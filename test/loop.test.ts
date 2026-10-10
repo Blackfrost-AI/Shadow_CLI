@@ -8,7 +8,9 @@ import { EventBus, type LoopEvent } from '../src/agent/events.js';
 import { ToolRegistry } from '../src/tools/registry.js';
 import { ScriptedApprovalGate, AutoApproveGate } from '../src/agent/approval.js';
 import { MockProvider } from '../src/provider/mock.js';
-import type { Provider, ProviderEvent } from '../src/provider/provider.js';
+import type { Provider, ProviderEvent, ResponsesReasoningItem } from '../src/provider/provider.js';
+import { buildResponsesBody } from '../src/provider/responses.js';
+import { hydrateContext, serializeContext } from '../src/state/snapshot.js';
 import type { Tool } from '../src/tools/types.js';
 import { ok } from '../src/tools/types.js';
 import type { AutonomyLevel } from '../src/safety/permissions.js';
@@ -107,6 +109,35 @@ test('runs reason→act→observe and terminates with the final answer', async (
   assert.equal(res.stopReason, 'end_turn');
   const ended = events.find((e) => e.type === 'tool_end');
   assert.ok(ended && ended.type === 'tool_end' && ended.result.ok);
+});
+
+test('tool findings preserve their originating call even when titles and bodies repeat', async () => {
+  const findings = [
+    { title: 'Matches', body: 'fixture.ts:4:1 match', severity: 'info' as const },
+    { title: 'Limited results', body: 'More matches were omitted.', severity: 'warn' as const },
+  ];
+  const tools: Tool[] = ['search_one', 'search_two'].map((name) => ({
+    name, description: 'Finding provenance fixture', risk: 'read', inputSchema: z.object({}),
+    run: async () => {
+      const result = ok(name, 'read', 1, 'Search completed', {});
+      result.meta.findings = findings;
+      return result;
+    },
+  }));
+  const { loop, events } = buildLoop(new MockProvider([]), tools, new AutoApproveGate());
+  const calls = [
+    { id: 'first-search', name: 'search_one', input: {} },
+    { id: 'second-search', name: 'search_two', input: {} },
+  ];
+  for (const call of calls) assert.equal((await loop.runToolCall(call)).ok, true);
+
+  assert.deepEqual(events.filter((event) => event.type === 'finding'), calls.flatMap((call) =>
+    findings.map((finding) => ({ type: 'finding', ...finding, toolCallId: call.id, toolName: call.name })),
+  ));
+  const emitted = events.filter((event) => event.type === 'tool_end' || event.type === 'finding');
+  assert.deepEqual(emitted.map((event) => event.type), [
+    'tool_end', 'finding', 'finding', 'tool_end', 'finding', 'finding',
+  ], 'findings follow their own tool result without changing the existing event sequence');
 });
 
 test('a clean empty end_turn retries twice, charges every attempt, then accepts a real answer', async () => {
@@ -286,7 +317,63 @@ test('an empty max_tokens turn keeps max_tokens handling and is not retried as a
 
   assert.equal(sends, 1);
   assert.equal(res.stopReason, 'max_tokens');
+  assert.equal(res.finalAnswer, '');
   assert.equal(events.some((e) => e.type === 'retry' && e.reason === 'empty response'), false);
+});
+
+test('reasoning-only max_tokens does not reuse visible progress from an earlier tool turn', async () => {
+  const provider = new MockProvider([
+    [
+      { type: 'text', delta: 'The handoff is not at the run root. Let me locate it.' },
+      { type: 'tool_call', call: { id: 'locate', name: 'echo', input: { msg: 'search' } } },
+      { type: 'done', stopReason: 'tool_use' },
+    ],
+    [
+      { type: 'thinking', delta: 'private reasoning that consumes the remaining output budget' },
+      { type: 'done', stopReason: 'max_tokens' },
+    ],
+  ]);
+  const { loop, events, context } = buildLoop(provider, [echoTool(() => {})], new AutoApproveGate());
+  const res = await loop.run();
+
+  assert.equal(res.stopReason, 'max_tokens');
+  assert.equal(res.finalAnswer, '', 'the terminal turn emitted no visible answer');
+  assert.ok(
+    events.some((event) => event.type === 'error' && /output-token cap before producing an answer/i.test(event.message)),
+    'the empty max_tokens diagnostic is not bypassed by earlier progress text',
+  );
+  const stop = events.find((event) => event.type === 'stop');
+  assert.ok(stop && stop.type === 'stop');
+  assert.equal(stop.finalAnswer, '', 'headless callers see an empty max_tokens stop and exit non-zero');
+  assert.ok(
+    context.messages().some(
+      (message) =>
+        message.role === 'assistant' &&
+        message.content.some(
+          (block) => block.type === 'text' && block.text === 'The handoff is not at the run root. Let me locate it.',
+        ),
+    ),
+    'earlier visible progress remains in conversation history for audit and resume',
+  );
+});
+
+test('non-provider ceilings still retain earlier visible progress across tool turns', async () => {
+  const provider = new MockProvider([
+    [
+      { type: 'text', delta: 'I found one useful partial result.' },
+      { type: 'tool_call', call: { id: 'inspect', name: 'echo', input: { msg: 'inspect' } } },
+      { type: 'done', stopReason: 'tool_use' },
+    ],
+  ]);
+  const { loop } = buildLoop(provider, [echoTool(() => {})], new AutoApproveGate(), { maxIterations: 1 });
+  const res = await loop.run();
+
+  assert.equal(res.stopReason, 'max_iterations');
+  assert.equal(
+    res.finalAnswer,
+    'I found one useful partial result.',
+    'the cumulative progress value remains available to host-imposed ceiling stops',
+  );
 });
 
 test('a denied tool returns a recoverable result and the loop still terminates', async () => {
@@ -652,12 +739,14 @@ test('the nameless-call retry HUD label is honest — not the JSON wording (P1A-
   assert.equal(retry.reason, 'tool call missing its name');
 });
 
-test('loop guard: identical repeated calls stop executing after the limit', async () => {
+test('loop guard: identical repeated calls stop executing, then terminate a model that ignores the guard', async () => {
   let ran = 0;
+  let turns = 0;
   const sameCall: Provider = {
     name: 'stuck',
     estimateTokens: () => 0,
     async *send(): AsyncIterable<ProviderEvent> {
+      turns += 1;
       yield { type: 'tool_call', call: { id: 't', name: 'echo', input: { msg: 'same' } } };
       yield { type: 'done', stopReason: 'tool_use' };
     },
@@ -668,7 +757,12 @@ test('loop guard: identical repeated calls stop executing after the limit', asyn
   const res = await loop.run();
   assert.equal(ran, 2, 'first two identical calls run; the 3rd+ are guarded, not executed');
   assert.ok(events.some((e) => e.type === 'tool_denied'), 'loop guard surfaces as tool_denied');
-  assert.equal(res.stopReason, 'max_iterations', 'still terminates on the iteration cap');
+  assert.equal(res.stopReason, 'fatal_tool_error', 'persistent repeats terminate before the iteration cap');
+  assert.equal(turns, 6, 'the model gets a bounded final recovery turn, then the sixth repeat is fatal');
+  assert.ok(
+    events.some((e) => e.type === 'tool_denied' && /persisted after loop guard/.test(e.reason)),
+    'the fatal guard reason is visible',
+  );
 });
 
 test('loop guard: repeated identical unknown-tool calls stop the run and list the real tools', async () => {
@@ -1058,4 +1152,105 @@ test('steering or hard abort during classifier work never starts the tool', asyn
     );
     assert.ok(paired && paired.type === 'tool_result' && !paired.ok, `${mode}: tool_use remains paired`);
   }
+});
+
+test('Responses opaque reasoning survives a tool turn and serialized resume without transcript leakage', async () => {
+  const item: ResponsesReasoningItem = {
+    type: 'reasoning', id: 'rs_fixture', summary: [{ type: 'summary_text', text: 'Inspect the file.' }],
+    encrypted_content: 'opaque-resume-fixture', status: 'completed',
+  };
+  let observedSecondTurn = false;
+  const provider = new MockProvider([
+    [
+      { type: 'thinking', delta: 'Inspect the file.' },
+      { type: 'response_reasoning_item', item },
+      { type: 'tool_call', call: { id: 'call_fixture', name: 'echo', input: { msg: 'safe' } } },
+      { type: 'done', stopReason: 'tool_use' },
+    ],
+    (messages) => {
+      const assistant = messages.find((message) => message.role === 'assistant');
+      assert.deepEqual(assistant?.responsesReasoning, { model: 'mock', items: [item] });
+      observedSecondTurn = true;
+      return [{ type: 'text', delta: 'Finished.' }, { type: 'done', stopReason: 'end_turn' }];
+    },
+  ]);
+  const { loop, context, events } = buildLoop(provider, [echoTool(() => {})], new AutoApproveGate());
+  assert.equal((await loop.run()).stopReason, 'end_turn');
+  assert.equal(observedSecondTurn, true);
+  assert.equal(JSON.stringify(events).includes(item.encrypted_content!), false, 'opaque wire state never goes onto the event bus');
+  const restored = hydrateContext(JSON.parse(JSON.stringify(serializeContext(context))), {
+    contextBudget: 1_000_000, triggerRatio: 0.75, keepLastTurns: 6,
+  });
+  const body = buildResponsesBody({
+    model: 'mock', system: 'fixture', tools: [], messages: restored.messages(), maxOutputTokens: 1024,
+  }, 'mock', true, { chatgptPlan: true });
+  const input = body.input as Array<Record<string, unknown>>;
+  const reasoningIndex = input.findIndex((entry) => entry.type === 'reasoning');
+  const callIndex = input.findIndex((entry) => entry.type === 'function_call');
+  const resultIndex = input.findIndex((entry) => entry.type === 'function_call_output');
+  assert.ok(reasoningIndex >= 0 && reasoningIndex < callIndex && callIndex < resultIndex);
+  assert.equal(input[reasoningIndex]?.encrypted_content, 'opaque-resume-fixture');
+});
+
+test('failed Responses turns discard opaque continuation state and tool intent', async () => {
+  let toolRuns = 0;
+  const provider = new MockProvider([[
+    { type: 'response_reasoning_item', item: { type: 'reasoning', id: 'rs_partial', summary: [], encrypted_content: 'discard-this' } },
+    { type: 'tool_call', call: { id: 'partial_call', name: 'echo', input: { msg: 'do not run' } } },
+    { type: 'text', delta: 'Partial prose.' },
+    { type: 'error', code: 'subscription_sharing_usage_limit_exceeded', recoverable: false, message: 'Plan limit.' },
+    { type: 'done', stopReason: 'end_turn' },
+  ]]);
+  const { loop, context } = buildLoop(provider, [echoTool(() => toolRuns++)], new AutoApproveGate());
+  assert.equal((await loop.run()).stopReason, 'provider_error');
+  assert.equal(toolRuns, 0);
+  assert.equal(context.messages().some((message) => message.responsesReasoning), false);
+  assert.equal(context.messages().some((message) => message.content.some((block) => block.type === 'tool_use')), false);
+});
+
+test('explicit account providers suppress automatic fallback for both error frames and throws', async () => {
+  for (const throws of [false, true]) {
+    let sends = 0;
+    let fallbacks = 0;
+    const provider: Provider = {
+      name: 'account-fixture', allowAutomaticFallback: false, estimateTokens: () => 0,
+      async *send(): AsyncIterable<ProviderEvent> {
+        sends++;
+        if (throws) throw new Error('http_503: unavailable');
+        yield { type: 'error', code: 'http_503', message: 'Unavailable.', recoverable: false };
+        yield { type: 'done', stopReason: 'end_turn' };
+      },
+    };
+    const { loop, events } = buildLoop(provider, [], new AutoApproveGate(), {
+      models: [
+        { label: 'primary', provider: 'mock', model: 'mock', fallback: 'paid' },
+        { label: 'paid', provider: 'openai', model: 'paid-model' },
+      ],
+      fallbackModel: 'paid',
+      resolveFallback: async () => {
+        fallbacks++;
+        return { provider: new MockProvider(), model: 'paid-model' };
+      },
+    });
+    if (throws) await assert.rejects(loop.run(), /http_503/);
+    else assert.equal((await loop.run()).stopReason, 'provider_error');
+    assert.equal(sends, 1);
+    assert.equal(fallbacks, 0);
+    assert.equal(events.some((event) => event.type === 'model_fallback'), false);
+  }
+});
+
+test('plan capability errors naming token caps do not trigger overflow retries', async () => {
+  let sends = 0;
+  const provider: Provider = {
+    name: 'plan-fixture', allowAutomaticFallback: false, estimateTokens: () => 0,
+    async *send(): AsyncIterable<ProviderEvent> {
+      sends++;
+      yield { type: 'error', recoverable: false, code: 'subscription_sharing_unsupported_capability', message: 'Unsupported parameter max_output_tokens.' };
+      yield { type: 'done', stopReason: 'end_turn' };
+    },
+  };
+  const { loop } = buildLoop(provider, [], new AutoApproveGate());
+  assert.equal((await loop.run()).stopReason, 'provider_error');
+  assert.equal(sends, 1);
 });

@@ -1,0 +1,5 @@
+Shadow can preserve a repeatable workflow in a local learned-skill store with no Shadow telemetry or callback. Model-visible conversation context and `skill_manage` results still travel to the provider or endpoint the user selected for this session.
+
+Use `skill_manage` only when the user explicitly asks to learn a workflow (including `/learn`) or when they ask you to draft a reusable procedure. A repeated action is not proof that it is correct. Build the candidate from local session, artifact, test, or review references; give every reusable claim at least one evidence reference; and include a passing validation or replay result that covers each claim. Record environment and scope limits in the skill instead of generalizing a one-off success.
+
+`skill_manage` creates candidates only. Never claim that a candidate is active, and never ask another tool to copy it into the active catalog. The user reviews it with `/skills pending`, `/skills show <name>`, and `/skills validate <name>`, then explicitly activates it with `/skills activate <name>`. Activated skills are advertised reliably in a new session and retain version history for rollback.

@@ -196,6 +196,54 @@ test('snapshot and currentCostUSD stay OWN-only after accrual (no /cost double-c
 
 // ── loop seam: ctx.parentBudget ──────────────────────────────────────────────────────────
 
+test('subscription usage keeps token, time and iteration ceilings without API or cache charges', () => {
+  const prices = Object.freeze({ mock: Object.freeze({ input: 1000, output: 1000 }) });
+  const b = new Budget({ maxIterations: 2, maxCostUSD: 0.01, maxTotalTokens: 300, maxWallClockSec: 60 }, 'mock', prices, t0);
+  b.recordUsage({ billing: 'subscription', inputTokens: 100, outputTokens: 100, cacheReadTokens: 500, cacheWriteTokens: 500 }, t0);
+  assert.equal(b.currentCostUSD, 0);
+  assert.equal(b.snapshot(t0).totalTokens, 200);
+  assert.equal(b.inheritableCeilings(t0).maxCostUSD, 0.01);
+  assert.equal(b.inheritableCeilings(t0).maxTotalTokens, 100);
+  assert.equal(b.check(t0), null);
+  assert.equal(b.check(t0 + 60_000), 'budget', 'subscription time still counts');
+  b.tick(); b.tick();
+  assert.equal(b.check(t0), 'max_iterations', 'subscription iterations still count');
+  b.recordUsage({ billing: 'subscription', inputTokens: 100, outputTokens: 0 }, t0);
+  assert.equal(b.checkSpending(t0), 'budget', 'subscription tokens still count');
+  assert.equal(b.currentCostUSD, 0);
+});
+
+test('subscription and API subagents retain separate billing while all tokens roll up', async () => {
+  const ws = mkdtempSync(join(tmpdir(), 'subscription-budget-'));
+  try {
+    const bus = new EventBus();
+    const costs: number[] = [];
+    bus.on((event) => { if (event.type === 'subagent_usage') costs.push(event.costUSD); });
+    const parentBudget = new Budget({ maxIterations: 10, maxCostUSD: 20 / 1e6, maxTotalTokens: 1000 }, 'mock', PRICE, t0);
+    parentBudget.recordUsage({ inputTokens: 5, outputTokens: 0 }, t0);
+    const ctx: ToolContext = { workspaceRoot: ws, signal: new AbortController().signal, log: () => {}, dryRun: false, parentBudget };
+    const subscription = new MockProvider([[
+      { type: 'text', delta: 'Plan answer' },
+      { type: 'usage', billing: 'subscription', inputTokens: 100, outputTokens: 50 },
+      { type: 'done', stopReason: 'end_turn' },
+    ]]);
+    assert.ok((await makeTool(ws, subscription, bus).run({ prompt: 'Plan task' }, ctx)).ok);
+    assert.equal(parentBudget.totalCostUSD, 5 / 1e6);
+    assert.equal(parentBudget.totalInputTokens + parentBudget.totalOutputTokens, 155);
+    assert.equal(parentBudget.checkSpending(t0), null);
+    const api = new MockProvider([[
+      { type: 'text', delta: 'API answer' },
+      { type: 'usage', inputTokens: 10, outputTokens: 5 },
+      { type: 'done', stopReason: 'end_turn' },
+    ]]);
+    await makeTool(ws, api, bus).run({ prompt: 'API task' }, ctx);
+    assert.deepEqual(costs, [0, 15 / 1e6]);
+    assert.equal(Math.round(parentBudget.totalCostUSD * 1e6), 20);
+    assert.equal(parentBudget.totalInputTokens + parentBudget.totalOutputTokens, 170);
+    assert.equal(parentBudget.checkSpending(t0), 'budget', 'real API spend still hits its ceiling');
+  } finally { rmSync(ws, { recursive: true, force: true }); }
+});
+
 test('the loop stamps ctx.parentBudget with its own budget (immediate parent of any sub-agent)', async () => {
   const ws = mkdtempSync(join(tmpdir(), 'p309-seam-'));
   try {
