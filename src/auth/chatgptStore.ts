@@ -111,14 +111,19 @@ function busy(error: unknown): boolean {
   const e = error as { errcode?: number; code?: string; errstr?: string; message?: string };
   const detail = `${e.errstr ?? ''} ${e.message ?? ''}`.toLowerCase();
   return (
-    e.errcode === 5
-    || e.errcode === 6
-    || e.code === 'SQLITE_BUSY'
-    || e.code === 'SQLITE_LOCKED'
-    || detail.includes('database is locked')
-    || detail.includes('database table is locked')
+    e.errcode === 5 ||
+    e.errcode === 6 ||
+    e.code === 'SQLITE_BUSY' ||
+    e.code === 'SQLITE_LOCKED' ||
+    detail.includes('database is locked') ||
+    detail.includes('database table is locked')
   );
 }
+// Keep the native wrapper reachable for the full critical section. A suspended callback's
+// promise may otherwise become unreachable while another active handle keeps the process alive,
+// allowing DatabaseSync finalization to release the transaction before the callback settles.
+const heldLockConnections = new Set<DatabaseSync>();
+
 /** A held BEGIN IMMEDIATE is released by the OS even when its owner process dies.
  * Zero SQLite busy_timeout plus asynchronous retries avoids blocking this process's
  * current lock owner while it awaits a token response. No stale lease can steal it. */
@@ -138,51 +143,54 @@ export async function withChatGPTLock<T>(
   let held = false;
   try {
     try {
-      const fd = openSync(path, 'wx', 0o600);
-      closeSync(fd);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-    }
-    checkFile(path);
-    const deadline = Date.now() + timeoutMs;
-    for (;;) {
-      requireActive(signal);
       try {
-        // A second process can observe SQLITE_BUSY while opening a brand-new SQLite file or
-        // applying the PRAGMA, before BEGIN IMMEDIATE runs. Keep the entire SQLite acquisition
-        // inside the same bounded retry so contention is never misreported as corrupt storage.
-        db = new DatabaseSync(path);
-        db.exec('PRAGMA busy_timeout=0');
-        db.exec('BEGIN IMMEDIATE');
-        held = true;
-        break;
+        const fd = openSync(path, 'wx', 0o600);
+        closeSync(fd);
       } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      }
+      checkFile(path);
+      const deadline = Date.now() + timeoutMs;
+      for (;;) {
+        requireActive(signal);
         try {
-          db?.close();
-        } catch {
-          /* retry with a fresh connection */
-        }
-        db = undefined;
-        if (!busy(error)) throw error;
-        if (Date.now() >= deadline)
-          throw new ChatGPTAuthError(
-            'account_busy',
-            'Another Shadow process is using this ChatGPT account. Try again after it finishes.',
-          );
-        try {
-          await delay(25, undefined, { signal });
-        } catch {
-          throw cancelled();
+          // A second process can observe SQLITE_BUSY while opening a brand-new SQLite file or
+          // applying the PRAGMA, before BEGIN IMMEDIATE runs. Keep the entire SQLite acquisition
+          // inside the same bounded retry so contention is never misreported as corrupt storage.
+          db = new DatabaseSync(path);
+          db.exec('PRAGMA busy_timeout=0');
+          db.exec('BEGIN IMMEDIATE');
+          held = true;
+          heldLockConnections.add(db);
+          break;
+        } catch (error) {
+          try {
+            db?.close();
+          } catch {
+            /* retry with a fresh connection */
+          }
+          db = undefined;
+          if (!busy(error)) throw error;
+          if (Date.now() >= deadline)
+            throw new ChatGPTAuthError(
+              'account_busy',
+              'Another Shadow process is using this ChatGPT account. Try again after it finishes.',
+            );
+          try {
+            await delay(25, undefined, { signal });
+          } catch {
+            throw cancelled();
+          }
         }
       }
+    } catch (error) {
+      if (error instanceof ChatGPTAuthError) throw error;
+      throw new ChatGPTAuthError(
+        'storage_unavailable',
+        'Shadow could not lock its protected ChatGPT account storage.',
+      );
     }
     return await run();
-  } catch (error) {
-    if (error instanceof ChatGPTAuthError) throw error;
-    throw new ChatGPTAuthError(
-      'storage_unavailable',
-      'Shadow could not lock its protected ChatGPT account storage.',
-    );
   } finally {
     if (held) {
       try {
@@ -191,6 +199,7 @@ export async function withChatGPTLock<T>(
         /* close also releases the transaction */
       }
     }
+    if (db) heldLockConnections.delete(db);
     db?.close();
   }
 }

@@ -675,26 +675,38 @@ test('failed revocation is retried, clears local tokens and reports remote uncer
   }
 });
 
-test('refresh lock excludes another process and is released automatically after an owner crash', async () => {
+test('refresh lock survives owner GC, excludes another process and releases after a crash', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'shadow-chatgpt-lock-'));
   const modulePath = pathToFileURL(resolve('src/auth/chatgptStore.ts')).href;
-  const script = `import {withChatGPTLock} from ${JSON.stringify(modulePath)}; await withChatGPTLock(${JSON.stringify(dir)},'crash',undefined,5000,async()=>{process.stdout.write('LOCKED\\n');await new Promise(()=>setInterval(()=>{},1000));});`;
-  const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', script], {
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  const script = `import {withChatGPTLock} from ${JSON.stringify(modulePath)}; await withChatGPTLock(${JSON.stringify(dir)},'crash',undefined,5000,async()=>{globalThis.gcCycles=0;process.stdout.write('LOCKED\\n');setInterval(()=>{globalThis.gc();globalThis.gcCycles++;if(globalThis.gcCycles===20)process.stdout.write('GCED\\n');},1);await new Promise(()=>{});});`;
+  const child = spawn(
+    process.execPath,
+    ['--expose-gc', '--import', 'tsx', '--input-type=module', '-e', script],
+    {
+      stdio: ['ignore', 'pipe', 'pipe'],
+    },
+  );
   let stderr = '';
   child.stderr.on('data', (bytes) => {
     stderr += bytes.toString();
   });
+  let stdout = '';
+  const collected = new Promise<void>((resolveReady) => {
+    child.stdout.on('data', (bytes) => {
+      stdout += bytes.toString();
+      if (stdout.includes('GCED\n')) resolveReady();
+    });
+  });
   const guard = setTimeout(() => child.kill('SIGKILL'), 5000);
   try {
-    const [first] = await Promise.race([
-      once(child.stdout, 'data'),
+    await Promise.race([
+      collected,
       once(child, 'close').then(() => {
         throw new Error(`Lock fixture exited before acquiring: ${stderr}`);
       }),
     ]);
-    assert.match(String(first), /LOCKED/, stderr);
+    assert.match(stdout, /LOCKED\nGCED\n/, stderr);
+    assert.equal(child.exitCode, null, stderr);
     await assert.rejects(
       withChatGPTLock(dir, 'crash', undefined, 75, async () => {
         throw new Error('Must not acquire');
@@ -717,6 +729,25 @@ test('refresh lock excludes another process and is released automatically after 
       child.kill('SIGKILL');
       await closed;
     }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('refresh lock preserves callback failures and releases the lock', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'shadow-chatgpt-lock-error-'));
+  const failure = new Error('callback failure');
+  try {
+    await assert.rejects(
+      withChatGPTLock(dir, 'callback', undefined, 1000, async () => {
+        throw failure;
+      }),
+      (error: unknown) => error === failure,
+    );
+    assert.equal(
+      await withChatGPTLock(dir, 'callback', undefined, 1000, async () => 'released'),
+      'released',
+    );
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });

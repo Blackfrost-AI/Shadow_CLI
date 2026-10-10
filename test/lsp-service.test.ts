@@ -47,10 +47,10 @@ if (pidfile) writeFileSync(pidfile, String(process.pid));
 const SILENT = argv.includes('--silent');
 const DIE = argv.includes('--die-after-init');
 // --log=<path>: append every method this INSTANCE receives, so a test can prove what a restarted
-// server was told (didOpen vs didChange). --die-after-first-diag: exit right after the first
-// publish, which is how a crash mid-session is simulated.
+// server was told (didOpen vs didChange). --die-after-diag=<basename>: exit right after
+// publishing diagnostics for that document, which is how a crash mid-session is simulated.
 const LOG = (argv.find((a) => a.startsWith('--log=')) || '').slice('--log='.length);
-const DIE_AFTER_FIRST = argv.includes('--die-after-first-diag');
+const DIE_AFTER_DIAG = (argv.find((a) => a.startsWith('--die-after-diag=')) || '').slice('--die-after-diag='.length);
 const log = (line) => { if (LOG) { try { appendFileSync(LOG, line + '\\n'); } catch {} } };
 let buf = '';
 const send = (msg) => {
@@ -77,7 +77,7 @@ const handle = (msg) => {
     const text = (msg.params.contentChanges && msg.params.contentChanges[0] && msg.params.contentChanges[0].text) || td.text || '';
     setTimeout(() => {
       send({ jsonrpc: '2.0', method: 'textDocument/publishDiagnostics', params: { uri: td.uri, version: td.version, diagnostics: diagsFor(text) } });
-      if (DIE_AFTER_FIRST) setTimeout(() => process.exit(0), 5);
+      if (DIE_AFTER_DIAG && td.uri.endsWith('/' + DIE_AFTER_DIAG)) setTimeout(() => process.exit(0), 5);
     }, 10);
   }
 };
@@ -518,7 +518,7 @@ test('service (lsp): after a server crash the restarted instance is re-OPENED, n
         servers: {
           typescript: {
             command: process.execPath,
-            args: [join(fx.root, 'fake-lsp.mjs'), `--log=${logPath}`, '--die-after-first-diag'],
+            args: [join(fx.root, 'fake-lsp.mjs'), `--log=${logPath}`, '--die-after-diag=a.ts'],
           },
         },
       },
