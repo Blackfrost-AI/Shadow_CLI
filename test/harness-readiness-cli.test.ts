@@ -18,9 +18,11 @@ import {
 } from '../src/harness/index.js';
 
 const CLI = resolve('src/index.ts');
+const TSX_IMPORT = import.meta.resolve('tsx/esm');
 
 function fixture(requiredTools: string[]): { home: string; marker: string } {
   const home = mkdtempSync(join(tmpdir(), 'shadow-harness-cli-'));
+  mkdirSync(join(home, 'workspace'));
   const packageDir = join(harnessesDir(home), 'readiness-fixture');
   mkdirSync(packageDir, { recursive: true });
   writeFileSync(
@@ -56,8 +58,8 @@ function run(home: string, args: string[]) {
   // the same isolated harness/config tree on every supported host.
   const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, USERPROFILE: home };
   delete env.SHADOW_HARNESSES;
-  return spawnSync(process.execPath, ['--import', 'tsx/esm', CLI, ...args], {
-    cwd: process.cwd(),
+  return spawnSync(process.execPath, ['--import', TSX_IMPORT, CLI, ...args], {
+    cwd: join(home, 'workspace'),
     env,
     encoding: 'utf8',
     timeout: 15_000,

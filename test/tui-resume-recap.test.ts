@@ -22,7 +22,7 @@ import type { Provider, ProviderEvent } from '../src/provider/provider.js';
 const tick = (ms = 80) => new Promise((r) => setTimeout(r, ms));
 const ANSI = new RegExp(String.fromCharCode(27) + '\\[[0-9;]*m', 'g');
 const strip = (s: string | undefined) => (s ?? '').replace(ANSI, '');
-async function until(pred: () => boolean, ms = 3000): Promise<boolean> {
+async function until(pred: () => boolean, ms = 10_000): Promise<boolean> {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) { if (pred()) return true; await tick(40); }
   return pred();
@@ -38,14 +38,17 @@ function seedSession(ws: string, bindingsDir: string): void {
     ctx.append({ role: 'user', content: [{ type: 'text', text: `now do step ${i + 1}` }] });
   }
   log.recordSnapshot(ctx, 0);
-  trustLegacySession(log.path, { bindingsDir });
+  const path = log.path;
+  log.close();
+  trustLegacySession(path, { bindingsDir });
 }
 
-function recapProvider(text: string): Provider {
+function recapProvider(text: string, onSend?: () => void): Provider {
   return {
     name: 'recap',
     estimateTokens: () => 1,
     async *send(): AsyncIterable<ProviderEvent> {
+      onSend?.();
       yield { type: 'text', delta: text };
       yield { type: 'done', stopReason: 'end_turn' };
     },
@@ -74,15 +77,19 @@ test('resumeRecap ON: /resume shows a "while you were away" summary from the pro
   const ws = mkdtempSync(join(tmpdir(), 'recap-'));
   const bindingsDir = join(ws, 'owner-bindings');
   seedSession(ws, bindingsDir);
-  const opts = baseOpts(ws, recapProvider('- Refactoring auth\n- Next: finish step 3') as unknown as TuiOpts['provider'], true, bindingsDir);
+  let providerCalls = 0;
+  const opts = baseOpts(ws, recapProvider('- Refactoring auth\n- Next: finish step 3', () => { providerCalls++; }) as unknown as TuiOpts['provider'], true, bindingsDir);
   const { stdin, lastFrame, unmount } = render(React.createElement(TuiApp, { opts }));
+  const frame = () => strip(lastFrame() ?? '');
   try {
-    await tick();
+    assert.ok(await until(() => /Send a message/.test(frame())), 'the composer mounted');
+    assert.ok(await until(() => stdin.listenerCount('readable') > 0), 'Ink wired the input handler');
     stdin.write('/resume');
-    await tick();
+    assert.ok(await until(() => /▸ \/resume/.test(frame())), 'the resume command reached the composer');
     stdin.write('\r');
-    assert.ok(await until(() => /Refactoring auth/.test(strip(lastFrame() ?? ''))), 'the provider summary appears');
-    assert.match(strip(lastFrame() ?? ''), /While you were away/, 'under the recap header');
+    assert.ok(await until(() => providerCalls === 1), 'resume invoked the recap provider once');
+    assert.ok(await until(() => /Refactoring auth/.test(frame())), 'the provider summary appears');
+    assert.match(frame(), /While you were away/, 'under the recap header');
   } finally {
     unmount();
     rmSync(ws, { recursive: true, force: true });
@@ -97,14 +104,16 @@ test('resumeRecap OFF (default): /resume shows no recap', async () => {
   const provider: Provider = { name: 'x', estimateTokens: () => 1, async *send() { called = true; yield { type: 'done', stopReason: 'end_turn' }; } };
   const opts = baseOpts(ws, provider as unknown as TuiOpts['provider'], false, bindingsDir);
   const { stdin, lastFrame, unmount } = render(React.createElement(TuiApp, { opts }));
+  const frame = () => strip(lastFrame() ?? '');
   try {
-    await tick();
+    assert.ok(await until(() => /Send a message/.test(frame())), 'the composer mounted');
+    assert.ok(await until(() => stdin.listenerCount('readable') > 0), 'Ink wired the input handler');
     stdin.write('/resume');
-    await tick();
+    assert.ok(await until(() => /▸ \/resume/.test(frame())), 'the resume command reached the composer');
     stdin.write('\r');
-    assert.ok(await until(() => /Resumed/.test(strip(lastFrame() ?? ''))), 'the session resumed');
+    assert.ok(await until(() => /Resumed/.test(frame())), 'the session resumed');
     await tick(150);
-    assert.doesNotMatch(strip(lastFrame() ?? ''), /while you were away/i, 'no recap when disabled');
+    assert.doesNotMatch(frame(), /while you were away/i, 'no recap when disabled');
     assert.equal(called, false, 'the provider was not called for a recap');
   } finally {
     unmount();

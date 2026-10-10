@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { tmpdir } from 'node:os';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { join } from 'node:path';
 import type { Interface as ReadlineInterface } from 'node:readline/promises';
 import { ReplGate } from '../src/replGate.js';
 import { raiseAutonomy } from '../src/safety/permissions.js';
@@ -109,16 +111,28 @@ test('raiseAutonomy steps up and clamps at full (never downgrades)', () => {
 // ── piped multi-line stdin must process EVERY line (readline line-loss guard) ──
 test('piped multi-line stdin processes every line and exits cleanly', { timeout: 30_000 }, async () => {
   const entry = fileURLToPath(new URL('../src/index.ts', import.meta.url));
-  const child = spawn(process.execPath, ['--import', 'tsx/esm', entry, '--provider', 'mock'], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-  });
-  let out = '';
-  child.stdout.on('data', (d: Buffer) => (out += d.toString()));
-  child.stdin.write('alpha\nbravo\ncharlie\nexit\n');
-  child.stdin.end();
-  const code: number = await new Promise((res) => child.on('close', (c) => res(c ?? -1)));
-  assert.equal(code, 0, 'clean exit on EOF/exit');
-  for (const line of ['alpha', 'bravo', 'charlie']) {
-    assert.match(out, new RegExp(`received "${line}"`), `line "${line}" was processed (not dropped)`);
+  const tsxImport = import.meta.resolve('tsx/esm');
+  const home = mkdtempSync(join(tmpdir(), 'shadow-piped-'));
+  const workspace = join(home, 'workspace');
+  mkdirSync(workspace);
+  const env: NodeJS.ProcessEnv = { ...process.env, HOME: home, USERPROFILE: home };
+  delete env.SHADOW_HARNESSES;
+  try {
+    const child = spawn(process.execPath, ['--import', tsxImport, entry, '--provider', 'mock'], {
+      cwd: workspace,
+      env,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    let out = '';
+    child.stdout.on('data', (d: Buffer) => (out += d.toString()));
+    child.stdin.write('alpha\nbravo\ncharlie\nexit\n');
+    child.stdin.end();
+    const code: number = await new Promise((res) => child.on('close', (c) => res(c ?? -1)));
+    assert.equal(code, 0, 'clean exit on EOF/exit');
+    for (const line of ['alpha', 'bravo', 'charlie']) {
+      assert.match(out, new RegExp(`received "${line}"`), `line "${line}" was processed (not dropped)`);
+    }
+  } finally {
+    rmSync(home, { recursive: true, force: true });
   }
 });

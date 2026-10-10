@@ -1,8 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { existsSync, realpathSync } from 'node:fs';
-import { basename, delimiter, resolve, dirname } from 'node:path';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { basename, delimiter, resolve, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -43,15 +44,30 @@ test('headless --task --provider mock exits non-zero with provider_error when SH
     execFileSync(process.execPath, [npmCli(), 'run', 'build'], { cwd: ROOT, stdio: 'pipe' });
   }
   assert.ok(existsSync(CLI), 'npm run build must produce dist/index.js');
-  const r = spawnSync(process.execPath, [CLI, '--task', 'x', '--provider', 'mock'], {
-    cwd: ROOT,
-    env: { ...process.env, SHADOW_MOCK_ERROR: '1', SHADOW_PROVIDER: 'mock' },
-    encoding: 'utf8',
-  });
-  assert.notEqual(r.status, 0, 'headless error-class stop must exit non-zero');
-  const out = (r.stdout ?? '') + (r.stderr ?? '');
-  assert.match(out, /provider_error|stopped/i, `expected stop visibility, got: ${out}`);
-  assert.match(out, /mock_provider_error/i);
+  const home = mkdtempSync(join(tmpdir(), 'shadow-headless-'));
+  const workspace = join(home, 'workspace');
+  mkdirSync(workspace);
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    HOME: home,
+    USERPROFILE: home,
+    SHADOW_MOCK_ERROR: '1',
+    SHADOW_PROVIDER: 'mock',
+  };
+  delete env.SHADOW_HARNESSES;
+  try {
+    const r = spawnSync(process.execPath, [CLI, '--task', 'x', '--provider', 'mock'], {
+      cwd: workspace,
+      env,
+      encoding: 'utf8',
+    });
+    assert.notEqual(r.status, 0, 'headless error-class stop must exit non-zero');
+    const out = (r.stdout ?? '') + (r.stderr ?? '');
+    assert.match(out, /provider_error|stopped/i, `expected stop visibility, got: ${out}`);
+    assert.match(out, /mock_provider_error/i);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test('attachRenderer stop path: loop returns provider_error stopReason', async () => {
