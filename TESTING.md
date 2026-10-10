@@ -176,7 +176,7 @@ local page so browser correctness is not confused with internet availability.
 
 ## Known issues / caveats
 
-Shadow `10.0.4` source candidate (2026-10-09): 3,246 tests pass on Node 26.5.0,
+Shadow `10.0.4` source candidate (2026-10-09): 3,247 tests pass on Node 26.5.0,
 with full source/test typecheck, ESLint, production build and release gates clean. The Bun 1.4.2 macOS ARM64
 binary passes five onboarding checks (save/retry/resize, Ctrl+C, SIGTERM, subscription navigation,
 piped answers), three normal terminal exit checks, and four streaming/thinking interrupt checks.
