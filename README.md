@@ -69,7 +69,7 @@ See the [terminal contract](TERMINAL_RENDERERS.md), [release verification](docs/
 - **Renderer contract:** In v9, Ink was the supported default and `SHADOW_TUI=pi shadow` selected the experimental preview. Its daily commands and session transitions are covered by regression tests; `/vim`, `/table`, `/statusline`, custom commands and custom key mappings remain Ink-only. See [Terminal renderers](TERMINAL_RENDERERS.md).
 - Approval previews make terminal and invisible controls visible without altering the original tool inputs. Session resume, rewind, fork and exports preserve the documented context and ownership boundaries.
 
-See the [release notes](CHANGELOG.md) and [Work Center guide](USER_GUIDE.md#work-center).
+See the [release notes](CHANGELOG.md) and [Work Center guide](USER_GUIDE.md#everyday-use).
 
 ## Previous transition: v8.7.1
 
