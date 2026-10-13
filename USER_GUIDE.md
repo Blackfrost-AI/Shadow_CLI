@@ -68,7 +68,8 @@ and **Custom endpoint**. The full list scrolls and supports search; no provider 
 - **/**: search the provider or model list, including items outside the visible page.
 - **Space**: select several models; Enter continues to the default-model choice.
 - **Esc**: clear search first, then go back. During a check, cancel the check and return to setup.
-- **Ctrl+C**: quit. Configuration changes happen only at **Save and finish**.
+- **Ctrl+C**: quit. Configuration changes happen only at **Save and finish**; cancelling the optional
+  post-save capability check keeps that saved configuration.
 
 Keys remain masked when pasted or edited. Endpoint discovery has one six-second deadline, and the
 connection check has a thirty-second deadline (sixty seconds for subscriptions). Verification waits
@@ -81,6 +82,13 @@ provider keys. If you already use an encrypted vault, setup unlocks it before sa
 Keyless servers explicitly use no authentication instead of inheriting a cloud key. Local files are
 registered on confirmation and start on first use; run `shadow local test <name>` to test one.
 Optional MCP extensions can be configured after connecting a model through `/mcp`.
+
+After an API/server setup is saved, an optional agent capability check tests tool calls, file edits,
+error recovery and autonomous follow-through with disposable fixtures. **Finish setup** skips it by
+default. Running it can use up to two minutes and seven model turns; the screen explains token usage
+and possible provider charges before you choose. A failure or cancellation keeps your endpoint usable.
+Use `/model test` later and `/model history` for the active configuration's dated local result. See
+[model capability results](docs/FUNCTIONALITY.md#understand-model-capability-results) for what is assessed.
 
 The expanded catalog includes [Cerebras](https://inference-docs.cerebras.ai/resources/openai),
 [Fireworks](https://docs.fireworks.ai/tools-sdks/openai-compatibility),
@@ -614,6 +622,15 @@ or endpoint you selected just like other prompts and tool results.
 - **`/help`** describes the active renderer; **`/model`**, **`/effort`**, **`/theme`**, **`/context`**,
   **`/copy`**, **`/export`**, **`/resume`**, **`/fork`**, **`/compact`**, **`/harness`**, and **`/mcp`**
   are common. Use **`/learn`** and **`/skills`** to prepare and review evidence-backed local skills.
+- **Use the local feature browsers in Snowfall**: `/checks` saves and runs reusable project checks;
+  `/workflows` previews local procedures before execution; `/findings` links security claims to
+  evidence and current check results. `/context` explains the prepared request and manages pinned
+  or excluded files. See [local workflows, sessions, review and evidence](docs/FUNCTIONALITY.md) for
+  commands, file formats and the limits of each feature.
+- **Review working changes with `/review working` or `/diff`**: preview and confirm staging,
+  unstaging or restoring files and text hunks. Restore saves a local backup first. `/review findings`
+  connects structured reviewer findings to a scoped fix and a project check. Historical commit/base
+  comparisons stay read-only; see the [review workflow](docs/FUNCTIONALITY.md#review-fix-and-check-changes).
 - **Branch a session with `/fork`**: copies the transcript so far into a new session id and switches
   to it, leaving the original untouched — try a risky refactor on the fork, keep exploring on the
   original. New turns and `/rewind` live in the fork, and pre-fork file checkpoints come with it.
@@ -658,6 +675,11 @@ or endpoint you selected just like other prompts and tool results.
   name yourself. Names survive restarts, resumes and forks. `/new` (or `/clear`) starts a separate
   conversation so the previous named session stays available. Older logs get a name from their
   first readable prompt when available. Closing Shadow restores the terminal's previous title.
+  In Snowfall, `/sessions` opens the searchable local library with tags and pins. Use
+  `/sessions add <path>` to include another project and `/sessions search <text>` to search recorded
+  conversations. It never crawls other projects automatically. See the
+  [session library](docs/FUNCTIONALITY.md#find-sessions-across-selected-projects) for search coverage and
+  cross-project resume behavior.
   Sessions created before harness-bound snapshots require a one-time explicit migration because an
   absent receipt cannot distinguish an old log from a copied or downgraded current log. Inspect the
   exact file, then run `shadow resume <id-or-path> --trust-legacy`. Shadow requires an explicit
@@ -698,6 +720,10 @@ or endpoint you selected just like other prompts and tool results.
   ` ```chart ` block (`label: value` lines, `type: bar|line|spark`) renders as a real unicode chart.
 - **Ctrl-C twice** quits; **Esc** interrupts the current turn.
 - Pipe a one-shot task non-interactively: `shadow --task "summarize README.md"` (scriptable, plain output).
+  Add `--output-format json` for one final object, or `--json` for versioned JSONL events.
+  `--output-schema result.schema.json` validates the final answer without replaying tools.
+  `--ephemeral` skips conversation persistence; files, checkpoints and other tool effects remain.
+  See [automation](docs/AUTOMATION.md) for exit codes, cancellation and the exact privacy boundary.
 
 ---
 
@@ -785,7 +811,8 @@ Key behaviors worth knowing:
   **Sub-agent definitions are inverted:** `~/.shadow/agents` < plugins `<workspace>/.shadow/agents`
   — later wins, so a cloned repo's same-named definition overrides yours (read `.shadow/` before
   working in an unfamiliar clone; THREAT_MODEL §4.14). **Skills** scan workspace roots first,
-  first-name-wins — the repo outranks plugins (there is no user-global skills dir). A disabled
+  first-name-wins — global skills under `~/.shadow/skills` are also supported. Use `/skills` to
+  inspect the selected source and any conflicts. A disabled
   plugin contributes nothing.
 - **Git installs are hardened:** scheme allowlist only (`https://`, `ssh://`, `file://`,
   `git@host:path`), scrubbed environment, shallow clone into a private temp dir, and the exact
@@ -961,13 +988,13 @@ permission before running tools — all inside the editor.
 - **Delegation.** When Shadow spins up sub-agents, their events are tagged `[subagent <id>]` so you
   can see delegated work in the stream.
 
-### v0 limitations (by design)
+### Editor capabilities and current limits
 
 - **Text-only prompts.** Images and other non-text blocks aren't accepted yet — the editor sends
   text, Shadow replies with text.
-- **No session restore, mode, or model switching.** `session/load`, `session/set_mode`, and
-  `session/set_model` return a clear "not supported" error rather than silently doing nothing.
-  Each new editor session starts fresh.
+- **Session restore and mode selection are supported.** `session/load` restores persisted
+  sessions and `session/set_mode` changes supported modes. Model options are advertised;
+  `session/set_model` is supported before the first prompt in a session.
 - **Shell output is delivered when the command finishes,** not streamed live. Long-running commands
   report their result in the final tool-call update.
 - **Unsaved editor buffers.** Shadow reads files from disk. If you have unsaved changes in an editor

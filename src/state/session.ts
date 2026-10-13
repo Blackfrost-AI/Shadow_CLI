@@ -13,6 +13,7 @@ import {
   writeSync,
 } from 'node:fs';
 import { basename, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { redact } from '../util/redact.js';
 import type { Context } from '../agent/context.js';
 import { serializeContext } from './snapshot.js';
@@ -382,6 +383,7 @@ export class SessionLog {
   private currentTitle?: string;
 
   get title(): string {
+    if (!this.persistent) return this.currentTitle ?? '';
     return this.currentTitle ??= SessionLog.titleFor(this.path);
   }
 
@@ -436,7 +438,12 @@ export class SessionLog {
     }
   >();
 
-  private constructor(public readonly path: string) {}
+  private constructor(public readonly path: string, public readonly persistent = true) {}
+
+  /** In-memory identity only: does not create a directory, journal, or resumable snapshot. */
+  static ephemeral(workspaceRoot: string): SessionLog {
+    return new SessionLog(join(workspaceRoot, SESSIONS_SUBDIR, `ephemeral-${randomUUID()}.jsonl`), false);
+  }
 
   private mainContext?: Context;
   private readSessionState?: () => SessionStateSnapshot;
@@ -523,6 +530,13 @@ export class SessionLog {
    *  Returns the byte offset where the line begins (undefined on a failed write), so snapshot
    *  bookkeeping can chain `baseOffset`s without re-stating the file. */
   record(event: Record<string, unknown>): number | undefined {
+    if (!this.persistent) {
+      if (!this.currentTitle && (event.kind === 'user' || event.type === 'user')) {
+        const prompt = event.task ?? event.text;
+        if (typeof prompt === 'string') this.currentTitle = deriveSessionTitle(prompt);
+      }
+      return 0;
+    }
     try {
       const isUser = event.kind === 'user' || (event.kind === 'event' && event.type === 'user');
       if (isUser && !this.title) {
@@ -610,6 +624,7 @@ export class SessionLog {
    * (FULL_EVERY_N_SNAPSHOTS / FULL_AFTER_DELTA_BYTES) bound the reconstruction walk.
    */
   recordSnapshot(ctx: Context, turn?: number): void {
+    if (!this.persistent) return;
     const data = serializeContext(ctx);
     const child = this.mainContext !== undefined && ctx !== this.mainContext;
     const kind = child ? 'subagent_context_snapshot' : 'context_snapshot';

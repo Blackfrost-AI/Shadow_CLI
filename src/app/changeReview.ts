@@ -5,8 +5,10 @@ import { approvalText } from '../util/approvalText.js';
 import { panelRows } from './panel.js';
 import { style } from './ansi.js';
 import { C } from '../tui/theme.js';
+import type { ReviewAction } from '../state/reviewActions.js';
 
-/** A read-only file/hunk browser; the explicit review action supplies the selected scope. */
+/** Read-only by default. Optional mutation callbacks receive exact file/hunk scope; the host
+ * must show the backend preview and obtain explicit confirmation before applying it. */
 export class ChangeReview implements Component {
   private cursor = 0;
   private offset = 0;
@@ -14,6 +16,7 @@ export class ChangeReview implements Component {
   constructor(private options: {
     changes: ChangeSet; diff: (file: ChangedFile) => string; rows: () => number;
     repaint: () => void; close: () => void; review?: () => void;
+    action?: (file: ChangedFile, action: ReviewAction, hunkIndex?: number) => void;
   }) {}
   invalidate(): void {}
   render(width: number): string[] {
@@ -24,9 +27,11 @@ export class ChangeReview implements Component {
       const safe = approvalText(line);
       return style.fg(line.startsWith('+') ? C.green : line.startsWith('-') ? C.red : C.dim, safe);
     }) : changes.summary.slice(start, start + height).map((line, i) => i + start === this.cursor ? style.fg(C.accent, `› ${approvalText(line)}`) : `  ${approvalText(line)}`);
-    return panelRows(changes.title, lines, width, this.detail
-      ? '↑/↓ scroll · n/p hunk · Esc files'
-      : `↑/↓ files · Enter diff${this.options.review ? ' · r review' : ''} · Esc close`);
+    const selected = this.selectedHunk();
+    const title = this.detail && selected !== undefined ? `${changes.title} · hunk ${selected + 1}` : changes.title;
+    return panelRows(title, lines, width, this.detail
+      ? `↑/↓ scroll · n/p hunk${this.options.action ? ' · s/u/d hunk · S/U/D file' : ''} · Esc files`
+      : `↑/↓ files · Enter diff${this.options.review ? ' · r review' : ''}${this.options.action ? ' · s stage · u unstage · d restore' : ''} · Esc close`);
   }
   handleInput(data: string): void {
     if (isKeyRelease(data)) return;
@@ -36,6 +41,13 @@ export class ChangeReview implements Component {
       return;
     }
     if (!this.detail && data === 'r' && this.options.review) { this.options.review(); return; }
+    if (this.options.action && /^[sudSUD]$/.test(data)) {
+      const file = this.options.changes.files[this.cursor];
+      const action = data.toLowerCase() === 's' ? 'stage' : data.toLowerCase() === 'u' ? 'unstage' : 'restore';
+      const hunk = this.detail && data === data.toLowerCase() ? this.selectedHunk() : undefined;
+      if (file && (!this.detail || data !== data.toLowerCase() || hunk !== undefined)) this.options.action(file, action, hunk);
+      return;
+    }
     if (!this.detail && matchesKey(data, 'enter')) {
       const file = this.options.changes.files[this.cursor];
       if (file) {
@@ -51,5 +63,13 @@ export class ChangeReview implements Component {
     } else if (matchesKey(data, 'up')) this.cursor = Math.max(0, this.cursor - 1);
     else if (matchesKey(data, 'down')) this.cursor = Math.min(Math.max(0, this.options.changes.files.length - 1), this.cursor + 1);
     this.options.repaint();
+  }
+  private selectedHunk(): number | undefined {
+    if (!this.detail) return undefined;
+    const starts = this.detail.flatMap((line, index) => line.startsWith('@@') ? [index] : []);
+    if (!starts.length) return undefined;
+    let selected = 0;
+    for (let i = 0; i < starts.length; i++) if (starts[i]! <= this.offset) selected = i;
+    return selected;
   }
 }

@@ -1,5 +1,5 @@
 import type { Message } from '../provider/provider.js';
-import { Context, type ContextOptions } from '../agent/context.js';
+import { Context, type ContextOptions, type ContextSource } from '../agent/context.js';
 import type { SessionStateSnapshot } from './sessionState.js';
 
 /** Payload stored in session JSONL `context_snapshot` records. */
@@ -8,6 +8,9 @@ export interface ContextSnapshotData {
   messages: Message[];
   pinnedPrefix: number;
   lastActualTokens: number;
+  lastReportedTokens?: number;
+  /** Explicit session pins/exclusions; request capture itself is deliberately not persisted. */
+  sources?: ContextSource[];
   /** Captured bg sub-agent launches for recovery (taskId + prompt snapshot). */
   subAgentTasks?: Array<{ taskId: string; prompt: string; subagentType?: string; ts?: string }>;
 }

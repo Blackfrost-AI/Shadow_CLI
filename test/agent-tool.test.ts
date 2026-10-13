@@ -819,7 +819,7 @@ test('a controlled budget stop stays a clean tool result while work remains inco
   } finally { h.close(); }
 });
 
-test('diagnostic listeners are released after sync success, failure, throw, and queued cancellation', async (t) => {
+test('subagent listeners are released after sync success, failure, throw, and queued cancellation', async (t) => {
   const originalOn = SubagentBus.prototype.on;
   const active = new Set<LoopListener>();
   t.mock.method(SubagentBus.prototype, 'on', function (this: SubagentBus, listener: LoopListener) {
@@ -838,18 +838,25 @@ test('diagnostic listeners are released after sync success, failure, throw, and 
   }
   let release!: () => void;
   const barrier = new Promise<void>((resolve) => { release = resolve; });
+  let started!: () => void;
+  const firstStarted = new Promise<void>((resolve) => { started = resolve; });
   const h = outcomeHarness({
     name: 'mock', estimateTokens: () => 1,
-    async *send() { await barrier; yield { type: 'text', delta: 'Done.' }; yield { type: 'done', stopReason: 'end_turn' }; },
+    async *send() { started(); await barrier; yield { type: 'text', delta: 'Done.' }; yield { type: 'done', stopReason: 'end_turn' }; },
   }, 10, 1);
   const queued = new AbortController();
   const first = h.tool.run({ prompt: 'first' }, h.ctx);
   try {
+    await firstStarted;
+    // Capture the running invocation's actual observers (diagnostics, completion evidence,
+    // etc.). Their count is an implementation detail; ownership and final cleanup are not.
+    const firstListeners = new Set(active);
+    assert.ok(firstListeners.size > 0, 'the running invocation has registered observers');
     const second = h.tool.run({ prompt: 'second' }, { ...h.ctx, signal: queued.signal });
     queued.abort();
     const result = await second;
     assert.equal(result.ok, false);
-    assert.equal(active.size, 1, 'only the running first agent still listens');
+    assert.deepEqual(active, firstListeners, 'only the running first agent still listens');
     release();
     await first;
     assert.equal(active.size, 0);

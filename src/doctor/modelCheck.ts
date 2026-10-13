@@ -45,6 +45,8 @@ export interface ModelCheckResult {
 }
 
 export interface ModelCheckOptions {
+  /** External cancellation applies to all probes; never starts another request after abort. */
+  signal?: AbortSignal;
   model: string;
   providerName?: string; // for display only
   isLocal?: boolean; // local .gguf endpoint (adds ctx/gpu-layers hints to the recommendation)
@@ -110,8 +112,12 @@ async function collectTurn(
   provider: Provider,
   req: Omit<CompletionRequest, 'signal'>,
   timeoutMs: number,
+  parent?: AbortSignal,
 ): Promise<TurnOutcome> {
+  parent?.throwIfAborted();
   const ac = new AbortController();
+  const cancel = () => ac.abort(parent?.reason);
+  parent?.addEventListener('abort', cancel, { once: true });
   const timer = setTimeout(() => ac.abort(), timeoutMs);
   const out: TurnOutcome = { text: '', toolCalls: [], timedOut: false };
   try {
@@ -130,7 +136,9 @@ async function collectTurn(
     else out.error = { code: 'turn_failed', message: (e as Error).message };
   } finally {
     clearTimeout(timer);
+    parent?.removeEventListener('abort', cancel);
   }
+  parent?.throwIfAborted();
   // The abort may never surface as a THROW: streamWithRetry swallows aborts and returns cleanly
   // (see its `if (a.signal?.aborted) return` paths), so the catch above never ran and `timedOut`
   // stayed false. Every one of the five `timedOut ?` branches downstream was therefore dead code,
@@ -155,10 +163,10 @@ function schemaFor(all: ToolSchema[], name: string): ToolSchema {
   return s;
 }
 
-function ctxFor(root: string): ToolContext {
+function ctxFor(root: string, signal?: AbortSignal): ToolContext {
   return {
     workspaceRoot: root,
-    signal: new AbortController().signal,
+    signal: signal ?? new AbortController().signal,
     log: () => {},
     dryRun: false,
   };
@@ -169,14 +177,16 @@ async function runCall(
   registry: ToolRegistry,
   call: ToolCall,
   root: string,
+  signal?: AbortSignal,
 ): Promise<{ ok: boolean; summary: string }> {
+  signal?.throwIfAborted();
   const tool = registry.get(call.name);
   if (!tool) return { ok: false, summary: `unknown tool "${call.name}"` };
   const parsed = tool.inputSchema.safeParse(call.input);
   if (!parsed.success) {
     return { ok: false, summary: `invalid arguments for ${call.name}: ${parsed.error.issues.map((i) => i.message).join('; ')}` };
   }
-  const res = await tool.run(parsed.data, ctxFor(root));
+  const res = await tool.run(parsed.data, ctxFor(root, signal));
   return { ok: res.ok, summary: res.summary };
 }
 
@@ -203,6 +213,7 @@ export async function runModelCheck(
   provider: Provider,
   opts: ModelCheckOptions,
 ): Promise<ModelCheckResult> {
+  opts.signal?.throwIfAborted();
   const t0 = Date.now();
   const timeout = opts.perTurnTimeoutMs ?? DEFAULT_PER_TURN_TIMEOUT_MS;
   const maxTokens = opts.maxOutputTokens ?? DEFAULT_MAX_OUTPUT_TOKENS;
@@ -230,6 +241,7 @@ export async function runModelCheck(
         temperature: opts.temperature,
       },
       timeout,
+      opts.signal,
     );
     const pingCall = t1.toolCalls.find((c) => c.name === 'ping' && isValidCall(c));
     const anyValid1 = t1.toolCalls.some(isValidCall);
@@ -278,11 +290,12 @@ export async function runModelCheck(
         temperature: opts.temperature,
       },
       timeout,
+      opts.signal,
     );
     const writeCall = t3.toolCalls.find((c) => c.name === 'write_file' && isValidCall(c));
     if (t3.toolCalls.some(isValidCall)) emittedAnyValidCall = true;
     if (writeCall) {
-      await runCall(registry, writeCall, tmp);
+      await runCall(registry, writeCall, tmp, opts.signal);
       const target = join(tmp, 'hello.txt');
       const okFile = existsSync(target) && readFileSync(target, 'utf8').includes('SHADOW_OK');
       probes.push({
@@ -310,6 +323,7 @@ export async function runModelCheck(
         temperature: opts.temperature,
       },
       timeout,
+      opts.signal,
     );
     const readCall = t4a.toolCalls.find((c) => c.name === 'read_file' && isValidCall(c));
     if (t4a.toolCalls.some(isValidCall)) emittedAnyValidCall = true;
@@ -317,7 +331,7 @@ export async function runModelCheck(
       probes.push({ id: 'error_recovery', label: 'Error recovery', status: 'fail', detail: t4a.timedOut ? `timed out after ${Math.round(timeout / 1000)}s` : 'no initial read_file call to recover from' });
     } else {
       // Execute the (failing) read against an empty workspace → error result, then hand it back.
-      const failed = await runCall(registry, readCall, tmp);
+      const failed = await runCall(registry, readCall, tmp, opts.signal);
       const failedPath = (readCall.input as { path?: unknown }).path;
       const t4b = await collectTurn(
         provider,
@@ -335,6 +349,7 @@ export async function runModelCheck(
           temperature: opts.temperature,
         },
         timeout,
+        opts.signal,
       );
       if (t4b.toolCalls.some(isValidCall)) emittedAnyValidCall = true;
       const nextCall = t4b.toolCalls.find(isValidCall);
@@ -369,6 +384,7 @@ export async function runModelCheck(
           temperature: opts.temperature,
         },
         timeout,
+        opts.signal,
       );
       if (t.timedOut) {
         autoTimedOut = true;
@@ -381,7 +397,7 @@ export async function runModelCheck(
       convo.push({ role: 'assistant', content: calls.map((c) => ({ type: 'tool_use', id: c.id, name: c.name, input: c.input })) });
       const resultBlocks = [];
       for (const c of calls) {
-        const r = await runCall(registry, c, tmp);
+        const r = await runCall(registry, c, tmp, opts.signal);
         resultBlocks.push({ type: 'tool_result' as const, toolCallId: c.id, ok: r.ok, content: r.summary });
       }
       convo.push({ role: 'user', content: resultBlocks });

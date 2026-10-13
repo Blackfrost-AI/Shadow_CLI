@@ -50,6 +50,9 @@ import { DEFAULT_EFFORT, effortDirective } from './effort.js';
 import { resolve as resolvePath, join, dirname, basename } from 'node:path';
 import { realpathSync } from 'node:fs';
 import { GLOBAL_DIR } from '../state/globalStore.js';
+import { CompletionGuard, completionAwaitsUser, completionPrompt, type CompletionPolicy } from './completion.js';
+import type { ProjectCheckStore, CheckSelection } from '../checks/store.js';
+import { projectChecksInputSchema } from '../tools/projectChecks.js';
 
 /**
  * Path equality for the config gate that survives respelling: a case-insensitive filesystem
@@ -191,6 +194,10 @@ export interface LoopDeps {
   readTracker?: ReadTracker;
   /** Goal or other durable UI state held outside Context message history. */
   continuityState?: string;
+  /** Session-local check selection/evidence; execution still passes the run_shell guards. */
+  checks?: ProjectCheckStore;
+  /** Bounded evidence-based correction, sharing this run's original budget (at most two). */
+  completion?: CompletionPolicy;
 }
 
 export interface LoopResult {
@@ -277,6 +284,10 @@ export class AgentLoop {
   private readonly guard: BudgetGuardState | null;
   /** Last cumulative session cost seen, for feeding the guard WINDOW cost deltas. */
   private lastGuardCostUsd = 0;
+  private completionGuard?: CompletionGuard;
+  private stopHooksEvaluated = false;
+  /** Exact host-created calls only: provider ids are not guaranteed unique or trustworthy. */
+  private readonly projectCheckShellCalls = new WeakSet<ToolCall>();
 
   constructor(
     private readonly deps: LoopDeps,
@@ -365,7 +376,7 @@ export class AgentLoop {
       if (result) return result;
       const block = outcome.block;
       const summary = 'content' in block && typeof block.content === 'string' ? block.content : 'Action did not execute.';
-      return fail(call.name, risk, 0, this.deps.signal.aborted ? 'cancelled' : 'not_executed', summary);
+      return fail(call.name, risk, 0, this.deps.signal.aborted ? 'cancelled' : 'not_executed', summary, !outcome.isFatal);
     } finally { unsubscribe(); }
   }
 
@@ -464,6 +475,16 @@ export class AgentLoop {
   }
 
   async run(): Promise<LoopResult> {
+    this.completionGuard = new CompletionGuard(this.deps.completion);
+    this.stopHooksEvaluated = false;
+    const unsubscribe = this.deps.bus.on((event) => {
+      this.completionGuard?.observe(event);
+    });
+    try { return await this.runWithCompletion(); }
+    finally { unsubscribe(); this.completionGuard = undefined; }
+  }
+
+  private async runWithCompletion(): Promise<LoopResult> {
     const { bus, budget, context } = this.deps;
     let finalAnswer = '';
     let emptyResponseAttempts = 0;
@@ -559,7 +580,7 @@ export class AgentLoop {
         // Defense-in-depth: an already-corrupt history (e.g. a snapshot taken mid-
         // interrupt by an older build) can end on an assistant tool_use with no
         // matching tool_result — which 400s every request. Heal it before sending.
-        messages: this.healDanglingToolUses(context.messages()),
+        messages: this.healDanglingToolUses(context.requestMessages()),
         tools: this.deps.registry.toSchemas(),
         maxOutputTokens: this.deps.maxOutputTokens,
         temperature: this.deps.temperature,
@@ -829,6 +850,7 @@ export class AgentLoop {
         // committed above — re-request to let the model continue rather than stop.
         // budget.check (iterations/tokens/wall-clock) bounds any runaway pausing.
         if (turn.stopReason === 'pause_turn') continue;
+        if ((turn.stopReason ?? 'end_turn') === 'end_turn' && this.requestCompletionCorrection(finalAnswer)) continue;
         return this.stop(turn.stopReason ?? 'end_turn', finalAnswer);
       }
 
@@ -1085,7 +1107,7 @@ export class AgentLoop {
         const turn = await this.runProviderTurn(activeProvider, {
           ...req,
           model,
-          messages: this.healDanglingToolUses(this.deps.context.messages()),
+          messages: this.healDanglingToolUses(this.deps.context.requestMessages()),
         });
         // Do not turn a user steer into a fallback request. Some adapters surface a final error
         // frame while their aborted stream unwinds; that error belongs to the obsolete turn.
@@ -1239,7 +1261,7 @@ export class AgentLoop {
     return this.runProviderTurn(activeProvider, {
       ...req,
       model,
-      messages: this.healDanglingToolUses(this.deps.context.messages()),
+      messages: this.healDanglingToolUses(this.deps.context.requestMessages()),
     });
   }
 
@@ -1281,6 +1303,7 @@ export class AgentLoop {
       | undefined;
 
     try {
+      this.deps.context.captureRequestMetadata({ system: req.system, tools: req.tools, messages: req.messages, model: req.model, provider: provider.name });
       for await (const ev of provider.send(req)) {
         if (req.signal?.aborted) break; // hard interrupt or user steering — stop consuming now
         switch (ev.type) {
@@ -1465,13 +1488,18 @@ export class AgentLoop {
     // Count only CONSECUTIVE identical calls — any different tool call in between
     // resets the counter, so a legitimate edit→test→edit cycle is never tripped.
     const sig = `${call.name}:${safeJson(call.input) ?? ''}`;
-    if (sig === this.lastCallSig) {
+    const delegatedCheck = call.name === 'project_checks' && this.deps.checks && (call.input as { action?: string })?.action === 'run';
+    // A check wrapper must not reset the consecutive-command guard between identical shell
+    // executions. The inner run_shell owns this count and all execution admission checks.
+    if (delegatedCheck) {
+      // No guard mutation for the data wrapper.
+    } else if (sig === this.lastCallSig) {
       this.consecutiveRepeats += 1;
     } else {
       this.lastCallSig = sig;
       this.consecutiveRepeats = 1;
     }
-    if (this.consecutiveRepeats >= LOOP_GUARD_LIMIT) {
+    if (!delegatedCheck && this.consecutiveRepeats >= LOOP_GUARD_LIMIT) {
       const fatal = this.consecutiveRepeats >= LOOP_GUARD_FATAL_LIMIT;
       bus.emit({
         type: 'tool_denied',
@@ -1785,6 +1813,13 @@ export class AgentLoop {
     // Final safe boundary. Steering never cancels a tool once `tool_start` has been emitted, but
     // anything still in classification/approval/validation must be skipped and paired cleanly.
     if (this.preExecutionCancelled()) return this.cancelledCall(call);
+    // Invalidate at admission as well as completion: an exec can change files before failing,
+    // and another agent may finish a check while this call is running. Keeping this on dispatch
+    // also covers native actions and background sub-agents after the lead turn has stopped.
+    // Managed check shells are exact host-created objects, so running check B preserves A.
+    const invalidatesChecks = !this.deps.dryRun && (tool.risk === 'write' || tool.risk === 'exec')
+      && !this.projectCheckShellCalls.has(call);
+    if (invalidatesChecks) this.deps.checks?.invalidate();
     bus.emit({ type: 'tool_start', call, risk: tool.risk });
     const sessionLog = this.deps.sessionLog;
     const ctx: ToolContext = {
@@ -1835,7 +1870,9 @@ export class AgentLoop {
       //
       // The tool keeps running in the background — we cannot kill code we do not control — so its
       // promise is given a no-op catch to avoid an unhandled rejection after we have moved on.
-      result = await raceAbort(tool.run(parsed.data, ctx), ctx.signal, call.name);
+      result = call.name === 'project_checks' && this.deps.checks && projectChecksInputSchema.safeParse(parsed.data).success && (parsed.data as { action: string }).action === 'run'
+        ? await this.executeProjectCheck(call)
+        : await raceAbort(tool.run(parsed.data, ctx), ctx.signal, call.name);
     } catch (err) {
       result = {
         ok: false,
@@ -1887,6 +1924,7 @@ export class AgentLoop {
     if (lspNote) result.summary += lspNote;
     if (hookNote) result.summary += `\n\nAdditional context (user hook):\n${hookNote}`;
 
+    if (invalidatesChecks) this.deps.checks?.invalidate();
     this.emitToolEnd(call, result);
 
     const isFatal = !result.ok && result.error?.recoverable === false;
@@ -2184,6 +2222,12 @@ export class AgentLoop {
    * positive only costs serial execution, a false negative wedges the turn.
    */
   private mayNeedPermissionPrompt(call: ToolCall): boolean {
+    if (call.name === 'project_checks' && (call.input as { action?: string })?.action === 'run') {
+      // Multiple read-only wrappers can contain commands that each need approval. Serialize
+      // those turns even though the outer discovery tool itself has read risk. Both the
+      // wrapper and the nested shell may be covered by separate user permission rules.
+      return true;
+    }
     const normalized = normalizeForeignTool({ name: call.name, input: call.input });
     const tool = this.deps.registry.get(normalized.name);
     if (!tool) return false;
@@ -2224,13 +2268,82 @@ export class AgentLoop {
     this.deps.bus.emit({ type: 'stop', reason, finalAnswer });
 
     // Hook: stop (fires for main and sub-agents)
-    if (this.deps.hooks?.stop?.length) {
+    if (!this.stopHooksEvaluated && this.deps.hooks?.stop?.length) {
       runHookPhase('stop', this.deps.hooks.stop, {
         workspaceRoot: this.deps.workspaceRoot,
         extra: { reason, finalAnswer: finalAnswer?.slice(0, 200) },
       });
     }
     return { stopReason: reason, finalAnswer };
+  }
+
+  /** A profile never supplies an executor or a permission grant. Dispatch the exact resolved
+   * command through the ordinary shell path, including hidden-tool capability subtraction,
+   * plan/permission rules, hooks, denylist, sandbox and interrupt handling. */
+  private async executeProjectCheck(call: ToolCall): Promise<ToolResult> {
+    const parsed = projectChecksInputSchema.parse(call.input);
+    const store = this.deps.checks!;
+    let profile;
+    try { profile = store.resolve(parsed.id!); }
+    catch (error) { return fail('project_checks', 'exec', 0, 'invalid_profiles', (error as Error).message); }
+    if (this.deps.budget.checkSpending(this.now())) return fail('project_checks', 'exec', 0, 'budget_exhausted', 'Check budget exhausted before execution.');
+    const innerId = `${call.id}:check`;
+    this.completionGuard?.markCheckCall(innerId);
+    // A successful explicit run selects its check for this task without erasing others.
+    store.select([...new Set([...store.snapshot().filter((item) => item.selected).map((item) => item.profile.id), profile.id])]);
+    const innerCall: ToolCall = { id: innerId, name: 'run_shell', input: store.shellInput(profile) };
+    this.projectCheckShellCalls.add(innerCall);
+    let result: ToolResult;
+    try { result = await this.runToolCall(innerCall); }
+    finally { this.projectCheckShellCalls.delete(innerCall); }
+    try {
+      const record = store.record(profile, result, this.deps.dryRun);
+      return { ...result, summary: `${profile.title}: ${record.status}. ${result.summary}`, data: { check: record }, meta: { ...result.meta, tool: 'project_checks', risk: 'exec' } };
+    } catch (error) {
+      // Do not repeat a command because recording its result failed. Preserve its outcome and
+      // make the evidence persistence failure visible in the same paired tool result.
+      return { ...result, summary: `${result.summary}\nCheck evidence could not be saved: ${(error as Error).message}. Do not rerun solely to save evidence.`, meta: { ...result.meta, tool: 'project_checks', risk: 'exec' } };
+    }
+  }
+
+  private requestCompletionCorrection(finalAnswer: string): boolean {
+    const guard = this.completionGuard;
+    if (!guard || guard.maxRetries === 0 || guard.blocked || this.deps.planMode?.active || completionAwaitsUser(finalAnswer)
+      || this.preExecutionCancelled() || this.deps.budget.check(this.now())) return false;
+    let checks: CheckSelection[] = [];
+    try { checks = this.deps.checks?.snapshot() ?? []; }
+    catch (error) {
+      this.deps.bus.emit({ type: 'finding', severity: 'warn', title: 'Completion unverified', body: `Cannot inspect project checks: ${(error as Error).message}` });
+      return false;
+    }
+    const reasons = guard.reasons({ todos: this.deps.todoList?.snapshot(), mission: this.deps.mission?.snapshot(), checks,
+      canUpdateTodos: Boolean(this.deps.registry.get('todo_write')), canUpdateMission: Boolean(this.deps.registry.get('mission_update')),
+      canRunChecks: Boolean(this.deps.registry.get('project_checks') && this.deps.registry.get('run_shell')) });
+    if (this.deps.hooks?.stop?.length) {
+      this.stopHooksEvaluated = true;
+      const hook = runHookPhase('stop', this.deps.hooks.stop, {
+        workspaceRoot: this.deps.workspaceRoot,
+        extra: { reason: 'end_turn', finalAnswer: finalAnswer.slice(0, 200), continuationAttempt: guard.attempts, maxContinuationAttempts: guard.maxRetries },
+      });
+      if (!hook.ok && !hook.veto) {
+        this.deps.bus.emit({ type: 'finding', severity: 'warn', title: 'Completion hook failed', body: hook.message ?? 'The stop hook failed; no corrective model request was made.' });
+        return false;
+      }
+      if (hook.veto) reasons.push(`Stop hook requested correction: ${hook.message ?? 'Completion was blocked.'}`);
+    }
+    if (reasons.length === 0) return false;
+    if (guard.attempts >= guard.maxRetries) {
+      this.deps.bus.emit({ type: 'finding', severity: 'warn', title: 'Completion remains unverified', body: `Stopped after ${guard.maxRetries} corrective turns. ${reasons.join(' ')}` });
+      return false;
+    }
+    // Hook execution can consume time. Do not request another turn once a shared ceiling ends.
+    if (this.preExecutionCancelled() || this.deps.budget.check(this.now())) return false;
+    guard.attempts += 1;
+    this.stopHooksEvaluated = false;
+    this.deps.bus.emit({ type: 'retry', attempt: guard.attempts, delayMs: 0, reason: `completion check: ${reasons.join(' ')}` });
+    this.deps.sessionLog?.record({ kind: 'completion_correction', attempt: guard.attempts, reasons });
+    this.deps.context.append({ role: 'user', content: [{ type: 'text', text: completionPrompt(reasons, guard.attempts, guard.maxRetries) }] });
+    return true;
   }
 
   /**

@@ -293,6 +293,8 @@ export interface TuiOpts {
   activeBaseUrl?: string;
   /** Runtime classification for `provider`; needed for explicitly self-hosted public endpoints. */
   activeSelfHosted?: boolean;
+  /** Credential-free identity captured from the options that created the active provider. */
+  activeCapabilityTarget?: Readonly<import('./doctor/capabilityRecords.js').CapabilityTarget>;
   registry: ToolRegistry;
   bus: EventBus;
   context: Context;

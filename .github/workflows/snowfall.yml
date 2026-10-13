@@ -41,3 +41,6 @@ jobs:
       - name: Interrupt stalled provider streams (POSIX)
         if: runner.os != 'Windows'
         run: python3 scripts/smoke-interrupt-pty.py node dist/index.js
+      - name: Local functionality menus and evidence lifecycle (POSIX)
+        if: runner.os != 'Windows'
+        run: python3 scripts/smoke-functionality-pty.py node dist/index.js

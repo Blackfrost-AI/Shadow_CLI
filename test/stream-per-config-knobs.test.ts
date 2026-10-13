@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import ts from 'typescript';
 
 import { isolateHome } from './helpers/isolateHome.js';
 import { resolveFakeHosts } from './helpers/fakeHostEgress.js';
@@ -270,15 +271,33 @@ test('every createProvider-from-entry site spreads entryStreamContract (F10-01 d
   );
   for (const [file, sites] of [
     ['../src/agent/bootstrap.ts', 2],
+    ['../src/app/modelSwitch.ts', 1], // Snowfall /model switch and capability test builds
     ['../src/tui.tsx', 1], // the /model-switch site stayed here (extracted switch helper)
     ['../src/tui/slash.ts', 1], // P3-02: the /model-test PROBE site moved here with runSlash
     ['../src/index.ts', 1],
   ] as const) {
     const src = readFileSync(new URL(file, import.meta.url), 'utf8');
-    const calls = (src.match(/createProvider\(\{/g) ?? []).length;
-    const spreads = (src.match(/\.\.\.entryStreamContract\(/g) ?? []).length;
-    assert.equal(calls, sites, `${file}: expected ${sites} createProvider site(s) — new site? spread entryStreamContract there and bump this pin`);
-    assert.equal(spreads, calls, `${file}: every createProvider call must spread entryStreamContract`);
+    const tree = ts.createSourceFile(file, src, ts.ScriptTarget.Latest, true);
+    const calls: ts.CallExpression[] = [];
+    const declarations = new Map<string, ts.Expression>();
+    const visit = (node: ts.Node): void => {
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+        assert.ok(!declarations.has(node.name.text) || !['providerOptions', 'nextOptions'].includes(node.name.text), `${file}: provider option names must resolve unambiguously`);
+        declarations.set(node.name.text, node.initializer);
+      }
+      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'createProvider') calls.push(node);
+      ts.forEachChild(node, visit);
+    };
+    visit(tree);
+    assert.equal(calls.length, sites, `${file}: expected ${sites} createProvider site(s) — new site? spread entryStreamContract there and bump this pin`);
+    for (const call of calls) {
+      const argument = call.arguments[0];
+      const options = argument && ts.isIdentifier(argument) ? declarations.get(argument.text) : argument;
+      assert.ok(options && ts.isObjectLiteralExpression(options), `${file}: each provider's exact options must be inspectable`);
+      assert.ok(options.properties.some((property) => ts.isSpreadAssignment(property)
+        && ts.isCallExpression(property.expression) && ts.isIdentifier(property.expression.expression)
+        && property.expression.expression.text === 'entryStreamContract'), `${file}: every provider's actual options must spread entryStreamContract`);
+    }
   }
 });
 

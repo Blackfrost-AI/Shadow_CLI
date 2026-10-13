@@ -117,11 +117,11 @@ export class RepositoryIndex {
     return { files: this.files.size, symbols: [...this.files.values()].reduce((n, f) => n + f.symbols.length, 0), updated, removed, skipped, truncated, discovery };
   }
 
-  async map(opts: { query?: string; maxCharacters?: number; signal?: AbortSignal } = {}): Promise<{ text: string; snapshot: RepositorySnapshot; truncated: boolean }> {
+  async map(opts: { query?: string; maxCharacters?: number; signal?: AbortSignal; isPathExcluded?: (path: string) => boolean } = {}): Promise<{ text: string; snapshot: RepositorySnapshot; truncated: boolean }> {
     const snapshot = await this.refresh(opts.signal);
     const budget = Math.max(100, Math.min(24_000, opts.maxCharacters ?? 6_000));
     const query = terms(opts.query ?? '');
-    const ranked = this.rank(query);
+    const ranked = this.rank(query).filter(({ file }) => !opts.isPathExcluded?.(file.path));
     const lines: string[] = [];
     let characters = 0;
     let truncated = snapshot.truncated;
@@ -152,11 +152,11 @@ export class RepositoryIndex {
     }).filter((entry) => query.length === 0 || entry.score > 0).sort((a, b) => b.score - a.score || a.file.path.localeCompare(b.file.path));
   }
 
-  async context(query: string, opts: { maxCharacters?: number; maxFiles?: number; signal?: AbortSignal } = {}): Promise<RankedContext> {
+  async context(query: string, opts: { maxCharacters?: number; maxFiles?: number; signal?: AbortSignal; isPathExcluded?: (path: string) => boolean } = {}): Promise<RankedContext> {
     const snapshot = await this.refresh(opts.signal);
     const budget = Math.max(100, Math.min(32_000, opts.maxCharacters ?? 8_000));
     const queryTerms = terms(query);
-    const ranked = this.rank(queryTerms);
+    const ranked = this.rank(queryTerms).filter(({ file }) => !opts.isPathExcluded?.(file.path));
     const excerpts: ContextExcerpt[] = [];
     let characters = 0;
     let clipped = false;

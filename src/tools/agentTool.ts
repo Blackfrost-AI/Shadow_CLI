@@ -9,7 +9,7 @@ import type { Tool } from './types.js';
 import { ok, fail } from './types.js';
 import { resolveAgentDef } from '../agent/defs.js';
 import { ToolRegistry } from './registry.js';
-import { createWorktree, type WorktreeInfo } from './worktree.js';
+import { createWorktree, sameWorktreePath, type WorktreeInfo } from './worktree.js';
 import { createWorkArtifact, finishWorkArtifact } from '../state/workArtifacts.js';
 import { JobStore, type JobAttempt } from '../state/jobStore.js';
 import { evaluateAcceptance } from '../agent/acceptance.js';
@@ -20,6 +20,7 @@ import type { EventBus } from '../agent/events.js';
 import type { Effort } from '../provider/provider.js';
 import type { ApprovalGate } from '../agent/approval.js';
 import type { ResolvedModelProfile } from '../agent/modelProfiles.js';
+import { checksForRegistry } from '../checks/registry.js';
 
 const inputSchema = z.object({
   require_priced_usage: z.boolean().optional().describe('Require configured model pricing before starting a dollar-limited collaboration stage.'),
@@ -544,6 +545,10 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         gate: consultation?.gate ?? base.gate,
         bus: subBus,
         registry,
+        // Shared-workspace workers must invalidate the lead's live evidence even after its
+        // turn ends. Isolated worktrees use their own profiles and evidence store instead.
+        checks: base.checks && sameWorktreePath(base.checks.workspaceRoot, subWorkspaceRoot)
+          ? base.checks : base.checks ? checksForRegistry(base.registry, subWorkspaceRoot) : undefined,
         context: subContext,
         budget,
         signal: AbortSignal.any([ctx.signal, jobAbort.signal, ...(bgAbort ? [bgAbort.signal] : [])]),

@@ -1,5 +1,27 @@
 # Shadow release notes
 
+## 10.1.0 — 2026-10-12
+
+- Add reusable project checks and bounded completion corrections under existing permissions,
+  cancellation and budgets. Shell and shared-workspace agent mutations invalidate earlier checks.
+- Add a context inspector with persistent file pins, exact managed-source exclusions, and clear
+  captured-request versus provisional estimates.
+- Add previewed file/hunk stage, unstage and restore, stale-state protection, retained backups,
+  guarded rewind, and scoped review-to-fix prompts.
+- Add local session search across explicitly selected projects, pins, tags and lineage;
+  cross-project results provide a launch command without changing the active workspace.
+- Add versioned executable workflows with typed inputs, no-call previews and local provenance.
+  Existing Markdown runbooks remain inspectable.
+- Add versioned JSON/JSONL automation, final JSON-schema validation, stable exit codes and
+  ephemeral transcripts. Schema failure never replays completed tool actions.
+- Add optional post-save onboarding capability probes and dated exact-endpoint capability history.
+  Skips, cancellation and failures preserve setup and users' endpoint choice.
+- Add local security findings, SARIF/JSON import, evidence history and redacted report export.
+  Verification requires current host-recorded check results, not model claims or imported passes.
+- Add extension and learned-skill review menus. No telemetry or hosted coordination is added.
+- Add local tmux discovery, autocomplete, scrollback and Codex terminal controls; detach preserves
+  the external session. Deliver queued follow-ups at the next safe boundary during active work.
+
 ## 10.0.4 — 2026-10-09
 
 - Add native ChatGPT subscription sign-in and an official Claude Code CLI connection. Preserve the

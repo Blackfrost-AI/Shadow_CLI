@@ -160,7 +160,9 @@ export interface SlashCommandSpec {
   name: string;
   desc: string;
   /** Optional live argument completion. */
-  args?: (prefix: string) => AutocompleteItem[];
+  args?: (prefix: string) => AutocompleteItem[] | Promise<AutocompleteItem[]>;
+  /** Selecting an argument with Enter executes this command; Tab still just completes. */
+  submitOnArgumentSelection?: boolean;
 }
 
 /** Absolute → workspace-relative, POSIX separators, or null when outside the workspace. */
@@ -243,8 +245,11 @@ export class ShadowAutocompleteProvider implements AutocompleteProvider {
       const argPrefix = withArg[2] ?? '';
       const cmd = this.commands.find((c) => c.name === name);
       if (cmd?.args) {
-        const items = cmd.args(argPrefix);
-        if (items.length) return { items: displayItems(items), prefix: argPrefix };
+        const items = await cmd.args(argPrefix);
+        if (_options.signal.aborted) return null;
+        if (items.length) return cmd.submitOnArgumentSelection
+          ? { items: displayItems(items.map((item) => ({ ...item, value: `${name} ${item.value}` }))), prefix: before }
+          : { items: displayItems(items), prefix: argPrefix };
       }
       return null;
     }

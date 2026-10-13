@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { GLYPHS } from './tui/glyphs.js';
-import { readFileSync, existsSync, unlinkSync } from 'node:fs';
+import { existsSync, unlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { resolve, parse, join } from 'node:path';
@@ -129,6 +129,7 @@ import { readVersion } from './version.js';
 import { runAcp } from './acp/cli.js';
 import { runHookPhase } from './hooks/runner.js';
 import { parseArgs } from './cli/flags.js';
+import { installAutomationOutput, loadOutputSchema, readTaskInput, schemaTask } from './cli/automation.js';
 import { attachScreenReader } from './tui/screenReader.js';
 import { shouldAutoOnboard, NO_PROVIDER_HINT } from './cli/autoOnboard.js';
 import {
@@ -144,6 +145,7 @@ import {
 // The version's single source of truth (package.json, or the build-injected env) lives in
 // ./version.js so non-index entry points (the ACP adapter) share it.
 const VERSION = readVersion();
+const automation = installAutomationOutput(process.argv.slice(2));
 
 /** Sentinel raced against rl.question so an interactive REPL exits cleanly on EOF. */
 const CLOSED = Symbol('repl-closed');
@@ -232,6 +234,10 @@ function helpText(): string {
     '  --dry-run            write/exec tools become no-ops that report intent',
     '  --plan-mode          explore/read first, write a plan, then approve before implementing',
     '  --task "<text>"      run a single task non-interactively and exit',
+    '  --output-format <text|json|jsonl>  text (default), one result, or versioned event stream',
+    '  --json              shorthand for --output-format jsonl (one-shot/piped input)',
+    '  --output-schema <path>  validate final JSON against a local JSON Schema; default format json',
+    '  --ephemeral         omit session transcript/snapshots; tool artifacts and security receipts remain',
     '  --repl               force the plain-text REPL (skip the Ink HUD)',
     '  --screen-reader      stable text output, named speakers, and text approvals',
     '  --reduced-motion     disable the TUI spinner animation',
@@ -1166,6 +1172,9 @@ function runFromClaudeImport(workspaceRoot: string): void {
 }
 
 async function main(): Promise<void> {
+  if (automation && process.argv[2] && !process.argv[2].startsWith('-') && process.argv[2] !== 'resume') {
+    throw new Error('machine output supports task/piped runs and resume, not administrative subcommands');
+  }
   ensureShadowLayout();
   // Self-heal local presets whose label is a bare HuggingFace snapshot hash (added before
   // deriveLocalName understood model FOLDERS). Cosmetic-only and best-effort: it renames the
@@ -1377,12 +1386,36 @@ async function main(): Promise<void> {
   }
   const flags = parseArgs(argv);
   if (flags.help) {
+    if (automation) { automation.information(helpText()); process.exitCode = automation.finish(); return; }
     stdout.write(helpText() + '\n');
     return;
   }
   if (flags.version) {
+    if (automation) { automation.information(`shadow ${VERSION}`); process.exitCode = automation.finish(); return; }
     stdout.write(`shadow ${VERSION}\n`);
     return;
+  }
+  if ((automation || flags.ephemeral) && !flags.task && process.stdin.isTTY) {
+    throw new Error('machine output and --ephemeral require --task or piped input');
+  }
+  if (flags.ephemeral && (flags.repl || flags.web || flags.screenReader)) {
+    throw new Error('--ephemeral is available for one-shot tasks and piped input, not interactive sessions');
+  }
+  const outputSchema = flags.outputSchema ? loadOutputSchema(resolve(flags.outputSchema)) : undefined;
+  automation?.configure({ schema: outputSchema, ephemeral: flags.ephemeral });
+
+  // Capture the pipe before starting provider/MCP resources. An asynchronous read keeps
+  // cancellation responsive even when a producer holds stdin open without sending EOF.
+  let pipedStdin: string | null = null;
+  if (!process.stdin.isTTY && !flags.task) {
+    const inputAbort = new AbortController();
+    const interruptInput = () => { automation?.cancel('SIGINT'); process.exitCode = 130; inputAbort.abort(); };
+    const terminateInput = () => { automation?.cancel('SIGTERM'); process.exitCode = 143; inputAbort.abort(); };
+    process.on('SIGINT', interruptInput);
+    process.on('SIGTERM', terminateInput);
+    try { pipedStdin = await readTaskInput(process.stdin, inputAbort.signal); }
+    finally { process.removeListener('SIGINT', interruptInput); process.removeListener('SIGTERM', terminateInput); }
+    if (automation && !pipedStdin.trim()) throw new Error('piped task is empty');
   }
 
   const cwd = process.cwd();
@@ -1590,7 +1623,7 @@ async function main(): Promise<void> {
 
   // Bind harness-aware snapshots outside the workspace before this session can write one. Agent
   // file tools cannot rewrite this owner-only receipt under the normal workspace jail.
-  recordSessionHarnessBinding(session.sessionLog.path, session.harnessState);
+  if (session.sessionLog.persistent) recordSessionHarnessBinding(session.sessionLog.path, session.harnessState);
 
   // Destructured so the rest of main() reads exactly as it did before the extraction.
   cfg = session.cfg;
@@ -1783,12 +1816,6 @@ async function main(): Promise<void> {
   // Deliver bg agent (and future) task results + record launches for snapshot/recovery to the *main* context (not throwaway sub ctxs).
   const pendingNotifications = attachBgAgentDelivery(bus, context);
 
-  // Capture piped stdin NOW, before any async startup work — MCP registration in particular — can
-  // disturb fd 0. Otherwise the startup delay from connecting an MCP server drops the piped task
-  // lines entirely (readline line-loss). Only reads when stdin is genuinely piped (never a TTY, so
-  // it can't block) and no --task was given; the piped branch below consumes it.
-  const pipedStdin = !process.stdin.isTTY && !flags.task ? readFileSync(0, 'utf8') : null;
-
   // Offline mode: skip MCP servers entirely — they are outbound connectors (another egress
   // vector), so an offline session keeps nothing but the local model.
   const mcpClients: Array<{ stop(): void }> = [];
@@ -1860,6 +1887,7 @@ async function main(): Promise<void> {
     forceStopGgufServers();
   });
   process.on('SIGTERM', () => {
+    automation?.cancel('SIGTERM');
     shutdownCore();
     void stopGgufServers().finally(() => process.exit(143));
   });
@@ -1884,7 +1912,7 @@ async function main(): Promise<void> {
   // Force the plain readline renderer instead of a half-broken TUI; interactive stays true so the
   // user keeps the question-loop REPL rather than being treated like a one-shot pipe.
   const dumbTerm = interactive && isDumbTerm(process.env);
-  const headless = !!flags.task || !!flags.repl || !!flags.screenReader || !interactive || dumbTerm;
+  const headless = !!automation || !!flags.task || !!flags.repl || !!flags.screenReader || !interactive || dumbTerm;
 
   const wakeupHandler = {
     fire: (_task: string, _reason: string) => {},
@@ -2067,6 +2095,8 @@ async function main(): Promise<void> {
         role: 'user',
         content: [{ type: 'text', text: 'This prompt was blocked by the user_prompt_submit hook.' }],
       });
+      automation?.fail('user_prompt_submit hook denied the task', 1);
+      if (automation) process.exitCode = 1;
       return;
     }
 
@@ -2157,7 +2187,9 @@ async function main(): Promise<void> {
     // turn. Only the interactive TUI paints ahead of the MCP settle.
     if (mcpSettled) await mcpSettled;
     const reader = flags.screenReader ? attachScreenReader(bus, { model: cfg.model }) : null;
-    const detach = reader ? () => reader.dispose() : attachRenderer(bus, { animate: false });
+    automation?.configure({ schema: outputSchema, ephemeral: flags.ephemeral,
+      sessionId: sessionLog.persistent ? SessionLog.sessionIdFromPath(sessionLog.path) : undefined });
+    const detach = automation ? automation.attach(bus) : reader ? () => reader.dispose() : attachRenderer(bus, { animate: false });
     // Abort controllers are one-shot. Reusing one for the whole REPL meant the first Ctrl-C
     // permanently poisoned every later prompt: each new AgentLoop saw an already-aborted signal
     // and stopped immediately. Keep a fresh controller per turn and point SIGINT at EVERY live
@@ -2186,6 +2218,8 @@ async function main(): Promise<void> {
       void runHeadlessTask(`[wakeup: ${reason}] ${task}`, gate).catch(() => {});
     };
     const onSigint = () => {
+      automation?.cancel('SIGINT');
+      if (flags.task || !process.stdin.isTTY) process.exitCode = 130;
       for (const c of liveControllers) c.abort();
     };
     process.on('SIGINT', onSigint);
@@ -2193,7 +2227,7 @@ async function main(): Promise<void> {
       if (flags.task) {
         // One-shot automation: no human to ask, so gated calls are denied.
         const gate: ApprovalGate = yolo ? new AutoApproveGate() : new AutoDenyGate();
-        await runHeadlessTask(flags.task, gate);
+        await runHeadlessTask(schemaTask(flags.task, outputSchema), gate);
       } else if (headlessInputSource(!!process.stdin.isTTY) === 'repl') {
         // stdin is a terminal → a human is present, so the question loop below is the only thing
         // allowed to read fd 0. stdout being REDIRECTED (`shadow | tee`) is not a pipe: this case
@@ -2237,26 +2271,27 @@ async function main(): Promise<void> {
           rl.close();
         }
       } else {
-        // Piped stdin: nobody to approve, so deny. Only reachable when stdin is NOT a TTY (a
-        // terminal on stdin is routed to the REPL above), so this fallback read cannot block on
-        // anything. Use the copy captured at startup (before MCP registration could disturb fd 0)
-        // so lines written before startup are not dropped.
+        // Piped stdin has no human approval channel. Consume the copy captured before startup.
         const gate: ApprovalGate = yolo ? new AutoApproveGate() : new AutoDenyGate();
-        const input = pipedStdin ?? readFileSync(0, 'utf8');
-        for (const line of input.split(/\r?\n/)) {
+        const input = pipedStdin ?? '';
+        // A machine run treats the complete pipe as one task, preserving multiline instructions.
+        for (const line of automation ? [input] : input.split(/\r?\n/)) {
+          if (process.exitCode === 130 || process.exitCode === 143) break;
           const task = line.trim();
-          if (task === 'exit' || task === 'quit') break;
+          if (!automation && (task === 'exit' || task === 'quit')) break;
           if (!task) continue;
           if (reader?.command(task)) continue;
           try {
-            await runHeadlessTask(task, gate);
+            await runHeadlessTask(schemaTask(task, outputSchema), gate);
           } catch (err) {
+            automation?.fail(err);
             process.stderr.write(flags.screenReader ? `\nERROR: ${(err as Error).message}\n` : `\n\x1b[31m${(err as Error).message}\x1b[0m\n`);
           }
         }
       }
     } finally {
       detach();
+      for (const controller of liveControllers) controller.abort();
       process.removeListener('SIGINT', onSigint);
       // F04-09 teardown: pending wakeups belong to THIS session. Without clearing them a
       // queued timer fires after the user has left — an invisible turn spending tokens and
@@ -2267,6 +2302,7 @@ async function main(): Promise<void> {
         runHookPhase('session_end', cfg.hooks.session_end, { workspaceRoot });
       }
     }
+    if (automation) process.exitCode = automation.finish(Number(process.exitCode ?? 0));
     return;
   }
 
@@ -2292,6 +2328,7 @@ async function main(): Promise<void> {
       provider,
       activeBaseUrl: session.startBaseUrl,
       activeSelfHosted: session.startSelfHosted,
+      activeCapabilityTarget: session.capabilityTarget,
       registry,
       bus,
       context,
@@ -2369,5 +2406,9 @@ async function main(): Promise<void> {
 
 main().catch((err) => {
   process.stderr.write(`fatal: ${(err as Error).message}\n`);
-  process.exit(1);
+  if (automation) {
+    if (process.exitCode !== 130 && process.exitCode !== 143) automation.fail(err);
+    process.exit(automation.finish(Number(process.exitCode ?? 0)));
+  }
+  process.exit(process.exitCode === 130 || process.exitCode === 143 ? Number(process.exitCode) : 1);
 });

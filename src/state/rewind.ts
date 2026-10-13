@@ -1,5 +1,7 @@
 import { isAbsolute, join, relative, resolve } from 'node:path';
-import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, readFileSync, rmSync, lstatSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { resolveWithin } from '../safety/workspaceJail.js';
 import { atomicWrite } from '../tools/util.js';
 import { listCheckpointsForTurn, listCheckpointTurns, restoreCheckpoint } from './checkpoints.js';
 import { hydrateContext, type ContextSnapshotData, type HydrateOptions } from './snapshot.js';
@@ -9,6 +11,8 @@ import type { Message } from '../provider/provider.js';
 import { coerceSessionState, type SessionStateSnapshot } from './sessionState.js';
 
 export interface RewindResult {
+  /** Current file contents retained before a guarded code rewind, including newly created files. */
+  safetyBackupPath?: string;
   sessionState?: SessionStateSnapshot;
   /** Absent for a `scope: 'code'` rewind — the conversation was deliberately left untouched. */
   context?: Context;
@@ -61,6 +65,60 @@ export interface RewindPreview {
   turn: number;
   scope: 'code' | 'chat' | 'code+chat';
   paths: Array<{ path: string; action: 'restore' | 'delete' | 'unavailable' }>;
+  /** Same-process, single-use evidence token. Pass as rewindToTurn's previewGuardId after approval. */
+  guardId?: string;
+}
+
+interface GuardFile { hash: string; mode: number; bytes: Buffer | null; }
+interface RewindGuard { sessionPath: string; root: string; turn: number; scope?: 'code' | 'chat'; sessionVersion: string; manifest: string; paths: Map<string, string>; }
+const rewindGuards = new Map<string, RewindGuard>();
+function digest(value: string | Buffer): string { return createHash('sha256').update(value).digest('hex'); }
+function guardedDestination(root: string, path: string): string {
+  if (!path || isAbsolute(path) || path.split(/[\\/]/).some((part) => part === '..')) throw new Error('Unsafe rewind destination; refresh the checkpoint inventory.');
+  const abs = resolveWithin(root, path);
+  let current = resolve(root);
+  for (const part of relative(current, resolve(root, path)).split(/[\\/]/)) {
+    current = join(current, part);
+    try { if (lstatSync(current).isSymbolicLink()) throw new Error('Guarded rewind does not follow symlink destinations.'); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+  }
+  return abs;
+}
+function guardFile(path: string): GuardFile {
+  try {
+    const stat = lstatSync(path);
+    if (!stat.isFile()) throw new Error('Guarded rewind supports regular files only.');
+    if (stat.size > 8 * 1024 * 1024) throw new Error('A rewind target exceeds the 8 MiB safety-backup limit.');
+    const bytes = readFileSync(path); const mode = stat.mode & 0o777;
+    return { hash: digest(Buffer.concat([Buffer.from(`${mode}:`), bytes])), mode, bytes };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { hash: 'absent', mode: 0o600, bytes: null };
+    throw error;
+  }
+}
+function sessionVersion(path: string): string { const s = statSync(path); return `${s.size}:${s.mtimeMs}:${s.ino}`; }
+function guardManifest(root: string, sessionId: string, turn: number, chatOnly: boolean): { hash: string; paths: string[]; sources: Map<string, Buffer> } {
+  const sources = new Map<string, Buffer>();
+  if (chatOnly) return { hash: '', paths: [], sources };
+  const checkpointRoot = resolveWithin(root, join('.shadow', 'checkpoints', sessionId));
+  const records = listCheckpointTurns(root, sessionId).filter((item) => item >= turn).map((index) => ({ index,
+    entries: listCheckpointsForTurn(root, sessionId, index).map((entry) => {
+      guardedDestination(root, entry.relPath);
+      const source = entry.absent ? undefined : resolveWithin(checkpointRoot, entry.absPath);
+      const file = source ? guardFile(source) : undefined;
+      if (file?.bytes) sources.set(entry.absPath, file.bytes);
+      return { ...entry, sourceHash: file?.hash ?? 'absent' };
+    }),
+  }));
+  return { hash: digest(JSON.stringify(records)), paths: [...new Set(records.flatMap((record) => record.entries.map((entry) => entry.relPath)))], sources };
+}
+function captureRewindGuard(sessionPath: string, turn: number, root: string, scope?: 'code' | 'chat'): string {
+  const manifest = guardManifest(root, SessionLog.sessionIdFromPath(sessionPath), turn, scope === 'chat');
+  const id = randomUUID();
+  if (rewindGuards.size >= 100) rewindGuards.delete(rewindGuards.keys().next().value!);
+  rewindGuards.set(id, { sessionPath: resolve(sessionPath), root: resolve(root), turn, scope, sessionVersion: sessionVersion(sessionPath), manifest: manifest.hash,
+    paths: new Map(manifest.paths.map((path) => [path, guardFile(guardedDestination(root, path)).hash])) });
+  return id;
 }
 
 /** A read-only preview of the checkpoint targets. Shell/external edits have no checkpoint guarantee. */
@@ -81,7 +139,7 @@ export function previewRewind(sessionPath: string, turn: number, workspaceRoot: 
       paths.set(entry.relPath, { path: entry.relPath, action });
     }
   }
-  return { turn, scope: scope ?? 'code+chat', paths: [...paths.values()] };
+  return { turn, scope: scope ?? 'code+chat', paths: [...paths.values()], guardId: captureRewindGuard(sessionPath, turn, root, scope) };
 }
 
 /**
@@ -98,7 +156,7 @@ export function rewindToTurn(
   sessionPath: string,
   turnIndex: number,
   workspaceRoot: string,
-  opts: HydrateOptions & { scope?: 'code' | 'chat' },
+  opts: HydrateOptions & { scope?: 'code' | 'chat'; previewGuardId?: string },
 ): RewindResult {
   if (turnIndex < 0) throw new Error('turnIndex must be >= 0');
   if (!Number.isInteger(turnIndex)) throw new Error('turnIndex must be an integer');
@@ -137,6 +195,34 @@ export function rewindToTurn(
   const restoredFiles: string[] = [];
   const deletedFiles: string[] = [];
   const partialFiles: string[] = [];
+  let safetyBackupPath: string | undefined;
+  let activeGuard: RewindGuard | undefined;
+  let guardedSources: Map<string, Buffer> | undefined;
+  if (opts.previewGuardId) {
+    activeGuard = rewindGuards.get(opts.previewGuardId);
+    rewindGuards.delete(opts.previewGuardId);
+    if (!activeGuard || activeGuard.sessionPath !== resolve(sessionPath) || activeGuard.root !== resolve(workspaceRoot) || activeGuard.turn !== turn || activeGuard.scope !== opts.scope) throw new Error('Rewind preview expired or does not match this action. Preview again.');
+    const manifest = guardManifest(workspaceRoot, sessionId, turn, opts.scope === 'chat');
+    if (sessionVersion(sessionPath) !== activeGuard.sessionVersion || manifest.hash !== activeGuard.manifest) throw new Error('Session or checkpoint evidence changed since preview. Preview the rewind again; nothing was restored.');
+    guardedSources = manifest.sources;
+    const captured = [...activeGuard.paths].map(([path, expected]) => {
+      const file = guardFile(guardedDestination(workspaceRoot, path));
+      if (file.hash !== expected) throw new Error(`File changed since preview: ${path}. Nothing was restored; preview again.`);
+      return { path, mode: file.mode, absent: file.bytes === null, contentBase64: file.bytes?.toString('base64') ?? null, size: file.bytes?.length ?? 0 };
+    });
+    if (captured.reduce((total, file) => total + file.size, 0) > 32 * 1024 * 1024) throw new Error('Rewind safety backup exceeds 32 MiB; choose a smaller scope. Nothing was restored.');
+    if (captured.length) {
+      const backupDir = resolveWithin(workspaceRoot, '.shadow/rewind-safety'); mkdirSync(backupDir, { recursive: true, mode: 0o700 });
+      safetyBackupPath = resolveWithin(workspaceRoot, join(backupDir, `${opts.previewGuardId}.json`));
+      writeFileSync(safetyBackupPath, JSON.stringify({ version: 1, sessionId, turn, recordedAt: new Date().toISOString(), files: captured }, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
+    }
+  }
+  const checkCurrent = (path: string): void => {
+    if (!activeGuard) return;
+    const expected = activeGuard.paths.get(path);
+    if (expected === undefined || guardFile(guardedDestination(workspaceRoot, path)).hash !== expected) throw new Error(`Rewind stopped because ${path} changed after preview. Retained pre-rewind contents: ${safetyBackupPath ?? 'no files changed'}.`);
+  };
+  const trackRestored = (path: string): void => { if (activeGuard) activeGuard.paths.set(path, guardFile(guardedDestination(workspaceRoot, path)).hash); };
 
   if (opts.scope !== 'chat') {
     // Restore EVERY turn from the target onward, newest first so the OLDEST backup lands last and
@@ -171,11 +257,13 @@ export function rewindToTurn(
         const destRel = inside(wsRoot, resolve(wsRoot, entry.relPath));
         if (destRel === null) continue; // relPath escapes the workspace — ignore the entry
         const dest = resolve(wsRoot, entry.relPath);
+        checkCurrent(entry.relPath);
         if (entry.absent) {
           // The file did not exist before that turn — rewinding past it means removing it again.
           if (existsSync(dest)) {
             try {
               rmSync(dest, { force: true });
+              trackRestored(entry.relPath);
               if (!seen.has(entry.relPath)) deletedFiles.push(entry.relPath);
             } catch {
               partialFiles.push(entry.relPath); // e.g. a directory now sits at the path
@@ -184,21 +272,22 @@ export function rewindToTurn(
           seen.add(entry.relPath);
           continue;
         }
-        if (!existsSync(entry.absPath)) {
+        if (guardedSources ? !guardedSources.has(entry.absPath) : !existsSync(entry.absPath)) {
           // Missing at the file's OLDEST turn → whatever newer backup already landed (or the
           // file's current on-disk state, if none did) stays: the chain cannot reach the target.
           if (minTurnByPath.get(entry.relPath) === t) partialFiles.push(entry.relPath);
           continue;
         }
         if (inside(cpRoot, entry.absPath) === null) continue; // absPath outside the checkpoint tree
-        atomicWrite(dest, restoreCheckpoint(entry.absPath));
+        atomicWrite(dest, guardedSources ? guardedSources.get(entry.absPath)!.toString('utf8') : restoreCheckpoint(entry.absPath));
+        trackRestored(entry.relPath);
         if (!seen.has(entry.relPath)) restoredFiles.push(entry.relPath);
         seen.add(entry.relPath);
       }
     }
   }
 
-  return { context, sessionState: coerceSessionState(pick.data.sessionState), restoredFiles, deletedFiles, partialFiles, turn, snapshotOffset: pick.offset };
+  return { context, sessionState: coerceSessionState(pick.data.sessionState), restoredFiles, deletedFiles, partialFiles, turn, snapshotOffset: pick.offset, safetyBackupPath };
 }
 
 /**

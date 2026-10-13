@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { readFileSync, statSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { resolveWithin } from '../safety/workspaceJail.js';
 import { getRepositoryIndex } from '../context/repository.js';
 import { getLspService, lspKillSwitchActive, type LspServiceConfig } from '../agent/lsp/index.js';
@@ -19,7 +20,7 @@ const inputSchema = z.object({
 type Input = z.infer<typeof inputSchema>;
 
 /** Read-only, bounded repository intelligence. All fallbacks explicitly identify their evidence. */
-export function makeRepositoryContextTool(lsp?: LspServiceConfig): Tool<Input> {
+export function makeRepositoryContextTool(lsp?: LspServiceConfig, contextPolicy?: { isPathExcluded: (absolutePath: string) => boolean }): Tool<Input> {
   return {
     name: 'repository_context', risk: 'read', inputSchema,
     description: 'Find source definitions/call sites/symbols with LSP or an explicitly labeled lexical fallback; build a compact repository map; rank bounded excerpts for a task; read a file range; inspect applicable ancestor/nested project instructions. Ignores generated files and repository ignores. Context results explain each selection and include instruction origins.',
@@ -28,23 +29,36 @@ export function makeRepositoryContextTool(lsp?: LspServiceConfig): Tool<Input> {
       try {
         ctx.signal?.throwIfAborted();
         const index = getRepositoryIndex(ctx.workspaceRoot);
+        const isPathExcluded = (path: string): boolean => {
+          if (!contextPolicy) return false;
+          // Scoped instruction origins may be legitimate ancestors outside this workspace.
+          // Canonicalize workspace paths (including symlink aliases); do not reject ancestors
+          // merely while filtering their already-discovered metadata.
+          let absolute: string;
+          try { absolute = resolveWithin(ctx.workspaceRoot, path); }
+          catch { absolute = resolve(ctx.workspaceRoot, path); }
+          return contextPolicy.isPathExcluded(absolute);
+        };
+        const filteredInstructions = (sources: ReturnType<typeof discoverProjectInstructions>['sources']) => sources.filter((source) => !isPathExcluded(source.path));
+        if (input.path && isPathExcluded(input.path)) return fail('repository_context', 'read', Date.now() - start, 'context_excluded', 'This source is excluded from repository context for this session. The user can remove the exclusion in /context.');
         if (input.action === 'map') {
-          const data = await index.map({ query: input.query, maxCharacters: input.maxCharacters, signal: ctx.signal });
+          const data = await index.map({ query: input.query, maxCharacters: input.maxCharacters, signal: ctx.signal, isPathExcluded });
           return ok('repository_context', 'read', Date.now() - start, `${data.snapshot.files} indexed files; lexical declaration map${data.truncated ? ' (bounded)' : ''}.`, data);
         }
         if (input.action === 'context') {
           if (!input.query?.trim()) return fail('repository_context', 'read', Date.now() - start, 'bad_input', 'Context selection requires a query describing the task.');
-          const data = await index.context(input.query, { maxCharacters: input.maxCharacters, signal: ctx.signal });
+          const data = await index.context(input.query, { maxCharacters: input.maxCharacters, signal: ctx.signal, isPathExcluded });
           const sources = new Map<string, ReturnType<typeof discoverProjectInstructions>['sources'][number]>();
           for (const excerpt of data.excerpts) {
             const path = resolveWithin(ctx.workspaceRoot, excerpt.path);
             ctx.readTracker?.markRead(path);
-            for (const source of discoverProjectInstructions(ctx.workspaceRoot, { targetPath: excerpt.path }).sources) sources.set(source.path, source);
+            for (const source of filteredInstructions(discoverProjectInstructions(ctx.workspaceRoot, { targetPath: excerpt.path }).sources)) sources.set(source.path, source);
           }
           return ok('repository_context', 'read', Date.now() - start, `${data.excerpts.length} ranked excerpts, approximately ${data.approximateTokens} code tokens (estimate). Reasons and instruction scopes are included.`, { ...data, instructions: boundedInstructionSources([...sources.values()]) });
         }
         if (input.action === 'instructions') {
           const data = discoverProjectInstructions(ctx.workspaceRoot, { targetPath: input.path ?? '.' });
+          data.sources = filteredInstructions(data.sources);
           return ok('repository_context', 'read', Date.now() - start, `${data.sources.length} instruction sources, in increasing precedence. Same-directory SHADOW > AGENTS > CLAUDE; nearer directories override ancestors.`, data);
         }
         if (!input.path) return fail('repository_context', 'read', Date.now() - start, 'bad_input', `${input.action} requires a path.`);
@@ -64,7 +78,7 @@ export function makeRepositoryContextTool(lsp?: LspServiceConfig): Tool<Input> {
           return ok('repository_context', 'read', Date.now() - start, `Source range ${input.path}:${line}-${line + content.split('\n').length - 1}.`, {
             path: input.path, startLine: line, endLine: line + content.split('\n').length - 1,
             content, truncated: content.length < window.length, totalLines: lines.length,
-            instructions: boundedInstructionSources(discoverProjectInstructions(ctx.workspaceRoot, { targetPath: input.path }).sources),
+            instructions: boundedInstructionSources(filteredInstructions(discoverProjectInstructions(ctx.workspaceRoot, { targetPath: input.path }).sources)),
           });
         }
         let locations = !lspKillSwitchActive() ? await getLspService(ctx.workspaceRoot, lsp).navigate?.({
@@ -73,9 +87,10 @@ export function makeRepositoryContextTool(lsp?: LspServiceConfig): Tool<Input> {
         ctx.signal?.throwIfAborted();
         const source = locations === null || locations === undefined ? 'lexical' : 'language-server';
         if (source === 'lexical') locations = await index.navigate(input.action, path, input.line, input.col, ctx.signal);
+        locations = locations?.filter((location) => !isPathExcluded(location.path));
         return ok('repository_context', 'read', Date.now() - start,
           `${locations?.length ?? 0} ${input.action} results (${source}${source === 'lexical' ? '; text matches may include unrelated identifiers' : ''}).`,
-          { source, locations, instructions: boundedInstructionSources(discoverProjectInstructions(ctx.workspaceRoot, { targetPath: input.path }).sources) });
+          { source, locations, instructions: boundedInstructionSources(filteredInstructions(discoverProjectInstructions(ctx.workspaceRoot, { targetPath: input.path }).sources)) });
       } catch (error) {
         return fail('repository_context', 'read', Date.now() - start, ctx.signal?.aborted ? 'interrupted' : 'context_unavailable', (error as Error).message);
       }

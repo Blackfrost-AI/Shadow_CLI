@@ -23,6 +23,11 @@ export interface Flags {
   logLevel?: string;
   dryRun?: boolean;
   task?: string;
+  /** Machine output is opt-in; ordinary text output remains the default. */
+  outputFormat?: 'text' | 'json' | 'jsonl';
+  outputSchema?: string;
+  /** Disable conversation journals and their sidecars for this one-shot run. */
+  ephemeral?: boolean;
   repl?: boolean;
   screenReader?: boolean;
   reducedMotion?: boolean;
@@ -134,6 +139,23 @@ export function parseArgs(argv: string[]): Flags {
       case '--task':
         f.task = next();
         break;
+      case '--output-format': {
+        const format = next();
+        if (!['text', 'json', 'jsonl'].includes(format)) throw new Error('--output-format must be text, json, or jsonl');
+        f.outputFormat = format as Flags['outputFormat'];
+        break;
+      }
+      case '--json':
+        noInlineValue();
+        f.outputFormat = 'jsonl';
+        break;
+      case '--output-schema':
+        f.outputSchema = next();
+        break;
+      case '--ephemeral':
+        noInlineValue();
+        f.ephemeral = true;
+        break;
       case '--repl':
         noInlineValue();
         f.repl = true;
@@ -180,6 +202,11 @@ export function parseArgs(argv: string[]): Flags {
       default:
         throw new Error(`unknown option: ${raw}`);
     }
+  }
+  if (f.outputSchema && !f.outputFormat) f.outputFormat = 'json';
+  if (f.outputSchema && f.outputFormat === 'text') throw new Error('--output-schema requires json or jsonl output');
+  if (f.outputFormat && f.outputFormat !== 'text' && (f.repl || f.screenReader || f.web)) {
+    throw new Error('machine output requires a one-shot task or piped input; --repl, --screen-reader, and --web are incompatible');
   }
   return f;
 }

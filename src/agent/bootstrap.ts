@@ -14,9 +14,12 @@ import { assertAccountPresetCompatible, resolveActiveModelPreset } from '../conf
 import { resolveAutoModel } from '../local/autoEndpoint.js';
 import { vaultExists } from '../auth/vault.js';
 import { vaultUnlocked } from '../state/globalStore.js';
-import { createProvider, entryStreamContract } from '../provider/index.js';
+import { createProvider, entryStreamContract, type ProviderOptions } from '../provider/index.js';
+import { capabilityTargetFromProviderOptions, type CapabilityTarget } from '../doctor/capabilityRecords.js';
 import { ToolRegistry } from '../tools/registry.js';
 import { BgRegistry } from '../tools/bgShell.js';
+import { attachProjectChecks, checksForRegistry } from '../checks/registry.js';
+import { makeSecurityFindingsTool } from '../tools/securityFindings.js';
 import {
   makeAskUserQuestionTool,
   makeEnterPlanModeTool,
@@ -185,6 +188,7 @@ export interface AgentSession {
   startBaseUrl: string | undefined;
   /** Authoritative sampling classification for the provider created at startup. */
   startSelfHosted: boolean;
+  capabilityTarget: Readonly<CapabilityTarget>;
   /**
    * The jail this session was built for — the SAME value that must reach buildLoopDeps. Added so
    * "one source of truth for the jail" is typecheckable rather than conventional: a web turn reads
@@ -199,7 +203,7 @@ export interface AgentSession {
    */
   connectMcp: () => Promise<Array<{ stop(): void }>>;
   /** Build and activate a complete model entry for automatic fallback. */
-  activateModel: (entry: ModelEntry, signal?: AbortSignal) => Promise<{ provider: ReturnType<typeof createProvider>; model: string }>;
+  activateModel: (entry: ModelEntry, signal?: AbortSignal) => Promise<{ provider: ReturnType<typeof createProvider>; model: string; capabilityTarget: Readonly<CapabilityTarget> }>;
 }
 
 /**
@@ -707,7 +711,7 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   // P1A-04: the operator escape hatch beats any per-entry config — a rescue env must apply
   // to a live wedged session without editing config.json. Strict positive-int only; a bogus
   // value is ignored so a typo cannot silently disable the watchdog.
-  const provider = createProvider({
+  const providerOptions: ProviderOptions = {
     // P1A-04 knobs + P1A-06 capability block, SHADOW_IDLE_MS env override included (F10-01:
     // one shared helper with the TUI rebuild sites so the contract can't drift between them).
     ...entryStreamContract(activeModelEntry ?? undefined, cfg.stream),
@@ -723,7 +727,9 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     wire: local ? undefined : providerCred.wire,
     selfHosted: startSelfHosted,
     reasoningRoundtrip: cfg.reasoningRoundtrip,
-  });
+  };
+  const provider = createProvider(providerOptions);
+  const capabilityTarget = capabilityTargetFromProviderOptions(providerOptions, cfg.activeProfile);
 
   const registry = new ToolRegistry();
   // Own the background-shell registry so we can kill orphaned children on shutdown (killAll had no
@@ -781,7 +787,9 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   // takes effect in a new session; it cannot leak new instructions into a running context.
   registry.register(makeSkillTool(skills));
   registry.register(makeSkillManageTool());
-  registry.register(makeRepositoryContextTool(cfg.lsp));
+  registry.register(makeRepositoryContextTool(cfg.lsp, { isPathExcluded: (path) => context.isSourceExcluded(path) }));
+  attachProjectChecks(registry);
+  registry.register(makeSecurityFindingsTool((workspace) => checksForRegistry(registry, workspace)));
   registry.setDenied(harness.tools.remove);
   registry.register(makeToolSearch(registry));
 
@@ -815,7 +823,7 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   // Best-effort: a retention failure must never block startup. The dry-run twin lives in
   // `/doctor` (see doctor.ts), surfaced BEFORE any pruning.
   try {
-    const ret = applyRetention(workspaceRoot, cfg, {
+    const ret = flags.ephemeral ? { archived: [], archiveDir: '' } : applyRetention(workspaceRoot, cfg, {
       excludeIds: opts.resumeSessionPath ? [SessionLog.sessionIdFromPath(opts.resumeSessionPath)] : undefined,
     });
     if (ret.archived.length) {
@@ -826,7 +834,7 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   }
 
   // M4: append-only, redacted session log for this process.
-  const sessionLog = SessionLog.open(workspaceRoot);
+  const sessionLog = flags.ephemeral ? SessionLog.ephemeral(workspaceRoot) : SessionLog.open(workspaceRoot);
 
   const contextOpts = {
     contextBudget: cfg.contextBudget,
@@ -877,7 +885,7 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   const activateModel = async (
     entry: ModelEntry,
     signal?: AbortSignal,
-  ): Promise<{ provider: ReturnType<typeof createProvider>; model: string }> => {
+  ): Promise<{ provider: ReturnType<typeof createProvider>; model: string; capabilityTarget: Readonly<CapabilityTarget> }> => {
     signal?.throwIfAborted();
     assertAccountPresetCompatible(entry);
     let nextProvider = entry.provider;
@@ -947,7 +955,7 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     cfg.contextBudget = policy.contextBudget;
     cfg.summarizeTriggerRatio = policy.triggerRatio;
     cfg.keepLastTurns = policy.keepLastTurns;
-    const next = createProvider({
+    const nextOptions: ProviderOptions = {
       // P1A-04 knobs + P1A-06 capability block (F10-01 shared helper — see entryStreamContract).
       ...entryStreamContract(entry, cfg.stream),
       provider: nextProvider,
@@ -960,10 +968,11 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
       wire: local ? undefined : entryCred.wire,
       selfHosted: entry.selfHosted,
       reasoningRoundtrip: cfg.reasoningRoundtrip,
-    });
+    };
+    const next = createProvider(nextOptions);
     // The WIRE model is what callers must propagate to sub-agents and the loop, while
     // `cfg.model` stays the entry's identity (see AgentSession.wireModel).
-    return { provider: next, model: wireModel };
+    return { provider: next, model: wireModel, capabilityTarget: capabilityTargetFromProviderOptions(nextOptions, cfg.activeProfile) };
   };
 
   return {
@@ -993,6 +1002,7 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     startProvider,
     startBaseUrl,
     startSelfHosted,
+    capabilityTarget,
     workspaceRoot,
     additionalRoots,
     connectMcp,

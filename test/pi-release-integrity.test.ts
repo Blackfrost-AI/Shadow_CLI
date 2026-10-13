@@ -338,6 +338,7 @@ test('pi keeps submit, direct start, and queue flush behind an in-flight model-s
     model: 'after',
     entryModel: 'after',
     selfHosted: false,
+    capabilityTarget: { provider: 'mock', model: 'after' },
   });
   await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
 

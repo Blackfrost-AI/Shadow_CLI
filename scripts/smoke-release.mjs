@@ -89,6 +89,7 @@ try {
   if (process.platform !== 'win32') {
     console.log(await run('python3', [resolve('scripts/smoke-interrupt-pty.py'), target]));
     console.log(await run('python3', [resolve('scripts/smoke-parity-pty.py'), target]));
+    console.log(await run('python3', [resolve('scripts/smoke-functionality-pty.py'), target]));
   }
   await install();
   assert.equal(installedHash(), release.checksum, 'Repeat install must remain valid');

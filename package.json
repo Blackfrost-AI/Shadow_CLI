@@ -1,6 +1,6 @@
 {
   "name": "shadow",
-  "version": "10.0.4",
+  "version": "10.1.0",
   "description": "Shadow — a private, provider-neutral security engineering CLI powered by the model and endpoint you choose.",
   "type": "module",
   "private": true,

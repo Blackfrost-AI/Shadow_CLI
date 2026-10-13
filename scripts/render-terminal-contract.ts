@@ -82,6 +82,38 @@ Thinking shows a bounded preview while streaming, then collapses to one summary 
 answer or tool starts. Ctrl+O expands transcript detail, including completed thinking and grep
 matches; /activity also retains tool output. Empty reasoning creates no block.
 
+While the agent works, Enter submits a follow-up at the next safe boundary. Model streaming
+stops immediately; already-running tools finish before the follow-up starts, and tool calls
+that have not started yield to the new message. Messages remain in submission order. Slash
+commands and scheduled wakeups stay deferred; Escape still interrupts active work explicitly.
+
+## Existing tmux agents
+
+In Snowfall, \`/tmux\` discovers every session on the current local tmux server. Type
+\`/tmux \` to complete a session name with Up/Down and Enter, or submit the bare command
+for a numbered picker. Sessions with multiple panes get a second picker. No per-agent
+registration is needed. \`/tmux <session-name>\` or \`/tmux %<pane-id>\` connects directly.
+
+The viewer reads retained terminal history and reflows it to Shadow's width. Mouse wheel,
+PgUp/PgDn, Ctrl+Home/Ctrl+End and Ctrl+F search navigate it; F3 finds the next match. History
+is limited to what tmux still retains, not the entire Codex conversation database.
+
+For a running Codex pane, Enter sends the draft as a bracketed paste followed by a separate
+submit. Shift+Enter/Ctrl+J inserts a newline. F2 enables direct keys for Codex slash menus,
+approvals, Escape and Ctrl+C; F2 returns to the composer. Approval choices are always made by
+the user. Escape detaches in composer mode; Ctrl+] detaches in either mode. Detaching keeps
+the existing process running, and unsent drafts stay available during this Shadow session.
+
+This is a local terminal integration with the existing Codex TUI, not a new Codex thread or
+an app-server resume. Existing profiles, conversation, credentials and tool permissions stay
+with that process. Shadow's provider is not called and terminal output is not added to its
+model context or transcript log. Non-Codex panes are view-only. A closed or replaced pane is
+never automatically retargeted; reconnect explicitly. No new dependency or daemon is installed.
+
+Native integration smoke: \`python3 scripts/smoke-tmux-pty.py ./dist-bin/shadow\` (requires
+installed tmux and Codex with \`--no-daemon\`). It uses a disposable tmux socket and Codex
+profile, exercises local slash menus with zero model tokens, and never sends to live agents.
+
 ## Images and terminal behavior
 
 Sessions take a short name from the opening prompt. \`/rename <name>\` overrides it; \`/resume\`

@@ -82,6 +82,7 @@ export function readLatestWorkCenterSnapshot(path: string): WorkCenterSnapshot |
 }
 
 export function recordWorkCenterSnapshot(log: SessionLog, snapshot: WorkCenterSnapshot): void {
+  if (!log.persistent) return;
   const target = sidecarPath(log.path);
   const temp = `${target}.tmp-${process.pid}`;
   try {

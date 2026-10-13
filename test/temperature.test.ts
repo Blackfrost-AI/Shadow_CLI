@@ -10,6 +10,7 @@ import { buildResponsesBody, ResponsesProvider } from '../src/provider/responses
 import type { CompletionRequest, Provider } from '../src/provider/provider.js';
 import { buildLoopDeps } from '../src/agent/loopDeps.js';
 import { Context } from '../src/agent/context.js';
+import { ToolRegistry } from '../src/tools/registry.js';
 import { runModelCheck } from '../src/doctor/modelCheck.js';
 import { resolveFakeHosts } from './helpers/fakeHostEgress.js';
 
@@ -167,7 +168,7 @@ test('buildLoopDeps carries the live config value into the next agent turn', () 
     const deps = buildLoopDeps({
       cfg,
       provider: {} as Provider,
-      registry: {} as never,
+      registry: new ToolRegistry(),
       gate: {} as never,
       bus: {} as never,
       budget: {} as never,

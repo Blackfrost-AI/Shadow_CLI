@@ -6,6 +6,7 @@ import { join } from 'node:path';
 
 import { assertStoreIsolated, isolateHome } from './helpers/isolateHome.js';
 import type { Message, Provider } from '../src/provider/provider.js';
+import type { CapabilityTarget } from '../src/doctor/capabilityRecords.js';
 
 // app.ts and modelSwitch.ts both reach globalStore at module load. Redirect HOME first so the
 // switch persistence exercised below cannot touch a developer's real ~/.shadow/config.json.
@@ -77,6 +78,7 @@ test('a successful model switch publishes the resolved runtime endpoint metadata
   const targets: Array<{
     baseUrl?: string;
     selfHosted: boolean;
+    capabilityTarget: Readonly<CapabilityTarget>;
     current: { provider: string; model: string };
     providerName: string;
   }> = [];
@@ -134,6 +136,12 @@ test('a successful model switch publishes the resolved runtime endpoint metadata
       {
         baseUrl: 'https://runtime.invalid/v1',
         selfHosted: true,
+        capabilityTarget: {
+          provider: 'openai', model: 'fixture-wire-model', baseUrl: 'https://runtime.invalid/v1',
+          connection: undefined, capabilities: undefined, profile: undefined,
+          selfHosted: true, wire: process.env.SHADOW_WIRE_API === 'responses' ? 'responses' : 'chat',
+          reasoningRoundtrip: 'last',
+        },
         current: { provider: 'openai', model: 'fixture-wire-model' },
         providerName: 'openai',
       },
@@ -164,6 +172,7 @@ test('pi /fork rebinds both the app and shared session-log holder before later w
     modelChecking: false,
     rewindable: [],
     rewindSeen: null,
+    switcher: { isSwitching: false },
     approvals: { clear: () => approvalsCleared++ },
     readTracker: { clear: () => readsCleared++ },
     pushLine: (line: { text?: string; lines?: Array<{ text: string }> }) => output.push(line),
@@ -249,6 +258,7 @@ test('pi /rewind persists the rewound chat state and prefills the next discarded
     first: true,
     rewindable: listRewindableTurns(log.path),
     rewindSeen: null,
+    switcher: { isSwitching: false },
     editor: { setText: (text: string) => drafts.push(text) },
     terminal: { rows: 40 },
     tui: {
@@ -266,6 +276,7 @@ test('pi /rewind persists the rewound chat state and prefills the next discarded
   app.runSlash('/rewind 0 --chat-only');
   assert.equal(live.messages().length, 4, 'preview does not rewind before confirmation');
   assert.ok(confirmation, 'rewind opens its confirmation picker');
+  confirmation.handleInput('2'); // Cancel is the safe default; explicitly select Apply.
   confirmation.handleInput('\r');
 
   assert.deepEqual(live.messages(), [message('user', 'first prompt'), message('assistant', 'first answer')]);

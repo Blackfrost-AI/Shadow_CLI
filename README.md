@@ -6,7 +6,7 @@
 
 > **A true gift of freedom and privacy.**
 > Zero-telemetry · provider-neutral · phone home to no one.
-> Current build: **`v10.0.4`** — subscription accounts, security harness add-ons, and hardened self-hosting in the full-width retro terminal.
+> Current build: **`v10.1.0`** — local workflows, verified checks, context controls, session search, and tmux integration in the full-width retro terminal.
 
 **Shadow is a zero-telemetry, provider-neutral security engineering agent that runs on your terms.** Point it at any model — Anthropic, any OpenAI-compatible endpoint, Gemini, or a local model on your own box. Its built-in Security foundation covers investigation, hardening, incident response, defensive automation, secure coding, and supporting systems work. **No Shadow account, no signup, no phone-home:** network access follows your provider, tool and update choices. Your config stays local and readable (`~/.shadow/config.json`), credentials are sent to their configured services, and you can switch models mid-session **without losing context**.
 
@@ -16,7 +16,19 @@ Under the hood it's a **tool-calling agentic runtime**: the model reasons, emits
 
 This is **not a chat app** — it is a tool-calling runtime.
 
-## What's new in v10.0.4
+## What's new in v10.1.0
+
+- **Workflows and checks:** run typed local workflows, preview their inputs, and verify work with reusable project checks and bounded completion corrections.
+- **Context controls:** inspect the captured request, pin files across compaction and resume, and exclude exact managed sources from future context.
+- **Review and recovery:** preview file or hunk staging, unstaging and restore; stale-state protection and retained backups cover review actions and guarded rewind.
+- **Session library:** search explicitly selected projects, pin sessions, add tags, and follow session lineage without changing the active workspace.
+- **Automation:** use versioned JSON/JSONL output, final JSON-schema validation, stable exit codes and ephemeral transcripts.
+- **Security evidence:** keep local findings, import SARIF/JSON, retain evidence history, and export redacted reports. Verification uses current host-recorded checks.
+- **Everyday controls:** optional onboarding capability probes, extension and learned-skill review menus, queued follow-ups during active work, and local tmux discovery, autocomplete and Codex terminal controls.
+
+Everything above runs locally through your chosen provider and existing permissions. No telemetry or hosted coordination was added. See the [functionality guide](docs/FUNCTIONALITY.md), [automation guide](docs/AUTOMATION.md), and [release notes](CHANGELOG.md).
+
+## Previous highlights: v10.0.4
 
 - **Subscription accounts:** sign in with ChatGPT directly or connect the official Claude Code CLI. Account identity survives model/profile changes and never silently falls back to API billing.
 - **Reliable onboarding:** choose a subscription, cloud provider, local model server, or local file through one keyboard-driven flow. Endpoint checks are bounded and retryable, and failed entries remain editable.

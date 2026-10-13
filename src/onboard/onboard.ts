@@ -10,7 +10,9 @@ import {
   type ProviderPreset,
   type OnboardMode,
 } from './catalog.js';
-import type { ProviderName } from '../provider/index.js';
+import type { ProviderName, ProviderOptions } from '../provider/index.js';
+import { runOnboardCapabilityCheck, saveCapabilityRecord } from '../doctor/capabilityRecords.js';
+import type { ModelCheckResult } from '../doctor/modelCheck.js';
 import {
   saveCredential,
   saveGlobalConfig,
@@ -119,6 +121,45 @@ export interface OnboardOptions {
   ui?: OnboardUI;
   probe?: typeof probeModelEndpoint;
   test?: typeof testConnection;
+  capabilityCheck?: typeof runOnboardCapabilityCheck;
+}
+
+/** Setup is already saved. Skipping, cancelling, or failing this optional test cannot undo it. */
+export async function offerOnboardCapabilityCheck(
+  ui: OnboardUI,
+  target: ProviderOptions,
+  check: (target: ProviderOptions, signal: AbortSignal) => Promise<ModelCheckResult> = runOnboardCapabilityCheck,
+): Promise<string> {
+  let summary = 'Deeper capability check skipped. Run /model test any time.';
+  try {
+    const choice = await ui.choose({ stage: 4, title: 'Test agent capabilities?',
+      description: 'Your setup is saved. Optional: test tools, file edits, recovery and multi-step work.',
+      details: ['Uses your selected endpoint: up to 2 minutes and 7 model turns.',
+        'Requests 1,024 output tokens per turn plus input tokens; provider reasoning budgets may be larger.',
+        'Provider charges may apply. Only temporary fixture files are edited. No telemetry or endpoint changes.'] },
+    choices([['skip', 'Finish setup', 'Keep the saved connection; test later with /model test'], ['run', 'Run capability check', 'Show what this exact endpoint and model can do']]), { initial: 'skip' });
+    if (choice === BACK || choice[0] !== 'run') return summary;
+    summary = 'Capability check cancelled. Your saved setup is ready to use.';
+    const result = await ui.busy({ stage: 4, title: 'Testing agent capabilities',
+      description: 'Up to 2 minutes · Escape cancels the test and keeps your saved setup.', details: [target.model, target.baseUrl ?? target.provider] },
+    (signal) => check(target, signal));
+    if (result === BACK) return summary;
+    summary = `Capability result: ${result.verdict.toUpperCase()}. ${result.recommendation}`;
+    try {
+      const record = saveCapabilityRecord(target, result);
+      summary += `\nSaved locally on ${record.checkedAt}. This result applies to the tested endpoint/model configuration.`;
+    } catch (error) {
+      summary += `\nCould not save capability history: ${safeError(error)}`;
+    }
+    await ui.choose({ stage: 4, title: 'Capability results', description: `${result.verdict.toUpperCase()} · ${result.recommendation}`,
+      details: [...result.probes.map((probe) => `${probe.status === 'pass' ? 'PASS' : 'FAIL'} ${probe.label}: ${probe.detail}`),
+        'Streaming compatibility, cancellation reliability and JSON-schema output: not assessed by this check.',
+        'Your chosen endpoint remains active regardless of this result.'] }, choices([['done', 'Finish setup']]));
+    return summary;
+  } catch (error) {
+    if (error instanceof OnboardCancelled) return summary;
+    return `Capability check could not complete: ${safeError(error)}. Your saved setup is ready to use; retry with /model test.`;
+  }
 }
 
 export async function runOnboard(options: OnboardOptions = {}): Promise<boolean> {
@@ -764,6 +805,10 @@ export async function runOnboard(options: OnboardOptions = {}): Promise<boolean>
                 : undefined,
             });
             finale = `Saved ${d.preset.label} · ${d.model}${d.test?.ok ? ' · connection verified' : ' · connection unverified'}.\nRun shadow to start. Use /model to switch between your selected models.`;
+            if (d.test?.ok) finale += `\n${await offerOnboardCapabilityCheck(ui, {
+              provider: d.adapter, model: d.model!, baseUrl: d.baseUrl, ...credentials(d), selfHosted: d.selfHosted,
+              capabilities: d.model === d.preset.defaultModel ? d.preset.entry?.capabilities : undefined,
+            }, options.capabilityCheck)}`;
             return true;
           }
         }

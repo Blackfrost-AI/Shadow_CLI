@@ -13,6 +13,7 @@ import type { MissionState } from './mission.js';
 import type { SessionLog as SessionLogType } from '../state/session.js';
 import { resolveParallelTools } from '../config/familyProfiles.js';
 import { sandboxToolAvailable } from '../safety/sandbox.js';
+import { checksForRegistry } from '../checks/registry.js';
 
 /**
  * The parts of `LoopDeps` that genuinely differ per call site. Everything else is
@@ -78,6 +79,7 @@ export function buildLoopDeps(input: LoopDepsInput): LoopDeps {
     bus: input.bus,
     budget: input.budget,
     context: input.context,
+    checks: input.registry.get('project_checks') ? checksForRegistry(input.registry, input.workspaceRoot) : undefined,
     signal: input.signal,
     model: input.model,
     system: input.system,

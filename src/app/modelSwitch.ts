@@ -14,7 +14,8 @@ import {
   isLocalServedEntry,
   mlxOfflineReady,
 } from '../gguf.js';
-import { createProvider, entryStreamContract, type ProviderName } from '../provider/index.js';
+import { createProvider, entryStreamContract, type ProviderName, type ProviderOptions } from '../provider/index.js';
+import { capabilityTargetFromProviderOptions, type CapabilityTarget } from '../doctor/capabilityRecords.js';
 import { subProviderFor } from '../auth/spec.js';
 import { ensureFreshSubscriptionCredential } from '../auth/refresh.js';
 import { resolveAutoModel } from '../local/autoEndpoint.js';
@@ -46,6 +47,7 @@ export interface BuiltProvider {
   entryModel: string;
   baseUrl?: string;
   selfHosted: boolean;
+  capabilityTarget: Readonly<CapabilityTarget>;
 }
 export type BuildResult = BuiltProvider | { ok: false; error: string; fatal?: boolean };
 
@@ -67,7 +69,7 @@ export interface SwitchHost {
   isRunning(): boolean;
   onModelSwitch?(provider: Provider, model: string): void;
   /** Keep renderer status/provider surfaces on the effective runtime endpoint after a switch. */
-  onTargetChange?(target: { baseUrl?: string; selfHosted: boolean }): void;
+  onTargetChange?(target: { baseUrl?: string; selfHosted: boolean; capabilityTarget: Readonly<CapabilityTarget> }): void;
 }
 
 export type BuildOpts = { clampBudget?: boolean; applyPolicy?: () => boolean };
@@ -190,7 +192,7 @@ export class ModelSwitcher {
         }
       }
     }
-    const client = createProvider({
+    const providerOptions: ProviderOptions = {
       // F10-01: a live /model switch or in-TUI fallback must carry the entry's P1A-04 stream
       // knobs + P1A-06 capability block exactly like bootstrap does — omitting them silently
       // reverted the idle watchdog to 120s and dropped the self-hosted contract mid-session.
@@ -209,7 +211,9 @@ export class ModelSwitcher {
             isLocalModelTarget({ gguf: entry.gguf, mlx: entry.mlx, vllm: entry.vllm, baseUrl })
           : undefined,
       reasoningRoundtrip: host.cfg.reasoningRoundtrip,
-    });
+    };
+    const client = createProvider(providerOptions);
+    const capabilityTarget = capabilityTargetFromProviderOptions(providerOptions, host.cfg.activeProfile);
     const selfHosted =
       provider === 'openai' &&
       (entry.selfHosted === true ||
@@ -222,6 +226,7 @@ export class ModelSwitcher {
       entryModel: entry.model,
       baseUrl,
       selfHosted,
+      capabilityTarget,
     };
   }
 
@@ -256,7 +261,7 @@ export class ModelSwitcher {
       }
       host.provider = built.client;
       host.current = { provider: built.provider, model: built.model };
-      host.onTargetChange?.({ baseUrl: built.baseUrl, selfHosted: built.selfHosted });
+      host.onTargetChange?.({ baseUrl: built.baseUrl, selfHosted: built.selfHosted, capabilityTarget: built.capabilityTarget });
       host.loop?.setProvider(built.client, built.model);
       host.onModelSwitch?.(built.client, built.model); // keep the agent tool's sub-agents on the live model
       try {

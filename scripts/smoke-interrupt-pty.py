@@ -28,7 +28,7 @@ def check(condition, message):
         raise RuntimeError(message)
 
 
-def exercise(command, label, key, partial, thinking=False):
+def exercise(command, label, key, partial, thinking=False, followup=False):
     class Provider(BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
         requests = 0
@@ -112,9 +112,12 @@ def exercise(command, label, key, partial, thinking=False):
             started = time.monotonic()
             os.write(master, key)
             wait_for(Provider.closed.is_set, 'interrupt did not close the connection', 3)
-            wait_for(lambda: contains(b'interrupted'), 'interrupt notice missing', 3)
-            os.write(master, b'A new request\r')
-            wait_for(lambda: contains(b'SECONDTURNCOMPLETED'), 'next turn stayed queued after interrupt', 3)
+            if followup:
+                wait_for(lambda: contains(b'next safe boundary'), 'follow-up handoff notice missing', 3)
+            else:
+                wait_for(lambda: contains(b'interrupted'), 'interrupt notice missing', 3)
+                os.write(master, b'A new request\r')
+            wait_for(lambda: contains(b'SECONDTURNCOMPLETED'), 'next turn stayed queued after handoff', 3)
             elapsed = time.monotonic() - started
             check(Provider.requests == 2, 'interrupt retried the cancelled request')
             os.write(master, b'/quit\r')
@@ -139,4 +142,5 @@ def exercise(command, label, key, partial, thinking=False):
 if __name__ == '__main__':
     check(len(sys.argv) > 1, 'provide a built CLI command')
     cases = [('escape-streaming', b'\x1b', True), ('escape-first-token', b'\x1b', False), ('ctrl-c-streaming', b'\x03', True), ('escape-thinking', b'\x1b', True, True)]
+    cases += [('followup-streaming', b'A new request\r', True, False, True), ('followup-first-token', b'A new request\r', False, False, True), ('followup-thinking', b'A new request\r', True, True, True)]
     print(json.dumps({'platform': sys.platform, 'checks': [exercise(sys.argv[1:], *case) for case in cases]}, indent=2))

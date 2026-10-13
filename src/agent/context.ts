@@ -1,5 +1,27 @@
-import type { ContentBlock, Message, Provider } from '../provider/provider.js';
-import { envelopeSafeSlice } from '../safety/envelope.js';
+import type { ContentBlock, Message, Provider, ToolSchema } from '../provider/provider.js';
+import { envelopeSafeSlice, envelopUntrusted } from '../safety/envelope.js';
+
+/** Explicit session attachments, separate from conversation history and never silently compacted. */
+export interface ContextSource {
+  id: string;
+  label: string;
+  kind: 'file' | 'note';
+  origin: string;
+  content: string;
+  state: 'pinned' | 'excluded';
+}
+
+export const MAX_CONTEXT_SOURCE_CHARACTERS = 64_000;
+export const MAX_PINNED_CONTEXT_CHARACTERS = 128_000;
+
+export interface PreparedContextRequest {
+  preparedAt: string;
+  model: string;
+  provider: string;
+  system: string;
+  tools: ToolSchema[];
+  messages: Message[];
+}
 
 export interface ContextOptions {
   contextBudget: number; // token budget that triggers summarization
@@ -32,9 +54,14 @@ export interface ContextOptions {
  */
 export class Context {
   private msgs: Message[] = [];
+  private sourceAttachments = new Map<string, ContextSource>();
+  /** Latest exact provider-neutral request; in-memory only, never added to session snapshots. */
+  private preparedRequest: PreparedContextRequest | undefined;
   private pinnedPrefix = 0;
   /** Last REAL request size (input + cache tokens) from the provider's usage event. */
   private lastActualTokens = 0;
+  /** Historical measured usage for inspection; independent from the compaction estimate floor. */
+  private lastReportedTokens = 0;
   /**
    * After a successful compact, auto-compact is suppressed until the estimate grows past
    * this floor. Prevents the "compact → still over trigger → compact again next tool"
@@ -117,7 +144,7 @@ export class Context {
       this.microcompactRatio = next.microcompactRatio!;
     }
     // Usage from the previous provider/model is not a valid request-size floor for the new one.
-    if (resetActualTokens) this.lastActualTokens = 0;
+    if (resetActualTokens) { this.lastActualTokens = 0; this.lastReportedTokens = 0; this.preparedRequest = undefined; }
     if (shrank || resetActualTokens) this.rearmAtTokens = 0;
     this.degradedReported = false; // a new model/budget is a new degradation episode
   }
@@ -142,7 +169,7 @@ export class Context {
    * includes the system prompt + tool definitions, which the message-only heuristic misses.
    */
   recordActualTokens(total: number): void {
-    if (total > 0) this.lastActualTokens = total;
+    if (total > 0) { this.lastActualTokens = total; this.lastReportedTokens = total; }
   }
 
   /** Seed the conversation with the task; the task is pinned. */
@@ -160,8 +187,11 @@ export class Context {
   /** Drop all history (used by the `/clear` command); the next pinTask re-seeds it. */
   reset(): void {
     this.msgs = [];
+    this.sourceAttachments.clear();
+    this.preparedRequest = undefined;
     this.pinnedPrefix = 0;
     this.lastActualTokens = 0;
+    this.lastReportedTokens = 0;
     this.rearmAtTokens = 0;
     this.degradedReported = false;
     this.estimateDirty = true; // F06-12
@@ -171,20 +201,76 @@ export class Context {
     return this.msgs;
   }
 
+  /** Next provider request, not the transcript. Attachments cannot split tool/result pairs. */
+  requestMessages(): Message[] {
+    const pins = [...this.sourceAttachments.values()].filter((source) => source.state === 'pinned');
+    if (pins.length === 0) return this.msgs;
+    return [{ role: 'user', content: pins.map((source) => ({ type: 'text' as const, text:
+      `[Pinned context: ${source.label.replace(/[\r\n\x00-\x1f\x7f]/g, ' ')}; retained across compaction]\n` +
+      envelopUntrusted({ tool: 'context_attachment', source: source.origin, content: source.content }),
+    })) }, ...this.msgs];
+  }
+
+  sources(): ContextSource[] { return [...this.sourceAttachments.values()].map((source) => ({ ...source })); }
+
+  /** Last completed request's provider usage, not a prediction for the next request. */
+  actualTokens(): number { return this.lastReportedTokens; }
+
+  captureRequestMetadata(request: Omit<PreparedContextRequest, 'preparedAt'>): void {
+    this.preparedRequest = structuredClone({ ...request, preparedAt: new Date().toISOString() });
+  }
+
+  /** Clone on read so a screen consumer cannot mutate later provider requests. */
+  preparedRequestMetadata(): PreparedContextRequest | undefined {
+    return this.preparedRequest ? structuredClone(this.preparedRequest) : undefined;
+  }
+
+  pinSource(source: Omit<ContextSource, 'state'>): void {
+    if (!source.id.trim() || !source.origin.trim()) throw new Error('Context sources need an id and origin.');
+    if (source.content.length > MAX_CONTEXT_SOURCE_CHARACTERS) throw new Error(`Source exceeds ${MAX_CONTEXT_SOURCE_CHARACTERS.toLocaleString()} characters; pin a smaller excerpt.`);
+    const retained = [...this.sourceAttachments.values()].filter((item) => item.id !== source.id && item.state === 'pinned')
+      .reduce((total, item) => total + item.content.length, source.content.length);
+    if (retained > MAX_PINNED_CONTEXT_CHARACTERS) throw new Error(`Pinned context exceeds ${MAX_PINNED_CONTEXT_CHARACTERS.toLocaleString()} characters; remove a pin first.`);
+    this.sourceAttachments.set(source.id, { ...source, state: 'pinned' });
+    this.estimateDirty = true;
+  }
+
+  /** A source exclusion affects attachments and participating retrieval tools, not prior history. */
+  excludeSource(id: string, metadata?: Pick<ContextSource, 'label' | 'kind' | 'origin'>): void {
+    const source = this.sourceAttachments.get(id);
+    if (!source && !metadata) throw new Error('Unknown context source.');
+    this.sourceAttachments.set(id, source ? { ...source, state: 'excluded' } : { id, ...metadata!, content: '', state: 'excluded' });
+    this.estimateDirty = true;
+    // A previous larger request is not an estimate of the newly excluded request.
+    this.lastActualTokens = 0;
+  }
+
+  removeSource(id: string): void {
+    if (this.sourceAttachments.delete(id)) { this.estimateDirty = true; this.lastActualTokens = 0; }
+  }
+
+  isSourceExcluded(idOrOrigin: string): boolean {
+    return [...this.sourceAttachments.values()].some((source) => source.state === 'excluded' && (source.id === idOrOrigin || source.origin === idOrOrigin));
+  }
+
   /** Export restorable state for session snapshots (resume / rewind). */
   exportState(): {
     messages: Message[];
     pinnedPrefix: number;
     lastActualTokens: number;
+    lastReportedTokens?: number;
     rearmAtTokens?: number;
     subAgentTasks?: any[];
+    sources?: ContextSource[];
   } {
     return {
       messages: [...this.msgs],
       pinnedPrefix: this.pinnedPrefix,
       lastActualTokens: this.lastActualTokens,
+      ...(this.lastReportedTokens ? { lastReportedTokens: this.lastReportedTokens } : {}),
       rearmAtTokens: this.rearmAtTokens,
       subAgentTasks: (this as any)._subAgentTasks || [],
+      ...(this.sourceAttachments.size ? { sources: this.sources() } : {}),
     };
   }
 
@@ -193,13 +279,24 @@ export class Context {
     messages: Message[];
     pinnedPrefix?: number;
     lastActualTokens?: number;
+    lastReportedTokens?: number;
     rearmAtTokens?: number;
     subAgentTasks?: any[];
+    sources?: ContextSource[];
   }): void {
     this.msgs = [...data.messages];
     this.pinnedPrefix = data.pinnedPrefix ?? 0;
     this.lastActualTokens = data.lastActualTokens ?? 0;
+    this.lastReportedTokens = data.lastReportedTokens ?? this.lastActualTokens;
     this.rearmAtTokens = data.rearmAtTokens ?? 0;
+    this.sourceAttachments.clear();
+    this.preparedRequest = undefined;
+    for (const source of data.sources ?? []) {
+      if (!source || typeof source.id !== 'string' || typeof source.label !== 'string' || typeof source.origin !== 'string' ||
+        typeof source.content !== 'string' || !['file', 'note'].includes(source.kind) || !['pinned', 'excluded'].includes(source.state)) continue;
+      if (source.state === 'pinned') this.pinSource(source);
+      else this.excludeSource(source.id, source);
+    }
     (this as any)._subAgentTasks = data.subAgentTasks || [];
     this.estimateDirty = true; // F06-12: history replaced wholesale
   }
@@ -213,7 +310,7 @@ export class Context {
     // provider directly: it measures the message-only heuristic, the one quantity
     // tombstoning can move.
     if (this.estimateDirty || this.estimateProvider !== provider) {
-      this.estimateCached = provider.estimateTokens(this.msgs);
+      this.estimateCached = provider.estimateTokens(this.requestMessages());
       this.estimateDirty = false;
       this.estimateProvider = provider;
     }
@@ -410,7 +507,7 @@ export class Context {
             // undercounts by exactly the fixed overhead every real request carries.
             const real = await provider.countTokens({
               model,
-              messages: this.msgs,
+              messages: this.requestMessages(),
               system: countCtx?.system,
               tools: countCtx?.tools as never,
               signal,
@@ -671,7 +768,7 @@ export class Context {
       const name = toolNameById.get(b.toolCallId);
       return !!name && MICROCOMPACTABLE_TOOLS.has(name);
     };
-    const underStopLine = (): boolean => provider.estimateTokens(this.msgs) <= trigger * 0.9;
+    const underStopLine = (): boolean => provider.estimateTokens(this.requestMessages()) <= trigger * 0.9;
 
     let droppedMessages = 0;
     for (const allowStateBearing of [false, true]) {

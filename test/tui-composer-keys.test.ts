@@ -21,7 +21,7 @@ import { loadConfig } from '../src/config.js';
 function makeOpts(over: Partial<TuiOpts> = {}): TuiOpts {
   return {
     provider: {} as TuiOpts['provider'],
-    registry: {} as TuiOpts['registry'],
+    registry: new ToolRegistry(),
     bus: new EventBus(),
     // startTurn's first message calls pinTask; most tests never submit, so a no-op stub suffices.
     context: { pinTask() {}, append() {} } as unknown as TuiOpts['context'],

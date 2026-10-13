@@ -165,6 +165,9 @@ export function parseHookStdout(raw: string): HookStdoutVerdict {
 export interface HookPhaseResult {
   ok: boolean;
   message?: string;
+  /** An explicit exit-0 decision, distinct from a crashed/timed-out hook. Only an explicit
+   * stop veto is eligible for bounded corrective model continuation. */
+  veto?: boolean;
   /** Accumulated `context` from exit-0 hooks (control-stripped, clamped), if any. */
   context?: string;
 }
@@ -181,7 +184,7 @@ export interface HookContext {
   extra?: Record<string, unknown>;
 }
 
-const DENY_PHASES = new Set<HookPhase>(['pre_tool_use', 'user_prompt_submit']);
+const DENY_PHASES = new Set<HookPhase>(['pre_tool_use', 'user_prompt_submit', 'stop']);
 
 /**
  * Run configured hook entries for a lifecycle phase. Non-zero exit on deny phases blocks the
@@ -265,7 +268,7 @@ export function runHookPhase(
     }
     const verdict = parseHookStdout(r.stdout ?? '');
     if (verdict.block && DENY_PHASES.has(phase)) {
-      return { ok: false, message: `${phase} hook ${entry.command} blocked: ${verdict.block}` };
+      return { ok: false, veto: true, message: `${phase} hook ${entry.command} blocked: ${verdict.block}` };
     }
     if (verdict.context) contexts.push(verdict.context);
   }

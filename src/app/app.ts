@@ -40,17 +40,27 @@ import { C, THEME_DESCRIPTIONS, THEME_NAMES, applyTheme, normalizeThemeName, bac
 import type { CanonicalThemeName } from '../tui/theme.js';
 import { customStyleNames, type OutputStyle } from '../agent/styles.js';
 import type { TodoItem } from '../agent/todo.js';
-import { writeFileSync, statSync, readFileSync, existsSync, readdirSync } from 'node:fs';
-import { isAbsolute, join, resolve, basename, dirname } from 'node:path';
+import { writeFileSync, statSync, readFileSync, existsSync } from 'node:fs';
+import { isAbsolute, join, resolve, basename } from 'node:path';
 import { homedir } from 'node:os';
 import { discoverCustomCommands, expandCommandBody } from '../tui/customCommands.js';
 import { PI_KEYS } from './keymap.js';
 import { ChoicePicker } from './picker.js';
+import { InputPrompt } from './inputPrompt.js';
+import { ContextInspector } from './contextInspector.js';
+import { buildContextInspection, pinContextFile, excludeContextFile } from '../context/inspection.js';
+import { checksForRegistry } from '../checks/registry.js';
+import { EvidenceStore, currentFindingRetest, type SecurityFinding } from '../security/evidence.js';
+import { discoverWorkflows, prepareWorkflow, assertWorkflowUnchanged, workflowRoots, type WorkflowEntry, type PreparedWorkflow } from '../workflows/catalog.js';
+import { TmuxClient, isCodexPane, type TmuxConnection, type TmuxPane } from '../tmux/client.js';
+import { TmuxView } from './tmuxView.js';
 import { TextViewer } from './textViewer.js';
 import { JobStore, type ProjectJob, type RoomMessage } from '../state/jobStore.js';
 import { WorkBrowser } from './workBrowser.js';
 import { ChangeReview } from './changeReview.js';
 import { readChanges, readFileDiff, reviewRequest, reviewMaterial, type ReviewScope } from '../state/gitChanges.js';
+import { previewReviewAction, applyReviewAction, type ReviewAction } from '../state/reviewActions.js';
+import type { ChangedFile } from '../state/gitChanges.js';
 import type { ReviewFinding } from '../agent/consultation.js';
 import { collaborationSchema, type CollaborationInput, type CollaborationResult } from '../agent/collaboration.js';
 import { resolveWithin } from '../safety/workspaceJail.js';
@@ -68,6 +78,7 @@ function parseSubProvider(value: string | undefined): SubProvider | null {
 }
 import { egressSummary } from '../safety/egress.js';
 import { discoverSkillCatalog } from '../skills/loader.js';
+import { SkillCandidateStore } from '../skills/candidateStore.js';
 import { formatDuration, shortPath } from '../tui/format.js';
 import { imageMediaType, MAX_IMAGE_BYTES } from '../util/image.js';
 import { copyToClipboard, hasClipboard } from '../util/clipboard.js';
@@ -82,6 +93,7 @@ import { listRewindableTurns, previewRewind, rewindToTurn } from '../state/rewin
 import { forkSession } from '../state/fork.js';
 import { ProjectMemory } from '../state/memory.js';
 import { SessionLog } from '../state/session.js';
+import { SessionLibrary, type LibrarySession } from '../state/sessionLibrary.js';
 import { normalizeSessionTitle, sessionTerminalTitle } from '../state/sessionTitle.js';
 import { recordWorkCenterSnapshot } from '../state/workCenterPersistence.js';
 import { sanitizeAssistantText } from '../tui/sanitize.js';
@@ -114,6 +126,7 @@ import { executeWorkCommand } from '../tui/workCommand.js';
 import { createReadTracker } from '../tools/readTracker.js';
 import { formatDoctorReport, runDoctor } from '../doctor.js';
 import { runModelCheck } from '../doctor/modelCheck.js';
+import { readCapabilityRecord, saveCapabilityRecord, type CapabilityTarget } from '../doctor/capabilityRecords.js';
 import { isLocalServedEntry } from '../gguf.js';
 import { addLocalModel, formatLocalList, listLocalModels, parseLocalAddArgs, removeLocalModel } from '../local/garage.js';
 import {
@@ -279,6 +292,9 @@ export class ShadowApp {
   private activityHandle: OverlayHandle | null = null;
   /** The composer's completion provider — held so the index can be warmed at startup. */
   private autocomplete: ShadowAutocompleteProvider | null = null;
+  private tmuxClient: TmuxConnection = new TmuxClient();
+  private tmuxView: TmuxView | null = null;
+  private tmuxDrafts = new Map<string, string>();
   /** Mid-session model switching (P1.1) — verbatim port of the Ink buildProvider/selectModel. */
   private switcher: ModelSwitcher;
   /** The session's ORIGINAL context budget — /model switches to a local model clamp under its
@@ -325,6 +341,7 @@ export class ShadowApp {
   private current: { provider: string; model: string };
   private provider;
   private activeTarget: { baseUrl?: string; selfHosted: boolean };
+  private activeCapabilityTarget?: Readonly<CapabilityTarget>;
   /** Read/edit evidence spans turns and is cleared only at conversation/session boundaries. */
   private readonly readTracker = createReadTracker();
   private style: OutputStyle = 'proactive';
@@ -342,6 +359,7 @@ export class ShadowApp {
     this.current = { provider: String(opts.provider.name ?? ''), model: opts.cfg.model ?? '' };
     this.provider = opts.provider;
     this.activeTarget = { baseUrl: opts.activeBaseUrl, selfHosted: opts.activeSelfHosted === true };
+    this.activeCapabilityTarget = opts.activeCapabilityTarget;
     this.planMode = !!opts.planMode?.active;
     this.mission = opts.mission?.snapshot() ?? null;
     this.todos = opts.todoList?.snapshot() ?? [];
@@ -386,6 +404,7 @@ export class ShadowApp {
       onModelSwitch: opts.onModelSwitch,
       onTargetChange: (target) => {
         app.activeTarget = target;
+        app.activeCapabilityTarget = target.capabilityTarget;
       },
     });
     this.tui = new TuiAltScreen(this.terminal, false, undefined, {
@@ -487,12 +506,12 @@ export class ShadowApp {
     // Publish the live abort controller so the `--web` mirror can interrupt this terminal's turn
     // — the same seam the Ink shell exposed. Without it the browser side can only watch.
     this.opts.setAbortGetter?.(() => this.controller);
-    // Scheduled wakeups (the schedule_wakeup tool). Mid-turn they QUEUE like typed type-ahead —
-    // starting a second turn on the shared Context mid-stream is how turns became un-abortable.
+    // Scheduled wakeups wait until turn-end. Only human input requests a safe-boundary handoff;
+    // a timer must never interrupt model work or start a second turn on the shared Context.
     if (this.opts.wakeupHandler) {
       this.opts.wakeupHandler.fire = (task: string, reason: string) => {
         const line = `[wakeup: ${reason}] ${task}`;
-        if (this.running) {
+        if (this.running || this.tmuxView) {
           this.queued.push(line);
           this.pushLine({ text: `  ⏰ wakeup queued (${reason}) — runs when this turn ends`, dimColor: true });
           this.hudRef = this.hudState();
@@ -1081,6 +1100,11 @@ export class ShadowApp {
   private installInputHandling(): void {
     this.tui.addInputListener((data: string) => {
       if (isKeyRelease(data)) return undefined;
+      if (this.tmuxView && this.pickerHandle?.isFocused()) {
+        // Let the focused view (and the terminal's mouse decoder) own every key,
+        // including Ctrl+C, instead of running Shadow's global turn/exit actions.
+        return undefined;
+      }
       // 1. Ctrl+C is a RESERVED chord: it must be reachable even while a dialog owns the
       //    keyboard. pi-tui dispatches input listeners before the focused component, and this
       //    listener returns consume:true for every key under a dialog — so if this check sat
@@ -1089,7 +1113,7 @@ export class ShadowApp {
       //    gate holds, the turn is running, so the first press aborts the turn — and the
       //    controller's signal settles the gate with it.
       if (isCtrlC(data)) {
-        if (this.running) {
+        if (this.running || this.modelChecking) {
           this.abortTurn();
           return { consume: true };
         }
@@ -1149,7 +1173,7 @@ export class ShadowApp {
 
       // 3. Esc interrupts a running turn. It is deliberately NOT the editor's key: while the
       //    agent works, Esc means one thing and the composer is not listening.
-      if (isEscape(data) && this.running) {
+      if (isEscape(data) && (this.running || this.modelChecking)) {
         this.abortTurn();
         return { consume: true };
       }
@@ -1172,10 +1196,11 @@ export class ShadowApp {
         return { consume: true };
       }
 
-      // 6. Enter while a turn runs: the draft is a follow-up. Queue it rather than dropping the
-      //    keystroke into a loop that cannot read it yet.
+      // 6. Enter while busy submits a follow-up. queue() asks the active loop to yield safely;
+      // commands and input behind a model-switch/compaction barrier stay in submission order.
       if (matchesKey(data, 'enter') && !matchesKey(data, 'ctrl+j') && (this.running || this.compacting || this.modelChecking || this.switcher.isSwitching) && this.editor.getText().trim()) {
         const q = this.editor.getExpandedText().trim();
+        this.editor.addToHistory(q);
         this.editor.setText('');
         this.queue(q);
         return { consume: true };
@@ -1230,9 +1255,19 @@ export class ShadowApp {
   }
 
   private queue(task: string): void {
+    // Enqueue before signalling: the loop's finally drains this queue once model work has
+    // stopped and every already-started tool has settled. Never hard-abort an active tool or
+    // cancel a prompt still waiting for the run lock (there is no loop to steer yet).
     this.queued.push(task);
     this.hudRef = this.hudState();
-    this.pushLine({ text: `  ⏳ queued: ${oneLine(task, 70)}`, dimColor: true });
+    const steered = !task.startsWith('/') && this.running && (this.loopRef?.requestSteer() ?? false);
+    if (steered) {
+      this.finishReasoning('interrupted');
+      this.flushStreamToTranscript();
+    }
+    this.pushLine({ text: steered
+      ? `  ↪ pending at the next safe boundary: ${oneLine(task, 70)}`
+      : `  ⏳ queued: ${oneLine(task, 70)}`, dimColor: true });
     this.tui.requestRender();
   }
 
@@ -1244,6 +1279,8 @@ export class ShadowApp {
       if (!next) continue;
       if (next.startsWith('/')) {
         this.runSlash(next);
+        // A command may start async work. Leave the rest of the FIFO intact until it settles.
+        if (this.running || this.compacting || this.modelChecking || this.switcher.isSwitching) return;
         continue;
       }
       this.startTurn(next);
@@ -1710,8 +1747,8 @@ export class ShadowApp {
       ] });
       const picker = new ChoicePicker({
         title: `Rewind turn ${turnIndex} · ${preview.paths.length} affected path(s)`,
-        items: ['Apply rewind', 'Cancel'], label: (item) => item,
-        choose: (item) => { this.closePicker(); if (item === 'Apply rewind') this.applyRewind(turnIndex, scope); },
+        items: ['Cancel', 'Apply rewind'], label: (item) => item,
+        choose: (item) => { this.closePicker(); if (item === 'Apply rewind') this.applyRewind(turnIndex, scope, preview.guardId); },
         close: () => this.closePicker(), repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
       });
       this.pickerHandle?.hide();
@@ -1722,10 +1759,11 @@ export class ShadowApp {
     }
   }
 
-  private applyRewind(turnIndex: number, scope: 'code' | 'chat' | undefined): void {
+  private applyRewind(turnIndex: number, scope: 'code' | 'chat' | undefined, previewGuardId?: string): void {
     try {
+      if (this.running || this.compacting || this.modelChecking || this.switcher.isSwitching) throw new Error('Finish the current operation before rewinding.');
       const turnsBefore = [...this.rewindable];
-      const { context: rewound, sessionState, restoredFiles, deletedFiles, partialFiles, turn, snapshotOffset } = rewindToTurn(
+      const { context: rewound, sessionState, restoredFiles, deletedFiles, partialFiles, turn, snapshotOffset, safetyBackupPath } = rewindToTurn(
         this.sessionLog.path,
         turnIndex,
         this.opts.workspaceRoot,
@@ -1734,6 +1772,7 @@ export class ShadowApp {
           triggerRatio: this.opts.cfg.summarizeTriggerRatio,
           keepLastTurns: this.opts.cfg.keepLastTurns,
           scope,
+          previewGuardId,
         },
       );
       // `context` is absent for a --code-only rewind: the conversation was deliberately left
@@ -1776,7 +1815,9 @@ export class ShadowApp {
         color: C.cyan,
       });
       if (scope !== 'chat') {
+        checksForRegistry(this.opts.registry, this.opts.workspaceRoot).invalidate();
         this.pushLine({ text: '  (workspace files were restored to that turn — /diff to inspect)', dimColor: true });
+        if (safetyBackupPath) this.pushLine({ text: `  Pre-rewind backup: ${approvalText(safetyBackupPath)}`, dimColor: true });
       }
       if (scope !== 'code') {
         const redo = turnsBefore.filter((candidate) => candidate.turn > turn).sort((a, b) => a.turn - b.turn)[0];
@@ -1905,8 +1946,17 @@ export class ShadowApp {
     return [...SLASH, ...this.discoverCommands().map((c) => ({ name: `/${c.name}`, desc: approvalText(c.description) }))].map((c: SlashSpec) => ({
       name: c.name,
       desc: c.desc,
+      submitOnArgumentSelection: c.name === '/tmux',
       args:
-        c.name === '/effort'
+        c.name === '/tmux'
+          ? async (prefix: string) => {
+              const panes = await this.tmuxClient.list().catch(() => []);
+              const sessions = [...new Set(panes.map((pane) => pane.session))];
+              return sessions.filter((session) => session.toLowerCase().includes(prefix.toLowerCase())).slice(0, 20)
+                .map((session) => ({ value: session, label: session,
+                  description: panes.filter((pane) => pane.session === session).map((pane) => `${pane.command} ${pane.id}`).join(' · ') }));
+            }
+          : c.name === '/effort'
           ? (prefix: string) => EFFORT_LEVELS.filter((level) => level.startsWith(prefix.toLowerCase()))
               .map((level) => ({ value: level, label: `${level}${level === this.effort ? ' · current' : ''}`, description: EFFORT_SUMMARIES[level] }))
           : c.name === '/model'
@@ -1951,6 +2001,9 @@ export class ShadowApp {
     // new catalog row cannot become an unreachable switch case through a second name lookup.
     const name = `/${handler}`;
     switch (name) {
+      case '/tmux':
+        this.openTmux(arg);
+        return;
       case '/quit':
       case '/exit':
         this.exit();
@@ -2047,14 +2100,13 @@ export class ShadowApp {
         });
         return;
       case '/context':
-        this.pushLine({
-          kind: 'system',
-          text: '',
-          lines: [
-            { text: `context window: ${Math.round(this.contextPct * 100)}% used`, bold: true },
-            { text: `model: ${this.current.provider}/${this.current.model}`, dimColor: true },
-          ],
-        });
+        this.openContextInspector(arg);
+        return;
+      case '/checks':
+        this.doChecks(arg);
+        return;
+      case '/findings':
+        this.doFindings(arg);
         return;
       case '/model':
         this.doModel(arg);
@@ -2527,29 +2579,7 @@ export class ShadowApp {
         this.tui.requestRender();
         this.pushLine({ text: `  ${this.showAllExpanded ? 'expanded — everything unfolded' : 'collapsed — folds back in'}`, dimColor: true });
         return;
-      case '/sessions': {
-        // The /resume INVENTORY — what /resume can load, without opening the picker.
-        const sessions = listResumableSessions(this.opts.workspaceRoot);
-        if (!sessions.length) {
-          this.pushLine({ text: '  No resumable sessions in this workspace yet.', dimColor: true });
-          return;
-        }
-        const currentId = SessionLog.sessionIdFromPath(this.sessionLog.path);
-        this.pushLine({
-          kind: 'system',
-          text: '',
-          lines: [
-            { text: `Resumable sessions (${sessions.length})`, bold: true },
-            ...sessions.slice(0, 50).map((x) => ({
-              text: approvalText(`  ${x.id === currentId ? '▸ ' : '  '}${x.title} · ${x.id}`),
-              color: x.id === currentId ? C.cyan : undefined,
-              dimColor: x.id !== currentId,
-            })),
-            { text: '  /resume <id> to load one', dimColor: true },
-          ],
-        });
-        return;
-      }
+      case '/sessions': void this.openSessionLibrary(arg); return;
       case '/agents': {
         const parts = arg.split(/\s+/).filter(Boolean);
         if (parts[0] === 'kill') {
@@ -2617,6 +2647,7 @@ export class ShadowApp {
         return;
       }
       case '/skills': {
+        if (!arg.trim()) { this.openSkillBrowser(); return; }
         const [sub = '', name = '', ...rest] = arg.trim().split(/\s+/);
         try {
           if (sub === 'pending') {
@@ -2680,34 +2711,13 @@ export class ShadowApp {
         else this.startTurn(prompt);
         return;
       }
-      case '/workflows': {
-        const roots = [
-          { label: 'workspace', dir: join(this.opts.workspaceRoot, '.shadow', 'workflows') },
-          ...enabledPluginDirs('workflows').map((dir) => ({ label: `plugin:${basename(dirname(dir))}`, dir })),
-          { label: 'global', dir: join(GLOBAL_DIR, 'workflows') },
-        ];
-        const wlines: { text: string; dimColor?: boolean }[] = [];
-        for (const root of roots) {
-          try {
-            const entries = readdirSync(root.dir, { withFileTypes: true })
-              .filter((entry) => !entry.name.startsWith('.'))
-              .map((entry) => `${entry.name}${entry.isDirectory() ? '/' : ''}`)
-              .sort((a, b) => a.localeCompare(b));
-            if (!entries.length) continue;
-            wlines.push({ text: approvalText(`${root.label}: ${shortPath(root.dir)}`), dimColor: true });
-            for (const entry of entries.slice(0, 20)) wlines.push({ text: approvalText(`  ${entry}`), dimColor: true });
-            if (entries.length > 20) wlines.push({ text: `  ... ${entries.length - 20} more`, dimColor: true });
-          } catch {
-            /* a missing root just contributes nothing */
-          }
-        }
-        this.pushLine({
-          kind: 'system',
-          text: '',
-          lines: wlines.length ? wlines : [{ text: 'No workflow files found under .shadow/workflows or ~/.shadow/workflows.', dimColor: true }],
-        });
+      case '/workflows':
+        this.doWorkflows(arg);
         return;
-      }
+      case '/extensions':
+        this.featureChoice('Extensions · inspect local configuration', ['Harness add-ons', 'Skills', 'Plugins', 'MCP servers', 'Hooks', 'Network receipts'], (value) => value,
+          (choice) => { this.closePicker(); this.runSlash(({ 'Harness add-ons': '/harness', Skills: '/skills', Plugins: '/plugins', 'MCP servers': '/mcp', Hooks: '/hooks', 'Network receipts': '/connections' })[choice]!); });
+        return;
       case '/hooks': {
         const hooks = (this.opts.cfg.hooks ?? {}) as Record<string, unknown[]>;
         const phases = Object.keys(hooks).filter((k) => Array.isArray(hooks[k]) && hooks[k]!.length > 0);
@@ -3487,6 +3497,14 @@ export class ShadowApp {
       }
       return;
     }
+    if (action === 'history') {
+      const target = this.activeCapabilityTarget;
+      const record = target ? readCapabilityRecord(target) : undefined;
+      this.openProjectText('Current model · local capability evidence', record
+        ? `Checked: ${record.checkedAt}\nModel: ${record.result.model}\nVerdict: ${record.result.verdict}\n\n${record.result.probes.map((probe) => `${probe.status}: ${probe.label}\n${probe.detail}`).join('\n\n')}\n\n${record.result.recommendation}\n\nStreaming, cancellation and structured output were not assessed. Results apply only to the tested endpoint and configuration; endpoints can change after a test.`
+        : 'No capability result for this exact current endpoint and configuration. Use /model test to make explicit test requests.', () => this.closePicker());
+      return;
+    }
     if (action === 'test') {
       const target = parts.slice(1).join(' ');
       const entry = target ? findModelPreset(models, target) : undefined;
@@ -3548,12 +3566,16 @@ export class ShadowApp {
   }
 
   private async runModelCapabilityCheck(entry?: ModelEntry): Promise<void> {
+    const controller = new AbortController(); this.controller = controller;
+    let release: (() => void) | undefined;
     try {
+      release = await runLock.acquire(CLI_HOLDER, { priority: true, signal: controller.signal });
       let provider = this.provider;
       let model = this.current.model;
       let providerName = this.current.provider;
       let local = this.activeTarget.selfHosted;
       let label = `${this.current.provider}/${this.current.model}`;
+      let target = this.activeCapabilityTarget;
       if (entry) {
         const built = await this.switcher.buildProvider(entry, { clampBudget: false });
         if (!built.ok) {
@@ -3565,15 +3587,23 @@ export class ShadowApp {
         providerName = built.provider;
         local = built.selfHosted || isLocalServedEntry(entry);
         label = entry.label;
+        target = built.capabilityTarget;
       }
-      this.pushLine({ text: approvalText(`  Testing ${label} — capability probes can take up to a minute…`), dimColor: true });
+      controller.signal.throwIfAborted();
+      this.pushLine({ text: approvalText(`  Testing ${label} — up to seven model turns; normal provider usage applies. Escape cancels.`), dimColor: true });
       const result = await runModelCheck(provider, {
         model,
         providerName,
         isLocal: local,
         temperature: this.opts.cfg.temperature,
+        signal: controller.signal,
         log: (message) => this.pushLine({ text: approvalText(`  ${message}`), dimColor: true }),
       });
+      controller.signal.throwIfAborted();
+      if (target) {
+        try { const saved = saveCapabilityRecord(target, result); this.pushLine({ text: `  Saved local evidence ${saved.checkedAt} · /model history`, dimColor: true }); }
+        catch (error) { this.pushLine({ text: `  Capability history not saved: ${approvalText((error as Error).message)}`, dimColor: true }); }
+      }
       this.pushLine({
         kind: 'system',
         text: 'model test',
@@ -3584,11 +3614,13 @@ export class ShadowApp {
           })),
           { text: `Verdict: ${result.verdict.toUpperCase()}`, color: result.verdict === 'agentic' ? C.green : result.verdict === 'limited' ? C.cyan : C.red },
           { text: approvalText(`  ${result.recommendation}`), dimColor: true },
+          { text: '  Streaming, cancellation and structured output: not assessed by these probes.', dimColor: true },
         ],
       });
     } catch (error) {
-      this.pushLine({ kind: 'error', text: `  Model test failed: ${approvalText((error as Error).message)}`, color: C.red });
+      if (!controller.signal.aborted) this.pushLine({ kind: 'error', text: `  Model test failed: ${approvalText((error as Error).message)}`, color: C.red });
     } finally {
+      release?.(); if (this.controller === controller) this.controller = null;
       this.modelChecking = false;
       this.flushQueue();
     }
@@ -3708,6 +3740,7 @@ export class ShadowApp {
       this.closePicker();
       this.pickerHandle = this.tui.showOverlay(new ChangeReview({ changes, diff: (file) => readFileDiff(this.opts.workspaceRoot, scope, file),
         rows: () => this.terminal.rows, repaint: () => this.tui.requestRender(), close: () => this.closePicker(),
+        action: scope.kind === 'working' ? (file, action, hunk) => this.reviewAction(file, action, hunk) : undefined,
         review: changes.files.length ? () => {
           this.closePicker();
           this.pickConsultProfile(reviewRequest(changes) + '\n\nReturn your final report as JSON: {"findings":[{"severity":"high|medium|low|info","path":"relative/path","line":1,"title":"Concrete issue","evidence":"Reason and verification evidence"}]}. Empty findings means no supported findings, not a test pass.', reviewMaterial(this.opts.workspaceRoot, changes));
@@ -3750,8 +3783,8 @@ export class ShadowApp {
     } catch (error) { this.pushLine({ kind: 'error', text: approvalText((error as Error).message), color: C.red }); }
   }
 
-  private async runTeam(input: CollaborationInput): Promise<void> {
-    if (!this.opts.runNativeTool || this.running || this.exiting) return;
+  private async runTeam(input: CollaborationInput, workflow?: PreparedWorkflow): Promise<void> {
+    if (!this.opts.runNativeTool || this.running || this.compacting || this.modelChecking || this.switcher.isSwitching || this.exiting) return;
     this.commitBrandLine(); this.running = true; this.runStart = Date.now();
     const controller = new AbortController(); this.controller = controller;
     this.startTicker(); this.hudRef = this.hudState();
@@ -3762,6 +3795,9 @@ export class ShadowApp {
       const budget = new Budget({ maxIterations: 0, ...this.opts.cfg.budget }, this.current.model, this.opts.cfg.priceTable, Date.now());
       const result = await this.opts.runNativeTool('collaborate', input, controller.signal, budget);
       const data = result.data as CollaborationResult | undefined;
+      if (data && workflow) this.withJobs((store) => store.postMessage({ room: data.room, from: 'operator', jobId: data.jobId,
+        body: redactString(JSON.stringify({ kind: 'workflow_provenance', id: workflow.entry.workflow.id, source: workflow.entry.source,
+          sourceDigest: workflow.entry.digest, runDigest: workflow.digest, values: workflow.values, limits: { seconds: input.deadlineSeconds, tokens: input.maxTokens } })) }));
       this.pushLine({ kind: 'assistant', text: data?.answer ?? result.summary, meta: 'team' });
       if (data) this.pushLine({ text: `${data.jobId} · ${data.status} · acceptance ${data.acceptance.status} · ${data.costConfidence === 'unknown' ? 'cost unknown' : '$' + budget.totalCostUSD.toFixed(4)} · /jobs · /room ${data.room} · /work artifacts`, dimColor: true });
     } catch (error) {
@@ -3880,6 +3916,327 @@ export class ShadowApp {
     this.pickerHandle = this.tui.showOverlay(new TextViewer({ title, text, close,
       repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
     }), { anchor: 'center', width: '90%' });
+  }
+
+  private featureChoice<T>(title: string, items: T[], label: (item: T) => string, choose: (item: T) => void, close = () => this.closePicker()): void {
+    this.closePicker();
+    this.pickerHandle = this.tui.showOverlay(new ChoicePicker({ title, items, label, choose: (item) => {
+      try { choose(item); } catch (error) { this.closePicker(); this.featureError(error); }
+    }, close, repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows }), { anchor: 'center', width: '90%' });
+  }
+
+  private featureInput(title: string, initial: string, submit: (text: string) => void, close = () => this.closePicker(), description?: string): void {
+    this.closePicker();
+    this.pickerHandle = this.tui.showOverlay(new InputPrompt({ title, initial, description, tui: this.tui, theme: editorTheme(),
+      submit: (text) => { try { submit(text); } catch (error) { this.closePicker(); this.featureError(error); } }, close, repaint: () => this.tui.requestRender(),
+    }), { anchor: 'center', width: '90%' });
+  }
+
+  private featureError(error: unknown): void {
+    this.pushLine({ kind: 'error', text: approvalText(error instanceof Error ? error.message : String(error)), color: C.red });
+  }
+
+  private withSessionLibrary<T>(fn: (library: SessionLibrary) => T): T {
+    const library = new SessionLibrary(this.opts.workspaceRoot);
+    try { return fn(library); } finally { library.close(); }
+  }
+
+  private async openSessionLibrary(arg = ''): Promise<void> {
+    let library: SessionLibrary | undefined;
+    try {
+      const parsed = splitPresetArgs(arg); if (!parsed.ok) throw new Error(parsed.message);
+      const [action, ...rest] = parsed.value;
+      if (action === 'projects') { this.sessionProjects(); return; }
+      if (action === 'add' || action === 'remove') {
+        if (!rest.length) throw new Error(`/sessions ${action} <project path>`);
+        const root = resolve(this.opts.workspaceRoot, rest.join(' '));
+        this.withSessionLibrary((store) => action === 'add' ? store.addProject(root) : store.removeProject(root));
+        this.sessionProjects(); return;
+      }
+      const query = action === 'search' ? rest.join(' ') : action === 'pinned' ? '' : arg.trim();
+      const pinnedOnly = action === 'pinned';
+      const controller = new AbortController();
+      this.featureChoice('Sessions · searching selected local projects…', ['Cancel'], (item) => item, () => this.closePicker());
+      this.pickerCleanup = () => controller.abort();
+      library = new SessionLibrary(this.opts.workspaceRoot);
+      const result = await library.search(query, { limit: 100, pinnedOnly, signal: controller.signal });
+      if (controller.signal.aborted || this.exiting) return;
+      if (result.notices.length) this.pushLine({ text: approvalText(result.notices.join(' · ')), dimColor: true });
+      const items: Array<LibrarySession | string> = ['Search sessions', pinnedOnly ? 'Show all sessions' : 'Pinned sessions', 'Selected projects', ...result.sessions];
+      this.featureChoice(`Sessions · ${result.sessions.length} matches${result.truncated ? ' · bounded search' : ''}${query ? ` · ${approvalText(query)}` : ''}`,
+        items, (item) => typeof item === 'string' ? item : redactString(`${item.pinned ? '★ ' : ''}${item.title} · ${item.projectRoot ? basename(item.projectRoot) : 'unknown workspace'}${item.tags.length ? ' · #' + item.tags.join(' #') : ''}${item.snippet ? ' · ' + oneLine(item.snippet, 70) : ''}`),
+        (item) => {
+          if (typeof item !== 'string') { this.sessionLibraryActions(item, arg); return; }
+          if (item === 'Search sessions') this.featureInput('Search selected project transcripts', query, (value) => { void this.openSessionLibrary(`search ${JSON.stringify(value)}`); });
+          else if (item === 'Selected projects') this.sessionProjects();
+          else void this.openSessionLibrary(item === 'Pinned sessions' ? 'pinned' : '');
+        });
+    } catch (error) { this.featureError(error); }
+    finally { library?.close(); }
+  }
+
+  private sessionProjects(): void {
+    const projects = this.withSessionLibrary((store) => store.projects());
+    this.featureChoice('Selected projects · no automatic scanning', ['+ Add a project', ...projects.map((project) => project.path)], (item) => item,
+      (item) => {
+        if (item === '+ Add a project') this.featureInput('Project directory to include', '', (path) => {
+          this.withSessionLibrary((store) => store.addProject(resolve(this.opts.workspaceRoot, path))); this.sessionProjects();
+        }, () => this.sessionProjects());
+        else this.featureChoice(item, projects.find((project) => project.path === item)?.current ? ['Back (current project is always included)'] : ['Back', 'Remove from library'], (value) => value, (value) => {
+          if (value === 'Remove from library') this.withSessionLibrary((store) => store.removeProject(item));
+          this.sessionProjects();
+        }, () => this.sessionProjects());
+      }, () => { void this.openSessionLibrary(); });
+  }
+
+  private sessionLibraryActions(session: LibrarySession, returnArg: string): void {
+    const back = (): void => { void this.openSessionLibrary(returnArg); };
+    this.featureChoice(session.title, ['Inspect match and lineage', session.pinned ? 'Unpin' : 'Pin', 'Edit tags',
+      ...(session.resumable ? [session.canResumeHere ? 'Resume in this workspace' : 'Show launch command'] : ['Show launch command'])], (item) => item,
+    (item) => {
+      if (item === 'Inspect match and lineage') this.openProjectText(session.title, JSON.stringify(session, null, 2), () => this.sessionLibraryActions(session, returnArg));
+      else if (item === 'Pin' || item === 'Unpin') { this.withSessionLibrary((store) => store.setPinned(session.path, !session.pinned)); back(); }
+      else if (item === 'Edit tags') this.featureInput('Tags separated by commas', session.tags.join(', '), (text) => {
+        this.withSessionLibrary((store) => store.setTags(session.path, text.split(',').map((tag) => tag.trim()).filter(Boolean))); back();
+      }, back);
+      else if (item === 'Resume in this workspace') {
+        if (this.running || this.compacting || this.modelChecking || this.switcher.isSwitching) throw new Error('Finish the current operation before resuming.');
+        this.closePicker(); this.applyResume({ path: session.path, id: session.id, title: session.title, ts: new Date(session.modifiedAt).toISOString() });
+      } else this.openProjectText('Open in the owning workspace', `${session.navigation.command}\n\n${session.projectRoot ? 'Run this command in another terminal. This session keeps its current workspace.' : 'Workspace ownership is unknown. Verify the correct project before using this path.'}`, back);
+    }, back);
+  }
+
+  private reviewAction(file: ChangedFile, action: ReviewAction, hunkIndex?: number): void {
+    try {
+      if (this.running || this.compacting || this.modelChecking || this.switcher.isSwitching) throw new Error('Finish the current operation before changing reviewed files.');
+      const preview = previewReviewAction(this.opts.workspaceRoot, file, action, hunkIndex);
+      const back = (): void => this.openChanges({ kind: 'working' });
+      this.openProjectText(preview.summary, `${preview.summary}\n\n${preview.diff}\n\n${preview.backupRequired ? 'A local backup will be retained before restoration.' : 'Only the selected index entry changes.'}\nChanges to the file, index or HEAD invalidate this preview.`, () => {
+        this.featureChoice(preview.summary, ['Cancel', `Apply ${action}`], (value) => value, (value) => {
+          if (value !== 'Cancel') {
+            if (this.running || this.compacting || this.modelChecking || this.switcher.isSwitching) throw new Error('Workspace became busy. Open a fresh review preview.');
+            const result = applyReviewAction(preview);
+            checksForRegistry(this.opts.registry, this.opts.workspaceRoot).invalidate();
+            this.pushLine({ text: `  ${result.action}: ${approvalText(result.path)}${result.backupPath ? ` · backup ${approvalText(result.backupPath)}` : ''}`, color: C.green });
+          }
+          back();
+        }, back);
+      });
+    } catch (error) { this.featureError(error); }
+  }
+
+  private openContextInspector(arg = ''): void {
+    try {
+      const parts = splitPresetArgs(arg); if (!parts.ok) throw new Error(parts.message);
+      const [action, ...rest] = parts.value; const path = rest.join(' ');
+      if (action) {
+        if (this.running || this.compacting) throw new Error('Finish or interrupt the current operation before changing context sources.');
+        if (!path || !['pin', 'exclude', 'remove'].includes(action)) throw new Error('/context [pin|exclude|remove <path>]');
+        if (action === 'pin') pinContextFile(this.opts.context, this.opts.workspaceRoot, path);
+        else if (action === 'exclude') excludeContextFile(this.opts.context, this.opts.workspaceRoot, path);
+        else this.opts.context.removeSource(`file:${resolveWithin(this.opts.workspaceRoot, path)}`);
+        this.sessionLog.recordSnapshot(this.opts.context, this.turnNo);
+      }
+      this.closePicker();
+      this.pickerHandle = this.tui.showOverlay(new ContextInspector({
+        snapshot: () => buildContextInspection({ context: this.opts.context, provider: this.provider, model: this.current.model,
+          system: this.opts.styleState?.systemForStyle?.(this.style) ?? this.opts.system, tools: this.opts.registry.toSchemas(),
+          destination: this.activeTarget.baseUrl ? (() => { const url = new URL(this.activeTarget.baseUrl!); return url.origin + url.pathname; })() : this.current.provider }),
+        rows: () => this.terminal.rows, repaint: () => this.tui.requestRender(), close: () => this.closePicker(),
+        action: (entry, action) => {
+          try {
+            if (this.running || this.compacting) throw new Error('Context controls are available between turns.');
+            if (!entry.source) return;
+            if (action === 'pin') pinContextFile(this.opts.context, this.opts.workspaceRoot, entry.source.origin);
+            else if (action === 'exclude') this.opts.context.excludeSource(entry.source.id);
+            else this.opts.context.removeSource(entry.source.id);
+            this.sessionLog.recordSnapshot(this.opts.context, this.turnNo);
+          } catch (error) { this.featureError(error); }
+        },
+      }), { anchor: 'center', width: '95%' });
+    } catch (error) { this.featureError(error); }
+  }
+
+  private async runFeatureTool(name: string, input: unknown, title: string, complete?: () => void): Promise<void> {
+    if (!this.opts.runNativeTool || this.running || this.compacting || this.modelChecking || this.switcher.isSwitching || this.exiting) {
+      this.pushLine({ text: '  Finish the current operation before starting this action.', dimColor: true }); return;
+    }
+    this.closePicker(); this.commitBrandLine(); this.running = true; this.runStart = Date.now();
+    const controller = new AbortController(); this.controller = controller; this.startTicker(); this.hudRef = this.hudState();
+    let release: (() => void) | undefined;
+    try {
+      release = await runLock.acquire(CLI_HOLDER, { priority: true, signal: controller.signal });
+      const budget = new Budget({ maxIterations: 0, ...this.opts.cfg.budget }, this.current.model, this.opts.cfg.priceTable, Date.now());
+      const result = await this.opts.runNativeTool(name, input, controller.signal, budget);
+      this.pushLine({ text: `${title}: ${approvalText(result.summary)}`, color: result.ok ? C.green : C.yellow });
+    } catch (error) { if (!controller.signal.aborted) this.featureError(error); }
+    finally { release?.(); this.endTurn(); if (!this.running && !this.exiting) complete?.(); }
+  }
+
+  private doChecks(arg = ''): void {
+    try {
+      const store = checksForRegistry(this.opts.registry, this.opts.workspaceRoot);
+      const [action, ...ids] = arg.trim().split(/\s+/);
+      if (action === 'run' && ids[0]) { void this.runFeatureTool('project_checks', { action: 'run', id: ids[0] }, `Check ${ids[0]}`, () => this.doChecks()); return; }
+      if (action === 'select') { store.select(ids); this.doChecks(); return; }
+      if (action === 'history') { this.openProjectText('Recorded checks · timestamped evidence', JSON.stringify(store.history(), null, 2), () => this.doChecks()); return; }
+      if (action && action !== 'list') throw new Error('/checks [run <id>|select <ids...>|history]');
+      const checks = store.snapshot();
+      this.featureChoice('Project checks · choose to inspect or run', [...checks.map((item) => item.profile.id), '+ Add a check', 'History'],
+        (id) => { const item = checks.find((candidate) => candidate.profile.id === id); return item ? `${item.selected ? '● ' : ''}${id} · ${item.status} · ${item.profile.title}` : id; },
+        (id) => {
+          if (id === 'History') { this.doChecks('history'); return; }
+          if (id === '+ Add a check') {
+            this.featureInput('Check identifier', '', (name) => {
+              this.featureInput('Check command · saved only, not executed', '', (command) => {
+                if (store.profiles().some((profile) => profile.id === name)) throw new Error('A check with that id already exists. Edit .shadow/checks.json to change it.');
+                store.saveProfiles({ version: 1, profiles: [...store.profiles(), { id: name, title: name, command }] }); this.doChecks();
+              }, () => this.doChecks());
+            }, () => this.doChecks()); return;
+          }
+          const item = store.snapshot().find((candidate) => candidate.profile.id === id)!;
+          this.featureChoice(`${id} · ${item.status}`, ['Inspect command and evidence', 'Run check', item.selected ? 'Remove from required checks' : 'Require for this task'], (value) => value,
+            (choice) => {
+              if (choice.startsWith('Inspect')) this.openProjectText(id, JSON.stringify(item, null, 2), () => this.doChecks());
+              else if (choice === 'Run check') void this.runFeatureTool('project_checks', { action: 'run', id }, id, () => this.doChecks());
+              else { store.select([...checks.filter((candidate) => candidate.selected && candidate.profile.id !== id).map((candidate) => candidate.profile.id), ...(!item.selected ? [id] : [])]); this.doChecks(); }
+            }, () => this.doChecks());
+        });
+    } catch (error) { this.featureError(error); }
+  }
+
+  private doWorkflows(arg = ''): void {
+    try {
+      const catalog = discoverWorkflows(workflowRoots(this.opts.workspaceRoot, GLOBAL_DIR, enabledPluginDirs('workflows')));
+      for (const error of catalog.errors) this.pushLine({ text: approvalText(error), color: C.yellow });
+      const [id, ...rest] = arg.trim().split(/\s+/);
+      if (id) {
+        const entry = catalog.entries.find((entry) => entry.workflow.id === id); if (!entry) throw new Error(`Unknown workflow: ${id}`);
+        if (rest.length) {
+          const values = JSON.parse(rest.join(' ')) as Record<string, string>;
+          this.previewWorkflow(prepareWorkflow(entry, values, this.opts.workspaceRoot));
+        } else this.workflowInputs(entry);
+        return;
+      }
+      this.featureChoice<WorkflowEntry | string>('Workflows · local procedures', [...catalog.entries, ...(catalog.references.length ? ['Reference runbooks'] : [])],
+        (entry) => typeof entry === 'string' ? entry : `${entry.workflow.title} · ${entry.workflow.preset}`, (entry) => {
+          if (typeof entry !== 'string') { this.workflowInputs(entry); return; }
+          this.featureChoice('Reference runbooks · inspect Markdown', catalog.references, (reference) => reference.label, (reference) => {
+            const roots = workflowRoots(this.opts.workspaceRoot, GLOBAL_DIR, enabledPluginDirs('workflows'));
+            const source = roots.find((root) => reference.label.startsWith(root.label + '/'));
+            if (!source) throw new Error('Workflow source is no longer enabled.');
+            const path = resolveWithin(source.dir, basename(reference.path));
+            if (statSync(path).size > 256 * 1024) throw new Error('Runbook exceeds the preview limit.');
+            this.openProjectText(reference.label, readFileSync(path, 'utf8'), () => this.doWorkflows());
+          }, () => this.doWorkflows());
+        });
+    } catch (error) { this.featureError(error); }
+  }
+
+  private workflowInputs(entry: WorkflowEntry, values: Record<string, string> = {}, index = 0): void {
+    const fields = Object.entries(entry.workflow.parameters);
+    const field = fields[index];
+    if (!field) { this.previewWorkflow(prepareWorkflow(entry, values, this.opts.workspaceRoot)); return; }
+    const [key, param] = field;
+    const next = (value: string): void => { if (param.required && !value.trim()) throw new Error(`${key} is required.`); this.workflowInputs(entry, { ...values, [key]: value }, index + 1); };
+    if (param.choices) this.featureChoice(`${entry.workflow.title} · ${param.description}`, param.choices, (value) => value, next, () => this.doWorkflows());
+    else this.featureInput(`${entry.workflow.title} · ${key}`, values[key] ?? param.default ?? '', next, () => this.doWorkflows(), param.description);
+  }
+
+  private previewWorkflow(prepared: PreparedWorkflow): void {
+    const actions = (): void => this.featureChoice(`${prepared.entry.workflow.title} · ready for review`, ['Inspect execution preview', 'Run workflow', 'Edit inputs'], (value) => value,
+      (choice) => {
+        if (choice === 'Inspect execution preview') this.openProjectText(prepared.entry.workflow.title, prepared.preview, actions);
+        else if (choice === 'Edit inputs') this.workflowInputs(prepared.entry, prepared.values);
+        else {
+          if (!this.opts.runNativeTool || this.running || this.compacting || this.modelChecking || this.switcher.isSwitching || this.exiting) throw new Error('Finish the current operation before starting a workflow.');
+          assertWorkflowUnchanged(prepared); this.closePicker();
+          this.sessionLog.record({ kind: 'workflow_launch', workflow: prepared.entry.workflow.id, source: prepared.entry.source, sourceDigest: prepared.entry.digest,
+            runDigest: prepared.digest, values: JSON.parse(redactString(JSON.stringify(prepared.values))) });
+          void this.runTeam(prepared.input, prepared);
+        }
+      }, () => this.doWorkflows());
+    this.openProjectText(prepared.entry.workflow.title, prepared.preview, actions);
+  }
+
+  private withEvidence<T>(fn: (store: EvidenceStore) => T): T {
+    const store = new EvidenceStore(this.opts.workspaceRoot); try { return fn(store); } finally { store.close(); }
+  }
+
+  private doFindings(arg = ''): void {
+    try {
+      if (arg.trim()) {
+        const parsed = splitPresetArgs(arg); if (!parsed.ok) throw new Error(parsed.message);
+        const [action, ...rest] = parsed.value;
+        if (action === 'import' && rest.length) { const result = this.withEvidence((store) => store.importFile(rest.join(' '))); this.pushLine({ text: `  Imported ${result.added} findings; ${result.duplicates} repeated observations.`, color: C.green }); }
+        else if (action === 'export') { const path = this.withEvidence((store) => store.exportReport()); this.pushLine({ text: `  Report saved: ${path}`, color: C.green }); return; }
+        else if (action === 'scope' && rest.length) this.withEvidence((store) => store.scope(rest.join(' ')));
+        else throw new Error('/findings [import <path>|scope <description>|export]');
+      }
+      const findings = this.withEvidence((store) => store.list());
+      this.featureChoice('Security findings · local evidence', [...findings.map((finding) => finding.id), 'Import JSON / SARIF', 'Assessment scope', 'Export report'],
+        (id) => { const finding = findings.find((f) => f.id === id); return finding ? `${finding.severity} · ${finding.status} · ${finding.title}` : id; },
+        (id) => {
+          if (id === 'Import JSON / SARIF') this.featureInput('Local import path', '', (path) => { const result = this.withEvidence((store) => store.importFile(path)); this.pushLine({ text: `  Imported ${result.added}; repeated ${result.duplicates}.`, color: C.green }); this.doFindings(); }, () => this.doFindings());
+          else if (id === 'Assessment scope') this.featureInput('Assessment scope · record only', this.withEvidence((store) => store.scope()), (scope) => { this.withEvidence((store) => store.scope(scope)); this.doFindings(); }, () => this.doFindings());
+          else if (id === 'Export report') this.doFindings('export');
+          else this.openFinding(this.withEvidence((store) => store.get(id)));
+        });
+    } catch (error) { this.featureError(error); }
+  }
+
+  private openFinding(finding: SecurityFinding): void {
+    const refresh = (): void => this.openFinding(this.withEvidence((store) => store.get(finding.id)));
+    this.featureChoice(`${finding.title} · ${finding.status}`, ['Inspect evidence and history', 'Update disposition', 'Attach text evidence', 'Record retest from check', 'Request scoped remediation'], (value) => value,
+      (choice) => {
+        if (choice === 'Inspect evidence and history') this.openProjectText(finding.title, JSON.stringify(finding, null, 2), refresh);
+        else if (choice === 'Update disposition') this.featureChoice('Finding disposition', ['open', 'triaged', 'remediated', 'accepted'] as const, (value) => value,
+          (status) => this.featureInput('Reason / remediation note', '', (note) => { this.withEvidence((store) => store.update(finding.id, status, note)); refresh(); }, refresh), refresh);
+        else if (choice === 'Attach text evidence') this.featureInput('Evidence path · redacted local copy', '', (path) => { this.withEvidence((store) => store.attach(finding.id, path, 'Operator-selected evidence')); refresh(); }, refresh);
+        else if (choice === 'Record retest from check') {
+          const liveChecks = checksForRegistry(this.opts.registry, this.opts.workspaceRoot);
+          const checks = liveChecks.snapshot().filter((item) => item.latest && item.status !== 'not_run').map((item) => item.latest!);
+          this.featureChoice('Select relevant current check · timestamps matter', checks, (check) => `${check.profileId} · ${check.status} · ${check.recordedAt}`,
+            (check) => { this.withEvidence((store) => store.retest(finding.id, currentFindingRetest(liveChecks, check.id))); refresh(); }, refresh);
+        } else {
+          this.closePicker(); this.editor.setText(`Investigate and address security finding ${finding.id}. Treat it as an unverified claim: ${finding.title}. Scope: ${finding.path || 'recorded assessment scope'}. Inspect its evidence with security_findings, make only supported fixes, and run relevant checks. Report limits; do not mark verified without a relevant recorded retest.`);
+          this.tui.requestRender();
+        }
+      }, () => this.doFindings());
+  }
+
+  private openSkillBrowser(): void {
+    this.featureChoice('Skills · local procedures', ['Installed skill catalog', 'Review learned candidates', 'Rollback an active skill'], (value) => value,
+      (choice) => {
+        if (choice === 'Installed skill catalog') { this.closePicker(); this.runSlash('/skills list'); return; }
+        if (choice === 'Rollback an active skill') {
+          this.featureInput('Skill name to roll back', '', (name) => this.featureInput('Archived generation number', '', (generation) => {
+            const number = Number(generation); if (!Number.isSafeInteger(number) || number < 1) throw new Error('Choose a positive generation number.');
+            this.featureChoice(`Roll back ${name} to generation ${number}?`, ['Cancel', 'Roll back'], (item) => item, (item) => {
+              if (item === 'Roll back') this.pushLine({ text: rollbackActiveSkill(name, number), color: C.green }); this.openSkillBrowser();
+            });
+          }, () => this.openSkillBrowser()), () => this.openSkillBrowser()); return;
+        }
+        const store = new SkillCandidateStore(); const candidates = store.listCandidates({ statuses: ['draft'] });
+        this.featureChoice('Learned candidates · review before activation', candidates, (candidate) => `${candidate.name} v${candidate.version} · ${candidate.rationale}`,
+          (candidate) => {
+            const snapshot = store.inspectCandidate(candidate.name); const activeGeneration = store.readActiveSkill(candidate.name)?.generation ?? 0;
+            const actions = (): void => this.featureChoice(`${candidate.name} v${snapshot.version}`, ['Inspect procedure and evidence', 'Validate', 'Activate reviewed version', 'Reject'], (value) => value,
+              (action) => {
+                if (action === 'Inspect procedure and evidence') this.openProjectText(candidate.name, inspectSkillCandidateLines(candidate.name).join('\n'), actions);
+                else if (action === 'Validate') this.openProjectText('Validation', validateSkillCandidateLines(candidate.name).join('\n'), actions);
+                else if (action === 'Reject') this.featureInput('Reason for rejection', '', (reason) => {
+                  store.rejectCandidate(candidate.name, { expectedVersion: snapshot.version, by: process.env.USER ?? 'local-operator', reason }); this.openSkillBrowser();
+                }, actions);
+                else {
+                  const result = store.activateCandidate(candidate.name, { expectedVersion: snapshot.version, expectedActiveGeneration: activeGeneration,
+                    approvedBy: process.env.USER ?? 'local-operator', confirmation: 'activate' });
+                  this.pushLine({ text: `  Activated ${candidate.name} generation ${result.active.generation}. Start a new session to load it.`, color: C.green }); this.openSkillBrowser();
+                }
+              }, () => this.openSkillBrowser());
+            this.openProjectText(candidate.name, inspectSkillCandidateLines(candidate.name).join('\n'), actions);
+          }, () => this.openSkillBrowser());
+      });
   }
 
   private async runPreparedJob(id: string): Promise<void> {
@@ -4053,7 +4410,25 @@ export class ShadowApp {
     this.closePicker();
     this.pickerHandle = this.tui.showOverlay(new ChoicePicker({ title: 'Review findings · model opinions, verification unverified', items: this.reviewFindings,
       label: (finding) => `${finding.severity} · ${finding.path}:${finding.line ?? 1} · ${finding.title}`,
-      choose: (finding) => {
+      choose: (finding) => this.reviewFindingActions(finding),
+      close: () => this.closePicker(), repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
+    }), { anchor: 'center', width: '90%' });
+  }
+
+  private reviewFindingActions(finding: ReviewFinding): void {
+    const back = (): void => this.reviewFindingActions(finding);
+    this.featureChoice(finding.title, ['Inspect source and evidence', 'Draft a scoped fix request', 'Run project checks', 'Save to security findings'], (value) => value, (value) => {
+      if (value === 'Draft a scoped fix request') {
+        this.closePicker();
+        this.editor.setText(`Investigate this review claim before changing anything. Scope the fix to ${JSON.stringify(finding.path)}:${finding.line ?? 1} and directly related tests. Finding: ${JSON.stringify(finding.title)}. Reviewer evidence (unverified): ${JSON.stringify(finding.evidence)}. Inspect current code and any selected review revision, make only supported changes, run relevant project checks, and report exact evidence and remaining limits. Do not treat the review itself as a test pass.`);
+        this.tui.requestRender(); return;
+      }
+      if (value === 'Run project checks') { this.doChecks(); return; }
+      if (value === 'Save to security findings') {
+        this.withEvidence((store) => store.importFindings([{ title: finding.title, description: finding.evidence, source: 'Shadow review', rule: 'model-review',
+          severity: finding.severity === 'high' ? 'error' : finding.severity === 'medium' ? 'warning' : 'note', path: finding.path, line: finding.line }]));
+        this.doFindings(); return;
+      }
         this.closePicker();
         const changes = { title: `${finding.path}:${finding.line ?? 1}`, scope: { kind: 'working' as const },
           files: [{ path: finding.path, status: '', area: 'revision' as const }], summary: [`${finding.title} — Enter to inspect source and evidence`] };
@@ -4064,10 +4439,9 @@ export class ShadowApp {
             if (statSync(file).size > 1024 * 1024) throw new Error('Source file too large for this preview.');
             const lines = readFileSync(file, 'utf8').split('\n'); const start = Math.max(0, (finding.line ?? 1) - 8);
             return `${finding.evidence}\n\n${lines.slice(start, start + 20).map((line, i) => `${start + i + 1}: ${line}`).join('\n')}`;
-          }, rows: () => this.terminal.rows, repaint: () => this.tui.requestRender(), close: () => this.openReviewFindings(),
+          }, rows: () => this.terminal.rows, repaint: () => this.tui.requestRender(), close: back,
         }), { anchor: 'center', width: '90%' });
-      }, close: () => this.closePicker(), repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
-    }), { anchor: 'center', width: '90%' });
+    }, () => this.openReviewFindings());
   }
 
   private openPicker(): void {
@@ -4095,11 +4469,77 @@ export class ShadowApp {
   }
 
   private closePicker(): void {
+    const wasTmux = !!this.tmuxView;
     this.pickerCleanup?.();
     this.pickerCleanup = null;
     this.pickerHandle?.hide();
     this.pickerHandle = null;
     this.tui.setFocus(this.editor);
+    this.tui.requestRender();
+    if (wasTmux && !this.exiting) this.flushQueue();
+  }
+
+  private openTmux(argument: string): void {
+    this.closePicker();
+    let cancelled = false;
+    this.pickerCleanup = () => { cancelled = true; };
+    this.pickerHandle = this.tui.showOverlay(new ChoicePicker({
+      title: 'tmux sessions', items: ['Discovering local sessions…'], label: (item) => item,
+      choose: () => {}, close: () => this.closePicker(), repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
+    }), { anchor: 'center', width: 76 });
+    void this.tmuxClient.list().then((panes) => {
+      if (cancelled || this.exiting) return;
+      this.closePicker();
+      if (!panes.length) { this.pushLine({ text: '  No running tmux sessions were found on the current tmux server.', dimColor: true }); return; }
+      const target = panes.some((pane) => pane.session === argument) ? argument : argument.replace(/^connect\s+/, '');
+      const matches = panes.filter((pane) => pane.session === target || pane.sessionId === target || pane.id === target);
+      if (target && (target !== 'list' || matches.length)) {
+        if (!matches.length) { this.pushLine({ text: `  No tmux session or pane named ${approvalText(target)}. Use /tmux to browse.`, color: C.yellow }); return; }
+        this.pickTmuxPane(matches); return;
+      }
+      const sessions = [...new Set(panes.map((pane) => pane.session))];
+      this.pickerHandle = this.tui.showOverlay(new ChoicePicker({
+        title: 'tmux sessions · choose a running agent', items: sessions,
+        label: (session) => `${session} · ${panes.filter((pane) => pane.session === session).map((pane) => `${pane.command} ${pane.id}`).join(' · ')}`,
+        choose: (session) => this.pickTmuxPane(panes.filter((pane) => pane.session === session)),
+        close: () => this.closePicker(), repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
+      }), { anchor: 'center', width: 86 });
+      this.tui.requestRender();
+    }).catch((error: Error) => {
+      if (cancelled || this.exiting) return;
+      this.closePicker(); this.pushLine({ text: `  tmux: ${approvalText(error.message)}`, color: C.yellow });
+    });
+  }
+
+  private pickTmuxPane(panes: TmuxPane[]): void {
+    this.closePicker();
+    if (panes.length === 1) { this.connectTmux(panes[0]!); return; }
+    this.pickerHandle = this.tui.showOverlay(new ChoicePicker({
+      title: 'Choose a tmux pane', items: panes,
+      label: (pane) => `${pane.session} · ${pane.windowIndex}:${pane.window} · pane ${pane.index} · ${pane.command} ${pane.id}`,
+      choose: (pane) => this.connectTmux(pane), close: () => this.closePicker(),
+      repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
+    }), { anchor: 'center', width: 86 });
+  }
+
+  private connectTmux(pane: TmuxPane): void {
+    this.closePicker();
+    if (this.running || this.compacting || this.modelChecking || this.switcher.isSwitching) {
+      this.pushLine({ text: '  Finish or interrupt the current Shadow operation before connecting to tmux.', dimColor: true });
+      return;
+    }
+    const draftKey = `${pane.sessionId}/${pane.id}/${pane.pid}`;
+    const view = new TmuxView({ client: this.tmuxClient, pane, tui: this.tui, theme: editorTheme(),
+      rows: () => this.terminal.rows, close: () => this.closePicker(), repaint: () => this.tui.requestRender(),
+      draft: this.tmuxDrafts.get(draftKey),
+    });
+    this.tmuxView = view;
+    this.pickerCleanup = () => {
+      this.tmuxDrafts.set(draftKey, view.getDraft()); view.dispose(); this.tmuxView = null;
+      this.refreshSessionTitle();
+    };
+    this.pickerHandle = this.tui.showOverlay(view, { anchor: 'center', width: '100%' });
+    this.terminal.setTitle(`${approvalText(pane.session)} · ${isCodexPane(pane) ? 'Codex' : 'tmux'} — Shadow`);
     this.tui.requestRender();
   }
 

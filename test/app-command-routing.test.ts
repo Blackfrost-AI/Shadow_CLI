@@ -423,9 +423,10 @@ test('pi workflows includes enabled plugin runbooks', (t) => {
   const h = harness(workspace(t, false).cwd);
 
   h.app.runSlash('/workflows');
-
-  assert.match(h.text(), /plugin:workflow-fixture/);
-  assert.match(h.text(), /release\.md/);
+  assert.match(h.overlayText(), /Reference runbooks/);
+  h.overlay()!.handleInput!('5'); h.overlay()!.handleInput!('\r');
+  assert.match(h.overlayText(), /plugin:workflow-fixture/);
+  assert.match(h.overlayText(), /release\.md/);
 });
 
 test('pi login reports the real subscription store and keeps imports in the CLI', (t) => {
