@@ -140,7 +140,7 @@ test('excluded sources cannot reappear via ranked retrieval, map, range, instruc
       symlinkSync(join(root, 'src/a.ts'), join(root, 'src/alias.ts'));
       assert.equal((await run({ action: 'range', path: 'src/alias.ts' })).error?.code, 'context_excluded');
     }
-    const sourceId = ctx.sources().find((item) => item.label === 'src/a.ts')!.id;
+    const sourceId = ctx.sources().find((item) => item.label === join('src', 'a.ts'))!.id;
     ctx.removeSource(sourceId);
     assert.match(JSON.stringify((await run({ action: 'context', query: 'confidentialContract' })).data), /EXCLUDED_PAYLOAD_SENTINEL/);
     assert.throws(() => pinContextFile(ctx, root, '../outside.txt'), /outside the workspace/);

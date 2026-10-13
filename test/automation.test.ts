@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -29,6 +29,24 @@ function fixture() {
 }
 
 function cliArgs(args: string[]) { return ['--import', loader, cli, ...args]; }
+
+type SignalDelivery = 'native' | 'event';
+const signalDelivery: SignalDelivery = process.platform === 'win32' ? 'event' : 'native';
+function cancellationArgs(args: string[], home: string, delivery = signalDelivery): string[] {
+  if (delivery === 'native') return cliArgs(args);
+  // child.kill() on Windows force-terminates instead of delivering a console
+  // signal. A test-only preload delivers the same process event over IPC so the
+  // real CLI cancellation/abort/output handlers still run end-to-end. POSIX
+  // continues to verify actual OS signal delivery. Nothing is added to the CLI.
+  const bridge = join(home, 'signal-bridge.mjs');
+  writeFileSync(bridge, `process.on('message', signal => {\n  if (signal === 'SIGINT' || signal === 'SIGTERM') process.emit(signal);\n});\nprocess.channel?.unref();\n`);
+  return ['--import', pathToFileURL(bridge).href, ...cliArgs(args)];
+}
+
+async function cancelChild(child: ChildProcess, signal: 'SIGINT' | 'SIGTERM', delivery = signalDelivery): Promise<void> {
+  if (delivery === 'native') { assert.equal(child.kill(signal), true); return; }
+  await new Promise<void>((resolve, reject) => child.send(signal, (error) => error ? reject(error) : resolve()));
+}
 
 test('automation flags, early detection, and existing default output remain explicit', () => {
   assert.deepEqual(parseArgs([]), {});
@@ -175,7 +193,9 @@ test('CLI ephemeral pipe preserves one multiline task and does not persist conve
   } finally { f.close(); }
 });
 
-test('CLI cancellation interrupts a stalled provider and emits a final result without retry', { timeout: 20000 }, async () => {
+// Exercise the Windows event bridge on every host as well as real POSIX signals.
+for (const delivery of (process.platform === 'win32' ? ['event'] : ['native', 'event']) as SignalDelivery[]) {
+test(`CLI cancellation (${delivery}) interrupts a stalled provider and emits a final result without retry`, { timeout: 20000 }, async () => {
   const f = fixture(); let requests = 0;
   let received!: () => void; const requested = new Promise<void>((done) => { received = done; });
   const server = createServer((req, res) => {
@@ -186,13 +206,14 @@ test('CLI cancellation interrupts a stalled provider and emits a final result wi
   });
   await new Promise<void>((done) => server.listen(0, '127.0.0.1', done));
   const address = server.address(); assert.ok(address && typeof address !== 'string');
-  const child = spawn(process.execPath, cliArgs(['--provider', 'openai', '--model', 'fixture', '--base-url', `http://127.0.0.1:${address.port}/v1`, '--task', 'fixture', '--json', '--ephemeral']), { cwd: f.workspace, env: { ...f.env, OPENAI_API_KEY: 'fixture-not-a-real-key' }, stdio: ['ignore', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, cancellationArgs(['--provider', 'openai', '--model', 'fixture', '--base-url', `http://127.0.0.1:${address.port}/v1`, '--task', 'fixture', '--json', '--ephemeral'], f.home, delivery), { cwd: f.workspace, env: { ...f.env, OPENAI_API_KEY: 'fixture-not-a-real-key' }, stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+  assert.ok(child.stdout && child.stderr);
   let stdout = ''; let stderr = ''; child.stdout.on('data', (data) => { stdout += data; }); child.stderr.on('data', (data) => { stderr += data; });
   const done = new Promise<number | null>((resolve) => child.once('close', resolve));
   const deadline = setTimeout(() => child.kill('SIGKILL'), 12000);
   try {
     await Promise.race([requested, done.then(() => { throw new Error(`child exited before request: ${stderr}`); })]);
-    child.kill('SIGINT'); assert.equal(await done, 130, stderr);
+    await cancelChild(child, 'SIGINT', delivery); assert.equal(await done, 130, stderr);
     const frames = stdout.trim().split('\n').map((line) => JSON.parse(line));
     assert.equal(frames.at(-1).status, 'cancelled'); assert.equal(frames.at(-1).stop_reason, 'interrupted');
     assert.equal(requests, 1);
@@ -200,6 +221,7 @@ test('CLI cancellation interrupts a stalled provider and emits a final result wi
     clearTimeout(deadline); child.kill('SIGKILL'); server.closeAllConnections(); await new Promise<void>((done) => server.close(() => done())); f.close();
   }
 });
+}
 
 test('CLI schema success returns a parsed structured value using a local fixture endpoint', { timeout: 15000 }, async () => {
   const f = fixture(); let requests = 0;
@@ -224,14 +246,15 @@ test('CLI schema success returns a parsed structured value using a local fixture
 test('CLI cancellation before piped EOF emits valid final JSON for SIGINT and SIGTERM', { timeout: 15000 }, async () => {
   for (const [signal, expected] of [['SIGINT', 130], ['SIGTERM', 143]] as const) {
     const f = fixture();
-    const child = spawn(process.execPath, cliArgs(['--provider', 'mock', '--json', '--ephemeral']), { cwd: f.workspace, env: f.env, stdio: ['pipe', 'pipe', 'pipe'] });
+    const child = spawn(process.execPath, cancellationArgs(['--provider', 'mock', '--json', '--ephemeral'], f.home), { cwd: f.workspace, env: f.env, stdio: ['pipe', 'pipe', 'pipe', 'ipc'] });
+    assert.ok(child.stdin && child.stdout && child.stderr);
     let stdout = ''; child.stdout.on('data', (chunk) => { stdout += chunk; }); child.stderr.resume();
     const done = new Promise<number | null>((resolve) => child.once('close', resolve));
     const deadline = setTimeout(() => child.kill('SIGKILL'), 5000);
     try {
       // Layout is created after the machine transport is installed and before stdin is read.
       while (!existsSync(join(f.home, '.shadow')) && child.exitCode === null) await new Promise((resolve) => setTimeout(resolve, 20));
-      child.stdin.write('still waiting for EOF'); child.kill(signal);
+      child.stdin.write('still waiting for EOF'); await cancelChild(child, signal);
       assert.equal(await done, expected);
       const result = JSON.parse(stdout.trim()); assert.equal(result.status, 'cancelled'); assert.equal(result.exit_code, expected);
     } finally { clearTimeout(deadline); child.kill('SIGKILL'); f.close(); }

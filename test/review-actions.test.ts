@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync, unlinkSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync, rmSync, existsSync, unlinkSync, symlinkSync, realpathSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { previewReviewAction, applyReviewAction } from '../src/state/reviewActions.js';
@@ -137,6 +137,22 @@ test('whole-file staging preserves executable index modes when Git ignores files
     applyReviewAction(previewReviewAction(f.root, f.file('untracked', 'new.txt'), 'stage'));
     assert.match(f.git('ls-files', '--stage', '--', 'new.txt'), /^100644 /);
   } finally { f.close(); }
+});
+
+test('review accepts physical workspace aliases and nested workspaces without widening the selected path', () => {
+  const f = fixture(); const aliasRoot = mkdtempSync(join(tmpdir(), 'shadow-review-alias-'));
+  try {
+    const alias = join(aliasRoot, 'workspace');
+    symlinkSync(realpathSync.native(f.root), alias, process.platform === 'win32' ? 'junction' : 'dir');
+    mkdirSync(join(f.root, 'nested'));
+    writeFileSync(join(f.root, 'nested', 'file.txt'), 'original\n'); f.git('add', '.'); f.git('commit', '-qm', 'nested');
+    writeFileSync(join(f.root, 'nested', 'file.txt'), 'change via an aliased nested workspace\n');
+    const preview = previewReviewAction(join(alias, 'nested'), { path: 'file.txt', status: 'M', area: 'unstaged' }, 'stage');
+    applyReviewAction(preview);
+    assert.match(f.git('diff', '--cached', '--', 'nested/file.txt'), /change via an aliased nested workspace/);
+    assert.equal(f.git('diff', '--', 'nested/file.txt'), '');
+    assert.throws(() => previewReviewAction(join(alias, 'nested'), { path: '../a.txt', status: 'M', area: 'unstaged' }, 'stage'), /exact workspace-relative/);
+  } finally { rmSync(aliasRoot, { recursive: true, force: true }); f.close(); }
 });
 
 test('restoring a hunk preserves no-final-newline bytes', () => {

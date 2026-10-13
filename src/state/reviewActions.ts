@@ -136,9 +136,14 @@ export function previewReviewAction(root: string, file: ChangedFile, action: Rev
   if (action === 'stage' && file.area === 'staged') throw new Error('This entry is already staged. Select its unstaged entry.');
   if (action === 'unstage' && file.area !== 'staged') throw new Error('Only staged changes can be unstaged.');
   if (action === 'restore' && file.area !== 'unstaged') throw new Error('Restore applies only to unstaged tracked changes, back to the index. Unstage first; untracked files are never deleted.');
-  const repoRoot = textGit(root, ['rev-parse', '--show-toplevel']).trim();
-  const repoPath = relative(realpathSync(repoRoot), join(realpathSync(root), relative(resolve(root), path))).split(sep).join('/');
-  if (repoPath.startsWith('../') || isAbsolute(repoPath)) throw new Error('File is outside the selected Git worktree.');
+  const repoRoot = realpathSync.native(textGit(root, ['rev-parse', '--show-toplevel']).trim());
+  // Git can report a long Windows username while TEMP/root uses its DOS alias.
+  // Native realpath expands both spellings; the non-native implementation does
+  // not reliably do so. Keep the jailed inner path relative to the caller's root,
+  // then anchor it under the canonical workspace (also supports deleted files).
+  const canonicalPath = join(realpathSync.native(root), relative(resolve(root), path));
+  const repoPath = relative(repoRoot, canonicalPath).split(sep).join('/');
+  if (repoPath === '..' || repoPath.startsWith('../') || isAbsolute(repoPath)) throw new Error('File is outside the selected Git worktree.');
   if (action !== 'unstage') requireLiteralFile(repoRoot, repoPath);
   const indexPath = textGit(root, ['rev-parse', '--path-format=absolute', '--git-path', 'index']).trim();
   const indexHash = sha(readIndex(indexPath)); const revision = head(root); const original = snapshot(path);
