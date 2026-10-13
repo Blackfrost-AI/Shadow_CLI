@@ -136,7 +136,13 @@ def exercise(command, ending, port):
                     send(b'\r')  # Retry.
                     expect(b'Review and save')
                     send(b'\r')
+                    expect(b'Test agent capabilities?')
+                    saved = json.loads((Path(profile) / '.shadow/config.json').read_text())
+                    check(saved['model'] == 'fixture-two', 'setup was not saved before optional check')
+                    attempts_before_skip = Provider.attempts
+                    send(b'\r')  # Default: finish without optional provider requests.
                     expect(b'Saved Custom endpoint')
+                    check(Provider.attempts == attempts_before_skip, 'skipping capability check contacted the provider')
                 elif ending == 'Ctrl+C':
                     send(b'\x03')
                 else:
@@ -185,7 +191,7 @@ if __name__ == '__main__':
                 if key.startswith(('SHADOW_', 'OPENAI_', 'ANTHROPIC_')):
                     env.pop(key)
             Provider.attempts = 0
-            answers = f'2\n7\nhttp://127.0.0.1:{server.server_port}/v1\nfixture-secret-onboard\n1,2\n2\n1\n1\n'
+            answers = f'2\n7\nhttp://127.0.0.1:{server.server_port}/v1\nfixture-secret-onboard\n1,2\n2\n1\n1\n1\n'
             result = subprocess.run(sys.argv[1:] + ['onboard'], input=answers, capture_output=True, text=True, env=env, timeout=8)
             check(result.returncode == 0 and 'Saved Custom endpoint' in result.stdout, 'piped onboarding did not complete')
             check('fixture-secret-onboard' not in result.stdout + result.stderr, 'piped secret was echoed')
