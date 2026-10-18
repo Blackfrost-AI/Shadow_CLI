@@ -389,6 +389,13 @@ test('source pins: every untrusted surface clamps before enveloping and dropped 
   assert.match(ctx, /envelopeSafeSlice\(b\.content, KEPT_TOOL_RESULT_CAP\)/, 'post-compact trim never leaves an envelope open');
 
   const loop = readFileSync(new URL('../src/agent/loop.ts', import.meta.url), 'utf8');
-  assert.match(loop, /envelopeSafeSlice\(body, max\)/, 'serialize() truncation is envelope-safe');
-  assert.match(loop, /characters omitted/, 'the notice counts characters, not bytes');
+  // serialize() now spills oversized output instead of discarding it, so the invariant is that the
+  // INLINE PREVIEW is still cut envelope-safely (`slice: envelopeSafeSlice`), not that the call
+  // site is literally `envelopeSafeSlice(body, max)`.
+  assert.match(loop, /slice: envelopeSafeSlice/, 'serialize() preview truncation is envelope-safe');
+
+  // The truncation NOTICE moved into the spill module when serialize() started spilling. Follow it
+  // rather than dropping the check: the wording still has to say characters, not bytes.
+  const spill = readFileSync(new URL('../src/agent/toolSpill.ts', import.meta.url), 'utf8');
+  assert.match(spill, /characters omitted/, 'the notice counts characters, not bytes');
 });

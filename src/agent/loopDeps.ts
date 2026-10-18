@@ -125,6 +125,10 @@ export function buildLoopDeps(input: LoopDepsInput): LoopDeps {
     // escalation). Otherwise the truth is whether this host has the tool to confine with.
     sandboxFailurePolicy: cfg.sandboxFailurePolicy,
     shellConfined: cfg.sandbox === 'off' ? undefined : sandboxToolAvailable(),
+    // The confinement level as a VALUE, so the runtime-context block can state it honestly.
+    // `sandbox: 'off'` is an explicit waiver → danger-full-access; otherwise the mode is
+    // workspace-write and `shellConfined` says whether this host can actually enforce it.
+    sandboxMode: cfg.sandbox === 'off' ? 'danger-full-access' : 'workspace-write',
     models: cfg.models,
     fallbackModel: cfg.fallbackModel,
     // explicit config > family profile > global default, resolved on the live model

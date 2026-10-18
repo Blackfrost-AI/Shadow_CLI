@@ -1,6 +1,7 @@
 import { existsSync, realpathSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { buildLandlockArgs, probeLandlock, standardReadRoots, standardWritableDevices } from './landlock.js';
 
 /**
  * OS-level sandbox for run_shell — the real boundary the env-allowlist/denylist
@@ -108,7 +109,36 @@ function seatbeltProfile(
   extraWrite: string[],
   socketDeny?: boolean,
   exclusiveWriteRoot?: string,
+  readOnly?: boolean,
 ): string {
+  // READ-ONLY MODE: the fail-safe default from sandboxPolicy.ts. The workspace is NOT writable —
+  // only /dev/null and friends, so ordinary `2>/dev/null` redirection still works but nothing can
+  // persist. This is the mode a caller gets when they never said "yes, let the agent write".
+  if (readOnly) {
+    return [
+      '(version 1)',
+      '(allow default)',
+      '(deny file-write*)',
+      '(allow file-write*',
+      '  (literal "/dev/null") (literal "/dev/zero") (literal "/dev/urandom")',
+      '  (literal "/dev/stdout") (literal "/dev/stderr") (literal "/dev/tty"))',
+      '(deny file-write* (subpath (param "SD")))',
+      '(deny file-read* (subpath (param "SD")))',
+      ...SECRET_READ_DENY.map((p) => `(deny file-read* (subpath ${JSON.stringify(p)}))`),
+      ...(socketDeny
+        ? [
+            '(deny file-write* (regex "^/private/tmp/com\\.apple\\.launchd\\."))',
+            '(deny file-write* (regex "^/private/tmp/ssh-"))',
+            '(deny file-write* (regex "^/private/var/folders/[^/]+/[^/]+/T/com\\.apple\\.launchd\\."))',
+            '(deny file-write* (regex "^/private/var/folders/[^/]+/[^/]+/T/ssh-"))',
+            '(deny file-write* (regex "^/private/var/folders/[^/]+/[^/]+/T/gpg-"))',
+          ]
+        : []),
+      allowNetwork ? '' : '(deny network*)',
+    ]
+      .filter(Boolean)
+      .join('\n');
+  }
   // DENOTATION MODE (exclusiveWriteRoot): writes are confined to ONE scratch dir and the
   // workspace itself is NOT writable. This is deliberately tighter than the run_shell profile —
   // detonating an untrusted sample should not be able to touch the repo it was triaged from, and
@@ -186,6 +216,7 @@ function seatbeltPrefix(
   extraWrite: string[],
   socketDeny?: boolean,
   exclusiveWriteRoot?: string,
+  readOnly?: boolean,
 ): string[] {
   return [
     'sandbox-exec',
@@ -194,7 +225,7 @@ function seatbeltPrefix(
     '-D',
     `SD=${shadowDir}`,
     '-p',
-    seatbeltProfile(allowNetwork, extraWrite, socketDeny, exclusiveWriteRoot),
+    seatbeltProfile(allowNetwork, extraWrite, socketDeny, exclusiveWriteRoot, readOnly),
   ];
 }
 
@@ -218,8 +249,35 @@ function bwrapFlags(
   allowNetwork: boolean,
   privateTmp?: boolean,
   exclusiveWriteRoot?: string,
+  readOnly?: boolean,
 ): string[] {
-  // DENOTATION MODE: the workspace is bound READ-ONLY and only the scratch dir is writable.
+  // READ-ONLY MODE: whole fs read-only, no writable binds at all. /dev and /proc are re-mounted by
+  // bwrap itself so ordinary redirection and process inspection still work; nothing else can be
+  // written. A private tmpfs keeps scratch writes out of the host /tmp (which would otherwise be a
+  // writable escape hatch and defeat the point).
+  if (readOnly) {
+    const flags = [
+      '--die-with-parent',
+      '--new-session',
+      '--unshare-pid',
+      '--ro-bind',
+      '/',
+      '/',
+      '--dev',
+      '/dev',
+      '--proc',
+      '/proc',
+      '--tmpfs',
+      '/tmp',
+      ...(maskable(shadowDir) ? ['--tmpfs', shadowDir] : []),
+      ...SECRET_READ_DENY.filter(maskable).flatMap((d) => ['--tmpfs', d]),
+      '--chdir',
+      ws,
+    ];
+    if (!allowNetwork) flags.push('--unshare-net');
+    return flags;
+  }
+  // DENOTATION MODE (exclusiveWriteRoot): the workspace is bound READ-ONLY and only the scratch dir is writable.
   // /tmp gets a private tmpfs rather than the host bind, so a sample cannot drop files into a
   // shared, predictable location and cannot see another process's scratch state.
   if (exclusiveWriteRoot) {
@@ -305,8 +363,18 @@ export function wrapCommand(opts: {
    * entirely and makes the sandbox prefix impossible to mis-slice.
    */
   execArgv?: string[];
+  /**
+   * READ-ONLY MODE from sandboxPolicy.ts — no writes anywhere except /dev/null and friends.
+   * Ignored when `exclusiveWriteRoot` is set (that is a stricter, more specific mode).
+   */
+  readOnly?: boolean;
+  /**
+   * Fence the READ side too (untrusted execution). On Linux this prefers Landlock, which needs no
+   * user namespaces; on macOS it tightens the seatbelt profile to deny reads outside the runtime.
+   */
+  readConfined?: boolean;
 }): SandboxResult {
-  const { command, workspaceRoot, allowNetwork, enabled } = opts;
+  const { command, workspaceRoot, allowNetwork, enabled, readOnly, readConfined } = opts;
   const shell = process.env.SHELL || '/bin/sh';
   const tail = opts.execArgv ?? [shell, '-c', command];
   const ws = real(workspaceRoot);
@@ -337,7 +405,15 @@ export function wrapCommand(opts: {
     }
     return {
       argv: [
-        ...seatbeltPrefix(ws, shadowDir, allowNetwork, exclusive ? [] : extra, undefined, exclusive),
+        ...seatbeltPrefix(
+          ws,
+          shadowDir,
+          allowNetwork,
+          exclusive || readOnly ? [] : extra,
+          undefined,
+          exclusive,
+          readOnly && !exclusive,
+        ),
         ...tail,
       ],
       sandboxed: true,
@@ -345,15 +421,54 @@ export function wrapCommand(opts: {
   }
 
   // Linux
+  //
+  // Read-confined (untrusted) execution prefers Landlock: it needs no unprivileged user
+  // namespaces, which are routinely disabled in containers and on hardened hosts — the exact
+  // environments where bwrap silently degrades to "no sandbox". Falling through to bwrap is still
+  // correct (its --ro-bind / gives the same read fence) so we try it only after Landlock.
+  if (readConfined) {
+    const ll = probeLandlock();
+    if (ll.ok && ll.launcher) {
+      const writable = readOnly ? standardWritableDevices() : [ws, ...standardWritableDevices()];
+      return {
+        argv: [
+          ll.launcher,
+          ...buildLandlockArgs(command, {
+            launcher: ll.launcher,
+            allowedRead: standardReadRoots(ws),
+            writableRoots: writable,
+          }),
+        ],
+        sandboxed: true,
+      };
+    }
+  }
   if (hasBwrap()) {
     return {
       argv: [
         'bwrap',
-        ...bwrapFlags(ws, shadowDir, exclusive ? [] : extra, allowNetwork, undefined, exclusive),
+        ...bwrapFlags(
+          ws,
+          shadowDir,
+          exclusive || readOnly ? [] : extra,
+          allowNetwork,
+          undefined,
+          exclusive,
+          readOnly && !exclusive,
+        ),
         ...tail,
       ],
       sandboxed: true,
     };
+  }
+  // Neither Landlock nor bwrap. For a read-confined (untrusted) run this is a real failure: the
+  // caller asked for a read fence and must not detonate unconfined. Say so explicitly rather than
+  // reusing the generic message, so the refusal reason is legible in the tool result.
+  if (readConfined) {
+    return passthrough(
+      'READ CONFINEMENT UNAVAILABLE: neither Landlock nor bwrap is usable here — untrusted ' +
+        'execution must not proceed unconfined (install bubblewrap, or use a kernel with Landlock)',
+    );
   }
   return passthrough('bubblewrap (bwrap) not found — run_shell runs unconfined');
 }

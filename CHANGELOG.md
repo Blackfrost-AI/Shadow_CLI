@@ -1,5 +1,28 @@
 # Shadow release notes
 
+## 10.4.0 — 2026-10-18
+
+Six capabilities adapted from DeepSeek Harness (MIT — see `THIRD_PARTY_NOTICES.md`).
+
+- **Read-only confinement is now real on macOS and Linux.** The `read-only` sandbox mode threads
+  through both the Seatbelt profile and the bwrap flags, so it is an enforced boundary rather than
+  a label. Use it for detonation work, where the code under test is hostile.
+- **A Landlock backend for Linux.** Shadow can confine `run_shell` with the Landlock LSM, which
+  needs no unprivileged user namespaces — so it works in containers and on hardened Kali images
+  where bubblewrap cannot start. It is preferred when read confinement is requested and falls back
+  to bubblewrap otherwise.
+- **The model is told its own confinement every request.** The effective sandbox mode, workspace
+  root, granted roots and offline state ride in the system prompt. When confinement was requested
+  but no backend exists, the prompt says so explicitly instead of claiming a boundary the kernel is
+  not providing.
+- **Oversized tool output is spilled, not discarded.** A large `grep` or build log now lands in a
+  private file under the session tree and the model gets a preview plus a locator, so it can read
+  the rest instead of re-running the command or guessing. Any failure to write falls back to the
+  previous truncation.
+- **Waterfall hook chains.** In-process middleware with `next()` — short-circuit, wrap, and rewrite
+  — for transforms the shell-hook runner cannot express, such as redacting a tool result before the
+  model sees it.
+
 ## 10.3.2 — 2026-10-18
 
 - Fix `shadow update` reporting a DNS timeout as a missing host. Every lookup ran under a 1.5s

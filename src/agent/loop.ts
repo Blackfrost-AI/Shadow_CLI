@@ -9,8 +9,11 @@ import { resolvePermissionRule, type PermissionRule } from '../safety/rules.js';
 import type { ShadowConfig } from '../config.js';
 import { runHooks, runHookPhase, combineHookContexts } from '../hooks/runner.js';
 import { diagnosticsNoteFor } from './diagnostics.js';
+import { runtimeContextBlock } from './runtimeContext.js';
+import type { SandboxMode } from '../safety/sandboxPolicy.js';
 import { getLspService, lspNoteFor } from './lsp/index.js';
 import type { LspServiceConfig } from './lsp/service.js';
+import { spillIfOversized } from './toolSpill.js';
 import { isFallbackEligible, resolveFallbackEntry } from '../provider/fallback.js';
 import { looksLikeTokenOverflow } from '../provider/stream.js';
 import type { UserQuestion } from './approval.js';
@@ -153,6 +156,15 @@ export interface LoopDeps {
   // `undefined` = not applicable (sandbox off / --yolo / --no-sandbox).
   shellConfined?: boolean;
   sandboxFailurePolicy?: 'auto' | 'fail-closed' | 'warn';
+  /**
+   * Confinement level, stated to the model in the runtime-context block each turn. Absent means
+   * the caller did not say, in which case no claim is made (better silent than wrong).
+   */
+  sandboxMode?: SandboxMode;
+  /** Offline Shadow Mode is active for this session (stated in the runtime-context block). */
+  offline?: boolean;
+  /** Human/agent-assigned session name, when one has been set. */
+  sessionName?: string;
   models?: ModelEntry[];
   fallbackModel?: string;
   /** Activate a fallback's complete entry (provider, endpoint and credentials), not just its id. */
@@ -414,6 +426,27 @@ export class AgentLoop {
     ];
   }
 
+  /**
+   * State the session's own confinement to the model, every request.
+   *
+   * Derived from the same deps that build the sandbox, so it cannot drift from reality: when the
+   * caller does not say (`sandboxMode` absent) we emit nothing rather than guessing a mode the
+   * kernel might not be enforcing. A model that knows it is read-only stops reporting phantom
+   * writes; a model told confinement is waived stops assuming a boundary it does not have.
+   */
+  private runtimeContext(): string {
+    if (!this.deps.sandboxMode) return '';
+    return runtimeContextBlock({
+      workspaceRoot: this.deps.workspaceRoot,
+      sandboxMode: this.deps.sandboxMode,
+      // undefined = explicit waiver; false = requested but no backend; true = really confined.
+      confinementEnforced: this.deps.shellConfined,
+      additionalRoots: this.deps.additionalRoots,
+      offline: this.deps.offline,
+      sessionName: this.deps.sessionName,
+    });
+  }
+
   private async maybeCompact(
     provider: Provider,
     model: string,
@@ -562,6 +595,7 @@ export class AgentLoop {
         this.deps.system,
         effortDirective(this.effort),
         ...this.controlStateBlocks(),
+        this.runtimeContext(),
       ]
         .filter((s) => s && s.trim())
         .join('\n\n');
@@ -1501,7 +1535,7 @@ export class AgentLoop {
           meta: { tool: call.name, durationMs: 0, risk: 'read' },
         };
         this.emitToolEnd(call, result);
-        return { block: this.resultBlock(call.id, false, this.serialize(result)), isFatal: true };
+        return { block: this.resultBlock(call.id, false, this.serialize(result, call.name, call.id)), isFatal: true };
       }
       const result: ToolResult = {
         ok: false,
@@ -1510,7 +1544,7 @@ export class AgentLoop {
         meta: { tool: call.name, durationMs: 0, risk: 'read' },
       };
       this.emitToolEnd(call, result);
-      return { block: this.resultBlock(call.id, false, this.serialize(result)), isFatal: false };
+      return { block: this.resultBlock(call.id, false, this.serialize(result, call.name, call.id)), isFatal: false };
     }
 
     // Canonicalize the call name to the RESOLVED tool (registry.get maps aliases like
@@ -1575,7 +1609,7 @@ export class AgentLoop {
           meta: { tool: call.name, durationMs: 0, risk: tool.risk },
         };
         this.emitToolEnd(call, result);
-        return { block: this.resultBlock(call.id, true, this.serialize(result)), isFatal: false };
+        return { block: this.resultBlock(call.id, true, this.serialize(result, call.name, call.id)), isFatal: false };
       }
       const decision = await this.requestApproval({
         kind: 'plan_enter',
@@ -1601,7 +1635,7 @@ export class AgentLoop {
         meta: { tool: call.name, durationMs: 0, risk: tool.risk },
       };
       this.emitToolEnd(call, result);
-      return { block: this.resultBlock(call.id, true, this.serialize(result)), isFatal: false };
+      return { block: this.resultBlock(call.id, true, this.serialize(result, call.name, call.id)), isFatal: false };
     }
 
     // ask_user_question — answers collected via the approval gate.
@@ -1924,7 +1958,7 @@ export class AgentLoop {
       const post = runHooks('post_tool_use', hooks.post_tool_use, {
         tool: call.name,
         input: parsed.data,
-        output: this.serialize(result),
+        output: this.serialize(result, call.name, call.id),
         ok: result.ok,
         workspaceRoot: this.deps.workspaceRoot,
       });
@@ -1966,7 +2000,7 @@ export class AgentLoop {
     this.emitToolEnd(call, result);
 
     const isFatal = !result.ok && result.error?.recoverable === false;
-    return { block: this.resultBlock(call.id, result.ok, this.serialize(result)), isFatal, images: result.images };
+    return { block: this.resultBlock(call.id, result.ok, this.serialize(result, call.name, call.id)), isFatal, images: result.images };
   }
 
   private invalidInput(call: ToolCall, risk: ToolRisk, msg: string): { block: ContentBlock; isFatal: boolean } {
@@ -1977,7 +2011,7 @@ export class AgentLoop {
       meta: { tool: call.name, durationMs: 0, risk },
     };
     this.emitToolEnd(call, result);
-    return { block: this.resultBlock(call.id, false, this.serialize(result)), isFatal: false };
+    return { block: this.resultBlock(call.id, false, this.serialize(result, call.name, call.id)), isFatal: false };
   }
 
   private preExecutionCancelled(): boolean {
@@ -2080,7 +2114,7 @@ export class AgentLoop {
     }
   }
 
-  private serialize(result: ToolResult): string {
+  private serialize(result: ToolResult, toolName = 'tool', toolCallId = 'call'): string {
     let body = result.summary;
     if (result.data !== undefined) {
       const json = safeJson(result.data);
@@ -2088,11 +2122,23 @@ export class AgentLoop {
     }
     const max = this.deps.maxToolResultChars;
     if (body.length > max) {
-      const omitted = body.length - max;
-      // P3-05: last-line-of-defense cut. envelopeSafeSlice guarantees this truncation can never
+      // Spill the full body to a private session file and hand the model a locator, so oversized
+      // output is recoverable instead of silently lost. Falls back to a plain truncation if the
+      // write fails, so this can never make a tool result worse than it was.
+      const spilled = spillIfOversized(body, {
+        maxChars: max,
+        toolName,
+        toolCallId,
+        workspaceRoot: this.deps.workspaceRoot,
+        // Keep the preview envelope-safe: a head that ends mid-`<<<UNTRUSTED_CONTENT_BEGIN>>>`
+        // would make following text look trusted.
+        slice: envelopeSafeSlice,
+      });
+      if (spilled.spilled) return spilled.text;
+      // No spill: last-line-of-defense cut. envelopeSafeSlice guarantees this truncation can never
       // leave an envelope open (tools clamp via fitPayload BEFORE enveloping, so it normally
       // never fires for enveloped results).
-      body = `${envelopeSafeSlice(body, max)}\n…(truncated, ${omitted} characters omitted)`;
+      body = spilled.text;
     }
     return body;
   }

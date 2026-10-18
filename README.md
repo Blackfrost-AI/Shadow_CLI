@@ -6,7 +6,7 @@
 
 > **A true gift of freedom and privacy.**
 > Zero-telemetry · provider-neutral · phone home to no one.
-> Current build: **`v10.3.2`** — `shadow update` now tells you whether DNS timed out or the name genuinely does not exist, instead of reporting both as "could not be resolved".
+> Current build: **`v10.4.0`** — real read-only confinement (Seatbelt, bubblewrap, Landlock), tool output spilled to a file instead of truncated, and a runtime-context block that tells the model its own sandbox.
 
 **Shadow is a zero-telemetry, provider-neutral security engineering agent that runs on your terms.** Point it at any model — Anthropic, any OpenAI-compatible endpoint, Gemini, or a local model on your own box. Its built-in Security foundation covers investigation, hardening, incident response, defensive automation, secure coding, and supporting systems work. **No Shadow account, no signup, no phone-home:** network access follows your provider, tool and update choices. Your config stays local and readable (`~/.shadow/config.json`), credentials are sent to their configured services, and you can switch models mid-session **without losing context**.
 
