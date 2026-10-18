@@ -168,7 +168,7 @@ test('containment: the workspace is read-only during detonation', async () => {
 
 // ── Network ──────────────────────────────────────────────────────────────────
 
-test('network is denied by default and permitted only when asked', async () => {
+test('network is denied by default and permitted only when asked', async (t) => {
   const { ws, cleanup } = scratch();
   try {
     // Use a raw socket so the result does not depend on curl/nc being installed.
@@ -186,8 +186,17 @@ test('network is denied by default and permitted only when asked', async () => {
     );
 
     const denied = await sampleRun.run({ path: 'net.py', timeout_ms: 15000 }, ctxFor(ws));
-    if (!denied.ok) return; // no python3 in this environment — nothing to prove
-    if (/No such file|not found|cannot execute/.test(denied.data!.stderr)) return;
+    // A missing interpreter must SKIP, not pass. A silent `return` here would report a green
+    // containment test on a host that never proved anything — the exact failure mode that lets a
+    // broken jail ship, because the suite goes green either way.
+    if (!denied.ok) {
+      t.skip(`no python3 in this environment — egress containment unproven: ${denied.summary}`);
+      return;
+    }
+    if (/No such file|not found|cannot execute/.test(denied.data!.stderr)) {
+      t.skip('no python3 in this environment — egress containment unproven');
+      return;
+    }
     assert.match(denied.data!.stdout, /BLOCKED/, `egress should be denied by default, got: ${denied.data!.stdout}`);
 
     const allowed = await sampleRun.run({ path: 'net.py', allow_network: true, timeout_ms: 15000 }, ctxFor(ws));
