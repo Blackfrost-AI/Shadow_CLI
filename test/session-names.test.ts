@@ -6,7 +6,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Context } from '../src/agent/context.js';
 import { SessionLog } from '../src/state/session.js';
-import { deriveSessionTitle, normalizeSessionTitle, sessionTerminalTitle } from '../src/state/sessionTitle.js';
+import {
+  deriveSessionTitle,
+  normalizeSessionTitle,
+  sessionTerminalTitle,
+  activityFrame,
+  TITLE_FRAMES,
+  TITLE_STATIC_BUSY,
+} from '../src/state/sessionTitle.js';
 import { listResumableSessions, resumeSession, trustLegacySession } from '../src/state/resume.js';
 import { forkSession } from '../src/state/fork.js';
 import { serializeContext } from '../src/state/snapshot.js';
@@ -98,4 +105,42 @@ test('a name chosen before the first message remains the name of the session', (
   assert.equal(log.title, 'My website');
   assert.equal(listResumableSessions(root)[0]!.title, 'My website');
   log.close();
+});
+
+// ── Tab activity indicator ───────────────────────────────────────────────────
+// The tab title is the only part of a long session visible from another window, so "is it
+// working?" has to be answerable without focusing the tab — and an idle tab must not move.
+
+test('idle titles carry no activity glyph', () => {
+  assert.equal(sessionTerminalTitle('Website launch'), 'Website launch — Shadow');
+  assert.equal(sessionTerminalTitle('Website launch', undefined), 'Website launch — Shadow');
+});
+
+test('a working title leads with a spinner frame', () => {
+  const t = sessionTerminalTitle('Website launch', { tick: 0 });
+  assert.equal(t, '⠋ Website launch — Shadow');
+  assert.ok(t.endsWith('Website launch — Shadow'), 'the name must stay intact and readable');
+});
+
+test('frames advance with the tick and wrap', () => {
+  const seen = new Set<string>();
+  for (let i = 0; i < TITLE_FRAMES.length; i++) {
+    seen.add(activityFrame({ tick: i }));
+  }
+  assert.equal(seen.size, TITLE_FRAMES.length, 'every frame is distinct — otherwise it looks stuck');
+  assert.equal(activityFrame({ tick: TITLE_FRAMES.length }), TITLE_FRAMES[0], 'wraps, never throws');
+  assert.equal(activityFrame({ tick: TITLE_FRAMES.length * 7 + 3 }), TITLE_FRAMES[3], 'wraps from any tick');
+  assert.equal(activityFrame({ tick: -5 }), TITLE_FRAMES[TITLE_FRAMES.length - 5], 'negative tick is safe');
+});
+
+test('reduced motion is busy but perfectly still', () => {
+  const frames = new Set<string>();
+  for (let i = 0; i < 20; i++) frames.add(activityFrame({ tick: i, reducedMotion: true }));
+  assert.deepEqual([...frames], [TITLE_STATIC_BUSY], 'exactly one frame — no motion at all');
+  // Still reports "working", which is the information the indicator exists to convey.
+  assert.equal(sessionTerminalTitle('x', { tick: 0, reducedMotion: true }), '● x — Shadow');
+});
+
+test('the glyph survives an untitled session', () => {
+  assert.equal(sessionTerminalTitle('', { tick: 0 }), '⠋ New session — Shadow');
 });

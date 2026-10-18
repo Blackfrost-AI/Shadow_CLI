@@ -6,7 +6,7 @@
 
 > **A true gift of freedom and privacy.**
 > Zero-telemetry · provider-neutral · phone home to no one.
-> Current build: **`v10.3.0`** — contained detonation for untrusted samples, and tool discovery that actually reaches the security toolkit.
+> Current build: **`v10.3.1`** — a working indicator in the tab title: animated while a turn runs, completely still when idle.
 
 **Shadow is a zero-telemetry, provider-neutral security engineering agent that runs on your terms.** Point it at any model — Anthropic, any OpenAI-compatible endpoint, Gemini, or a local model on your own box. Its built-in Security foundation covers investigation, hardening, incident response, defensive automation, secure coding, and supporting systems work. **No Shadow account, no signup, no phone-home:** network access follows your provider, tool and update choices. Your config stays local and readable (`~/.shadow/config.json`), credentials are sent to their configured services, and you can switch models mid-session **without losing context**.
 
@@ -16,7 +16,11 @@ Under the hood it's a **tool-calling agentic runtime**: the model reasons, emits
 
 This is **not a chat app** — it is a tool-calling runtime.
 
-## What's new in v10.3.0
+## What's new in v10.3.1
+
+- **Working indicator in the tab title:** a braille frame leads the tab title while a turn is in flight and the title is rewritten bare the moment it finishes, so an idle tab is completely still. The glyph leads because terminal tab strips truncate on the right. `--reduced-motion` swaps the animation for a single static `●` that still reads as busy.
+
+## Previous highlights: v10.3.0
 
 - **Contained detonation (`sample_run`):** run an untrusted sample and observe what it actually does. The sample executes under an OS sandbox whose only writable path is a private scratch directory — workspace read-only, `/tmp` a private tmpfs, no inherited environment, network denied unless the engagement authorises it. Every dropped file is enumerated and hashed, and the receipt is bound to the sample's SHA-256. If no sandbox is available it **refuses to run** rather than detonating unconfined.
 - **Tool discovery actually works:** `tool_search` previously reimplemented its own filter, ignored intent aliases, returned a bare name with no argument schema, and never promoted what it found into the active tool list — so a model could "discover" a tool it then could not call. It now matches on aliases and natural language, returns full schemas, and promotes matches for the rest of the session.

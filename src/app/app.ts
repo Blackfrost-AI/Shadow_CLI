@@ -281,6 +281,10 @@ export class ShadowApp {
   private runStart = 0;
   private tick = 0;
   private ticker: ReturnType<typeof setInterval> | null = null;
+  /** Last OSC title written while working — the spinner frame changes every tick. */
+  private lastActivityTitle = '';
+  /** True when the title currently carries a working glyph, so it can be cleared exactly once. */
+  private lastTitleBusy = false;
   /** The compact brand is committed once per conversation (again after /clear). */
   private brandCommitted = false;
 
@@ -453,7 +457,39 @@ export class ShadowApp {
   }
 
   private refreshSessionTitle(): void {
+    // A rename while a turn is running must keep the working glyph, so route through the
+    // activity path rather than writing a bare title and dropping the spinner.
+    this.lastActivityTitle = '';
+    if (this.running) {
+      this.refreshTitleActivity();
+      return;
+    }
+    this.lastTitleBusy = false;
     this.terminal?.setTitle(sessionTerminalTitle(this.sessionLog.title));
+  }
+
+  /**
+   * Called from the render tick. The title animates only while a turn is actually running, and
+   * goes still the moment it finishes — an idle tab should not move at all, which is the whole
+   * point of the indicator. Only the frame index changes per tick, so the base title is compared
+   * against what was last written to avoid rewriting identical escapes 6×/sec.
+   */
+  private refreshTitleActivity(): void {
+    if (!this.running) {
+      if (this.lastTitleBusy) {
+        this.lastTitleBusy = false;
+        this.refreshSessionTitle();
+      }
+      return;
+    }
+    const next = sessionTerminalTitle(this.sessionLog.title, {
+      tick: this.tick,
+      reducedMotion: !!this.opts.cfg.reducedMotion,
+    });
+    if (next === this.lastActivityTitle) return;
+    this.lastActivityTitle = next;
+    this.lastTitleBusy = true;
+    this.terminal?.setTitle(next);
   }
 
   /** The live state object the HUD components read. Rebuilt only when a scalar changes. */
@@ -1561,18 +1597,28 @@ export class ShadowApp {
   }
 
   private endTurn(): void {
-    this.finishReasoning(this.controller?.signal.aborted ? 'interrupted' : 'complete');
-    // F10-02: clear FINISHED background-agent rows that lingered from the previous turn. Still-
-    // running agents stay so a long bg job spans turns visibly.
-    for (const [id, a] of this.subAgents) {
-      if (a.done) this.subAgents.delete(id);
+    // The activity glyph must be cleared on EVERY exit path, including one where a display
+    // helper throws. `running` and the title are therefore settled first and in a `finally`:
+    // a tab that animates forever reports work that is not happening, which is worse than no
+    // indicator at all. Everything below is presentation and may fail without stranding it.
+    try {
+      this.finishReasoning(this.controller?.signal.aborted ? 'interrupted' : 'complete');
+      // F10-02: clear FINISHED background-agent rows that lingered from the previous turn. Still-
+      // running agents stay so a long bg job spans turns visibly.
+      for (const [id, a] of this.subAgents) {
+        if (a.done) this.subAgents.delete(id);
+      }
+    } finally {
+      this.running = false;
+      // Clear the working glyph before the ticker stops — otherwise the last frame stays frozen
+      // in the tab title and an idle session looks busy forever.
+      this.refreshTitleActivity();
+      this.stopTicker();
     }
-    this.running = false;
     this.controller = null;
     this.toolLine = null;
     const secs = Math.max(0, Math.round((Date.now() - this.runStart) / 1000));
     if (secs >= 1) this.pushLine({ text: `${GLYPHS.tool} done · ${formatDuration(secs)}`, dimColor: true });
-    this.stopTicker();
     this.hudRef = this.hudState();
     this.tui.requestRender();
     this.flushQueue();
@@ -1582,6 +1628,7 @@ export class ShadowApp {
     if (this.ticker) return;
     this.ticker = setInterval(() => {
       this.tick++;
+      this.refreshTitleActivity();
       const trace = this.reasoning;
       if (trace?.startedAt != null) {
         const durationMs = trace.elapsedMs + Math.max(0, Date.now() - trace.startedAt);

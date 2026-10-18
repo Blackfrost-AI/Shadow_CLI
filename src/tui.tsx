@@ -431,10 +431,6 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // swap too — otherwise events after a fork would keep landing in the SOURCE transcript.
   const localSessionLogRef = useRef(sessionLog);
   const sessionLogRef = opts.sessionLogBox ?? localSessionLogRef;
-  const activeSessionTitle = sessionLogRef.current.title;
-  useEffect(() => {
-    if (stdout.isTTY) stdout.write(`\x1b]2;${sessionTerminalTitle(activeSessionTitle)}\x07`);
-  }, [stdout, activeSessionTitle]);
   const [style, setStyle] = useState<OutputStyle>(opts.styleState?.style ?? opts.cfg.lastStyle ?? 'proactive');
 
   const terminalSize = useTerminalSize();
@@ -623,6 +619,20 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   // so the layout's hasGoal accounting keeps meaning exactly one pinned row.
   const [missionSnap, setMissionSnap] = useState<MissionSnapshot | null>(opts.mission?.snapshot() ?? null);
   const [tick, setTick] = useState(0);
+  /**
+   * Tab title doubles as the activity indicator: a braille frame leads the title while a turn is
+   * in flight, and the title is rewritten bare when it ends so an idle tab is completely still.
+   * `tick` is the dependency that advances the frame; its interval only runs while `running`, so
+   * this costs nothing at rest. Declared here (not beside the other title code) because `tick`,
+   * `running` and `reducedMotion` are all in scope by this point.
+   */
+  const titleWithActivity = sessionTerminalTitle(
+    sessionLogRef.current.title,
+    running ? { tick, reducedMotion } : undefined,
+  );
+  useEffect(() => {
+    if (stdout.isTTY) stdout.write(`\x1b]2;${titleWithActivity}\x07`);
+  }, [stdout, titleWithActivity]);
   const runStartRef = useRef(0); // wall-clock start of the current turn, for the elapsed timer
   const [menuIndex, setMenuIndex] = useState(0); // selected row in the slash-command menu
   const [cursor, setCursor] = useState(0); // caret position within the composer input

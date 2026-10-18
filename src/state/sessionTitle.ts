@@ -23,6 +23,35 @@ export function deriveSessionTitle(prompt: string): string {
   return title ? title[0]!.toLocaleUpperCase() + title.slice(1) : '';
 }
 
-export function sessionTerminalTitle(title = ''): string {
-  return `${normalizeSessionTitle(title) || 'New session'} — Shadow`;
+export function sessionTerminalTitle(title = '', activity?: TitleActivity): string {
+  const base = `${normalizeSessionTitle(title) || 'New session'} — Shadow`;
+  const frame = activity ? activityFrame(activity) : '';
+  return frame ? `${frame} ${base}` : base;
+}
+
+/** Working-state spinner for the terminal title. Braille runs at 10 frames with even weight. */
+export const TITLE_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] as const;
+
+/** Shown instead of an animation when motion is reduced: visibly "busy", never moving. */
+export const TITLE_STATIC_BUSY = '●';
+
+export interface TitleActivity {
+  /** Live tick from the render loop; advances the frame. */
+  tick: number;
+  /** `reducedMotion` swaps the animation for a single static marker. */
+  reducedMotion?: boolean;
+}
+
+/**
+ * The leading glyph for a working session, or `''` when idle.
+ *
+ * A tab title is the only part of a long-running session visible when you are looking at a
+ * different window, so "is it working?" needs to be answerable without focusing the tab. The
+ * glyph leads because terminal tab strips truncate from the right — a trailing marker disappears
+ * first on a narrow tab.
+ */
+export function activityFrame(activity: TitleActivity): string {
+  if (activity.reducedMotion) return TITLE_STATIC_BUSY;
+  const i = Math.abs(Math.floor(activity.tick)) % TITLE_FRAMES.length;
+  return TITLE_FRAMES[i]!;
 }
