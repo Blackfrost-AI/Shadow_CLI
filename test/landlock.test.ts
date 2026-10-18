@@ -9,6 +9,7 @@
  */
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 
@@ -101,4 +102,15 @@ test('standardWritableDevices are the harmless sinks a shell needs, granted writ
   for (const d of devs) {
     assert.ok(d.startsWith('/dev/'), `${d} must be a device node`);
   }
+});
+
+test('the Landlock launcher documents that inode metadata is not mediated', () => {
+  // Landlock has no chmod/chown/utimes access bit, so a read-only ruleset still permits metadata
+  // changes. That is a real limitation, and the one place it must never be silently lost is the
+  // source of truth — otherwise a later change may start describing the sandbox as "no
+  // modification" when it only means "no content modification".
+  const src = readFileSync(new URL('../native/shadow-landlock.c', import.meta.url), 'utf8');
+  assert.match(src, /INODE METADATA IS NOT MEDIATED/);
+  assert.match(src, /chmod/);
+  assert.match(src, /no content modification/i);
 });

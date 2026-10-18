@@ -21,6 +21,16 @@
  * Unlisted paths are NOT readable. That is the point: a deny-list fails open on the file nobody
  * thought of, and for detonating real ransomware the read side has to be a hard boundary.
  *
+ * KNOWN LIMITATION — INODE METADATA IS NOT MEDIATED
+ * -------------------------------------------------
+ * Landlock has no access bit for chmod/chown/utimes: the kernel exposes file CONTENT rights
+ * (read/write/truncate/execute/make/remove) and nothing for inode attributes. So inside a
+ * read-only ruleset a process can still `chmod 600` a file it cannot write, anywhere it can reach
+ * by path. Verified on Linux 6.x. This does not let it change content, but it can make a file
+ * unreadable to its owner — a real (if modest) denial-of-service. Do not describe a Landlock
+ * read-only sandbox as "no modification"; it is "no content modification". Where that matters,
+ * combine with a read-only bind mount or a mount namespace, which bwrap provides.
+ *
  * Build: cc -O2 -o shadow-landlock shadow-landlock.c
  */
 #define _GNU_SOURCE
