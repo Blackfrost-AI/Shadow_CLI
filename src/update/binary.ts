@@ -72,13 +72,33 @@ export async function updateInstalledBinary(target = process.execPath): Promise<
   // Authenticate the small metadata before accepting a large response from the release host.
   // A compromised origin can still refuse service, but it cannot make `shadow update` buffer an
   // attacker-controlled 512 MiB candidate before we know the manifest is genuine.
-  const [manifestBytes, signature] = await Promise.all([
-    download(`${base}/SHASUMS256.txt`, MAX_METADATA_BYTES),
-    download(`${base}/SHASUMS256.txt.sig`, MAX_METADATA_BYTES),
-  ]);
-
+  //
+  // The two fetches must belong to the SAME publish. A bucket/CDN edge can serve the manifest and
+  // the signature from different generations for a few seconds after a release, and then a
+  // perfectly good release fails `shadow update` with "signature verification failed" — which reads
+  // as tampering when the truth is a race. Retry the PAIR together on a verification failure so a
+  // torn read heals itself; a genuinely bad signature still fails after the budget.
+  let manifestBytes!: Buffer;
+  let signature!: Buffer;
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    [manifestBytes, signature] = await Promise.all([
+      download(`${base}/SHASUMS256.txt`, MAX_METADATA_BYTES),
+      download(`${base}/SHASUMS256.txt.sig`, MAX_METADATA_BYTES),
+    ]);
+    if (verify('sha256', manifestBytes, SHADOW_RELEASE_PUBKEY, signature)) break;
+    lastErr = new Error('release manifest signature verification failed; refusing the update');
+    // Brief, bounded backoff — long enough for an edge to settle, short enough not to hang an
+    // interactive update.
+    if (attempt < 3) await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
+  }
   if (!verify('sha256', manifestBytes, SHADOW_RELEASE_PUBKEY, signature)) {
-    throw new Error('release manifest signature verification failed; refusing the update');
+    throw lastErr instanceof Error
+      ? new Error(
+          `${lastErr.message} (retried 4x — if this persists the manifest and signature on the ` +
+            `release host are genuinely inconsistent, not mid-publish)`,
+        )
+      : lastErr;
   }
   const expected = expectedHash(manifestBytes.toString('utf8'), asset);
   const binary = await download(`${base}/${asset}`, MAX_BINARY_BYTES);

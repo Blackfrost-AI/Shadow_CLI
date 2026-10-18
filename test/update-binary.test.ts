@@ -26,12 +26,20 @@ test('binary update ignores env mirrors and leaves the target untouched on a bad
   try {
     await assert.rejects(() => updateInstalledBinary(target), /signature verification failed/);
     assert.equal(readFileSync(target, 'utf8'), 'known-good');
-    assert.equal(urls.length, 2, 'an unauthenticated manifest must not trigger a binary download');
-    assert.deepEqual(urls.toSorted(), [
-      'https://storage.googleapis.com/blackfrost-ai-prod-shadow-releases/bin/SHASUMS256.txt',
-      'https://storage.googleapis.com/blackfrost-ai-prod-shadow-releases/bin/SHASUMS256.txt.sig',
-    ]);
-    assert.deepEqual(redirects, ['error', 'error'], 'migration must preserve redirect refusal');
+    // The manifest+sig pair is retried together (a CDN edge can serve them from different
+    // generations for a few seconds after a publish), so the count is a small multiple of 2.
+    // The invariant that matters is that ONLY those two metadata URLs are ever touched — a bad
+    // signature must never trigger the much larger binary download.
+    assert.ok(urls.length >= 2 && urls.length % 2 === 0, `expected manifest+sig pairs, got ${urls.length}`);
+    assert.deepEqual(
+      [...new Set(urls)].toSorted(),
+      [
+        'https://storage.googleapis.com/blackfrost-ai-prod-shadow-releases/bin/SHASUMS256.txt',
+        'https://storage.googleapis.com/blackfrost-ai-prod-shadow-releases/bin/SHASUMS256.txt.sig',
+      ],
+      'an unauthenticated manifest must not trigger a binary download',
+    );
+    assert.ok(redirects.every((r) => r === 'error'), 'migration must preserve redirect refusal');
   } finally {
     globalThis.fetch = oldFetch;
     restoreResolver();
