@@ -145,6 +145,19 @@ if ! mv "$tmp" "$target" 2>/dev/null && ! cp "$tmp" "$target" 2>/dev/null; then
       or with elevated rights:     curl -fsSL $url -o /tmp/shadow && sudo install -m 0755 /tmp/shadow /usr/local/bin/shadow"
 fi
 chmod 0755 "$target" 2>/dev/null || true
+
+# ── macOS: ad-hoc sign so the kernel will execute it ─────────────────────────
+# An unsigned arm64 Mach-O is killed by the kernel (SIGKILL, exit 137) on Apple
+# silicon — the binary is downloaded, hashes match, and it simply dies with no
+# output. Ad-hoc signing is free, needs no certificate, and is what makes a
+# locally-built binary runnable. Without this the installer produces a dead
+# binary for every macOS user, so it is not optional.
+if [ "$os_tag" = "darwin" ] && command -v codesign >/dev/null 2>&1; then
+  if ! codesign --force --sign - "$target" >/dev/null 2>&1; then
+    warn "warning: ad-hoc codesign failed; if 'shadow' exits 137 with no output, run:"
+    warn "         codesign --force --sign - \"$target\""
+  fi
+fi
 say "installed → $target"
 
 # ── post-install notes ────────────────────────────────────────────────────────
