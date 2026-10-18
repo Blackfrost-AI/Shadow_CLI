@@ -6,7 +6,7 @@
 
 > **A true gift of freedom and privacy.**
 > Zero-telemetry · provider-neutral · phone home to no one.
-> Current build: **`v10.3.1`** — a working indicator in the tab title: animated while a turn runs, completely still when idle.
+> Current build: **`v10.3.2`** — `shadow update` now tells you whether DNS timed out or the name genuinely does not exist, instead of reporting both as "could not be resolved".
 
 **Shadow is a zero-telemetry, provider-neutral security engineering agent that runs on your terms.** Point it at any model — Anthropic, any OpenAI-compatible endpoint, Gemini, or a local model on your own box. Its built-in Security foundation covers investigation, hardening, incident response, defensive automation, secure coding, and supporting systems work. **No Shadow account, no signup, no phone-home:** network access follows your provider, tool and update choices. Your config stays local and readable (`~/.shadow/config.json`), credentials are sent to their configured services, and you can switch models mid-session **without losing context**.
 
@@ -16,7 +16,11 @@ Under the hood it's a **tool-calling agentic runtime**: the model reasons, emits
 
 This is **not a chat app** — it is a tool-calling runtime.
 
-## What's new in v10.3.1
+## What's new in v10.3.2
+
+- **A slow resolver no longer reads as a missing host.** Every egress lookup ran under a 1.5s budget and the timeout was swallowed, so on a cold resolver (fresh Linux install, VPN, container DNS) `shadow update` could report the release bucket as permanently gone while it was perfectly reachable. The budget is now 5s and overridable with `SHADOW_EGRESS_DNS_BUDGET_MS`, and a timeout is reported as a timeout — naming the budget — rather than as `could not be resolved`. Both failures still fail closed.
+
+## Previous highlights: v10.3.1
 
 - **Working indicator in the tab title:** a braille frame leads the tab title while a turn is in flight and the title is rewritten bare the moment it finishes, so an idle tab is completely still. The glyph leads because terminal tab strips truncate on the right. `--reduced-motion` swaps the animation for a single static `●` that still reads as busy.
 

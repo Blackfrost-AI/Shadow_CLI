@@ -13,6 +13,7 @@ import {
   setEgressLogPathForTests,
   flushEgressLogForTests,
   setEgressResolverForTests,
+  setEgressLookupForTests,
   egressSummary,
   recordEgress,
   readEgressLogAggregate,
@@ -240,12 +241,42 @@ test('the metadata tier FAILS CLOSED when resolution returns nothing (no unpinne
   try {
     await assert.rejects(
       () => shadowFetch('http://gateway.internal:8080/v1', {}, { purpose: 'provider', origin: 'user' }),
-      /could not be resolved|fails closed/,
+      /did not resolve \(no A\/AAAA records|fails closed/,
     );
     const s = summaryFor('gateway.internal');
     assert.ok(s && s.denied >= 1 && s.allowed === 0, 'the fail-closed deny must be recorded, never an allow');
   } finally {
     setEgressResolverForTests(null);
+  }
+});
+
+// The bug this pins: a slow resolver and a missing name both surfaced as "could not be resolved",
+// so a cold DNS cache on a fresh Linux box read as a dead release bucket. The two failures must
+// stay distinguishable, and both must fail closed.
+test('a DNS budget timeout is reported as a timeout, not as a missing name', async () => {
+  // Drive the REAL defaultResolver through a lookup that never answers, so this exercises the
+  // budget + the catch that used to collapse a timeout into an empty answer. Injecting a
+  // pre-made EgressDnsTimeout here would pin the message while leaving the swallow untested.
+  const prev = process.env.SHADOW_EGRESS_DNS_BUDGET_MS;
+  process.env.SHADOW_EGRESS_DNS_BUDGET_MS = '50';
+  setEgressLookupForTests(() => new Promise(() => {})); // hangs forever
+  try {
+    await assert.rejects(
+      () => shadowFetch('http://slow-renderer.example/v1', {}, { purpose: 'provider', origin: 'user' }),
+      (e: Error) => {
+        assert.match(e.message, /timed out after 50ms/);
+        assert.match(e.message, /SHADOW_EGRESS_DNS_BUDGET_MS/, 'the operator must be told how to raise it');
+        assert.doesNotMatch(e.message, /did not resolve/, 'a timeout must not claim the name is absent');
+        return true;
+      },
+    );
+    const s = summaryFor('slow-renderer.example');
+    assert.ok(s && s.denied >= 1 && s.allowed === 0, 'a timeout must still fail closed and be recorded as a deny');
+  } finally {
+    setEgressLookupForTests(null);
+    setEgressResolverForTests(null);
+    if (prev === undefined) delete process.env.SHADOW_EGRESS_DNS_BUDGET_MS;
+    else process.env.SHADOW_EGRESS_DNS_BUDGET_MS = prev;
   }
 });
 

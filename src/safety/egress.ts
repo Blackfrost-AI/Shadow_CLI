@@ -295,8 +295,34 @@ export function setEgressResolverForTests(r: Resolver | null): void {
 }
 
 const RESOLVE_TTL_MS = 30_000;
-const RESOLVE_BUDGET_MS = 1_500;
+// A cold resolver on a slow link is not a missing host. 1.5s was tight enough that a first-request
+// lookup on a fresh Linux install (systemd-resolved cold cache, VPN, container DNS) timed out and
+// was reported as "could not be resolved" — indistinguishable from NXDOMAIN, so a reachable release
+// bucket looked permanently gone. Operator-overridable for genuinely slow resolvers.
+// Read per call (not at import) so a test can lower it without re-importing the module.
+function resolveBudgetMs(): number {
+  const raw = Number(process.env.SHADOW_EGRESS_DNS_BUDGET_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 5_000;
+}
 const resolveCache = new Map<string, { ips: string[]; at: number }>();
+
+/** Resolution gave up rather than came back empty — a different fact from "no such name". */
+export class EgressDnsTimeout extends Error {
+  constructor(host: string, ms: number) {
+    super(`DNS lookup for ${host} exceeded ${ms}ms`);
+    this.name = 'EgressDnsTimeout';
+  }
+}
+
+// Test seam for the resolver itself: lets a test drive the REAL defaultResolver (budget, cache and
+// swallow behaviour included) instead of injecting a pre-made answer, which would pin nothing.
+type LookupFn = (host: string) => Promise<{ address: string }[]>;
+const realLookup: LookupFn = (h) => lookup(h, { all: true });
+let lookupFn: LookupFn = realLookup;
+export function setEgressLookupForTests(fn: LookupFn | null): void {
+  lookupFn = fn ?? realLookup;
+  resolveCache.clear();
+}
 
 async function defaultResolver(host: string): Promise<string[]> {
   const bare = hostKey(host);
@@ -306,15 +332,20 @@ async function defaultResolver(host: string): Promise<string[]> {
   const cached = resolveCache.get(bare);
   if (cached && Date.now() - cached.at < RESOLVE_TTL_MS) return cached.ips;
   try {
+    const budget = resolveBudgetMs();
     const ips = await withBudget(
-      lookup(bare, { all: true }).then((rs) => rs.map((r) => r.address)),
-      RESOLVE_BUDGET_MS,
+      lookupFn(bare).then((rs) => rs.map((r) => r.address)),
+      budget,
     );
     resolveCache.set(bare, { ips, at: Date.now() });
     return ips;
-  } catch {
+  } catch (e) {
     // NO negative cache: a resolution failure must not open a 30s window in which every
     // request skips validation (the metadata tier fails closed on an empty answer).
+    //
+    // A budget timeout is NOT an empty answer — let it propagate so the caller can say which
+    // happened. Swallowing it here made every slow lookup look like NXDOMAIN.
+    if (e instanceof Error && e.message === 'dns budget exceeded') throw new EgressDnsTimeout(bare, resolveBudgetMs());
     return [];
   }
 }
@@ -783,13 +814,33 @@ export async function shadowFetch(url: string, init?: RequestInit, opts?: Shadow
         throw e;
       }
     } else if (ssrf === 'metadata') {
-      const resolved = await resolver(host);
+      let resolved: string[];
+      try {
+        resolved = await resolver(host);
+      } catch (e) {
+        // Still fail closed — but say which failure this was. "Could not be resolved" on a
+        // timeout sends the operator hunting for a dead host or a bad allowlist when the answer
+        // is a slow resolver. Name the budget and the override.
+        recordEgress(host, purpose, 'denied');
+        if (e instanceof EgressDnsTimeout) {
+          throw new Error(
+            `egress blocked: DNS lookup for ${host} timed out after ${resolveBudgetMs()}ms ` +
+              `(not a denial — the resolver did not answer in time; host is unverified so the ` +
+              `check fails closed). Retry, or raise the budget with ` +
+              `SHADOW_EGRESS_DNS_BUDGET_MS=<ms>.`,
+          );
+        }
+        throw e;
+      }
       if (resolved.length === 0) {
         // FAIL CLOSED (netguard parity): proceeding unpinned on an unvalidated name left the
         // socket-layer lookup — unbudgeted and unchecked — as the sole resolver, and the
         // negative cache stretched that hole to 30s.
         recordEgress(host, purpose, 'denied');
-        throw new Error(`egress blocked: ${host} could not be resolved (the metadata check fails closed)`);
+        throw new Error(
+          `egress blocked: ${host} did not resolve (no A/AAAA records — the metadata check ` +
+            `fails closed). Check DNS, /etc/hosts, or a proxy.`,
+        );
       }
       const bad = resolved.find(isCloudMetadataIp);
       if (bad) {

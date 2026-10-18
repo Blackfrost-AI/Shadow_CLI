@@ -1,5 +1,15 @@
 # Shadow release notes
 
+## 10.3.2 — 2026-10-18
+
+- Fix `shadow update` reporting a DNS timeout as a missing host. Every lookup ran under a 1.5s
+  budget and the timeout was swallowed, so a cold resolver (fresh Linux install, VPN, container
+  DNS) could report the release bucket as permanently gone while it was reachable — the error read
+  `could not be resolved`, indistinguishable from NXDOMAIN.
+- The budget is now 5s and overridable with `SHADOW_EGRESS_DNS_BUDGET_MS`, and the two failures
+  are distinct: a timeout names the budget and the override, a genuine empty answer reports no
+  A/AAAA records. Both still fail closed.
+
 ## 10.3.1 — 2026-10-18
 
 - Add a working indicator to the terminal tab title: a braille frame leads the title while a turn
