@@ -1,4 +1,4 @@
-import { existsSync, realpathSync } from 'node:fs';
+import { existsSync, realpathSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -103,24 +103,54 @@ export const SECRET_READ_DENY: readonly string[] = [
 ].map((rel) => join(homedir(), rel));
 
 /** The macOS seatbelt profile, parameterized by WS (workspace) and SD (~/.shadow). */
-function seatbeltProfile(allowNetwork: boolean, extraWrite: string[], socketDeny?: boolean): string {
+function seatbeltProfile(
+  allowNetwork: boolean,
+  extraWrite: string[],
+  socketDeny?: boolean,
+  exclusiveWriteRoot?: string,
+): string {
+  // DENOTATION MODE (exclusiveWriteRoot): writes are confined to ONE scratch dir and the
+  // workspace itself is NOT writable. This is deliberately tighter than the run_shell profile —
+  // detonating an untrusted sample should not be able to touch the repo it was triaged from, and
+  // /tmp + /private/var/folders are a shared, predictable escape surface. The caller sets TMPDIR
+  // into the scratch dir, so runtimes that need temp space still work.
+  const writeAllow = exclusiveWriteRoot
+    ? [
+        `  (subpath ${JSON.stringify(exclusiveWriteRoot)})`,
+        '  (literal "/dev/null") (literal "/dev/zero") (literal "/dev/urandom")',
+        '  (literal "/dev/stdout") (literal "/dev/stderr") (literal "/dev/tty")',
+      ]
+    : [
+        '  (subpath (param "WS"))',
+        ...extraWrite.map((p) => `  (subpath ${JSON.stringify(p)})`),
+        '  (subpath "/private/tmp")',
+        '  (subpath "/private/var/folders")',
+        '  (literal "/dev/null") (literal "/dev/zero") (literal "/dev/urandom")',
+        '  (literal "/dev/stdout") (literal "/dev/stderr") (literal "/dev/tty") (literal "/dev/dtracehelper")',
+      ];
   return [
     '(version 1)',
     '(allow default)',
     '(deny file-write*)',
     '(allow file-write*',
-    '  (subpath (param "WS"))',
-    ...extraWrite.map((p) => `  (subpath ${JSON.stringify(p)})`),
-    '  (subpath "/private/tmp")',
-    '  (subpath "/private/var/folders")',
-    '  (literal "/dev/null") (literal "/dev/zero") (literal "/dev/urandom")',
-    '  (literal "/dev/stdout") (literal "/dev/stderr") (literal "/dev/tty") (literal "/dev/dtracehelper"))',
+    ...writeAllow.slice(0, -1),
+    `${writeAllow[writeAllow.length - 1]})`,
     // Protect the credential store even when ~/.shadow sits INSIDE the workspace (the common `shadow`
     // run-from-$HOME case): these denies come AFTER the workspace file-write* allow, and in seatbelt the
     // LAST matching rule wins — so writes/reads to ~/.shadow are blocked regardless of WS containment.
     // Without the write deny, a sandboxed run_shell could overwrite config.json with an attacker baseUrl+key.
     '(deny file-write* (subpath (param "SD")))',
     '(deny file-read* (subpath (param "SD")))',
+    // …EXCEPT in detonation mode, where the scratch dir lives under ~/.shadow/security/detonation
+    // and the workspace may itself BE $HOME. Re-allowing it here (last match wins) keeps the
+    // credential store sealed while still letting the sample write where it is supposed to. Scoped
+    // to the exact run directory, so config.json and the rest of ~/.shadow stay unreadable.
+    ...(exclusiveWriteRoot
+      ? [
+          `(allow file-write* (subpath ${JSON.stringify(exclusiveWriteRoot)}))`,
+          `(allow file-read* (subpath ${JSON.stringify(exclusiveWriteRoot)}))`,
+        ]
+      : []),
     // Credential stores OUTSIDE ~/.shadow get the same treatment, and for the same reason: the
     // profile is `(allow default)` minus writes, so a sandboxed read of ~/.ssh/id_rsa or
     // ~/.aws/credentials was permitted and its contents would be handed to the provider as a tool
@@ -136,10 +166,10 @@ function seatbeltProfile(allowNetwork: boolean, extraWrite: string[], socketDeny
     ...(socketDeny
       ? [
           '(deny file-write* (regex "^/private/tmp/com\\.apple\\.launchd\\."))',
-          '(deny file-write* (regex "^/private/tmp/ssh-"))',
+                    '(deny file-write* (regex "^/private/tmp/ssh-"))',
           '(deny file-write* (regex "^/private/var/folders/[^/]+/[^/]+/T/com\\.apple\\.launchd\\."))',
-          '(deny file-write* (regex "^/private/var/folders/[^/]+/[^/]+/T/ssh-"))',
-          '(deny file-write* (regex "^/private/var/folders/[^/]+/[^/]+/T/gpg-"))',
+                    '(deny file-write* (regex "^/private/var/folders/[^/]+/[^/]+/T/ssh-"))',
+                    '(deny file-write* (regex "^/private/var/folders/[^/]+/[^/]+/T/gpg-"))',
         ]
       : []),
     allowNetwork ? '' : '(deny network*)',
@@ -149,12 +179,81 @@ function seatbeltProfile(allowNetwork: boolean, extraWrite: string[], socketDeny
 }
 
 /** The macOS seatbelt argv prefix (profile included) shared by run_shell and MCP confinement. */
-function seatbeltPrefix(ws: string, shadowDir: string, allowNetwork: boolean, extraWrite: string[], socketDeny?: boolean): string[] {
-  return ['sandbox-exec', '-D', `WS=${ws}`, '-D', `SD=${shadowDir}`, '-p', seatbeltProfile(allowNetwork, extraWrite, socketDeny)];
+function seatbeltPrefix(
+  ws: string,
+  shadowDir: string,
+  allowNetwork: boolean,
+  extraWrite: string[],
+  socketDeny?: boolean,
+  exclusiveWriteRoot?: string,
+): string[] {
+  return [
+    'sandbox-exec',
+    '-D',
+    `WS=${ws}`,
+    '-D',
+    `SD=${shadowDir}`,
+    '-p',
+    seatbeltProfile(allowNetwork, extraWrite, socketDeny, exclusiveWriteRoot),
+  ];
 }
 
+// bwrap needs every --tmpfs mountpoint to exist (it mkdirs it under the read-only root), and it
+// needs the PARENT to be writable in the new root. Neither is guaranteed: ~/.shadow may not exist
+// yet, and /root is read-only inside the sandbox. Mount a tmpfs only where the directory already
+// exists; masking a path that isn't there would be a no-op anyway.
+const maskable = (p: string): boolean => {
+  try {
+    return existsSync(p) && statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+};
+
 /** The bubblewrap flag list shared by run_shell and MCP confinement. */
-function bwrapFlags(ws: string, shadowDir: string, extra: string[], allowNetwork: boolean, privateTmp?: boolean): string[] {
+function bwrapFlags(
+  ws: string,
+  shadowDir: string,
+  extra: string[],
+  allowNetwork: boolean,
+  privateTmp?: boolean,
+  exclusiveWriteRoot?: string,
+): string[] {
+  // DENOTATION MODE: the workspace is bound READ-ONLY and only the scratch dir is writable.
+  // /tmp gets a private tmpfs rather than the host bind, so a sample cannot drop files into a
+  // shared, predictable location and cannot see another process's scratch state.
+  if (exclusiveWriteRoot) {
+    const flags = [
+      '--die-with-parent',
+      '--new-session',
+      '--unshare-pid',
+      '--ro-bind',
+      '/',
+      '/', // whole fs read-only…
+      '--dev',
+      '/dev',
+      '--proc',
+      '/proc',
+      '--bind',
+      exclusiveWriteRoot,
+      exclusiveWriteRoot, // …scratch dir writable…
+      '--tmpfs',
+      '/tmp', // …private tmp, not the host's…
+      // ~/.shadow is masked by an empty tmpfs so no credentials are readable… but when the
+      // workspace is $HOME the scratch dir lives under it, and bwrap's LAST bind for a path wins.
+      // Re-bind the run directory after the tmpfs so the sample can write where it should while
+      // config.json and the rest of ~/.shadow stay hidden.
+      ...(maskable(shadowDir) ? ['--tmpfs', shadowDir] : []),
+      '--bind',
+      exclusiveWriteRoot,
+      exclusiveWriteRoot,
+      ...SECRET_READ_DENY.filter(maskable).flatMap((d) => ['--tmpfs', d]),
+      '--chdir',
+      exclusiveWriteRoot,
+    ];
+    if (!allowNetwork) flags.push('--unshare-net');
+    return flags;
+  }
   const flags = [
     '--die-with-parent',
     '--new-session',
@@ -171,11 +270,11 @@ function bwrapFlags(ws: string, shadowDir: string, extra: string[], allowNetwork
     // legitimately exchange scratch files there).
     ...(privateTmp ? ['--tmpfs', '/tmp'] : ['--bind', '/tmp', '/tmp']), // …and /tmp…
     ...extra.flatMap((d) => ['--bind', d, d]), // …and any granted dirs writable…
-    '--tmpfs', shadowDir, // …and ~/.shadow hidden behind an empty tmpfs (no creds read)
+    ...(maskable(shadowDir) ? ['--tmpfs', shadowDir] : []), // …and ~/.shadow hidden behind an empty tmpfs (no creds read)
     // Same treatment for the credential stores outside ~/.shadow. A tmpfs makes them read as
     // empty rather than erroring, which is the friendlier failure and still leaks nothing.
-    // Only bind paths that EXIST — bwrap aborts on a missing source.
-    ...SECRET_READ_DENY.filter((d) => existsSync(d)).flatMap((d) => ['--tmpfs', d]),
+    // Only bind paths that EXIST and are directories — bwrap aborts otherwise.
+    ...SECRET_READ_DENY.filter(maskable).flatMap((d) => ['--tmpfs', d]),
     '--chdir', ws,
   ];
   if (!allowNetwork) flags.push('--unshare-net');
@@ -189,18 +288,34 @@ export function wrapCommand(opts: {
   additionalRoots?: string[];
   allowNetwork: boolean;
   enabled: boolean;
+  /**
+   * DETONATION MODE. When set, writes are confined to this single directory and the workspace
+   * itself is NOT writable — the sample under analysis cannot touch the tree it came from, and
+   * /tmp is not a shared escape hatch. The caller is responsible for pointing TMPDIR/HOME inside
+   * it. `sandboxed: false` in the result means CONTAINMENT FAILED and the caller must refuse to
+   * run rather than detonate unconfined.
+   */
+  exclusiveWriteRoot?: string;
+  /**
+   * Execute exactly this argv instead of `[shell, '-c', command]`.
+   *
+   * Detonation needs the sample to be the process, not an argument to a shell: a compiled Mach-O
+   * or ELF run as `sh <sample>` is a syntax error (exit 126), and a filename reaching a shell
+   * string is an injection surface. Passing the argv explicitly keeps this out of the shell
+   * entirely and makes the sandbox prefix impossible to mis-slice.
+   */
+  execArgv?: string[];
 }): SandboxResult {
   const { command, workspaceRoot, allowNetwork, enabled } = opts;
   const shell = process.env.SHELL || '/bin/sh';
+  const tail = opts.execArgv ?? [shell, '-c', command];
   const ws = real(workspaceRoot);
   const shadowDir = real(join(homedir(), '.shadow'));
   // Real, existing, de-duplicated extra roots — bwrap can't bind a missing path.
   const extra = [...new Set((opts.additionalRoots ?? []).map(real))].filter((p) => p !== ws && existsSync(p));
 
   const passthrough = (note?: string): SandboxResult => ({
-    argv: IS_WIN
-      ? ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', command]
-      : [shell, '-c', command],
+    argv: IS_WIN ? ['powershell.exe', '-NoProfile', '-NonInteractive', '-Command', command] : tail,
     sandboxed: false,
     note,
   });
@@ -209,16 +324,36 @@ export function wrapCommand(opts: {
   // --yolo (or explicit noSandbox/unrestricted) means the caller wants no sandbox at all.
   if (IS_WIN) return passthrough('no OS sandbox on Windows — run_shell runs unconfined');
 
+  // Detonation mode: resolve the exclusive root once; a missing dir is a hard error, not a silent
+  // fallback to the workspace-wide profile.
+  const exclusive = opts.exclusiveWriteRoot ? real(opts.exclusiveWriteRoot) : undefined;
+  if (opts.exclusiveWriteRoot && !existsSync(exclusive!)) {
+    throw new Error(`exclusiveWriteRoot does not exist: ${opts.exclusiveWriteRoot}`);
+  }
+
   if (IS_MAC) {
     if (!existsSync('/usr/bin/sandbox-exec')) {
       return passthrough('sandbox-exec not found — run_shell runs unconfined');
     }
-    return { argv: [...seatbeltPrefix(ws, shadowDir, allowNetwork, extra), shell, '-c', command], sandboxed: true };
+    return {
+      argv: [
+        ...seatbeltPrefix(ws, shadowDir, allowNetwork, exclusive ? [] : extra, undefined, exclusive),
+        ...tail,
+      ],
+      sandboxed: true,
+    };
   }
 
   // Linux
   if (hasBwrap()) {
-    return { argv: ['bwrap', ...bwrapFlags(ws, shadowDir, extra, allowNetwork), shell, '-c', command], sandboxed: true };
+    return {
+      argv: [
+        'bwrap',
+        ...bwrapFlags(ws, shadowDir, exclusive ? [] : extra, allowNetwork, undefined, exclusive),
+        ...tail,
+      ],
+      sandboxed: true,
+    };
   }
   return passthrough('bubblewrap (bwrap) not found — run_shell runs unconfined');
 }

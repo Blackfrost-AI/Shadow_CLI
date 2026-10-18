@@ -14,6 +14,7 @@ import { webSearch } from './webSearch.js';
 import { makeWorktreeCreateTool, makeWorktreeRemoveTool, makeWorktreeListTool } from './worktree.js';
 import { binRecon } from './binRecon.js';
 import { patchBytes } from './patchBytes.js';
+import { sampleRun } from './sampleRun.js';
 import { targetSnapshot } from './targetSnapshot.js';
 import { engagementOps } from './engagementOps.js';
 import { makeWatcherTool } from './watcherTool.js';
@@ -104,6 +105,7 @@ export function registerBuiltinTools(
   // Phase 1 redteam toolbelt (facts-only; receipts in the SQL evidence ledger)
   registry.register(binRecon);
   registry.register(patchBytes);
+  registry.register(sampleRun);
   registry.register(targetSnapshot);
   // Phase 2 targeting doctrine (F3EAD engagement state machine)
   registry.register(engagementOps);

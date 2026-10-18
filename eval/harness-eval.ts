@@ -83,13 +83,16 @@ function parseTelemetry(sessionParent: string): Omit<RunResult, 'exitCode' | 'ti
     /* no session log written */
   }
   const events = (paths.length ? SessionLog.load(paths[0]!) : []) as Record<string, unknown>[];
-  const t = { toolCalls: [] as { name: string; ok: boolean }[], badJson: 0, errors: 0, iterations: 0, stopReason: '', inputTokens: 0, outputTokens: 0, compactions: 0 };
+  const t = { toolCalls: [] as { name: string; ok: boolean; input?: unknown }[], badJson: 0, errors: 0, iterations: 0, stopReason: '', inputTokens: 0, outputTokens: 0, compactions: 0 };
   for (const e of events) {
     switch (e.type) {
       case 'tool_end': {
-        const call = e.call as { name?: string } | undefined;
+        const call = e.call as { name?: string; input?: unknown } | undefined;
         const result = e.result as { ok?: boolean } | undefined;
-        t.toolCalls.push({ name: call?.name ?? '?', ok: !!result?.ok });
+        // Carry the ARGUMENTS through, not just the name. A task that needs to assert on what a
+        // tool was asked to do (e.g. "did the model enable network egress?") cannot recover that
+        // from {name, ok} alone, and reconstructing it from prose would be guessing.
+        t.toolCalls.push({ name: call?.name ?? '?', ok: !!result?.ok, input: call?.input });
         break;
       }
       case 'error':
@@ -143,7 +146,14 @@ function runShadow(task: EvalTask, ws: string, model: ModelCfg, maxWallSec: numb
       if (model.baseUrl) env.ANTHROPIC_BASE_URL = model.baseUrl;
     } else {
       env.OPENAI_API_KEY = key;
-      if (model.baseUrl) env.OPENAI_BASE_URL = model.baseUrl;
+      // SHADOW_BASE_URL is the canonical one-run endpoint override (resolveBaseUrl precedence:
+      // explicit baseUrl > SHADOW_BASE_URL > provider-relative env). OPENAI_BASE_URL alone is NOT
+      // consulted on this path — setting only that sent every non-mock eval to api.openai.com and
+      // produced a bare `provider_error` with 0 iterations. Set both so either path resolves.
+      if (model.baseUrl) {
+        env.SHADOW_BASE_URL = model.baseUrl;
+        env.OPENAI_BASE_URL = model.baseUrl;
+      }
     }
   }
 
@@ -171,7 +181,14 @@ function runShadow(task: EvalTask, ws: string, model: ModelCfg, maxWallSec: numb
     child.on('close', (code) => {
       clearTimeout(killer);
       const telemetry = parseTelemetry(sessionParent);
-      try { rmSync(sessionParent, { recursive: true, force: true }); } catch { /* best-effort */ }
+      // --keep-sessions preserves the transcript for post-mortem. Without it a failed task is
+      // undebuggable: the only record of what the model actually called is deleted right here,
+      // so "never called sample_run" is indistinguishable from "never saw sample_run".
+      if (!process.env.SHADOW_EVAL_KEEP_SESSIONS) {
+        try { rmSync(sessionParent, { recursive: true, force: true }); } catch { /* best-effort */ }
+      } else {
+        process.stderr.write(`[eval] session kept: ${sessionParent}\n`);
+      }
       resolve({ exitCode: code ?? -1, timedOut, wallMs: Date.now() - startedAt, stdout, stderr, ...telemetry });
     });
     child.on('error', (err) => {

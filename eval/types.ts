@@ -13,7 +13,7 @@ export interface RunResult {
   stdout: string;
   stderr: string;
   /** Tool calls the loop actually executed (from the session log). */
-  toolCalls: { name: string; ok: boolean }[];
+  toolCalls: { name: string; ok: boolean; input?: unknown }[];
   /** Count of `bad_tool_json` errors — the #1 local-model failure signal. */
   badJson: number;
   /** Total error events surfaced during the run. */
@@ -44,6 +44,7 @@ export interface EvalTask {
     | 'write'
     | 'edit'
     | 'shell'
+    | 'exec'
     | 'error-recovery'
     | 'completion'
     | 'compaction'

@@ -136,3 +136,134 @@ test('aliases are tokenised, so a multi-word alias matches its parts', () => {
     ['bin_recon'],
   );
 });
+// REGRESSION (2026-10-18 DWM eval): `tool_search` reimplemented its own filter
+// (`name.includes(query) || every word in name`) and ignored `searchAliases` entirely. A live
+// model asked to detonate a sample searched five times — "detonate sample in sandbox
+// containment", "malware", "sample_run detonate binary sandbox" — got "No matching tools" for
+// all but the exact-name query, then burned its remaining iterations shelling around looking for
+// a CLI surface that does not exist. These are the verbatim queries from that transcript.
+const detonator: Tool = {
+  name: 'sample_run',
+  description: 'contained detonation',
+  risk: 'exec',
+  deferred: true,
+  searchAliases: ['detonate', 'sandbox', 'execution', 'malware', 'ransomware'],
+  inputSchema: z.object({ path: z.string() }),
+  async run() {
+    return ok('sample_run', 'exec', 0, 'ok');
+  },
+};
+
+function searchRegistry(): ToolRegistry {
+  const reg = new ToolRegistry();
+  reg.register(detonator);
+  reg.register(aliased);
+  return reg;
+}
+
+test('tool_search resolves the natural-language queries from the DWM transcript', async () => {
+  const reg = searchRegistry();
+  const search = makeToolSearch(reg);
+  reg.register(search);
+  const ctx = { workspaceRoot: '/tmp', signal: new AbortController().signal, log: () => {}, dryRun: false };
+
+  const cases: Array<[string, string]> = [
+    ['detonate sample in sandbox containment', 'sample_run'],
+    ['sample_run detonate binary sandbox', 'sample_run'],
+    ['malware', 'bin_recon'],
+    ['sample_run', 'sample_run'],
+    ['detonate', 'sample_run'],
+    ['malware reverse disassemble', 'bin_recon'],
+  ];
+  for (const [query, expected] of cases) {
+    const r = await search.run({ query }, ctx as never);
+    assert.ok(
+      r.data!.tools.includes(expected),
+      `query ${JSON.stringify(query)} should reach ${expected}, got [${r.data!.tools.join(', ')}]`,
+    );
+  }
+});
+
+test('tool_search returns a callable schema, not a bare name', async () => {
+  const reg = searchRegistry();
+  const search = makeToolSearch(reg);
+  const ctx = { workspaceRoot: '/tmp', signal: new AbortController().signal, log: () => {}, dryRun: false };
+  const r = await search.run({ query: 'detonate' }, ctx as never);
+  const first = r.data!.schemas[0];
+  assert.equal(first.name, 'sample_run');
+  assert.equal(first.risk, 'exec');
+  assert.ok(first.description.length > 0, 'description must be included so the model can choose');
+  assert.equal((first.parameters as { type?: string }).type, 'object');
+  assert.ok(
+    JSON.stringify(first.parameters).includes('path'),
+    'the argument schema must be present or the model cannot construct a valid call',
+  );
+  assert.ok(!('$schema' in (first.parameters as object)), 'providers want a bare object schema');
+});
+
+test('an unmatched query returns no tools and a usable hint', async () => {
+  const reg = searchRegistry();
+  const search = makeToolSearch(reg);
+  const ctx = { workspaceRoot: '/tmp', signal: new AbortController().signal, log: () => {}, dryRun: false };
+  const r = await search.run({ query: 'kubernetes' }, ctx as never);
+  assert.deepEqual(r.data!.tools, []);
+  assert.match(String(r.summary), /No deferred tool matches/);
+});
+
+test('searchDeferredRanked drops filler words and ranks by matched word count', () => {
+  const reg = searchRegistry();
+  // "in"/"the" carry no intent; they must not decide the result.
+  assert.deepEqual(reg.searchDeferredRanked('detonate in the sandbox').map((t) => t.name), ['sample_run']);
+  // Three hits outrank one hit. `bin_recon` still appears — it legitimately carries the
+  // "malware" alias — but below `sample_run`, and ties fall back to name order.
+  reg.register({ ...detonator, name: 'zzz_other', searchAliases: ['detonate'] });
+  assert.deepEqual(reg.searchDeferredRanked('malware detonate sandbox').map((t) => t.name), [
+    'sample_run',
+    'bin_recon',
+    'zzz_other',
+  ]);
+});
+
+// REGRESSION (2026-10-18 DWM eval): discovery was a dead end. `tool_search` returned a bare name
+// and never added the tool to `toSchemas()`, so the model had to emit a call for a tool whose
+// arguments it had never seen. Live models instead shelled out to `otool`/`xxd` for 15 iterations
+// and never touched `bin_recon`. Search must promote.
+test('tool_search promotes a match into the active schema', async () => {
+  const reg = searchRegistry();
+  const search = makeToolSearch(reg);
+  reg.register(search);
+
+  assert.ok(!reg.toSchemas().some((s) => s.name === 'sample_run'), 'starts hidden');
+  assert.deepEqual(reg.listRevealed(), []);
+
+  await search.run({ query: 'detonate' }, { workspaceRoot: '/tmp', signal: new AbortController().signal, log: () => {}, dryRun: false } as never);
+
+  const schemas = reg.toSchemas();
+  assert.ok(schemas.some((s) => s.name === 'sample_run'), 'revealed tool must appear in the schema');
+  assert.deepEqual(reg.listRevealed(), ['sample_run']);
+  // The revealed schema must carry real arguments, or the model still cannot call it.
+  const s = schemas.find((x) => x.name === 'sample_run')!;
+  assert.ok(JSON.stringify(s.parameters).includes('path'));
+});
+
+test('revealed tools leave the deferred list and survive re-search', async () => {
+  const reg = searchRegistry();
+  const search = makeToolSearch(reg);
+  reg.register(search);
+  const ctx = { workspaceRoot: '/tmp', signal: new AbortController().signal, log: () => {}, dryRun: false } as never;
+
+  await search.run({ query: 'detonate' }, ctx);
+  assert.ok(!reg.listDeferred().some((t) => t.name === 'sample_run'), 'no longer deferred');
+  await search.run({ query: 'detonate' }, ctx);
+  assert.deepEqual(reg.listRevealed(), ['sample_run'], 'idempotent');
+});
+
+test('search cannot reveal a denied tool', async () => {
+  const reg = searchRegistry();
+  const search = makeToolSearch(reg);
+  reg.register(search);
+  reg.setDenied(['sample_run']);
+  await search.run({ query: 'detonate' }, { workspaceRoot: '/tmp', signal: new AbortController().signal, log: () => {}, dryRun: false } as never);
+  assert.deepEqual(reg.listRevealed(), []);
+  assert.ok(!reg.toSchemas().some((s) => s.name === 'sample_run'));
+});

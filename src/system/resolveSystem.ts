@@ -50,6 +50,7 @@ const PROMPT_REFERENCED_TOOLS = [
 
 const SECURITY_TOOLKIT_TOOLS = [
   'bin_recon',
+  'sample_run',
   'patch_bytes',
   'target_snapshot',
   'engagement_ops',

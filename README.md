@@ -6,7 +6,7 @@
 
 > **A true gift of freedom and privacy.**
 > Zero-telemetry · provider-neutral · phone home to no one.
-> Current build: **`v10.2.0`** — local workflows, verified checks, context controls, session search, and tmux integration in the full-width retro terminal.
+> Current build: **`v10.3.0`** — contained detonation for untrusted samples, and tool discovery that actually reaches the security toolkit.
 
 **Shadow is a zero-telemetry, provider-neutral security engineering agent that runs on your terms.** Point it at any model — Anthropic, any OpenAI-compatible endpoint, Gemini, or a local model on your own box. Its built-in Security foundation covers investigation, hardening, incident response, defensive automation, secure coding, and supporting systems work. **No Shadow account, no signup, no phone-home:** network access follows your provider, tool and update choices. Your config stays local and readable (`~/.shadow/config.json`), credentials are sent to their configured services, and you can switch models mid-session **without losing context**.
 
@@ -16,7 +16,14 @@ Under the hood it's a **tool-calling agentic runtime**: the model reasons, emits
 
 This is **not a chat app** — it is a tool-calling runtime.
 
-## What's new in v10.2.0
+## What's new in v10.3.0
+
+- **Contained detonation (`sample_run`):** run an untrusted sample and observe what it actually does. The sample executes under an OS sandbox whose only writable path is a private scratch directory — workspace read-only, `/tmp` a private tmpfs, no inherited environment, network denied unless the engagement authorises it. Every dropped file is enumerated and hashed, and the receipt is bound to the sample's SHA-256. If no sandbox is available it **refuses to run** rather than detonating unconfined.
+- **Tool discovery actually works:** `tool_search` previously reimplemented its own filter, ignored intent aliases, returned a bare name with no argument schema, and never promoted what it found into the active tool list — so a model could "discover" a tool it then could not call. It now matches on aliases and natural language, returns full schemas, and promotes matches for the rest of the session.
+- **Detonation sandbox mode:** `exclusiveWriteRoot` threads a single-writable-root mode through both the macOS seatbelt profile and the Linux bubblewrap flag list.
+- **Ten security eval tasks:** the four new ones cover snapshot drift and contained detonation (benign execution, containment escape, network denial).
+
+## Previous highlights: v10.2.0
 
 - **Security toolkit is now discoverable:** `tool_search` matches intent aliases as well as tool names, so `malware`, `ransomware`, `shellcode`, `c2`, `ioc`, `reverse`, `pentest`, `redteam`, `vuln`, `sarif`, `drift` and `triage` all resolve to the right tool. Previously five working tools were reachable only by already knowing their exact names.
 - **Security engagement policy:** `prompts/policies/security-engagement.md` documents when to reach for each security tool, and the verification rules that are not optional.
