@@ -243,7 +243,7 @@ export function parseMarkdown(src) {
 // ── GFM tables ────────────────────────────────────────────────────────────────
 /** Split a `| a | b |` row into trimmed cells, honoring `\|` escapes. */
 function splitTableRow(line) {
-    const placeholder = ' PIPE ';
+    const placeholder = '\u0000PIPE\u0000';
     const unescaped = line.replace(/\\\|/g, placeholder);
     let inner = unescaped.trim();
     // Strip one leading + one trailing pipe if present.

@@ -25,6 +25,7 @@ import { homedir } from 'node:os';
 import type { Message, Provider, ToolCall, ContentBlock, ImageBlock, Effort } from './provider/provider.js';
 import type { ToolRegistry } from './tools/registry.js';
 import type { BgRegistry } from './tools/bgShell.js';
+import type { WatcherRegistry } from './agent/watcher.js';
 import type { WorkCenter } from './app/workCenter.js';
 import type { HistoricalWorkItem } from './state/workCenterPersistence.js';
 import { EventBus, type StopReasonExt } from './agent/events.js';
@@ -325,6 +326,8 @@ export interface TuiOpts {
   workCenter?: WorkCenter;
   /** Authoritative background-shell registry used by Work Center controls. */
   bgRegistry?: BgRegistry;
+  /** Detached watcher registry — work that outlives the session (surfaced in Work Center + /work kill). */
+  watchers?: WatcherRegistry;
   /** Read-only cross-session Work Center query. */
   workHistory?: (session?: string) => HistoricalWorkItem[];
   planMode?: PlanModeState;

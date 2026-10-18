@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { isolateHome } from './helpers/isolateHome.js';
 import type { ToolCall } from '../src/provider/provider.js';
 
@@ -20,6 +22,61 @@ const GLOBAL_CFG = join(HOME, '.shadow', 'config.json');
 
 const call = (path: string): ToolCall => ({ id: 'c1', name: 'write_file', input: { path } });
 const edit = (path: string): ToolCall => ({ id: 'c1', name: 'edit_file', input: { path } });
+
+test('snapshot restores always prompt, including directory roots; non-restores do not', () => {
+  for (const path of ['shadow.config.json', GLOBAL_CFG, '.', 'nested/tree', 'ordinary.bin']) {
+    assert.equal(writeTouchesConfigFile('target_snapshot', { action: 'restore', path }), true);
+    for (const action of ['baseline', 'verify', 'list']) {
+      assert.equal(writeTouchesConfigFile('target_snapshot', { action, path }), false);
+    }
+  }
+  assert.equal(writeTouchesConfigFile('patch_bytes', { action: 'revert', path: GLOBAL_CFG }), true);
+});
+
+test('denying a snapshot restore protects configs at auto-edit and full autonomy', async () => {
+  const { AgentLoop } = await import('../src/agent/loop.js');
+  const { Budget } = await import('../src/agent/budget.js');
+  const { Context } = await import('../src/agent/context.js');
+  const { EventBus } = await import('../src/agent/events.js');
+  const { MockProvider } = await import('../src/provider/mock.js');
+  const { ToolRegistry } = await import('../src/tools/registry.js');
+  const { targetSnapshot } = await import('../src/tools/targetSnapshot.js');
+  const root = mkdtempSync(join(tmpdir(), 'cfg-restore-'));
+  const ctx = { workspaceRoot: root, signal: new AbortController().signal, log: () => {}, dryRun: false };
+  try {
+    mkdirSync(join(root, 'tree'));
+    const config = join(root, 'tree', 'shadow.config.json');
+    for (const path of ['tree/shadow.config.json', 'tree']) {
+      writeFileSync(config, '{"marker":"old"}');
+      const baseline = await targetSnapshot.run({ action: 'baseline', path }, ctx);
+      assert.equal(baseline.ok, true, baseline.summary);
+      writeFileSync(config, '{"marker":"current"}');
+      for (const autonomy of ['auto-edit', 'full'] as const) {
+        let approvalRequests = 0;
+        const registry = new ToolRegistry();
+        registry.register(targetSnapshot);
+        const loop = new AgentLoop({
+          ...ctx, registry, provider: new MockProvider(), model: 'mock', system: 'test',
+          gate: { async request() { approvalRequests++; return 'deny' as const; } },
+          bus: new EventBus(), budget: new Budget({ maxIterations: 10 }, 'mock', {}, Date.now()),
+          context: new Context({ contextBudget: 100_000, triggerRatio: 0.9, keepLastTurns: 6 }),
+          maxOutputTokens: 256, maxToolResultChars: 1000, contextBudget: 100_000,
+        }, autonomy);
+        const result = await loop.runToolCall({
+          id: 'restore', name: 'target_snapshot', input: {
+            action: 'restore', path, snapshot_id: (baseline.data as { snapshotId: string }).snapshotId,
+            overwrite_drift: true,
+          },
+        });
+        assert.equal(approvalRequests, 1, `${autonomy}: restore must reach the gate`);
+        assert.equal(result.ok, false);
+        assert.equal(readFileSync(config, 'utf8'), '{"marker":"current"}');
+      }
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('write_file/edit_file targeting any shadow.config.json is detected (→ always prompts)', () => {
   // Project config (relative).

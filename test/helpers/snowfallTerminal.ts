@@ -67,6 +67,7 @@ export const snowfallFixtureState = (): SnowfallState => ({
     { id: '3', subject: 'Review the release candidate', status: 'pending' },
   ],
   agents: [{ taskId: 'review', subagentType: 'reviewer', description: 'Checking terminal behavior', tool: 'read_file', toolUseCount: 4, inputTokens: 100, outputTokens: 20, startedAt: 0, background: true }],
+  toasts: [],
 });
 
 export const snowfallFixtureItems = (): FlattenItem[] => [

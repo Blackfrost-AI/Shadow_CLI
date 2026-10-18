@@ -57,6 +57,7 @@ import { TmuxView } from './tmuxView.js';
 import { TextViewer } from './textViewer.js';
 import { JobStore, type ProjectJob, type RoomMessage } from '../state/jobStore.js';
 import { WorkBrowser } from './workBrowser.js';
+import { ToastQueue, type Toast } from './toast.js';
 import { ChangeReview } from './changeReview.js';
 import { readChanges, readFileDiff, reviewRequest, reviewMaterial, type ReviewScope } from '../state/gitChanges.js';
 import { previewReviewAction, applyReviewAction, type ReviewAction } from '../state/reviewActions.js';
@@ -100,10 +101,12 @@ import { sanitizeAssistantText } from '../tui/sanitize.js';
 import type { ResumableSession } from '../state/resume.js';
 import type { RewindableTurn } from '../state/rewind.js';
 import {
+  clampLiveRest,
   extractCommittableUnits,
   leadsWithBlock,
   stripTrailingNewlines,
 } from '../tui/streamCommit.js';
+import { scrubForDisplay, sanitizeTerminalEscapes } from '../util/scrub.js';
 import type { FlattenItem } from '../tui/flatten.js';
 import type { ContentBlock, Message } from '../provider/provider.js';
 
@@ -166,6 +169,10 @@ function isCtrlO(data: string): boolean {
 function isCtrlT(data: string): boolean {
   return matchesKey(data, 'ctrl+t');
 }
+/** Live work/watchers overlay. Ctrl+N is unclaimed by the editor and the app-wide dispatch. */
+function isCtrlN(data: string): boolean {
+  return matchesKey(data, 'ctrl+n');
+}
 
 // ── status line ──────────────────────────────────────────────────────────────
 
@@ -184,6 +191,8 @@ interface HudState {
   mcpConnecting: boolean;
   mcpFailed: boolean;
   planMode: boolean;
+  /** Live toast rows; empty array when nothing is showing. */
+  toasts: Toast[];
 }
 
 function oneLine(s: string, max: number): string {
@@ -317,6 +326,16 @@ export class ShadowApp {
   private mcpFailed = false;
   /** Live sub-agent registry (P1.2) — keyed by taskId, rendered by SubAgentsCell. */
   private subAgents = new Map<string, SubAgentView>();
+  /** Transient notices (sub-agent finished, bg shell exited, watcher fired) — ToastCell renders them. */
+  private toasts = new ToastQueue();
+  /** Injectable clock so toast expiry is testable without real timers. */
+  private toastClock: () => number = () => Date.now();
+  /**
+   * Expiry timer for toasts. The main ticker only runs during a turn, but background work
+   * finishes precisely when no turn is running — so toasts need their own idle-scoped ticker or
+   * they would sit on screen forever after the turn that spawned the work ends.
+   */
+  private toastTimer: ReturnType<typeof setInterval> | null = null;
   /** Mission-mode snapshot (P1.3) — replaces the raw goal row when a mission is active. */
   private mission: MissionSnapshot | null;
 
@@ -456,6 +475,7 @@ export class ShadowApp {
         mcpConnecting: false,
         mcpFailed: false,
         planMode: false,
+        toasts: [],
       };
     }
     const s = this.hudRef;
@@ -473,6 +493,9 @@ export class ShadowApp {
     s.mcpConnecting = this.mcpConnecting;
     s.mcpFailed = this.mcpFailed;
     s.planMode = this.planMode;
+    const now = this.toastClock();
+    this.toasts.tick(now);
+    s.toasts = this.toasts.live(now);
     return s;
   }
 
@@ -490,7 +513,9 @@ export class ShadowApp {
     this.document.addChild(this.transcript);
     this.document.addChild(this.splashSlot);
     this.document.addChild(this.streamCell);
-    this.tui.setLayoutRoot(snowfallLayout(this.document, this.editor, () => this.snowfallState()).root);
+    this.tui.setLayoutRoot(
+      snowfallLayout(this.document, this.editor, () => this.snowfallState(), () => this.terminal.rows).root,
+    );
 
     this.editor.onSubmit = (text: string) => this.submit(text);
     this.editor.onChange = () => {
@@ -524,6 +549,7 @@ export class ShadowApp {
 
     this.tui.setFocus(this.editor);
     this.refreshSessionTitle();
+    this.startToastTicker();
     this.tui.start();
 
     if (this.opts.context.messages().length) {
@@ -570,6 +596,7 @@ export class ShadowApp {
     this.gate.cancel();
     if (this.flushTimer) clearTimeout(this.flushTimer);
     if (this.ticker) clearInterval(this.ticker);
+    this.stopToastTicker();
     if (this.pendingStream !== null) this.streamCell.setText(this.pendingStream, this.answerOpen);
     runLock.releaseFor(CLI_HOLDER);
     try {
@@ -718,10 +745,20 @@ export class ShadowApp {
     this.streamBuf += delta;
     const { units, rest, trailingBlank } = extractCommittableUnits(this.streamBuf, this.padCarry);
     for (const u of units) {
-      if (!u.text.trim()) continue;
+      // F11: model prose is untrusted bytes. The live channel is raw BY DESIGN (src/agent/loop.ts
+      // emits the provider delta untouched and every renderer scrubs for itself) — Snowfall was the
+      // one renderer that did not, so a README, log line or fetched page could carry SGR (forging
+      // Shadow's own error/success styling), `CSI 8m` conceal (invisible on screen, intact in
+      // scrollback and captured transcripts), OSC 52 clipboard writes, or OSC 8 hyperlinks.
+      //
+      // Stripped at INGEST, not at render time: `flattenItem` measures display width from span
+      // text, and displayWidth only understands SGR — an OSC or cursor escape in the raw text would
+      // already corrupt row layout before a render-time scrub could see it.
+      const display = sanitizeAssistantText(u.text);
+      if (!display.trim()) continue;
       this.pushLine({
         kind: 'assistant',
-        text: stripTrailingNewlines(u.text),
+        text: stripTrailingNewlines(display),
         color: undefined,
         meta: 'assistant',
         tight: this.answerOpen && !u.pad,
@@ -729,19 +766,48 @@ export class ShadowApp {
       this.answerOpen = true;
     }
     this.padCarry = trailingBlank;
-    this.streamBuf = rest;
-    this.pendingStream = rest;
+    // F12: bound the retained live remainder (P1A-11). `rest` holds whatever open construct the
+    // splitter kept live, and it grows without limit on a never-closing fence — re-feeding it
+    // through the splitter on every 30 ms flush was the O(n²) shape `clampLiveRest` was written to
+    // bound. Mirrors src/tui.tsx:2291 and src/tui/headless.ts:63; the forced commit goes to
+    // scrollback as ordinary assistant text, so the cap relocates text rather than truncating it.
+    let liveRest = rest;
+    const clamped = clampLiveRest(liveRest);
+    if (clamped.commit !== null) {
+      const committed = sanitizeAssistantText(clamped.commit);
+      if (committed.trim()) {
+        this.pushLine({
+          kind: 'assistant',
+          text: stripTrailingNewlines(committed),
+          color: undefined,
+          meta: 'assistant',
+          tight: this.answerOpen,
+        });
+        this.answerOpen = true;
+      }
+      liveRest = clamped.rest;
+    }
+    this.streamBuf = liveRest;
+    // The still-open tail is painted straight into `StreamCell` → `flattenItem` → `lineToAnsi`, so
+    // it takes the same scrub as the committed blocks — otherwise escapes merely wait for one more
+    // delta in the live region instead of never arriving. `streamBuf` deliberately keeps the RAW
+    // text (the commit paths above scrub), matching Ink's split at src/tui.tsx:2305.
+    this.pendingStream = scrubForDisplay(liveRest);
     this.scheduleFlush();
   }
 
   private flushStreamToTranscript(): void {
     const t = this.streamBuf;
-    if (t.trim()) {
+    // F11: the turn-end leftover is the third path that turns buffered model text into a
+    // transcript item — it needs the same scrub as the streamed units, or a short answer that
+    // never closed a unit would carry its escapes through to the terminal.
+    const display = sanitizeAssistantText(t);
+    if (display.trim()) {
       this.pushLine({
         kind: 'assistant',
-        text: stripTrailingNewlines(t),
+        text: stripTrailingNewlines(display),
         meta: 'assistant',
-        tight: this.answerOpen && !this.padCarry && !leadsWithBlock(t),
+        tight: this.answerOpen && !this.padCarry && !leadsWithBlock(display),
       });
     }
     this.streamBuf = '';
@@ -764,7 +830,11 @@ export class ShadowApp {
     const trace = this.reasoning;
     trace.startedAt ??= Date.now();
     trace.item.reasoningState = 'streaming';
-    trace.item.text += delta;
+    // F11: reasoning renders through the same `flattenItem` → `lineToAnsi` funnel as the answer, so
+    // a thinking block must not carry escapes either. Scrubbed per delta — O(1) per token, no
+    // quadratic rescan of the accumulated text — and `sanitizeTerminalEscapes` never trims, so the
+    // model's leading indentation survives.
+    trace.item.text += sanitizeTerminalEscapes(delta, false);
     this.cellById.get(trace.item.id)?.invalidate();
     this.toolLine = 'thinking…';
   }
@@ -781,6 +851,14 @@ export class ShadowApp {
   }
 
   private finishReasoning(state: NonNullable<FlattenItem['reasoningState']> = 'complete'): void {
+    const trace = this.reasoning;
+    if (trace) {
+      // F11 / control tokens: the block is now committed display text. The per-delta pass already
+      // removed escapes; this single pass additionally sheds leaked chat-template tokens and
+      // blank-line runs — once per block rather than once per token.
+      trace.item.text = scrubForDisplay(trace.item.text);
+      this.cellById.get(trace.item.id)?.invalidate();
+    }
     this.pauseReasoning(state);
     this.reasoning = null;
     if (this.toolLine === 'thinking…') this.toolLine = null;
@@ -809,12 +887,15 @@ export class ShadowApp {
         const text = String(e.text ?? '');
         if (this.reasoning) {
           // The provider's final projection replaces the streamed text in place, so a long
-          // answer can never push its thinking underneath the answer or duplicate it.
-          this.reasoning.item.text = text;
+          // answer can never push its thinking underneath the answer or duplicate it. F11: this
+          // assignment REPLACES the per-delta scrub applied in onThinkingDelta, so the projection
+          // is untrusted bytes and needs the same pass — otherwise scrubbing deltas while the
+          // final text arrives raw would leave the escapes in place regardless.
+          this.reasoning.item.text = scrubForDisplay(text);
           this.cellById.get(this.reasoning.item.id)?.invalidate();
           this.finishReasoning();
         } else if (text.trim()) {
-          this.pushLine({ kind: 'reasoning', text, durationMs: e.durationMs as number | undefined, reasoningState: 'complete' });
+          this.pushLine({ kind: 'reasoning', text: scrubForDisplay(text), durationMs: e.durationMs as number | undefined, reasoningState: 'complete' });
         }
         break;
       }
@@ -827,15 +908,17 @@ export class ShadowApp {
           // used to clobber the parent's activeTool in the Ink path, hiding the top-level agent.
           this.updateSubAgent(sub, (a) => ({
             ...a,
-            tool: String((e.call as { name?: string }).name ?? ''),
-            argPreview: previewOf((e.call as { input?: unknown }).input),
+            tool: sanitizeTerminalEscapes(String((e.call as { name?: string }).name ?? ''), false),
+            argPreview: sanitizeTerminalEscapes(previewOf((e.call as { input?: unknown }).input), false),
             toolUseCount: a.toolUseCount + 1,
           }));
           break;
         }
         this.finishReasoning();
         const call = e.call as { name: string; input?: unknown };
-        this.toolLine = `${call.name}: ${previewOf(call.input)}`;
+        // F11: `toolLine` is painted into the live status region (hudState → SnowfallStatus), which
+        // sits outside the transcript cells — the one display string that bypasses `lineToAnsi`.
+        this.toolLine = `${sanitizeTerminalEscapes(call.name, false)}: ${sanitizeTerminalEscapes(previewOf(call.input), false)}`;
         break;
       }
       case 'tool_end': {
@@ -851,7 +934,8 @@ export class ShadowApp {
         this.toolLine = null;
         this.pushTool(call, result);
         for (const image of result?.images ?? []) {
-          this.pushLine({ kind: 'image', text: '', image: { bytes: image.data, mediaType: image.mediaType, alt: previewOf(call.input) || call.name, source: previewOf(call.input) } });
+          const imageSource = sanitizeTerminalEscapes(previewOf(call.input), false);
+          this.pushLine({ kind: 'image', text: '', image: { bytes: image.data, mediaType: image.mediaType, alt: imageSource || sanitizeTerminalEscapes(call.name, false), source: imageSource } });
         }
         break;
       }
@@ -863,7 +947,7 @@ export class ShadowApp {
         const call = e.call as { name: string; input?: unknown };
         this.pushLine({
           kind: 'blocked',
-          text: `  ✗ ${call.name} blocked — ${String(e.reason ?? '')}`,
+          text: `  ✗ ${sanitizeTerminalEscapes(call.name, false)} blocked — ${sanitizeTerminalEscapes(String(e.reason ?? ''), false)}`,
           color: C.yellow,
         });
         break;
@@ -884,8 +968,9 @@ export class ShadowApp {
         }
         this.pushLine({
           kind: 'finding',
-          text: String(e.body ?? ''),
-          title: String(e.title ?? ''),
+          // F11: a finding body is grep output — file contents, i.e. fully untrusted bytes.
+          text: sanitizeTerminalEscapes(String(e.body ?? ''), false),
+          title: sanitizeTerminalEscapes(String(e.title ?? ''), false),
           severity: String(e.severity ?? 'info'),
         });
         break;
@@ -915,10 +1000,10 @@ export class ShadowApp {
         break;
       case 'model_fallback':
         if (!sub) this.finishReasoning('stopped');
-        this.pushLine({ text: `  model fallback: ${e.from} → ${e.to}`, dimColor: true });
+        this.pushLine({ text: `  model fallback: ${oneLine(sanitizeTerminalEscapes(String(e.from), false), 60)} → ${oneLine(sanitizeTerminalEscapes(String(e.to), false), 60)}`, dimColor: true });
         break;
       case 'retry':
-        this.pushLine({ text: `  retry ${e.attempt} in ${e.delayMs}ms (${oneLine(String(e.reason), 60)})`, dimColor: true });
+        this.pushLine({ text: `  retry ${e.attempt} in ${e.delayMs}ms (${oneLine(sanitizeTerminalEscapes(String(e.reason), false), 60)})`, dimColor: true });
         break;
       case 'autonomy':
         this.autonomy = e.level as AutonomyLevel;
@@ -932,7 +1017,8 @@ export class ShadowApp {
         break;
       case 'error':
         if (!sub) this.finishReasoning('stopped');
-        this.pushLine({ kind: 'error', text: `  ! ${String(e.message)}`, color: C.red });
+        // F11: an error message can embed tool output or a provider body, so it is untrusted too.
+        this.pushLine({ kind: 'error', text: `  ! ${sanitizeTerminalEscapes(String(e.message), false)}`, color: C.red });
         break;
       case 'subagent_start': {
         // Register in the live panel (P1.2). Re-registration for the same taskId is safe: an
@@ -940,14 +1026,25 @@ export class ShadowApp {
         // cannot clobber real activity.
         this.subAgents.set(String(e.taskId), {
           taskId: String(e.taskId),
-          subagentType: String(e.subagentType ?? 'agent'),
-          description: e.description ? String(e.description) : undefined,
+          subagentType: sanitizeTerminalEscapes(String(e.subagentType ?? 'agent'), false),
+          // F11: the description is the model's own `agent` tool argument and the panel paints it
+          // straight through subagents.ts:lineToAnsi — same funnel, same scrub. The subagentType is
+          // echoed under the parent's delegation event; strict pass on both.
+          description: e.description ? sanitizeTerminalEscapes(String(e.description), false) : undefined,
           background: !!e.background,
           queued: !!e.queued,
           toolUseCount: 0,
           inputTokens: 0,
           outputTokens: 0,
           startedAt: Date.now(),
+        });
+        // Tell the user who just went to work — the dock shows live rows, but a start can happen
+        // while they are reading scrollback.
+        this.toasts.raise({
+          key: `agent:${String(e.taskId)}`,
+          level: 'info',
+          text: `${sanitizeTerminalEscapes(String(e.subagentType ?? 'agent'), false)} ${e.background ? 'running in background' : 'started'}${e.description ? `: ${oneLine(sanitizeTerminalEscapes(String(e.description), false), 60)}` : ''}`,
+          now: this.toastClock(),
         });
         break;
       }
@@ -966,6 +1063,15 @@ export class ShadowApp {
           );
         }
         const cur = this.subAgents.get(id);
+        const label = cur?.subagentType ?? 'agent';
+        // Outcome toast. Keyed per task so a burst of finishes does not stack more than two rows,
+        // and a repeat inside the coalesce window reads as a count instead of a strobe.
+        this.toasts.raise({
+          key: `agent-done:${id}`,
+          level: e.ok ? 'ok' : 'error',
+          text: `${sanitizeTerminalEscapes(label, false)} ${sanitizeTerminalEscapes(String(e.status ?? (e.ok ? 'finished' : 'failed')), false)}`,
+          now: this.toastClock(),
+        });
         if (cur) {
           if (cur.background) {
             this.subAgents.set(id, { ...cur, done: true, ok: !!e.ok, status: e.status as SubAgentView['status'], tool: undefined, argPreview: undefined });
@@ -1000,7 +1106,7 @@ export class ShadowApp {
       case 'shell_output':
         break; // live shell output belongs in the tool body, not a firehose into the transcript
       case 'shell_pid':
-        if (e.warn) this.pushLine({ text: `  ⚠ shell pid ${e.pid}: ${String(e.warn)}`, color: C.yellow });
+        if (e.warn) this.pushLine({ text: `  ⚠ shell pid ${e.pid}: ${sanitizeTerminalEscapes(String(e.warn), false)}`, color: C.yellow });
         break;
       case 'stop':
         break; // handled by the turn's finally
@@ -1020,7 +1126,7 @@ export class ShadowApp {
   ): void {
     this.capturedGrepFindings = null;
     const input = (call.input ?? {}) as Record<string, unknown>;
-    const arg =
+    const rawArg =
       typeof input.command === 'string'
         ? oneLine(input.command, 200)
         : typeof input.path === 'string'
@@ -1030,7 +1136,10 @@ export class ShadowApp {
             : typeof input.url === 'string'
               ? input.url
               : undefined;
-    const summary = oneLine(String(result?.summary ?? (result?.ok ? 'ok' : 'failed')), 120);
+    // F11: the tool row's arg/summary are model-authored strings that reach the terminal, and there
+    // is no legitimate source of rendition in a command or a path — strict scrub.
+    const arg = rawArg === undefined ? undefined : sanitizeTerminalEscapes(rawArg, false);
+    const summary = sanitizeTerminalEscapes(oneLine(String(result?.summary ?? (result?.ok ? 'ok' : 'failed')), 120), false);
     const durationMs = Number(result?.meta?.durationMs ?? 0);
 
     // Capture the body so a collapsed run is not a dead end: Ctrl-O expands it inline, and
@@ -1061,18 +1170,31 @@ export class ShadowApp {
       }
     }
 
+    // F11: tool output is untrusted bytes that reach the terminal through the same
+    // `flattenItem` → `lineToAnsi` funnel as prose. Scrubbed once here, so both consumers of `body`
+    // (the transcript row below and the /activity detail panel) get the same bytes. Shell, diff
+    // and grep bodies KEEP their SGR — `ls --color`, npm and test runners are legitimate sources of
+    // rendition, and `sanitizeTerminalEscapes` now drops CSI conceal even when keepSgr is set —
+    // while an `agent` sub-answer is model prose and takes the strict pass.
+    if (body) body = body.map((l) => sanitizeTerminalEscapes(l, meta !== 'answer'));
+
     // Input JSON for the panel (8.7's toolDetail carries it; capped to keep the doc bounded).
     let inputJson: string | undefined;
     try {
       const j = JSON.stringify(call.input ?? {}, null, 2);
-      if (j && j !== '{}') inputJson = j.length > 400 ? j.slice(0, 400) + '…' : j;
+      if (j && j !== '{}') {
+        const capped = j.length > 400 ? j.slice(0, 400) + '…' : j;
+        inputJson = sanitizeTerminalEscapes(capped, false);
+      }
     } catch {
       inputJson = undefined;
     }
     this.details.push({
       n: this.details.length + 1,
       turn: this.turnNo,
-      name: call.name,
+      // F11: the tool name is normally canonicalized by the loop, but a blocked/unknown name can be
+      // raw model text — it is painted by activity.ts:144 outside the `lineToAnsi` funnel.
+      name: sanitizeTerminalEscapes(call.name, false),
       arg,
       ok: !!result?.ok,
       durationMs,
@@ -1085,7 +1207,7 @@ export class ShadowApp {
     this.pushLine({
       kind: 'tool',
       text: '',
-      tool: { name: call.name, arg, ok: !!result?.ok, durationMs, summary },
+      tool: { name: sanitizeTerminalEscapes(call.name, false), arg, ok: !!result?.ok, durationMs, summary },
       lines: body?.map((l) => ({
         text: l,
         color: meta === 'diff' ? (l.startsWith('+') ? C.green : l.startsWith('-') ? C.red : undefined) : undefined,
@@ -1190,9 +1312,17 @@ export class ShadowApp {
         return { consume: true };
       }
 
-      // 5. Ctrl-T prints the full task list.
+      // 5. Ctrl-T: anchored task snapshot overlay (no longer scrolls away).
       if (isCtrlT(data)) {
-        this.printTasks();
+        this.openTaskOverlay();
+        return { consume: true };
+      }
+
+      // 5b. Ctrl+N: live work overlay — sub-agents, background shells and watchers, with their
+      //     current activity and status. Ctrl+G cannot be this key: step 2.5 claims it first
+      //     whenever the session is idle, which is exactly when a user reaches for a status view.
+      if (isCtrlN(data)) {
+        this.openWorkOverlay();
         return { consume: true };
       }
 
@@ -1467,6 +1597,25 @@ export class ShadowApp {
   private stopTicker(): void {
     if (this.ticker) clearInterval(this.ticker);
     this.ticker = null;
+  }
+
+  /**
+   * Toast expiry. Runs for the life of the app rather than per-turn: work that outlives a turn
+   * (background sub-agents, watchers, bg shells) reports back while the session sits idle, and a
+   * toast that only expires during a turn would be permanent. One tick per second is plenty for a
+   * 6s TTL, and the timer is unref'd-safe to clear on shutdown.
+   */
+  private startToastTicker(): void {
+    if (this.toastTimer) return;
+    this.toastTimer = setInterval(() => {
+      if (this.toasts.size === 0) return;
+      if (this.toasts.tick(this.toastClock())) this.tui.requestRender();
+    }, 1000);
+  }
+
+  private stopToastTicker(): void {
+    if (this.toastTimer) clearInterval(this.toastTimer);
+    this.toastTimer = null;
   }
 
   // ── dialogs ──────────────────────────────────────────────────────────────
@@ -1921,11 +2070,41 @@ export class ShadowApp {
     });
   }
 
-  private printTasks(): void {
-    if (!this.todos.length) {
-      this.pushLine({ text: '  no tasks', dimColor: true });
+  /** True when the active terminal can host an anchored overlay (Snowfall yes, Ink compat no). */
+  private canOverlay(): boolean {
+    const tui = this.tui as unknown as { showOverlay?: unknown };
+    return typeof tui.showOverlay === 'function';
+  }
+
+  private openTaskOverlay(): void {
+    if (!this.canOverlay()) {
+      this.printTasksToTranscript();
       return;
     }
+    if (this.tui.hasOverlay()) return;
+    void import('./overlay.js').then(({ TaskSnapshotOverlay }) => {
+      if (this.tui.hasOverlay()) return;
+      let handle: { hide: () => void } | null = null;
+      const close = () => handle?.hide();
+      const overlay = new TaskSnapshotOverlay(() => this.todos, {
+        rows: () => (this.tui as unknown as { terminal?: { rows?: number } }).terminal?.rows ?? 24,
+        onClose: close,
+      });
+      handle = this.tui.showOverlay(overlay, {
+        width: '80%',
+        maxHeight: '70%',
+        anchor: 'center',
+      });
+    });
+  }
+
+  // Ctrl-G delegates to the existing work browser overlay.
+  private openWorkOverlay(): void {
+    this.openWorkBrowser();
+  }
+
+  /** Fallback for terminals without overlays (and tests): the compact list, inline. */
+  private printTasksToTranscript(): void {
     this.pushLine({
       kind: 'system',
       text: '',
@@ -1933,6 +2112,14 @@ export class ShadowApp {
         text: `  ${t.status === 'completed' ? '✓' : t.status === 'in_progress' ? '▸' : '○'} ${t.subject}`,
       })),
     });
+  }
+
+  private printTasks(): void {
+    if (!this.todos.length) {
+      this.pushLine({ text: '  no tasks', dimColor: true });
+      return;
+    }
+    this.openTaskOverlay();
   }
 
   // ── commands ─────────────────────────────────────────────────────────────
@@ -2633,6 +2820,7 @@ export class ShadowApp {
           workCenter: this.opts.workCenter,
           bus: this.opts.bus,
           bgRegistry: this.opts.bgRegistry,
+          watchers: this.opts.watchers,
           workHistory: this.opts.workHistory,
         });
         if (result.error) {
@@ -2865,16 +3053,27 @@ export class ShadowApp {
         this.pushLine({ text: '  Context compacted — earlier turns summarized.', color: C.cyan });
       } else if (result === 'truncated') {
         this.sessionLog.record({ kind: 'compaction_degraded', mode: 'truncated', source: 'manual' });
+        const reason = this.opts.context.takeFailureReason();
         this.pushLine({
-          text: '  Summarizer unavailable — context reclaimed by dropping the oldest tool results (re-read any file you still need).',
+          text: `  Summarizer unavailable${reason ? ` (${reason})` : ''} — context reclaimed by dropping the oldest tool results (re-read any file you still need).`,
           color: C.yellow,
         });
-      } else if (result === 'failed') {
-        this.sessionLog.record({ kind: 'compaction_degraded', mode: 'failed', source: 'manual' });
-        this.pushLine({
-          text: '  Compaction failed — summarizer unavailable and nothing left to reclaim. Try /clear, or /model to a larger window.',
-          color: C.red,
-        });
+      } else if (result === 'failed' || result === 'failed-short-history') {
+        this.sessionLog.record({ kind: 'compaction_degraded', mode: result, source: 'manual' });
+        if (result === 'failed-short-history') {
+          // No model call was made — say so, rather than blaming the endpoint the caller never
+          // contacted. The remedy is to make the active turn smaller, not to swap models.
+          this.pushLine({
+            text: '  Nothing to summarize — every message is pinned or part of the turn being answered. Finish or /clear this turn first.',
+            color: C.yellow,
+          });
+        } else {
+          const reason = this.opts.context.takeFailureReason();
+          this.pushLine({
+            text: `  Compaction failed${reason ? ` — ${reason}` : ''}. Nothing left to reclaim. Try /clear.`,
+            color: C.red,
+          });
+        }
       } else {
         this.pushLine({ text: '  Nothing to compact yet.', dimColor: true });
       }
@@ -3639,7 +3838,7 @@ export class ShadowApp {
       title: plansOnly ? 'Plan and task progress' : undefined,
       rows: () => this.terminal.rows, repaint: () => this.tui.requestRender(), close: () => this.closePicker(),
       command: (command) => {
-        const result = executeWorkCommand(command, { workCenter: work, bus: this.opts.bus, bgRegistry: this.opts.bgRegistry!, workHistory: this.opts.workHistory });
+        const result = executeWorkCommand(command, { workCenter: work, bus: this.opts.bus, bgRegistry: this.opts.bgRegistry!, watchers: this.opts.watchers, workHistory: this.opts.workHistory });
         return result.error ?? result.lines.join('\n');
       },
       artifacts: (item) => this.openArtifacts(item),

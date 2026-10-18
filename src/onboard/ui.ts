@@ -287,6 +287,7 @@ export class TerminalOnboardUI implements OnboardUI {
   private tui: TuiAltScreen;
   private rejectPending?: (error: Error) => void;
   private closed = false;
+  private keepAlive?: ReturnType<typeof setInterval>;
   private signals = new Map<NodeJS.Signals, () => void>();
   private onEnd = () => this.rejectPending?.(new OnboardCancelled('Input closed'));
   constructor(
@@ -316,10 +317,15 @@ export class TerminalOnboardUI implements OnboardUI {
     terminal.write('\x1b[22;2t' + backgroundSequence(themeBackground(theme), true));
     terminal.setTitle('Setup — Shadow');
     this.tui.start();
+    // A pending prompt Promise does not keep a process alive. Do not depend on the
+    // host/console backend keeping its input handle referenced between operations.
+    // Own the wizard lifetime, not just the busy spinner's lifetime, until close/EOF.
+    this.keepAlive = setInterval(() => {}, 30_000);
   }
   private restore = () => {
     if (this.closed) return;
     this.closed = true;
+    clearInterval(this.keepAlive);
     this.tui.stop();
     this.terminal.write(backgroundSequence(null, true) + '\x1b[0m\x1b[23;2t\x1b[?2004l\x1b[?25h');
   };

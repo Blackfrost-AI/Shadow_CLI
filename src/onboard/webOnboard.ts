@@ -16,7 +16,9 @@
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
-import { execFile } from 'node:child_process';
+import { openBrowser } from '../web/browser.js';
+import { installUnlocked } from '../auth/unlock.js';
+import { isLocalBaseUrl } from '../safety/offline.js';
 import {
   createVault,
   vaultExists,
@@ -101,7 +103,7 @@ export function persistOnboardSecret(input: {
     // sealed vault is actually readable. Without this a vault and a live credentials.json coexist,
     // and the plaintext is still served whenever nothing is unlocked.
     try {
-      unlockWithKey(key);
+      installUnlocked(unlockWithKey(key), key);
       shredLegacyCredentials();
     } catch {
       /* keep the plaintext — the vault failed verification, it is the only copy now */
@@ -116,7 +118,7 @@ export function persistOnboardSecret(input: {
   const key = createVault(input.password, initial);
   const cached = keychainAvailable() ? storeKey(key.toString('base64')) : false;
   try {
-    unlockWithKey(key);
+    installUnlocked(unlockWithKey(key), key);
     shredLegacyCredentials(); // verified readable — now the plaintext copy can go
   } catch {
     /* keep the plaintext */
@@ -126,6 +128,8 @@ export function persistOnboardSecret(input: {
 
 export interface WebOnboardResult {
   ok: boolean;
+  /** Explicit browser action: continue in the same process's terminal wizard. */
+  terminal?: boolean;
   provider?: string;
   cached?: boolean;
   /** true = added to an existing vault; false = created a new one. */
@@ -153,16 +157,6 @@ export function persistWebOnboardTarget(input: {
 /** Matches terminal onboarding's endpoint-specific slot; never aliases a provider-wide key. */
 export function webOnboardCredentialRef(provider: 'anthropic' | 'openai', baseUrl: string): string {
   return `onboard-${provider}-${createHash('sha256').update(baseUrl).digest('hex').slice(0, 20)}`;
-}
-
-function openBrowser(url: string): void {
-  try {
-    if (process.platform === 'win32') execFile('cmd', ['/c', 'start', '', url], () => {});
-    else if (process.platform === 'darwin') execFile('open', [url], () => {});
-    else execFile('xdg-open', [url], () => {});
-  } catch {
-    /* the URL is printed too — the user can paste it */
-  }
 }
 
 function escapeHtml(value: string): string {
@@ -205,7 +199,8 @@ export function page(token: string, hasVault = false): string {
 <style>
  :root{--bg:#0d1117;--panel:#161b22;--fg:#e6edf3;--dim:#8b949e;--accent:#c3e5ff;--cyan:#38dbf5;--line:#30363d}
  *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;padding:24px}
- .card{width:100%;max-width:440px;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:28px}
+ .card{width:100%;max-width:600px;background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:28px}
+ fieldset{border:0;padding:0;margin:0;min-width:0}h2{font-size:18px;margin:20px 0 4px}.steps{display:flex;gap:8px;margin:20px 0}.steps span{flex:1;border-top:3px solid var(--line);padding-top:8px;color:var(--dim);font-size:13px}.steps [aria-current=step]{border-color:var(--cyan);color:var(--fg)}.nav{display:flex;gap:12px}.nav button{flex:1}.choices label{overflow-wrap:anywhere}.review{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;color:var(--dim)}button:focus-visible{outline:2px solid var(--cyan);outline-offset:3px}
  h1{margin:0 0 4px;font-size:20px}h1 span{color:var(--accent)}
  p.sub{margin:0 0 20px;color:var(--dim);font-size:13px}
  label{display:block;margin:14px 0 5px;font-size:13px;color:var(--dim)}
@@ -214,6 +209,7 @@ export function page(token: string, hasVault = false): string {
  button{width:100%;margin-top:22px;padding:12px;background:var(--accent);border:none;border-radius:8px;color:#0d1117;font-weight:700;font-size:15px;cursor:pointer}
  button:disabled{opacity:.5;cursor:default}
  button.secondary{margin-top:10px;background:transparent;color:var(--cyan);border:1px solid var(--line);font-size:13px;padding:9px}
+ .nav button.secondary{margin-top:22px;padding:12px;font-size:15px}
  .note{margin-top:16px;font-size:12px;color:var(--dim);text-align:center}
  .msg{margin-top:14px;padding:10px;border-radius:8px;font-size:13px;display:none}
  .ok{background:#1a3326;color:#4ade80;display:block}.err{background:#3a1e1e;color:#f87171;display:block}
@@ -224,53 +220,68 @@ export function page(token: string, hasVault = false): string {
  [hidden]{display:none!important}
 </style></head><body>
 <div class="card">
- <h1>THE <span>SHADOW</span> vault</h1>
+ <h1>Set up <span>Shadow</span></h1>
  <p class="sub">${hasVault ? 'This machine already has a vault — add another provider to it. Your existing keys are kept.' : 'Your keys are encrypted at rest with a master password and used only with your selected endpoint.'}</p>
- <p class="sub">For ChatGPT or Claude subscriptions, run <code>shadow onboard</code> and choose <strong>Subscription account</strong>.</p>
- <form id="f" autocomplete="off">
-  <label>Provider</label>
+ <details><summary>Subscription accounts, local files, or terminal-only setup</summary><p class="sub">These flows remain available in the terminal wizard. Choose <strong>Subscription account</strong> for ChatGPT or Claude, or <strong>Local file</strong> for GGUF / MLX.</p><button id="terminal" class="secondary" type="button">Continue in this terminal</button><p class="note">Or start with <code>shadow onboard --terminal</code>.</p></details>
+ <div class="steps" aria-label="Setup progress"><span id="progress0" aria-current="step">1 · Connect</span><span id="progress1">2 · Models</span><span id="progress2">3 · Save</span></div>
+ <form id="f" autocomplete="off" novalidate>
+ <fieldset id="step0">
+  <h2>Connect your endpoint</h2>
+  <label for="provider">Provider</label>
   <select id="provider">
    ${providerOptions()}
   </select>
-  <label>API key <span style="color:var(--dim)">(local endpoints: any value, e.g. sk-local)</span></label>
+  <label for="apiKey">API key <span style="color:var(--dim)">(leave blank if your server needs none)</span></label>
   <input id="apiKey" type="password" placeholder="sk-..." autocomplete="off">
-  <label>Base URL <span style="color:var(--dim)">(auto-filled; edit for custom)</span></label>
+  <label for="baseUrl">Base URL <span style="color:var(--dim)">(auto-filled; edit for custom)</span></label>
   <input id="baseUrl" type="text" placeholder="(provider default)">
+ </fieldset>
+ <fieldset id="step1" hidden>
+  <h2>Choose your models</h2>
   <div id="selfHostedWrap" hidden>
-   <label>Is this endpoint self-hosted?</label>
+   <label for="selfHosted">Is this endpoint self-hosted?</label>
    <select id="selfHosted">
     <option value="no">No — hosted service</option>
     <option value="yes">Yes — my server</option>
    </select>
   </div>
   <button id="discover" class="secondary" type="button">Discover models from this endpoint</button>
-  <div id="endpointStatus" class="status">Recommended models are ready; discovery checks what this key can actually access.</div>
-  <label>Models to add <span style="color:var(--dim)">(only checked models appear in Shadow)</span></label>
+  <div id="endpointStatus" class="status" role="status">Recommended models are ready; discovery checks what this key can actually access.</div>
+  <label for="modelFilter">Models to add <span style="color:var(--dim)">(only checked models appear in Shadow)</span></label>
   <input id="modelFilter" type="text" placeholder="Filter models…">
   <div id="modelChoices" class="choices"></div>
-  <label>Exact model ID <span style="color:var(--dim)">(optional, when the API does not list it)</span></label>
+  <label for="manualModel">Exact model ID <span style="color:var(--dim)">(optional, when the API does not list it)</span></label>
   <input id="manualModel" type="text" placeholder="e.g. glm-5.3">
-  <label>Default model</label>
+  <label for="model">Default model</label>
   <select id="model" required></select>
+ </fieldset>
+ <fieldset id="step2" hidden>
+  <h2>Verify and save securely</h2>
+  <p id="review" class="review"></p>
+  <p class="status">Save checks that your model completes a tool call, then encrypts your credentials. This small request may use provider credits.</p>
   ${
     hasVault
-      ? `<label>Master password <span style="color:var(--dim)">(to unlock — leave blank if cached in your keychain)</span></label>
+      ? `<label for="pw">Master password <span style="color:var(--dim)">(to unlock — leave blank if cached in your keychain)</span></label>
   <input id="pw" type="password" placeholder="unlock existing vault" autocomplete="off">`
       : `<div class="row">
-   <div><label>Master password</label><input id="pw" type="password" placeholder="min 8 chars"></div>
-   <div><label>Confirm</label><input id="pw2" type="password" placeholder="repeat"></div>
+   <div><label for="pw">Master password</label><input id="pw" type="password" placeholder="min 8 chars"></div>
+   <div><label for="pw2">Confirm</label><input id="pw2" type="password" placeholder="repeat"></div>
   </div>`
   }
   <button id="go" type="submit">${hasVault ? 'Unlock &amp; add' : 'Encrypt &amp; save'}</button>
-  <div id="msg" class="msg"></div>
+ </fieldset>
+  <div class="nav"><button id="back" type="button" class="secondary" hidden>Back</button><button id="next" type="button">Discover models →</button></div>
+  <div id="msg" class="msg" role="status" aria-live="polite"></div>
   <p class="note">This page talks to Shadow on your machine. Discover and Save check the selected endpoint; Save verifies a completed tool response before storing your setup.</p>
  </form>
+ <button id="cancel" class="secondary" type="button">Cancel setup</button>
 </div>
 <script>
  var TOKEN=${JSON.stringify(token)};
  var HASVAULT=${JSON.stringify(hasVault)};
+ var step=0,busy=false,closed=false;
  var lastActivity=0;
- function activity(){var now=Date.now();if(now-lastActivity<15000)return;lastActivity=now;fetch('/activity',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:TOKEN})}).catch(function(){});}
+ function activity(){if(closed)return;var now=Date.now();if(now-lastActivity<15000)return;lastActivity=now;fetch('/activity',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:TOKEN})}).catch(function(){});}
  document.getElementById('f').addEventListener('input',activity);
  document.getElementById('f').addEventListener('change',activity);
  var sel=document.getElementById('provider'),base=document.getElementById('baseUrl'),model=document.getElementById('model');
@@ -279,16 +290,26 @@ export function page(token: string, hasVault = false): string {
  var selfHosted=document.getElementById('selfHosted'),selfHostedWrap=document.getElementById('selfHostedWrap');
  function selectedModels(){return Array.prototype.map.call(choices.querySelectorAll('input:checked'),function(x){return x.value;});}
  function updateDefault(preferred){var picked=selectedModels();var exact=manual.value.trim();if(exact&&picked.indexOf(exact)<0)picked.push(exact);var old=preferred||model.value;model.textContent='';picked.forEach(function(id){var op=document.createElement('option');op.value=id;op.textContent=id;model.appendChild(op);});if(picked.indexOf(old)>=0)model.value=old;else if(picked.length)model.value=picked[0];}
- function renderModels(models,checked,preferred){choices.textContent='';var initial=checked||models;models.forEach(function(id){var lab=document.createElement('label');var cb=document.createElement('input');cb.type='checkbox';cb.value=id;cb.checked=initial.indexOf(id)>=0;cb.addEventListener('change',function(){updateDefault(preferred);});var span=document.createElement('span');span.textContent=id;lab.appendChild(cb);lab.appendChild(span);choices.appendChild(lab);});if(!models.length){var empty=document.createElement('div');empty.className='status';empty.textContent='No catalog yet — discover models or enter an exact ID below.';choices.appendChild(empty);}updateDefault(preferred);}
+ function renderModels(models,checked,preferred){choices.textContent='';filter.value='';var initial=checked||models;models.forEach(function(id){var lab=document.createElement('label');var cb=document.createElement('input');cb.type='checkbox';cb.value=id;cb.checked=initial.indexOf(id)>=0;cb.addEventListener('change',function(){updateDefault();});var span=document.createElement('span');span.textContent=id;lab.appendChild(cb);lab.appendChild(span);choices.appendChild(lab);});if(!models.length){var empty=document.createElement('div');empty.className='status';empty.textContent='No catalog yet — discover models or enter an exact ID below.';choices.appendChild(empty);}updateDefault(preferred);}
  function fill(){var o=sel.options[sel.selectedIndex];base.value=o.getAttribute('data-url')||'';detectedProvider=o.getAttribute('data-p')||'openai';manual.value='';var models=[];try{models=JSON.parse(o.getAttribute('data-models')||'[]');}catch(e){}renderModels(models,models,o.getAttribute('data-model')||'');endpointStatus.textContent='Recommended models are ready; discovery checks what this key can actually access.';var custom=sel.value==='custom'&&detectedProvider==='openai';selfHostedWrap.hidden=!custom;if(!custom)selfHosted.value='no';}
- sel.addEventListener('change',fill);fill();
+ sel.addEventListener('change',function(){document.getElementById('apiKey').value='';fill();});fill();
  manual.addEventListener('input',function(){updateDefault();});
  filter.addEventListener('input',function(){var q=filter.value.toLowerCase();Array.prototype.forEach.call(choices.querySelectorAll('label'),function(row){row.hidden=q&&row.textContent.toLowerCase().indexOf(q)<0;});});
- document.getElementById('discover').addEventListener('click',function(){var btn=this;var o=sel.options[sel.selectedIndex];btn.disabled=true;btn.textContent='Discovering…';endpointStatus.textContent='Checking endpoint and credentials…';fetch('/probe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:TOKEN,provider:o.getAttribute('data-p'),label:sel.value,apiKey:document.getElementById('apiKey').value,baseUrl:base.value.trim()})}).then(function(r){return r.json();}).then(function(d){if(!d.ok&&d.source==='none')throw new Error(d.error||'No model catalog found');detectedProvider=d.provider||detectedProvider;if(d.baseUrl)base.value=d.baseUrl;var live=d.models||[],recommended=[];try{recommended=JSON.parse(o.getAttribute('data-models')||'[]');}catch(e){}var wanted=live.filter(function(id){return recommended.some(function(rec){return rec.toLowerCase()===id.toLowerCase();});});if(!wanted.length&&live.length)wanted=[live[0]];renderModels(live,wanted,wanted[0]);endpointStatus.textContent=(d.source==='live'?'✓ Live catalog: ':'Using recommendations: ')+live.length+' model(s) · '+(d.hosting||'unknown')+' · '+detectedProvider;if(sel.value==='custom'){if(d.hosting==='self-hosted'){selfHosted.value='yes';selfHostedWrap.hidden=true;}else if(d.hosting==='hosted'){selfHosted.value='no';selfHostedWrap.hidden=true;}else{selfHostedWrap.hidden=detectedProvider!=='openai';}}}).catch(function(e){endpointStatus.textContent='Could not discover models: '+e.message+'. You can enter an exact ID.';}).then(function(){btn.disabled=false;btn.textContent='Refresh models from this endpoint';});});
  var msg=document.getElementById('msg');
+ function setBusy(value){busy=value;Array.prototype.forEach.call(document.querySelectorAll('fieldset'),function(el){el.disabled=value;});['back','next','terminal','cancel'].forEach(function(id){document.getElementById(id).disabled=value;});}
+ function showStep(value){step=value;[0,1,2].forEach(function(i){document.getElementById('step'+i).hidden=i!==step;var progress=document.getElementById('progress'+i);if(i===step)progress.setAttribute('aria-current','step');else progress.removeAttribute('aria-current');});document.getElementById('back').hidden=step===0;document.getElementById('next').hidden=step===2;document.getElementById('next').textContent=step===0?'Discover models →':'Review and secure →';msg.className='msg';document.getElementById('review').textContent=[sel.options[sel.selectedIndex].textContent||'',base.value,'Default: '+model.value].join(String.fromCharCode(10));}
+ function discoverModels(){if(busy||closed)return Promise.resolve();var btn=document.getElementById('discover'),o=sel.options[sel.selectedIndex];setBusy(true);btn.textContent='Discovering…';endpointStatus.textContent='Checking endpoint and credentials…';var previous=selectedModels(),preferred=model.value;return fetch('/probe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:TOKEN,provider:o.getAttribute('data-p'),label:sel.value,apiKey:document.getElementById('apiKey').value,baseUrl:base.value.trim()})}).then(function(r){return r.json();}).then(function(d){if(!d.ok&&(!d.source||d.source==='none'))throw new Error(d.error||'No model catalog found');detectedProvider=d.provider||detectedProvider;if(d.baseUrl)base.value=d.baseUrl;var live=d.models||[],recommended=[];try{recommended=JSON.parse(o.getAttribute('data-models')||'[]');}catch(e){}var wanted=live.filter(function(id){return previous.indexOf(id)>=0||recommended.some(function(rec){return rec.toLowerCase()===id.toLowerCase();});});if(!wanted.length&&live.length)wanted=[live[0]];renderModels(live,wanted,preferred||wanted[0]);endpointStatus.textContent=(d.source==='live'?'✓ Live catalog: ':'Using recommendations: ')+live.length+' model(s) · '+(d.hosting||'unknown')+' · '+detectedProvider;if(sel.value==='custom'){if(d.hosting==='self-hosted'){selfHosted.value='yes';selfHostedWrap.hidden=true;}else if(d.hosting==='hosted'){selfHosted.value='no';selfHostedWrap.hidden=true;}else{selfHostedWrap.hidden=detectedProvider!=='openai';}}}).catch(function(e){endpointStatus.textContent='Could not discover models: '+e.message+'. Your entries are kept. Retry, go Back, or enter an exact ID.';}).finally(function(){setBusy(false);btn.textContent='Refresh models from this endpoint';});}
+ function advance(){if(busy||closed)return;if(step===0){try{var url=new URL(base.value.trim());if(!/^https?:$/.test(url.protocol)||url.username||url.password||url.search||url.hash)throw new Error();}catch(e){msg.className='msg err';msg.textContent='Enter an HTTP(S) API base URL, for example http://localhost:8800/v1.';return;}showStep(1);return discoverModels();}if(!model.value){msg.className='msg err';msg.textContent='Select a model or enter an exact model ID.';return;}showStep(2);}
+ document.getElementById('discover').addEventListener('click',discoverModels);
+ document.getElementById('next').addEventListener('click',advance);
+ document.getElementById('back').addEventListener('click',function(){if(!busy&&!closed)showStep(Math.max(0,step-1));});
+ function finishInBrowser(path,text){if(busy||closed)return;setBusy(true);fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:TOKEN})}).then(function(r){return r.json();}).then(function(d){if(!d.ok)throw new Error(d.error||'Could not finish setup.');closed=true;msg.className='msg ok';msg.textContent=text;}).catch(function(e){setBusy(false);msg.className='msg err';msg.textContent=e.message;});}
+ document.getElementById('terminal').addEventListener('click',function(){finishInBrowser('/terminal','Continue in the terminal that launched Shadow. You do not need to run the command again.');});
+ document.getElementById('cancel').addEventListener('click',function(){finishInBrowser('/cancel','Setup cancelled. Your existing configuration is unchanged. You can close this tab.');});
  document.getElementById('f').addEventListener('submit',function(e){
   e.preventDefault();
-  var o=sel.options[sel.selectedIndex];
+  if(busy||closed)return;
+  if(step<2){advance();return;}
   var pw=document.getElementById('pw').value;
   var pw2el=document.getElementById('pw2');var pw2=pw2el?pw2el.value:'';
   msg.className='msg';
@@ -298,20 +319,24 @@ export function page(token: string, hasVault = false): string {
   }
   var btn=document.getElementById('go');btn.disabled=true;btn.textContent='Checking model and tool support…';
   var picked=selectedModels();var exact=manual.value.trim();if(exact&&picked.indexOf(exact)<0)picked.push(exact);if(!picked.length){msg.className='msg err';msg.textContent='Select a model or enter an exact model ID.';btn.disabled=false;btn.textContent=HASVAULT?'Unlock & add':'Encrypt & save';return;}var defaultModel=model.value||picked[0];if(picked.indexOf(defaultModel)<0)defaultModel=picked[0];
+  setBusy(true);
   fetch('/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
    token:TOKEN,provider:detectedProvider,label:sel.value,apiKey:document.getElementById('apiKey').value,
    baseUrl:base.value.trim(),model:defaultModel,models:picked,
    selfHosted:detectedProvider==='openai'&&sel.value==='custom'&&selfHosted.value==='yes',password:pw})})
   .then(function(r){return r.json()}).then(function(d){
-   if(d.ok){msg.className='msg ok';msg.textContent='✓ '+(d.merged?'Key added to your vault':'Vault created')+(d.cached?' and unlocked via your keychain':'')+'. You can close this tab and return to the terminal.';btn.textContent='Done';}
-   else{msg.className='msg err';msg.textContent=d.error||'Failed to save.';btn.disabled=false;btn.textContent=HASVAULT?'Unlock & add':'Encrypt & save';}
-  }).catch(function(){msg.className='msg err';msg.textContent='Could not reach Shadow (did the terminal close?).';btn.disabled=false;btn.textContent='Encrypt & save';});
+   if(d.ok){closed=true;msg.className='msg ok';msg.textContent='✓ '+(d.merged?'Key added to your vault':'Vault created')+(d.cached?' and unlocked via your keychain':'')+'. You can close this tab and return to the terminal.';btn.textContent='Done';['apiKey','pw','pw2'].forEach(function(id){var el=document.getElementById(id);if(el)el.value='';});}
+   else{setBusy(false);msg.className='msg err';msg.textContent=d.error||'Failed to save.';btn.disabled=false;btn.textContent=HASVAULT?'Unlock & add':'Encrypt & save';}
+  }).catch(function(){setBusy(false);msg.className='msg err';msg.textContent='Could not reach Shadow (did the terminal close?). Your entries are kept; retry here.';btn.disabled=false;btn.textContent=HASVAULT?'Unlock & add':'Encrypt & save';});
  });
 </script></body></html>`;
 }
 
 export interface WebOnboardOptions {
   signal?: AbortSignal;
+  /** --no-open keeps the server alive and prints a pasteable/forwardable loopback URL. */
+  launchBrowser?: boolean;
+  terminalAvailable?: boolean;
   /** Test seams; production uses the shared connection check and protected stores. */
   test?: typeof testConnection;
   probe?: typeof probeModelEndpoint;
@@ -348,11 +373,13 @@ export async function runWebOnboard(
     let cancelIdle: (() => void) | undefined;
     let forcedClose: ReturnType<typeof setTimeout> | undefined;
     const onAbort = (): void => finish({ ok: false, reason: 'cancelled' });
+    const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'] as const;
     const finish = (r: WebOnboardResult): void => {
       if (settled) return;
       settled = true;
       cancelIdle?.();
       options.signal?.removeEventListener('abort', onAbort);
+      for (const signal of signals) process.removeListener(signal, onAbort);
       controller.abort();
       server.close(() => {
         clearTimeout(forcedClose);
@@ -416,7 +443,7 @@ export async function runWebOnboard(
       }
       if (
         req.method !== 'POST' ||
-        !['/save', '/probe', '/activity'].includes(url.pathname) ||
+        !['/save', '/probe', '/activity', '/terminal', '/cancel'].includes(url.pathname) ||
         url.search
       ) {
         reply(404, { ok: false, error: 'not found' });
@@ -452,6 +479,29 @@ export async function runWebOnboard(
         }
         touch();
         if (url.pathname === '/activity') {
+          reply(200, { ok: true });
+          return;
+        }
+        if (url.pathname === '/terminal' || url.pathname === '/cancel') {
+          if (saving) {
+            reply(409, { ok: false, error: 'Wait for the save to finish before leaving setup.' });
+            return;
+          }
+          const terminal = url.pathname === '/terminal';
+          if (
+            terminal &&
+            !(options.terminalAvailable ?? (process.stdin.isTTY && process.stdout.isTTY))
+          ) {
+            reply(400, {
+              ok: false,
+              error:
+                'No interactive terminal is attached. Run shadow onboard --terminal in a terminal, or continue browser setup here.',
+            });
+            return;
+          }
+          res.once('finish', () =>
+            finish({ ok: false, terminal, reason: terminal ? undefined : 'cancelled' }),
+          );
           reply(200, { ok: true });
           return;
         }
@@ -555,6 +605,11 @@ export async function runWebOnboard(
         if (!selectedModels.includes(model)) selectedModels.unshift(model);
         saving = true;
         try {
+          const selfHosted =
+            provider === 'openai' &&
+            (chosenPreset?.kind === 'local' ||
+              isLocalBaseUrl(baseUrl) ||
+              (chosenPreset?.kind === 'custom' && d.selfHosted === true));
           const bearer = provider === 'anthropic' && chosenPreset?.bearer === true;
           const checked = await withDeadline(
             (signal) =>
@@ -564,7 +619,7 @@ export async function runWebOnboard(
                   model,
                   baseUrl,
                   ...(bearer ? { authToken: apiKey } : { apiKey }),
-                  selfHosted: d.selfHosted === true,
+                  selfHosted,
                   ...(chosenPreset?.entry ?? {}),
                 },
                 signal,
@@ -611,7 +666,7 @@ export async function runWebOnboard(
             model,
             baseUrl,
             customEndpoint: d.label === 'custom',
-            selfHosted: d.selfHosted === true,
+            selfHosted,
             entryExtras: chosenPreset?.entry
               ? { label: chosenPreset.label, ...chosenPreset.entry }
               : undefined,
@@ -645,6 +700,7 @@ export async function runWebOnboard(
       clearTimeout(forcedClose);
     });
     options.signal?.addEventListener('abort', onAbort, { once: true });
+    for (const signal of signals) process.on(signal, onAbort);
     if (options.signal?.aborted) {
       finish({ ok: false, reason: 'cancelled' });
       return;
@@ -654,12 +710,21 @@ export async function runWebOnboard(
       const port = (server.address() as AddressInfo).port;
       origin = `http://127.0.0.1:${port}`;
       const url = `${origin}/?t=${token}`;
-      write(`\nOpening secure onboarding in your browser…\n  ${url}\n`);
       write(
-        'If it does not open, paste that URL into your browser. API keys are checked only against the selected endpoint.\n',
+        `\n${options.launchBrowser === false ? 'Open this local setup URL in your browser' : 'Opening secure onboarding in your browser'}…\n  ${url}\n`,
+      );
+      write(
+        'Keep this process open until setup finishes. If the browser does not open, paste that URL into it.\n' +
+          'On SSH, forward this loopback port; for terminal-only setup use shadow onboard --terminal.\n',
       );
       touch();
-      (options.openBrowser ?? openBrowser)(url);
+      if (options.launchBrowser !== false) {
+        try {
+          (options.openBrowser ?? openBrowser)(url);
+        } catch {
+          write('Browser launch failed. The setup URL above is still active.\n');
+        }
+      }
     });
   });
 }

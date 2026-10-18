@@ -1,4 +1,4 @@
-import type { CompletionRequest, ContentBlock, Effort, ImageBlock, Message, Provider, ResponsesReasoningItem, ToolCall, ToolUseBlock } from '../provider/provider.js';
+import type { CompletionRequest, ContentBlock, Effort, ImageBlock, Message, Provider, ResponsesReasoningItem, StopReason, ToolCall, ToolUseBlock } from '../provider/provider.js';
 import type { ToolRegistry } from '../tools/registry.js';
 import type { ToolContext, ToolResult, ToolRisk } from '../tools/types.js';
 import { fail } from '../tools/types.js';
@@ -459,16 +459,30 @@ export class AgentLoop {
     // consumeDegradedReport dedupes: a summarizer that stays broken re-fires compaction every
     // turn (right — each attempt may succeed once new reclaimable results arrive), but the
     // warning must not spam once per turn. The episode resets on a healthy compaction.
-    if ((result === 'truncated' || result === 'failed') && this.deps.context.consumeDegradedReport()) {
-      this.deps.bus.emit({
-        type: 'finding',
-        severity: 'warn',
-        title: result === 'truncated' ? 'Compaction degraded — local truncation' : 'Compaction failed',
-        body:
-          result === 'truncated'
-            ? 'The context summarizer failed; context was reclaimed locally by dropping the oldest tool results. The session continues with coarser older history.'
-            : 'The context summarizer failed and no local reclamation was possible — context is still over budget. The next request may fail.',
-      });
+    //
+    // Each failure mode names its OWN cause. A single "the context summarizer failed" string for
+    // both "the endpoint threw" and "we never called it" sent a user chasing a serve-side problem
+    // that did not exist: swapping models appeared to fix it only because a larger budget moved
+    // the tail guard off the boundary.
+    const failed = result === 'truncated' || result === 'failed' || result === 'failed-short-history';
+    if (failed && this.deps.context.consumeDegradedReport()) {
+      const reason = this.deps.context.takeFailureReason();
+      const report =
+        result === 'truncated'
+          ? {
+              title: 'Compaction degraded — local truncation',
+              body: `The context summarizer produced no usable summary${reason ? ` (${reason})` : ''}; context was reclaimed locally by dropping older tool results. The session continues with coarser history.`,
+            }
+          : result === 'failed-short-history'
+            ? {
+                title: 'Compaction skipped — nothing summarizable',
+                body: 'Context is over budget, but every message is either pinned or part of the turn being answered, so there is no older history to summarize. Nothing was sent to the model. Reduce the active turn (finish or /clear) to recover.',
+              }
+            : {
+                title: 'Compaction failed',
+                body: `The context summarizer was called and did not deliver${reason ? ` (${reason})` : ''}, and no local reclamation was possible — context is still over budget. The next request may fail.`,
+              };
+      this.deps.bus.emit({ type: 'finding', severity: 'warn', title: report.title, body: report.body });
       this.deps.sessionLog?.record({ kind: 'compaction_degraded', mode: result });
     }
     return result === 'summarized' || result === 'truncated';
@@ -850,6 +864,17 @@ export class AgentLoop {
         // committed above — re-request to let the model continue rather than stop.
         // budget.check (iterations/tokens/wall-clock) bounds any runaway pausing.
         if (turn.stopReason === 'pause_turn') continue;
+        // A refusal ends the turn, but not the way `end_turn` does: the endpoint declined to
+        // produce the answer. Surface it as such so the user is not left staring at an empty
+        // reply that looks like a normal finish — and so a retry/correction path can react.
+        if (turn.stopReason === 'refusal') {
+          if (!finalAnswer.trim()) {
+            finalAnswer =
+              'The model declined to continue this turn (provider stop reason: refusal). ' +
+              'No answer was produced.';
+          }
+          return this.stop('refusal', finalAnswer);
+        }
         if ((turn.stopReason ?? 'end_turn') === 'end_turn' && this.requestCompletionCorrection(finalAnswer)) continue;
         return this.stop(turn.stopReason ?? 'end_turn', finalAnswer);
       }
@@ -1041,7 +1066,7 @@ export class AgentLoop {
     thinkingText: string;
     providerReasoning?: { text: string; field: 'reasoning_content' | 'reasoning' };
     responsesReasoning?: ResponsesReasoningItem[];
-    stopReason?: 'end_turn' | 'tool_use' | 'max_tokens' | 'pause_turn';
+    stopReason?: StopReason;
     badJsonMsg?: string;
     badCalls: string[];
     namelessCall: boolean;
@@ -1276,7 +1301,7 @@ export class AgentLoop {
     thinkingText: string;
     providerReasoning?: { text: string; field: 'reasoning_content' | 'reasoning' };
     responsesReasoning?: ResponsesReasoningItem[];
-    stopReason?: 'end_turn' | 'tool_use' | 'max_tokens' | 'pause_turn';
+    stopReason?: StopReason;
     badJsonMsg?: string;
     badCalls: string[];
     namelessCall: boolean;
@@ -1289,7 +1314,7 @@ export class AgentLoop {
     let thinkingText = '';
     let providerReasoning: { text: string; field: 'reasoning_content' | 'reasoning' } | undefined;
     const responsesReasoning: ResponsesReasoningItem[] = [];
-    let stopReason: 'end_turn' | 'tool_use' | 'max_tokens' | 'pause_turn' | undefined;
+    let stopReason: StopReason | undefined;
     let badJsonMsg: string | undefined;
     let namelessCall = false;
     const badCalls: string[] = [];
@@ -1314,6 +1339,17 @@ export class AgentLoop {
               type: 'debug',
               code: ev.code,
               message: JSON.stringify({ ...ev.data, requestedMaxOutputTokens: req.maxOutputTokens }),
+            });
+            break;
+          case 'notice':
+            // A provider telling the user how the request was actually shaped (ultra mode
+            // downgrades, unverified endpoints). Rendered as a standalone finding so it stays in
+            // the transcript instead of scrolling past in a transient status line.
+            this.deps.bus.emit({
+              type: 'finding',
+              title: ev.title,
+              body: ev.body,
+              severity: ev.severity,
             });
             break;
           case 'text':
@@ -1740,7 +1776,9 @@ export class AgentLoop {
         reason: forced
           ? `⛔ BLOCKED — acknowledge only · ${forced}`
           : configTouch
-            ? `editing the safety config (${call.name}) always requires confirmation (P1A-01)`
+            ? call.name === 'target_snapshot'
+              ? 'Restoring a snapshot can replace safety configuration; restores always require confirmation.'
+              : `editing the safety config (${call.name}) always requires confirmation (P1A-01)`
             : unconfinedNoBend
               ? '⚠ UNCONFINED — no OS sandbox on this host; run_shell will run WITHOUT confinement (policy: fail-closed — this gate never bends)'
               : unconfinedShell
@@ -2487,13 +2525,17 @@ export function touchesConfigFile(call: ToolCall, roots?: readonly string[]): bo
  * sites (dispatch gating and mayNeedPermissionPrompt) funnel through here, so the config gate
  * cannot be routed around by tool choice — at auto-edit those tools are otherwise auto-approved.
  */
-const CONFIG_GATE_WRITE_TOOLS = new Set(['write_file', 'edit_file', 'multi_edit', 'apply_patch']);
+const CONFIG_GATE_WRITE_TOOLS = new Set(['write_file', 'edit_file', 'multi_edit', 'apply_patch', 'patch_bytes']);
 const PATCH_HEADER_PATH = /^\*\*\*\s+(?:Add|Update|Delete) File:[ \t]*(.+?)[ \t]*$/gm;
 const PATCH_MOVE_TO_PATH = /^\*\*\*\s+Move to:[ \t]*(.+?)[ \t]*$/gm;
 
 export function writeTouchesConfigFile(name: string, input: unknown, roots?: readonly string[]): boolean {
-  if (!CONFIG_GATE_WRITE_TOOLS.has(name)) return false;
   if (!input || typeof input !== 'object') return false;
+  // A restore can replace a whole tree, including safety configuration hidden beneath its
+  // root. Always gate restores rather than trusting a mutable manifest or a preflight walk.
+  // Baseline/verify/list do not replace the target and keep their ordinary approval policy.
+  if (name === 'target_snapshot') return (input as { action?: unknown }).action === 'restore';
+  if (!CONFIG_GATE_WRITE_TOOLS.has(name)) return false;
   const { path, patch } = input as { path?: unknown; patch?: unknown };
   const probe = (p: string): boolean =>
     touchesConfigFile({ id: 'config-gate-probe', name, input: { path: p } }, roots);

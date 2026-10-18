@@ -48,6 +48,14 @@ const PROMPT_REFERENCED_TOOLS = [
   'describe_media',
 ] as const;
 
+const SECURITY_TOOLKIT_TOOLS = [
+  'bin_recon',
+  'patch_bytes',
+  'target_snapshot',
+  'engagement_ops',
+  'security_findings',
+] as const;
+
 function harnessPreamble(capabilities: PromptCapabilityView): string {
   if (PROMPT_REFERENCED_TOOLS.every((name) => capabilities.has(name))) return HARNESS_PREAMBLE;
   const available = PROMPT_REFERENCED_TOOLS.filter((name) => capabilities.has(name));
@@ -164,6 +172,13 @@ function loadInstructionModules(
       // later session. If either half of that lifecycle is hidden, omitting the whole module is
       // more honest than leaving a heading or a partial procedure that the model cannot finish.
       if (name === 'skill-learning.md' && (!capabilities.has('skill') || !capabilities.has('skill_manage'))) continue;
+      // The security toolkit module names five deferred tools. If the host removed any of them,
+      // the module would advertise a capability the session cannot call, so omit it whole rather
+      // than leave a procedure with a missing step.
+      if (
+        name === 'security-engagement.md' &&
+        !SECURITY_TOOLKIT_TOOLS.every((tool) => capabilities.has(tool))
+      ) continue;
       const effectiveContent = capabilityAwarePrompt(content, capabilities);
       if (!effectiveContent) continue;
       const title = name.replace(/\.md$/, '').replace(/-/g, ' ');

@@ -67,7 +67,7 @@ export type LoopEvent =
   | { type: 'shell_output'; callId: string; stream: 'stdout' | 'stderr'; chunk: string }
   | { type: 'shell_pid'; pid: number | null; warn: string | null } // active run_shell child + interrupt warning
   | { type: 'model_fallback'; from: string; to: string; reason: string }
-  | { type: 'task_notification'; taskId: string; answer: string; fromSubagent?: string } // bg agent result delivered as user-role message (Claude parity)
+  | { type: 'task_notification'; taskId: string; answer: string; fromSubagent?: string; status?: 'completed' | 'partial' | 'failed' | 'cancelled'; stopReason?: StopReasonExt } // bg agent result delivered as user-role message (Claude parity)
   | { type: 'bg_agent_launched'; taskId: string; prompt: string; subagentType?: string } // launch metadata recorded to main ctx for snapshot/recovery
   // A finished sub-agent's TOTAL spend, emitted once by the `agent` tool. Sub-agents run on their
   // own Budget, so their per-turn `usage` events must NOT reach the parent HUD (see SubagentBus);

@@ -7,6 +7,8 @@ import { BORDER, GLYPHS, SPACING } from '../tui/glyphs.js';
 import { C } from '../tui/theme.js';
 import { formatDuration } from '../tui/format.js';
 import { approvalText } from '../util/approvalText.js';
+import { SubAgentsCell } from './subagents.js';
+import { ToastCell, type Toast } from './toast.js';
 import { bgAnsi, RESET, style } from './ansi.js';
 
 export interface SnowfallState {
@@ -24,6 +26,8 @@ export interface SnowfallState {
   toolLine: string | null;
   todos: TodoItem[];
   agents: SubAgentView[];
+  /** Live toast rows; empty when nothing is showing. Formatting happens at render width. */
+  toasts: Toast[];
   contextPct: number;
   costUSD: number;
   goal: string | null;
@@ -146,18 +150,31 @@ export class SnowfallEditor extends Editor {
   }
 }
 
-export function snowfallLayout(document: Component, editor: Component, state: () => SnowfallState): { root: VStack; scroll: ScrollView } {
+export function snowfallLayout(
+  document: Component,
+  editor: Component,
+  state: () => SnowfallState,
+  rows?: () => number,
+): { root: VStack; scroll: ScrollView; agents: SubAgentsCell } {
   const scroll = new ScrollView(document, {
     primary: true, follow: 'end', scrollbar: 'auto',
     scrollbarThumbStyle: (text) => style.fg(C.border ?? C.dim, text),
     scrollbarTrackStyle: (text) => style.dim(text),
   });
+  // Live agent dock. It returns [] when idle, and VStack measures height by rendering, so a
+  // quiet dock costs zero rows; when agents are running it takes 1–4 rows above the status bar.
+  const agents = new SubAgentsCell(() => state().agents, () => rows?.() ?? 24);
+  // Toast stack: non-blocking, max 2, rendered above the dock so a passing notice never covers
+  // in-flight work. Also zero-height when empty.
+  const toasts = new ToastCell(() => state().toasts);
   const root = new VStack([
     { component: new SnowfallHeader(state), basis: 2, shrink: 0, visible: ({ height }) => height >= 10 },
     { component: scroll, basis: 0, grow: 1, shrink: 1, minSize: 0 },
     { component: editor, basis: 'auto', shrink: 0 },
+    { component: toasts, basis: 'auto', shrink: 0, visible: ({ height }) => height >= 12 },
+    { component: agents, basis: 'auto', shrink: 0, visible: ({ height }) => height >= 12 },
     { component: new Spacer(1), basis: 1, shrink: 0, visible: ({ height }) => height >= STATUS_SPACER_MIN_ROWS },
     { component: new SnowfallStatus(state), basis: 1, shrink: 0 },
   ]);
-  return { root, scroll };
+  return { root, scroll, agents };
 }

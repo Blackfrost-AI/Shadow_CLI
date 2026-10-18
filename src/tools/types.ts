@@ -92,6 +92,15 @@ export interface Tool<I = unknown, O = unknown> {
   inputSchema: z.ZodType<I, z.ZodTypeDef, unknown>;
   /** When true, omitted from the default tool schema until discovered via `tool_search`. */
   deferred?: boolean;
+  /**
+   * Extra search terms for `tool_search`, beyond the tool name.
+   *
+   * Deferred tools are discovered by name substring, so a tool whose name does not contain the
+   * words a model would reach for is effectively unreachable: `bin_recon` was invisible to
+   * "malware", "binary", "disassemble" and "macho". These aliases close that gap. Keep them
+   * lowercase; matching is case-insensitive on both sides.
+   */
+  searchAliases?: string[];
   run(input: I, ctx: ToolContext): Promise<ToolResult<O>>;
 }
 

@@ -18,6 +18,7 @@ import { createProvider, entryStreamContract, type ProviderOptions } from '../pr
 import { capabilityTargetFromProviderOptions, type CapabilityTarget } from '../doctor/capabilityRecords.js';
 import { ToolRegistry } from '../tools/registry.js';
 import { BgRegistry } from '../tools/bgShell.js';
+import { WatcherRegistry } from './watcher.js';
 import { attachProjectChecks, checksForRegistry } from '../checks/registry.js';
 import { makeSecurityFindingsTool } from '../tools/securityFindings.js';
 import {
@@ -155,6 +156,8 @@ export interface AgentSession {
   provider: ReturnType<typeof createProvider>;
   registry: ToolRegistry;
   bg: BgRegistry;
+  /** Detached watchers — registered with the tool registry and surfaced by Work Center. */
+  watchers: WatcherRegistry;
   memory: ProjectMemory;
   todoList: TodoList;
   planMode: PlanModeState;
@@ -735,6 +738,21 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   // Own the background-shell registry so we can kill orphaned children on shutdown (killAll had no
   // call site — quitting left dev servers holding their ports across sessions).
   const bg = new BgRegistry();
+  // Detached watchers outlive the session by design, so their registry is workspace-scoped: the
+  // durable state (.shadow/watchers.json) belongs to the project, not to this process.
+  const watchers = new WatcherRegistry(workspaceRoot);
+  // Reap at session start, before the first render can report a stale "running". This cannot be
+  // left to shutdown: the cases that leak are precisely the ones with no clean shutdown — SIGKILL,
+  // a closed terminal, a crash. Doing it here means every entry point (TUI, headless, ACP, web)
+  // inherits the cleanup without each one remembering to call it. Cost is one syscall per record,
+  // bounded by MAX_WATCHERS.
+  const reaped = watchers.reap();
+  if (reaped.length > 0) {
+    // stderr, not stdout: headless/ACP modes parse stdout, and this must not corrupt a response.
+    process.stderr.write(
+      `shadow: reaped ${reaped.length} orphaned watcher(s): ${reaped.map((w) => w.name).join(', ')}\n`,
+    );
+  }
   registerBuiltinTools(registry, {
     bg,
     shellEnvAllowlist: cfg.shellEnvAllowlist,
@@ -746,6 +764,7 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     // Offline mode: do NOT register the web tools (web_fetch / web_search). They are simply
     // absent from the registry — the model can't choose what it doesn't have.
     network: !offline,
+    watchers,
   }); // M1 tools + M5 web tools (web tools gated off when offline)
 
   // Shadow's "eyes": register describe_media only when the user configured an OpenAI-compatible
@@ -981,6 +1000,7 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     provider,
     registry,
     bg,
+    watchers,
     memory,
     todoList,
     planMode,

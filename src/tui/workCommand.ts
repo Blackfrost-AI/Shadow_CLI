@@ -7,6 +7,7 @@
 import type { WorkCenter, WorkItem, WorkItemStatus, WorkItemType, WorkCenterFilters } from '../app/workCenter.js';
 import type { EventBus } from '../agent/events.js';
 import type { BgRegistry } from '../tools/bgShell.js';
+import type { WatcherRegistry } from '../agent/watcher.js';
 import type { HistoricalWorkItem } from '../state/workCenterPersistence.js';
 import { approvalText } from '../util/approvalText.js';
 
@@ -20,6 +21,11 @@ export interface WorkCommandOptions {
   workCenter: WorkCenter;
   bus: EventBus;
   bgRegistry: BgRegistry;
+  /**
+   * Detached watcher registry. Watchers are cancelled by deleting durable state rather than by
+   * signalling this process, so the verb needs its own handle even though it shares `/work kill`.
+   */
+  watchers?: WatcherRegistry;
   /** Read-only snapshots from durable session logs. */
   workHistory?: (session?: string) => HistoricalWorkItem[];
 }
@@ -252,15 +258,26 @@ export function executeWorkCommand(arg: string, opts: WorkCommandOptions): WorkC
     return { kind: 'retry', lines: [`Retry scheduled for ${item.id} as a linked new background run.`] };
   }
 
-  // /work kill <id> - kills a background shell
+  // /work kill <id> - kills a background shell or stops a detached watcher
   if (subcommand === 'kill' && parts.length >= 2) {
     const id = parts[1];
     const item = workCenter.get(id);
     if (!item) {
       return { kind: 'error', lines: [], error: `No work item found: ${id}` };
     }
+    if (item.type === 'watcher') {
+      if (!opts.watchers) {
+        return { kind: 'error', lines: [], error: 'Watcher registry is unavailable in this session.' };
+      }
+      try {
+        const watcher = opts.watchers.cancel(id);
+        return { kind: 'kill', lines: [`Stopped watcher ${watcher.name} (detached process signalled).`] };
+      } catch (err) {
+        return { kind: 'error', lines: [], error: approvalText((err as Error).message) };
+      }
+    }
     if (item.type !== 'bgshell') {
-      return { kind: 'error', lines: [], error: `Cannot kill ${item.type} (only background shells are killable)` };
+      return { kind: 'error', lines: [], error: `Cannot kill ${item.type} (only background shells and watchers are killable)` };
     }
     if (item.status !== 'running') {
       return { kind: 'error', lines: [], error: `Shell ${id} is not running` };

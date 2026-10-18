@@ -2,18 +2,21 @@ import { readdirSync, statSync, lstatSync, readFileSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { join, relative, sep, basename } from 'node:path';
 import { z } from 'zod';
+import { RE2JS } from 're2js';
 import type { Tool, ToolResult } from './types.js';
 import { ok, fail } from './types.js';
 import { resolveWithin } from '../safety/workspaceJail.js';
 import { looksBinary, clamp } from './util.js';
 import { globToRegExp } from './glob.js';
+import { scrubbedEnv } from '../util/safeEnv.js';
 
 const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', '.cache', '.shadow']);
 const MAX_FILE_BYTES = 1_000_000;
 const LINE_CLAMP = 400;
+const MAX_PATTERN_CHARS = 5000;
 
 const inputSchema = z.object({
-  pattern: z.string().min(1).describe('Regular expression to search for.'),
+  pattern: z.string().min(1).max(MAX_PATTERN_CHARS).describe('RE2 regular expression to search for (no backreferences or lookaround).'),
   path: z.string().optional().describe('Directory (or file) to search under. Defaults to the workspace root.'),
   glob: z.string().optional().describe('Only search files whose path matches this glob, e.g. "**/*.ts".'),
   max_results: z.number().int().positive().optional().describe('Cap on matches returned. Default 200.'),
@@ -32,6 +35,52 @@ export interface GrepData {
   matches: GrepMatch[];
   truncated: boolean;
   engine: 'ripgrep' | 'node';
+  /**
+   * Paths that could not be searched (including unreadable directories). Present so a negative
+   * result can be reported as a QUALIFIED negative: without this, a file skipped
+   * for looking binary is indistinguishable from a file that was searched and
+   * had no match. A NUL byte anywhere in the first 4 KB is enough to classify a
+   * file as binary (`looksBinary`), and a NUL inside a string literal is a fully
+   * textual source file — so this is a real false-negative path, not a
+   * theoretical one.
+   */
+  skipped?: GrepSkipped;
+}
+
+/** Paths a scan could not search, with a capped sample for the summary line. */
+export interface GrepSkipped {
+  binary: number;
+  tooLarge: number;
+  unreadable: number;
+  sample: string[];
+}
+
+const SKIPPED_NAME_CAP = 5;
+
+function tallySkip(target: GrepSkipped, kind: 'binary' | 'tooLarge' | 'unreadable', file: string): void {
+  target[kind] += 1;
+  if (target.sample.length < SKIPPED_NAME_CAP) target.sample.push(file);
+}
+
+function skippedTotal(s: GrepSkipped | undefined): number {
+  if (!s) return 0;
+  return s.binary + s.tooLarge + s.unreadable;
+}
+
+function emptySkipped(): GrepSkipped {
+  return { binary: 0, tooLarge: 0, unreadable: 0, sample: [] };
+}
+
+/** Human-readable qualification of a negative result; '' when nothing was skipped. */
+function skippedNote(s: GrepSkipped | undefined): string {
+  const total = skippedTotal(s);
+  if (!s || total === 0) return '';
+  const parts: string[] = [];
+  if (s.binary) parts.push(`${s.binary} binary-looking (NUL byte present — content NOT searched)`);
+  if (s.tooLarge) parts.push(`${s.tooLarge} over 1 MB (content NOT searched)`);
+  if (s.unreadable) parts.push(`${s.unreadable} unreadable`);
+  const names = s.sample.length ? ` [${s.sample.join(', ')}${total > s.sample.length ? `, +${total - s.sample.length} more` : ''}]` : '';
+  return `⚠ ${total} path(s) skipped${names}: ${parts.join('; ')}.`;
 }
 
 /**
@@ -44,12 +93,17 @@ let rgAvailable: boolean | null = null;
 function hasRipgrep(): boolean {
   if (rgAvailable !== null) return rgAvailable;
   try {
-    const probe = spawnSync('rg', ['--version'], { timeout: 3000, windowsHide: true });
+    const probe = spawnSync('rg', ['--version'], { timeout: 3000, windowsHide: true, env: scrubbedEnv() });
     rgAvailable = !probe.error && probe.status === 0;
   } catch {
     rgAvailable = false;
   }
   return rgAvailable;
+}
+
+/** Test seam for exercising the fallback deterministically on hosts that have ripgrep installed. */
+export function __setRipgrepAvailabilityForTests(value: boolean | null): void {
+  rgAvailable = value;
 }
 
 export const grep: Tool<GrepInput, GrepData> = {
@@ -72,20 +126,14 @@ export const grep: Tool<GrepInput, GrepData> = {
 
     const maxResults = Math.max(1, Math.min(2000, input.max_results ?? 200));
 
-    // Validate the regex up front (used by the Node fallback; also a good guard
-    // before handing it to ripgrep).
-    let re: RegExp;
+    // Both engines must avoid native RegExp's catastrophic backtracking. Time checks
+    // around a synchronous exec cannot interrupt it, and shape heuristics are incomplete.
+    let re: RE2JS;
     try {
-      re = new RegExp(input.pattern);
+      if (input.pattern.length > MAX_PATTERN_CHARS) throw new Error(`pattern exceeds ${MAX_PATTERN_CHARS} characters`);
+      re = RE2JS.compile(input.pattern);
     } catch (e) {
-      return fail('grep', 'read', Date.now() - start, 'invalid_regex', `invalid regular expression: ${(e as Error).message}`);
-    }
-    // Reject the classic ReDoS shape — a quantified group whose body is itself unbounded-quantified
-    // (e.g. `(a+)+`, `(.*)*`, `(\d+){2,}`). Backed by catastrophic backtracking, one `re.exec` can pin
-    // the event loop for minutes with NO way to interrupt (the nodeGrep fallback is synchronous). ripgrep
-    // (RE2-class) is immune, but this is the LIVE path whenever no real `rg` binary exists.
-    if (/\([^()]*[*+][^()]*\)[*+{]/.test(input.pattern)) {
-      return fail('grep', 'read', Date.now() - start, 'invalid_regex', 'pattern rejected: nested unbounded quantifier (ReDoS risk) — rewrite without `(x+)+`/`(x*)*`-style constructs.');
+      return fail('grep', 'read', Date.now() - start, 'invalid_regex', `invalid or unsupported RE2 regular expression: ${(e as Error).message}`);
     }
 
     let targetStat;
@@ -97,7 +145,8 @@ export const grep: Tool<GrepInput, GrepData> = {
     // Grep a single FILE directly when given a file path — models (and people)
     // naturally do `grep pattern file.txt`. (Previously this returned not_a_directory.)
     if (targetStat.isFile()) {
-      return finish(grepSingleFile(re, root, maxResults), 'node', start);
+      const skipped = emptySkipped();
+      return finish(grepSingleFile(re, root, maxResults, skipped), 'node', start, skipped);
     }
 
     // Prefer ripgrep when a real binary exists; fall back on any trouble.
@@ -107,8 +156,9 @@ export const grep: Tool<GrepInput, GrepData> = {
     }
 
     const globRe = input.glob ? globToRegExp(input.glob) : null;
-    const res = nodeGrep(re, root, globRe, maxResults, ctx.signal);
-    return finish(res, 'node', start);
+    const skipped = emptySkipped();
+    const res = nodeGrep(re, root, globRe, maxResults, ctx.signal, skipped);
+    return finish(res, 'node', start, skipped);
   },
 };
 
@@ -116,12 +166,26 @@ function finish(
   res: { matches: GrepMatch[]; truncated: boolean },
   engine: 'ripgrep' | 'node',
   start: number,
+  skipped?: GrepSkipped,
 ): ToolResult<GrepData> {
-  const summary =
+  const note = skippedNote(skipped);
+  const base =
     res.matches.length === 0
-      ? `No matches (${engine}).`
+      ? res.truncated
+        ? `No matches before the search limit (${engine}); search INCOMPLETE.`
+        : `No matches (${engine}).`
       : `${res.matches.length} match(es)${res.truncated ? ' (truncated)' : ''} (${engine}).`;
-  const result = ok('grep', 'read', Date.now() - start, summary, { ...res, engine });
+  // A bare "No matches" next to a silently-skipped file is the defect this guards:
+  // it reads as proof of absence. Say instead that the search was incomplete.
+  const summary =
+    res.matches.length === 0 && note
+      ? `No matches (${engine}) — but the search was INCOMPLETE. ${note}`
+      : `${base}${note ? ` ${note}` : ''}`;
+  const result = ok('grep', 'read', Date.now() - start, summary, {
+    ...res,
+    engine,
+    ...(note ? { skipped } : {}),
+  });
   if (res.matches.length > 0) {
     const preview = res.matches.slice(0, 20);
     const body =
@@ -150,15 +214,31 @@ function ripgrep(
   signal: AbortSignal,
 ): Promise<{ matches: GrepMatch[]; truncated: boolean } | null> {
   return new Promise((resolve) => {
-    const args = ['--json', '--max-filesize', '1M', '-g', '!.shadow/**'];
+    // `--text` makes rg search NUL-bearing source instead of silently classifying it as binary.
+    // A wall-clock/output cap below bounds pathological large files without turning them into an
+    // unqualified negative result.
+    const args = ['--json', '--text', '-g', '!.shadow/**'];
     if (glob) args.push('-g', glob);
     args.push('-e', pattern, '.');
-    const child = spawn('rg', args, { cwd: root, signal, windowsHide: true });
+    const child = spawn('rg', args, { cwd: root, signal, windowsHide: true, env: scrubbedEnv() });
     let out = '';
     let errored = false;
+    let incomplete = false;
     const OUT_CAP = 16 * 1024 * 1024; // bound the JSON buffer so a huge tree can't balloon memory
+    const timer = setTimeout(() => {
+      incomplete = true;
+      try {
+        child.kill();
+      } catch {
+        /* already gone */
+      }
+    }, 15_000);
+    timer.unref();
     child.stdout.on('data', (d) => {
-      if (out.length > OUT_CAP) {
+      const chunk = d.toString();
+      if (out.length + chunk.length > OUT_CAP) {
+        out += chunk.slice(0, Math.max(0, OUT_CAP - out.length));
+        incomplete = true;
         try {
           child.kill();
         } catch {
@@ -166,18 +246,20 @@ function ripgrep(
         }
         return;
       }
-      out += d.toString();
+      out += chunk;
     });
     child.on('error', () => {
       errored = true;
+      clearTimeout(timer);
       resolve(null);
     });
     child.on('close', (code) => {
+      clearTimeout(timer);
       if (errored) return;
       // rg exit codes: 0 = matches, 1 = no matches, 2 = error.
-      if (code === 2) return resolve(null);
+      if (code === 2 && !incomplete) return resolve(null);
       const matches: GrepMatch[] = [];
-      let truncated = false;
+      let truncated = incomplete;
       for (const raw of out.split('\n')) {
         if (!raw.trim()) continue;
         if (matches.length >= maxResults) {
@@ -192,9 +274,9 @@ function ripgrep(
         }
         const m = ev as { type?: string; data?: RgMatchData };
         if (m.type !== 'match' || !m.data) continue;
-        const file = m.data.path?.text ?? '';
+        const file = decodeRgText(m.data.path);
         const lineNo = m.data.line_number ?? 0;
-        const lineText = (m.data.lines?.text ?? '').replace(/\r?\n$/, '');
+        const lineText = decodeRgText(m.data.lines).replace(/\r?\n$/, '');
         const sub = m.data.submatches?.[0];
         const column = (sub?.start ?? 0) + 1;
         matches.push({ file, line: lineNo, column, text: clamp(lineText, LINE_CLAMP) });
@@ -204,30 +286,63 @@ function ripgrep(
   });
 }
 
+interface RgText {
+  text?: string;
+  /** rg uses base64 when a path or matched line is not valid UTF-8. */
+  bytes?: string;
+}
+
+function decodeRgText(value: RgText | undefined): string {
+  if (typeof value?.text === 'string') return value.text;
+  if (typeof value?.bytes === 'string') {
+    try {
+      return Buffer.from(value.bytes, 'base64').toString('utf8');
+    } catch {
+      return '';
+    }
+  }
+  return '';
+}
+
 interface RgMatchData {
-  path?: { text?: string };
+  path?: RgText;
   line_number?: number;
-  lines?: { text?: string };
+  lines?: RgText;
   submatches?: { start?: number }[];
 }
 
 /** Grep a single file (when `path` points at a file, not a directory). */
-function grepSingleFile(re: RegExp, file: string, maxResults: number): { matches: GrepMatch[]; truncated: boolean } {
+function grepSingleFile(
+  re: RE2JS,
+  file: string,
+  maxResults: number,
+  skipped: GrepSkipped,
+): { matches: GrepMatch[]; truncated: boolean } {
   const matches: GrepMatch[] = [];
   let truncated = false;
   let buf: Buffer;
   try {
     buf = readFileSync(file);
   } catch {
+    tallySkip(skipped, 'unreadable', basename(file));
     return { matches, truncated };
   }
-  if (buf.length > MAX_FILE_BYTES || looksBinary(buf)) return { matches, truncated };
+  // Report WHY nothing was searched. A skipped file must not be reported as a
+  // searched-and-empty one — that is the false negative this guards against.
+  if (buf.length > MAX_FILE_BYTES) {
+    tallySkip(skipped, 'tooLarge', basename(file));
+    return { matches, truncated };
+  }
+  if (looksBinary(buf)) {
+    tallySkip(skipped, 'binary', basename(file));
+    return { matches, truncated };
+  }
   const name = basename(file);
   const lines = buf.toString('utf8').split('\n');
   for (let i = 0; i < lines.length; i++) {
-    const hit = re.exec(lines[i]!);
-    if (hit) {
-      matches.push({ file: name, line: i + 1, column: hit.index + 1, text: clamp(lines[i]!, LINE_CLAMP) });
+    const matcher = re.matcher(lines[i]!);
+    if (matcher.find()) {
+      matches.push({ file: name, line: i + 1, column: matcher.start() + 1, text: clamp(lines[i]!, LINE_CLAMP) });
       if (matches.length >= maxResults) {
         truncated = true;
         break;
@@ -237,13 +352,14 @@ function grepSingleFile(re: RegExp, file: string, maxResults: number): { matches
   return { matches, truncated };
 }
 
-/** Dependency-free recursive scan used when ripgrep is unavailable. */
+/** In-process recursive scan used when ripgrep is unavailable. */
 function nodeGrep(
-  re: RegExp,
+  re: RE2JS,
   root: string,
   globRe: RegExp | null,
   maxResults: number,
   signal: AbortSignal,
+  skipped: GrepSkipped,
 ): { matches: GrepMatch[]; truncated: boolean } {
   const matches: GrepMatch[] = [];
   let truncated = false;
@@ -261,6 +377,7 @@ function nodeGrep(
     try {
       names = readdirSync(dir);
     } catch {
+      tallySkip(skipped, 'unreadable', `${relative(root, dir).split(sep).join('/') || '.'}/`);
       return;
     }
     for (const name of names) {
@@ -277,22 +394,31 @@ function nodeGrep(
         // the jail (matches glob/read_file behavior).
         st = lstatSync(full);
       } catch {
+        tallySkip(skipped, 'unreadable', relative(root, full).split(sep).join('/') || name);
         continue;
       }
       if (st.isDirectory()) {
         if (!SKIP_DIRS.has(name)) walk(full);
         continue;
       }
-      if (!st.isFile() || st.size > MAX_FILE_BYTES) continue;
+      if (!st.isFile()) continue;
       const rel = relative(root, full).split(sep).join('/') || name;
       if (globRe && !globRe.test(rel)) continue;
+      if (st.size > MAX_FILE_BYTES) {
+        tallySkip(skipped, 'tooLarge', rel);
+        continue;
+      }
       let buf: Buffer;
       try {
         buf = readFileSync(full);
       } catch {
+        tallySkip(skipped, 'unreadable', rel);
         continue;
       }
-      if (looksBinary(buf)) continue;
+      if (looksBinary(buf)) {
+        tallySkip(skipped, 'binary', rel);
+        continue;
+      }
       const lines = buf.toString('utf8').split('\n');
       for (let i = 0; i < lines.length; i++) {
         if ((i & 1023) === 0 && (signal.aborted || Date.now() - t0 > TIME_LIMIT_MS)) {
@@ -300,9 +426,9 @@ function nodeGrep(
           return;
         }
         const line = lines[i]!;
-        const hit = re.exec(line);
-        if (hit) {
-          matches.push({ file: rel, line: i + 1, column: hit.index + 1, text: clamp(line, LINE_CLAMP) });
+        const matcher = re.matcher(line);
+        if (matcher.find()) {
+          matches.push({ file: rel, line: i + 1, column: matcher.start() + 1, text: clamp(line, LINE_CLAMP) });
           if (matches.length >= maxResults) {
             truncated = true;
             return;

@@ -369,48 +369,56 @@ test('F1: if the 4th request STILL overflows at rung 2, the terminal finding fir
   );
 });
 
-test('F2: rung 1 reclaiming NOTHING (short history) escalates to rung 2 immediately instead of wedging', async () => {
+test('R1: keepLastTurns larger than the whole history still compacts (the reproduced wedge)', async () => {
+  // THE BUG THE USER HIT. The old guard computed `end = msgs.length - keepLastTurns` once; with
+  // keepLastTurns (12) >= the message count it landed at or before the pin and returned 'failed'
+  // WITHOUT EVER CALLING THE MODEL, while the caller reported "the context summarizer failed" —
+  // naming a round trip that never happened. Swapping to a model with a bigger contextBudget
+  // appeared to fix it only because it moved the `<= 40_000` keep-clamp off the boundary.
+  //
+  // Contract now: the kept tail is capped at half the unpinned history, so a compaction always
+  // has something to summarize as long as more than one unpinned turn exists.
   const counter = { main: 0 };
   const provider = new MockProvider(Array.from({ length: 8 }, () => ladderScript(2, counter)));
-  // keepLastTurns 12 → the 11 seeded messages are "too short to summarize": maybeSummarize
-  // returns false at rung 1 (end <= pinnedPrefix). The old code returned the bare 400 here and
-  // every future turn re-ran the same deterministic failure — rung 2 never got a chance.
-  const { loop, events, context } = buildLoop(provider, undefined, { keepLastTurns: 12 });
+  const summarizerCalls: number[] = [];
+  const scripted = ladderScript(2, counter);
+  const wrap = new MockProvider(
+    Array.from({ length: 8 }, () => (messages: Message[]): ProviderEvent[] => {
+      const isSummarizer = messages.some((m) =>
+        m.content.some((b) => b.type === 'text' && b.text.includes('OLDER HISTORY TO REPLACE')),
+      );
+      if (isSummarizer) summarizerCalls.push(messages.length);
+      return typeof scripted === 'function' ? scripted(messages) : scripted;
+    }),
+  );
+  void provider;
+  const { loop, events, context } = buildLoop(wrap, undefined, { keepLastTurns: 12 });
   seedHistory(context);
 
   const res = await loop.run();
 
+  assert.ok(summarizerCalls.length >= 1, 'the summarizer WAS called — no more zero-call "failure"');
   assert.equal(res.finalAnswer, 'Ladder recovered.');
-  assert.equal(counter.main, 2, 'rung-1 failure + rung-2 local reclaim + one retry — no extra attempts');
-  const retries = events.flatMap((e) =>
-    e.type === 'retry' && e.reason.includes('context overflow') ? [e] : [],
-  );
-  assert.equal(retries.length, 1, 'only rung 2 recovered, so only one retry event');
-  assert.match(retries[0]!.reason, /stripped 2 image block\(s\)/, 'rung 2 strip reported');
-  assert.match(retries[0]!.reason, /shrunk kept tail/, 'rung 2 shrink reported');
+  assert.equal(counter.main, 2, 'rung 1 actually reclaimed, so one retry sufficed');
   assert.ok(
     !events.some((e) => e.type === 'finding' && e.severity === 'error'),
-    'no irrecoverable finding — the ladder recovered after escalation',
+    'no irrecoverable finding — the ladder recovered at rung 1',
   );
 });
 
-test('F2: when NOTHING can reclaim (no images, small bodies, short history), rung 2 still runs and the end is an honest irrecoverable finding', async () => {
+test('R2: a genuinely unsummarizable history (one unpinned message) still runs rung 2 and ends honestly', async () => {
   const counter = { main: 0 };
   const provider = new MockProvider(Array.from({ length: 8 }, () => ladderScript(0, counter)));
   const records: Array<Record<string, unknown>> = [];
   const sessionLog = {
-    path: '/tmp/shadow-overflow-ladder-test/f2',
+    path: '/tmp/shadow-overflow-ladder-test/r2',
     record: (e: Record<string, unknown>) => records.push(e),
     recordSnapshot: () => {},
   } as unknown as LoopDeps['sessionLog'];
   const { loop, events, context } = buildLoop(provider, sessionLog, { keepLastTurns: 12 });
-  // One small round: nothing to strip, nothing to shrink, nothing to summarize.
-  for (const m of [
-    { role: 'assistant', content: [{ type: 'tool_use', id: 's0', name: 'read_file', input: {} }] },
-    { role: 'user', content: [{ type: 'tool_result', toolCallId: 's0', ok: true, content: 'small' }] },
-  ] as Message[]) {
-    context.append(m);
-  }
+  // A single bare assistant message: history is one message long, so there is no split that
+  // leaves anything behind and no tool_result body for local reclamation to cap.
+  context.append({ role: 'assistant', content: [{ type: 'text', text: BIG }] } as Message);
 
   const res = await loop.run();
 
@@ -422,6 +430,31 @@ test('F2: when NOTHING can reclaim (no images, small bodies, short history), run
   assert.ok(
     records.some((r) => r.kind === 'compaction_degraded' && r.mode === 'overflow_irrecoverable'),
     'the wedge end state is recorded',
+  );
+});
+
+test('R3: an unsummarizable history holding an image still recovers — rung 2 escalates and strips', async () => {
+  const counter = { main: 0 };
+  const provider = new MockProvider(Array.from({ length: 8 }, () => ladderScript(2, counter)));
+  const { loop, events, context } = buildLoop(provider, undefined, { keepLastTurns: 12 });
+  // A single unpinned user message holding an image and nothing else: history is one message
+  // long, so rung 1 has no split that leaves anything behind and declines — which is exactly the
+  // shape that used to return the bare 400 forever with rung 2 never getting a chance.
+  context.append({
+    role: 'user',
+    content: [{ type: 'image', mediaType: 'image/png', data: 'QUJD' }],
+  } as Message);
+
+  const res = await loop.run();
+
+  assert.equal(res.finalAnswer, 'Ladder recovered.');
+  assert.equal(counter.main, 2, 'rung-1 decline + rung-2 local reclaim + one retry');
+  const retries = events.flatMap((e) => (e.type === 'retry' && e.reason.includes('context overflow') ? [e] : []));
+  assert.equal(retries.length, 1, 'only rung 2 recovered, so only one retry event');
+  assert.match(retries[0]!.reason, /stripped 1 image block\(s\)/, 'rung 2 strip reported');
+  assert.ok(
+    !events.some((e) => e.type === 'finding' && e.severity === 'error'),
+    'no irrecoverable finding — the ladder recovered after escalation',
   );
 });
 

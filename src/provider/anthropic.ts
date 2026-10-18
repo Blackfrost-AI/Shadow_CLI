@@ -23,6 +23,8 @@ import { shadowFetch } from '../safety/egress.js';
 import { isLocalBaseUrl } from '../safety/offline.js';
 import { eventsFromAnthropicMessage } from './nonStream.js';
 import { parseToolArgs } from './toolJson.js';
+import type { ModelCapabilities } from '../config.js';
+import { planUltra, planNotice, type UltraPlan } from '../agent/ultraMode.js';
 
 const DEFAULT_ANTHROPIC_BASE = 'https://api.anthropic.com';
 // the reference client 2.1.187 sends this exact version header — it is the only GA Messages
@@ -51,6 +53,7 @@ export class AnthropicProvider implements Provider {
    * protection trigger for remote self-hosted Anthropic front-ends too.
    */
   private readonly selfHosted: boolean;
+  private readonly capabilities?: ModelCapabilities;
 
   constructor(opts: {
     apiKey?: string;
@@ -61,6 +64,8 @@ export class AnthropicProvider implements Provider {
     idleTimeoutMs?: number;
     firstByteTimeoutMs?: number;
     streamRetries?: number;
+    /** Declared capabilities for this endpoint (ultra mode). Absent = prior behaviour. */
+    capabilities?: ModelCapabilities;
   }) {
     this.apiKey = opts.apiKey;
     this.authToken = opts.authToken;
@@ -72,6 +77,7 @@ export class AnthropicProvider implements Provider {
     this.streamRetries = opts.streamRetries;
     // P1A-04: explicit selfHosted marker mirrors OpenAIProvider — covers remote proxies.
     this.selfHosted = opts.selfHosted === true || isLocalBaseUrl(opts.baseUrl);
+    this.capabilities = opts.capabilities;
   }
 
   estimateTokens(messages: Message[]): number {
@@ -135,16 +141,49 @@ export class AnthropicProvider implements Provider {
     return json.input_tokens ?? estimateTokensFromMessages(args.messages ?? []);
   }
 
+  /**
+   * Emit the ultra plan to the transcript exactly once per provider instance.
+   *
+   * Why `finding` and not a status line: the status line is per-frame and transient, so a notice
+   * there scrolls away with the stream — the same complaint that killed the Ctrl-T snapshot. A
+   * standalone finding lands in the transcript and stays. Once per instance (not per request)
+   * because the plan is a property of the endpoint, and repeating it every turn would bury it.
+   *
+   * Only the DEGRADED and UNVERIFIED cases announce themselves. A fully-delivered plan is the
+   * normal case and says nothing; a notice on every session is noise.
+   */
+  private announced = false;
+  private *noticeOnce(plan: UltraPlan): Generator<ProviderEvent> {
+    if (this.announced) return;
+    const notice = planNotice(plan);
+    if (!notice) return;
+    this.announced = true;
+    yield { type: 'notice', ...notice };
+  }
+
   async *send(req: CompletionRequest): AsyncIterable<ProviderEvent> {
     const model = req.model || this.model;
     const headers: Record<string, string> = {
       'anthropic-version': ANTHROPIC_VERSION,
       'content-type': 'application/json',
     };
+    // Ultra mode: resolve ONCE per send so the plan drives the wire AND the notice below, rather
+    // than being recomputed per body and then dropped. A plan nobody can see is the defect this
+    // feature exists to fix; computing it here is what lets `plan.summary` reach the transcript.
+    const plan = planUltra(
+      { effort: req.effort ?? 'high', fastMode: req.fastMode, extendedCache: req.cacheTtl === '1h' },
+      this.capabilities,
+    );
+    // Premium channels are fail-closed in buildAnthropicBody (which owns both the body params and
+    // the choice of cacheControl), so the header logic only has to mirror that decision. Keeping a
+    // second, independent gate here is how the two drift apart.
+    const allowFast = plan.unverified || !plan.unavailable.includes('fast-mode');
+    const allowExtendedCache = plan.unverified || !plan.unavailable.includes('extended-cache');
+    yield* this.noticeOnce(plan);
     const betas = anthropicBetaHeaders({
       model,
-      cacheTtl: req.cacheTtl,
-      fastMode: req.fastMode,
+      cacheTtl: req.cacheTtl === '1h' && allowExtendedCache ? '1h' : undefined,
+      fastMode: req.fastMode && allowFast,
     });
     if (betas.length) headers['anthropic-beta'] = betas.join(',');
     if (this.authToken) headers['authorization'] = `Bearer ${this.authToken}`;
@@ -153,10 +192,10 @@ export class AnthropicProvider implements Provider {
     yield* streamWithRetry({
       url: this.url,
       headers,
-      body: buildAnthropicBody(req, model, true),
+      body: buildAnthropicBody(req, model, true, { capabilities: this.capabilities }),
       parse: parseAnthropicSSE,
       signal: req.signal,
-      nonStreamBody: buildAnthropicBody(req, model, false),
+      nonStreamBody: buildAnthropicBody(req, model, false, { capabilities: this.capabilities }),
       parseNonStream: eventsFromAnthropicMessage,
       // The marker must travel with the attempt: streamWithRetry recomputes only from the URL,
       // so a hand-configured REMOTE self-hosted Anthropic front-end got the 120s public idle
@@ -303,6 +342,10 @@ export function buildAnthropicBody(
   req: CompletionRequest,
   fallbackModel: string,
   stream = true,
+  opts: {
+    /** Declared capabilities for this endpoint. Drives ultra mode; absent = legacy behaviour. */
+    capabilities?: ModelCapabilities;
+  } = {},
 ): Record<string, unknown> {
   const model = req.model || fallbackModel;
   // F10-03: the wire id is the BASE model — the `[1m]` config alias never goes on the wire
@@ -311,10 +354,36 @@ export function buildAnthropicBody(
   // and toAnthropicMessages compares thinking-block signature stamps, which the loop writes
   // with the configured (aliased) model string.
   const wireModel = stripContext1mAlias(model);
+  // Fail-closed against the declaration (computed once, above): a declared endpoint that lacks
+  // `fastMode` must not lose adaptive thinking to a fast-mode request we are not going to send.
+  const declaredAny = !!opts.capabilities && Object.keys(opts.capabilities).length > 0;
+  const fastEnabled = !!req.fastMode && (!declaredAny || opts.capabilities?.fastMode === true);
   // Fast mode is a low-latency path; it's mutually exclusive with extended thinking,
   // so fast mode disables adaptive thinking rather than risk a 400.
-  const adaptive = supportsAdaptiveThinking(model) && !req.fastMode;
-  const cacheControl = req.cacheTtl === '1h' ? { type: 'ephemeral', ttl: '1h' } : { type: 'ephemeral' };
+  //
+  // `adaptiveThinking` is a DECLARED channel and a declaration is the authority; the model-id
+  // regex is only the fallback. Before this, the field was declared and folded into
+  // plan.enabled but never consulted here, so the wire came from id-guessing alone:
+  //   - declared true  → adaptive even on an id the regex predates (forward compatible)
+  //   - declared false → never adaptive, even if the id matches (fail closed on a wrong guess)
+  //   - undeclared     → id fallback, preserving prior behaviour exactly
+  const adaptive =
+    (opts.capabilities?.adaptiveThinking ?? supportsAdaptiveThinking(model)) && !fastEnabled;
+  // Extended cache (1h TTL) is a premium channel: it is billed differently, so it is fail-closed
+  // against the declaration the same way fast mode is. Gating only the beta header in send() was
+  // not enough -- the body carries the ttl independently, so withholding the header while still
+  // asking for a 1h TTL requests a path the endpoint never claimed. Undeclared keeps prior
+  // behaviour.
+  const cacheDeclared = !declaredAny || opts.capabilities?.extendedCache === true;
+  // `promptCache` gates whether breakpoints are emitted AT ALL. It was declared and folded into
+  // plan.enabled, then ignored here, so an endpoint that explicitly declared `promptCache: false`
+  // still received cache_control markers. Undeclared (and declared-true) keep prior behaviour;
+  // only an explicit `false` suppresses the markers, so nothing working can regress.
+  const cachingEnabled = opts.capabilities?.promptCache !== false;
+  const cacheControl =
+    req.cacheTtl === '1h' && cacheDeclared
+      ? { type: 'ephemeral' as const, ttl: '1h' as const }
+      : { type: 'ephemeral' as const };
   // Rolling prompt-cache breakpoint on the conversation: tag the last block of the
   // last message so the whole prefix is cached and the NEXT turn reads it back.
   // Anthropic allows up to 4 cache_control breakpoints — we use system + last tool
@@ -322,7 +391,7 @@ export function buildAnthropicBody(
   // was re-billed in full every turn; this is the big multi-turn latency/cost win.
   const messages = toAnthropicMessages(req.messages, model);
   const lastMsg = messages[messages.length - 1];
-  if (lastMsg && lastMsg.content.length > 0) {
+  if (cachingEnabled && lastMsg && lastMsg.content.length > 0) {
     (lastMsg.content[lastMsg.content.length - 1] as Record<string, unknown>).cache_control = cacheControl;
   }
   const body: Record<string, unknown> = {
@@ -340,14 +409,29 @@ export function buildAnthropicBody(
   // automatic under adaptive mode.
   if (adaptive) {
     body.thinking = { type: 'adaptive', display: 'summarized' };
-    body.output_config = { effort: req.effort ?? 'high' };
+    // Ultra mode: send the strongest depth this endpoint DECLARES it accepts, never a value its
+    // author never claimed this model takes. Three cases, and the third is the one that was wrong.
+    //   - No declaration  → today's behaviour, unchanged. Nothing working may regress.
+    //   - Declared scale  → clamped to that scale, so a tier the catalog omits is never sent.
+    //   - Declared, no scale → the endpoint is asserting it takes no effort param; omit it rather
+    //     than guess a value. (Before this, every adaptive model got whatever /effort was set to.)
+    const plan = planUltra({ effort: req.effort ?? 'high' }, opts.capabilities);
+    const declaresScale = (opts.capabilities?.effortScale?.length ?? 0) > 0;
+    if (plan.unverified || declaresScale) {
+      body.output_config = { effort: plan.effort };
+    }
   }
   // Fast mode (premium low-latency): a top-level speed param + the beta header (see send()).
-  if (req.fastMode) body.speed = 'fast';
+  // Same fail-closed decision as `adaptive` above — one resolution, two consumers.
+  if (fastEnabled) body.speed = 'fast';
 
   // System as a cacheable text block (prompt caching is GA; no beta header).
   if (req.system && req.system.trim()) {
-    body.system = [{ type: 'text', text: req.system, cache_control: cacheControl }];
+    body.system = [
+      cachingEnabled
+        ? { type: 'text', text: req.system, cache_control: cacheControl }
+        : { type: 'text', text: req.system },
+    ];
   }
 
   if (req.tools.length > 0) {
@@ -358,7 +442,7 @@ export function buildAnthropicBody(
         input_schema: t.parameters,
       };
       // cache_control on the LAST tool only — caches the whole tool block prefix.
-      if (i === req.tools.length - 1) tool.cache_control = cacheControl;
+      if (cachingEnabled && i === req.tools.length - 1) tool.cache_control = cacheControl;
       return tool;
     });
   }
@@ -577,7 +661,7 @@ export async function* parseAnthropicSSE(lines: AsyncIterable<string>): AsyncIte
   }
 }
 
-function mapAnthropicStop(reason: string): StopReason {
+export function mapAnthropicStop(reason: string): StopReason {
   switch (reason) {
     case 'tool_use':
       return 'tool_use';
@@ -588,8 +672,13 @@ function mapAnthropicStop(reason: string): StopReason {
       return 'pause_turn';
     case 'end_turn':
     case 'stop_sequence':
-    case 'refusal':
     default:
       return 'end_turn';
+    case 'refusal':
+      // A refusal is NOT a normal end of turn and must not be reported as one. Collapsed into
+      // `end_turn`, it reads to the loop as "the model finished" — so the turn looks complete,
+      // the empty answer goes to the user with no explanation, and nothing records that the
+      // endpoint declined. Keeping it distinct lets the loop say what happened.
+      return 'refusal';
   }
 }

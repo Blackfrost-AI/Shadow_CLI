@@ -1,9 +1,20 @@
 import type { EventBus } from './events.js';
 import type { Context } from './context.js';
 
-/** Text form of a background sub-agent's completion, as the model sees it. */
-export function formatTaskNotification(e: { taskId?: string; fromSubagent?: string; answer?: string }): string {
-  return `<task-notification task_id="${e.taskId}"${e.fromSubagent ? ` subagent="${e.fromSubagent}"` : ''}>\n${e.answer || ''}\n</task-notification>`;
+/**
+ * Text form of a background sub-agent's completion, as the model sees it. The header carries
+ * the lifecycle status and stop reason so a parent can never mistake a ceiling-truncated
+ * (partial) or failed run for a finished one from the body alone.
+ */
+export function formatTaskNotification(e: { taskId?: string; fromSubagent?: string; answer?: string; status?: string; stopReason?: string }): string {
+  const escaped = (value: string): string =>
+    value.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const attr = (key: string, value?: string): string =>
+    value ? ` ${key}="${escaped(value.replace(/[\x00-\x1f\x7f-\x9f]/g, ''))}"` : '';
+  // A sub-agent answer is model-authored. Keep ordinary Markdown/HTML intact, but neutralize this
+  // envelope's own tag so the body cannot close it early and forge a second "completed" header.
+  const answer = (e.answer || '').replace(/<\/?task-notification\b/gi, (tag) => `&lt;${tag.slice(1)}`);
+  return `<task-notification${attr('task_id', e.taskId)}${attr('subagent', e.fromSubagent)}${attr('status', e.status)}${attr('stop_reason', e.stopReason)}>\n${answer}\n</task-notification>`;
 }
 
 /**

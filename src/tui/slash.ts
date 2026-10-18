@@ -1050,20 +1050,30 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
             pushLine({ text: 'Context compacted — earlier turns summarized.', color: C.cyan });
           } else if (did === 'truncated') {
             sessionLogRef.current.record({ kind: 'compaction_degraded', mode: 'truncated', source: 'manual' });
+            const reason = context.takeFailureReason();
             pushLine({
               text:
-                'Summarizer unavailable — context reclaimed by dropping the oldest tool results ' +
+                `Summarizer unavailable${reason ? ` (${reason})` : ''} — context reclaimed by dropping the oldest tool results ` +
                 '(re-read any file you still need).',
               color: C.yellow,
             });
-          } else if (did === 'failed') {
-            sessionLogRef.current.record({ kind: 'compaction_degraded', mode: 'failed', source: 'manual' });
-            pushLine({
-              text:
-                'Compaction failed — summarizer unavailable and nothing left to reclaim. ' +
-                'Try /clear, or /model to a larger window.',
-              color: C.red,
-            });
+          } else if (did === 'failed' || did === 'failed-short-history') {
+            sessionLogRef.current.record({ kind: 'compaction_degraded', mode: did, source: 'manual' });
+            if (did === 'failed-short-history') {
+              // No model call happened; the remedy is a smaller active turn, not a different model.
+              pushLine({
+                text:
+                  'Nothing to summarize — every message is pinned or part of the turn being answered. ' +
+                  'Finish or /clear this turn first.',
+                color: C.yellow,
+              });
+            } else {
+              const reason = context.takeFailureReason();
+              pushLine({
+                text: `Compaction failed${reason ? ` — ${reason}` : ''}. Nothing left to reclaim. Try /clear.`,
+                color: C.red,
+              });
+            }
           } else {
             pushLine({ text: 'Nothing to compact yet.', dimColor: true });
           }

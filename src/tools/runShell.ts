@@ -32,17 +32,238 @@ function killTree(child: ChildProcess, signal: NodeJS.Signals): void {
   }
 }
 
+/** Commands that run their argument as another (usually root) user. */
+const PRIVILEGE_CMDS = new Set(['sudo', 'doas', 'pkexec', 'run0']);
 /**
- * Reason a command may escape ESC/Ctrl-C and need a MANUAL kill, or null. `sudo`/`doas`
- * run as root (a non-root Shadow can't signal them); `setsid`/`nohup`/`disown`/trailing `&`
- * detach into a new session/background (out of the killed process group).
+ /** Words that keep the NEXT word in command position (precommand modifiers + shell keywords). */
+ const COMMAND_PREFIXES = new Set([
+   'time', 'exec', 'command', 'builtin', 'env', 'nice', 'nohup', 'setsid', 'xargs', 'stdbuf',
+   'timeout', 'if', 'then', 'elif', 'else', 'while', 'until', 'do', '!', '{',
+ ]);
+ /** Shells that execute their `-c` argument as a script. */
+ const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh', 'mksh', 'ash', 'fish', 'busybox']);
+
+interface ShellScan {
+  /** Every simple command found, as its unquoted words (quotes removed, escapes resolved). */
+  commands: string[][];
+  /** True when the top-level command list ends with a lone `&` (job backgrounded). */
+  trailingAmp: boolean;
+}
+
+/**
+ * Minimal quote-aware POSIX shell lexer — only what is needed to find COMMAND-POSITION words.
+ * Text inside '…', "…" and heredoc bodies is data, never a command; `$(…)` and backticks
+ * (including inside double quotes) open a nested command context. Not a full parser: on
+ * malformed input (unterminated quotes) it flushes what it has, which can only under-report.
  */
-export function uninterruptibleReason(cmd: string): string | null {
-  if (/(^|[\s;&|(])(sudo|doas)\s/.test(cmd)) return 'runs as root — Shadow cannot signal a root process';
-  if (/(^|[\s;&|(])setsid\b/.test(cmd)) return 'detaches into a new session (setsid)';
-  if (/(^|[\s;&|(])nohup\b/.test(cmd)) return 'detaches (nohup)';
-  if (/(^|[\s;])disown\b/.test(cmd)) return 'detaches (disown)';
-  if (/&\s*$/.test(cmd.trim())) return 'backgrounded with & — may outlive the turn';
+function scanShell(cmd: string): ShellScan {
+  type Code = { kind: 'top' | 'subst' | 'bt'; words: string[]; cur: string; has: boolean; depth: number };
+  type Frame = Code | { kind: 'dq' };
+  const commands: string[][] = [];
+  const stack: Frame[] = [{ kind: 'top', words: [], cur: '', has: false, depth: 0 }];
+  let trailingAmp = false;
+  const heredocs: { delim: string; strip: boolean }[] = [];
+
+  const code = (): Code => {
+    for (let k = stack.length - 1; k >= 0; k--) {
+      const f = stack[k]!;
+      if (f.kind !== 'dq') return f;
+    }
+    return stack[0] as Code;
+  };
+  const endWord = (c: Code): void => {
+    if (c.has) c.words.push(c.cur);
+    c.cur = '';
+    c.has = false;
+  };
+  const endCommand = (c: Code): void => {
+    endWord(c);
+    if (c.words.length) commands.push(c.words);
+    c.words = [];
+  };
+  const append = (c: Code, s: string): void => {
+    c.cur += s;
+    c.has = true;
+    if (c.kind === 'top') trailingAmp = false;
+  };
+
+  let i = 0;
+  const n = cmd.length;
+  while (i < n) {
+    const ch = cmd[i]!;
+    const nx = cmd[i + 1];
+    const top = stack[stack.length - 1]!;
+
+    if (top.kind === 'dq') {
+      const c = code();
+      if (ch === '\\' && i + 1 < n) { append(c, nx!); i += 2; continue; }
+      if (ch === '"') { stack.pop(); c.has = true; i++; continue; }
+      if (ch === '$' && nx === '(') { stack.push({ kind: 'subst', words: [], cur: '', has: false, depth: 0 }); i += 2; continue; }
+      if (ch === '`') { stack.push({ kind: 'bt', words: [], cur: '', has: false, depth: 0 }); i++; continue; }
+      append(c, ch);
+      i++;
+      continue;
+    }
+
+    const c = top;
+    if (ch === '\\') {
+      if (nx === '\n') { i += 2; continue; } // line continuation
+      if (i + 1 < n) append(c, nx!);
+      i += 2;
+      continue;
+    }
+    if (ch === "'") {
+      const close = cmd.indexOf("'", i + 1);
+      const end = close === -1 ? n : close;
+      append(c, cmd.slice(i + 1, end));
+      i = end + 1;
+      continue;
+    }
+    if (ch === '"') { c.has = true; if (c.kind === 'top') trailingAmp = false; stack.push({ kind: 'dq' }); i++; continue; }
+    if (ch === '$' && nx === '(') {
+      if (c.kind === 'top') trailingAmp = false;
+      stack.push({ kind: 'subst', words: [], cur: '', has: false, depth: 0 });
+      i += 2;
+      continue;
+    }
+    if (ch === '`') {
+      if (c.kind === 'bt') { endCommand(c); stack.pop(); code().has = true; i++; continue; }
+      if (c.kind === 'top') trailingAmp = false;
+      stack.push({ kind: 'bt', words: [], cur: '', has: false, depth: 0 });
+      i++;
+      continue;
+    }
+    if (ch === ')') {
+      if (c.kind === 'subst' && c.depth === 0) { endCommand(c); stack.pop(); code().has = true; i++; continue; }
+      if (c.depth > 0) c.depth--;
+      endCommand(c);
+      i++;
+      continue;
+    }
+    if (ch === '(') { c.depth++; endCommand(c); if (c.kind === 'top') trailingAmp = false; i++; continue; }
+    if (ch === '#' && !c.has) {
+      while (i < n && cmd[i] !== '\n') i++;
+      continue;
+    }
+    if (ch === ' ' || ch === '\t') { endWord(c); i++; continue; }
+    if (ch === '<' && nx === '<' && cmd[i + 2] !== '<') {
+      // Heredoc: capture the delimiter; its body (after the next newline) is data.
+      let j = i + 2;
+      let strip = false;
+      if (cmd[j] === '-') { strip = true; j++; }
+      while (cmd[j] === ' ' || cmd[j] === '\t') j++;
+      let delim = '';
+      while (j < n && !/[\s;&|<>()]/.test(cmd[j]!)) {
+        const d = cmd[j]!;
+        if (d !== '"' && d !== "'" && d !== '\\') delim += d;
+        j++;
+      }
+      if (delim) heredocs.push({ delim, strip });
+      endWord(c);
+      i = j;
+      continue;
+    }
+    if (ch === '&') {
+      const prev = cmd[i - 1];
+      if (prev === '>' || prev === '<' || nx === '>') { append(c, ch); i++; continue; } // 2>&1, &>file
+      if (nx === '&') { endCommand(c); if (c.kind === 'top') trailingAmp = false; i += 2; continue; }
+      endCommand(c);
+      if (c.kind === 'top') trailingAmp = true;
+      i++;
+      continue;
+    }
+    if (ch === ';' || ch === '|' || ch === '\n') {
+      endCommand(c);
+      if (c.kind === 'top' && ch !== '\n') trailingAmp = false;
+      i++;
+      if (ch === '\n' && heredocs.length) {
+        // Skip each pending heredoc body up to and including its delimiter line.
+        while (heredocs.length && i < n) {
+          const { delim, strip } = heredocs[0]!;
+          const eol = cmd.indexOf('\n', i);
+          const lineEnd = eol === -1 ? n : eol;
+          const line = cmd.slice(i, lineEnd);
+          i = lineEnd + 1;
+          if ((strip ? line.replace(/^\t+/, '') : line) === delim) heredocs.shift();
+        }
+        heredocs.length = 0;
+      }
+      continue;
+    }
+    append(c, ch);
+    i++;
+  }
+  // Flush any unterminated nested contexts, innermost first.
+  for (let k = stack.length - 1; k >= 0; k--) {
+    const f = stack[k]!;
+    if (f.kind !== 'dq') endCommand(f);
+  }
+  return { commands, trailingAmp };
+}
+
+/** Command-position words of one simple command: assignments + prefix opts skipped. */
+function commandChain(words: string[]): string[] {
+  const chain: string[] = [];
+  let expectCommand = true;
+  for (const w of words) {
+    if (!expectCommand) break;
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(w)) continue; // FOO=bar cmd
+    // Options, option values and durations consumed by a prefix (nice -n 10, timeout 5s).
+    if (chain.length && (/^-/.test(w) || /^\d+(\.\d+)?[smhd]?$/.test(w))) continue;
+    const base = w.includes('/') ? w.slice(w.lastIndexOf('/') + 1) : w;
+    chain.push(base);
+    expectCommand = COMMAND_PREFIXES.has(base);
+  }
+  return chain;
+}
+
+/**
+ * Every command chain in `cmd`, including scripts handed to `sh -c`/`bash -lc`/`eval`, which run
+ * as children of the spawned shell. Depth-bounded so a pathological quote nest cannot recurse away.
+ */
+function allChains(cmd: string, depth = 0): string[][] {
+  const out: string[][] = [];
+  for (const words of scanShell(cmd).commands) {
+    const chain = commandChain(words);
+    out.push(chain);
+    const head = chain[0];
+    if (!head || depth >= 4) continue;
+    let script: string | undefined;
+    if (head === 'eval') script = words.slice(1).join(' ');
+    else if (SHELLS.has(head)) {
+      const at = words.findIndex((w) => /^-[A-Za-z]*c[A-Za-z]*$/.test(w));
+      if (at >= 0) script = words[at + 1];
+    }
+    if (script) out.push(...allChains(script, depth + 1));
+  }
+  return out;
+}
+
+/** True when `cmd` actually EXECUTES sudo/doas/pkexec/run0 (not merely mentions the word). */
+export function invokesPrivilegeEscalation(cmd: string): boolean {
+  return allChains(cmd).some((ch) => ch.some((w) => PRIVILEGE_CMDS.has(w)));
+}
+
+/**
+ * Reason a command may escape ESC/Ctrl-C and need a MANUAL kill, or null. A command that
+ * EXECUTES `sudo`/`doas` runs as another user (a non-root Shadow can't signal it);
+ * `setsid`/`nohup`/`disown`/trailing `&` detach into a new session/background (out of the
+ * killed process group). Only command-position words count — `git commit -m "fix sudo"`,
+ * `grep -r "nohup " .`, or a heredoc body mentioning sudo are NOT flagged. When Shadow itself
+ * runs as root it can signal root children, so the privilege warning is suppressed.
+ */
+export function uninterruptibleReason(
+  cmd: string,
+  opts: { shadowIsRoot?: boolean } = {},
+): string | null {
+  const shadowIsRoot = opts.shadowIsRoot ?? (typeof process.getuid === 'function' && process.getuid() === 0);
+  const chains = allChains(cmd);
+  const any = (pred: (w: string) => boolean): boolean => chains.some((ch) => ch.some(pred));
+  if (!shadowIsRoot && any((w) => PRIVILEGE_CMDS.has(w))) return 'runs as root — Shadow cannot signal a root process';
+  if (any((w) => w === 'setsid')) return 'detaches into a new session (setsid)';
+  if (any((w) => w === 'nohup')) return 'detaches (nohup)';
+  if (chains.some((ch) => ch[0] === 'disown')) return 'detaches (disown)';
+  if (scanShell(cmd).trailingAmp) return 'backgrounded with & — may outlive the turn';
   return null;
 }
 
@@ -246,7 +467,7 @@ export function makeRunShell(
           const warn = uninterruptibleReason(input.command);
           ctx.onShellStart?.({ pid: child.pid, warn });
           if (warn) {
-            const killCmd = /(^|[\s;&|(])(sudo|doas)\s/.test(input.command) ? `sudo kill ${child.pid}` : `kill ${child.pid}`;
+            const killCmd = invokesPrivilegeEscalation(input.command) ? `sudo kill ${child.pid}` : `kill ${child.pid}`;
             const note = `⚠ shell pid ${child.pid}: ${warn}. ESC may not stop it — kill with: ${killCmd}`;
             ctx.log(note);
             if (ctx.streamShell && ctx.onShellOutput) ctx.onShellOutput(`${note}\n`, 'stderr');

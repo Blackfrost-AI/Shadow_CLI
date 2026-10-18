@@ -6,7 +6,7 @@
 
 > **A true gift of freedom and privacy.**
 > Zero-telemetry · provider-neutral · phone home to no one.
-> Current build: **`v10.1.0`** — local workflows, verified checks, context controls, session search, and tmux integration in the full-width retro terminal.
+> Current build: **`v10.2.0`** — local workflows, verified checks, context controls, session search, and tmux integration in the full-width retro terminal.
 
 **Shadow is a zero-telemetry, provider-neutral security engineering agent that runs on your terms.** Point it at any model — Anthropic, any OpenAI-compatible endpoint, Gemini, or a local model on your own box. Its built-in Security foundation covers investigation, hardening, incident response, defensive automation, secure coding, and supporting systems work. **No Shadow account, no signup, no phone-home:** network access follows your provider, tool and update choices. Your config stays local and readable (`~/.shadow/config.json`), credentials are sent to their configured services, and you can switch models mid-session **without losing context**.
 
@@ -16,7 +16,15 @@ Under the hood it's a **tool-calling agentic runtime**: the model reasons, emits
 
 This is **not a chat app** — it is a tool-calling runtime.
 
-## What's new in v10.1.0
+## What's new in v10.2.0
+
+- **Security toolkit is now discoverable:** `tool_search` matches intent aliases as well as tool names, so `malware`, `ransomware`, `shellcode`, `c2`, `ioc`, `reverse`, `pentest`, `redteam`, `vuln`, `sarif`, `drift` and `triage` all resolve to the right tool. Previously five working tools were reachable only by already knowing their exact names.
+- **Security engagement policy:** `prompts/policies/security-engagement.md` documents when to reach for each security tool, and the verification rules that are not optional.
+- **Six security eval tasks:** scoring on workspace state and tool telemetry, covering Mach-O triage, fail-closed patching, a correct patch landing, F3EAD engagement persistence, the findings ledger, and integrity baselines.
+- **Honoured capability declarations:** `adaptiveThinking` and `promptCache` are now read by the Anthropic adapter — a declaration is the authority and the model-id regex is the fallback.
+- **Hardened release gate:** `typecheck:all` and `lint` now run as part of the gate, so a release can no longer go green with a type error in `test/` or `eval/`.
+
+## Previous highlights: v10.1.0
 
 - **Workflows and checks:** run typed local workflows, preview their inputs, and verify work with reusable project checks and bounded completion corrections.
 - **Context controls:** inspect the captured request, pin files across compaction and resume, and exclude exact managed sources from future context.

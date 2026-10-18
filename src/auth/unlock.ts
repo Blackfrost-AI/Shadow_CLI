@@ -89,7 +89,7 @@ async function promptLine(question: string): Promise<string> {
 
 /** Install the decrypted secrets + remember the key for the session. The vault stores the same
  *  provider→{apiKey,…} shape the credential store reads (plus a `kind` tag it ignores). */
-function installUnlocked(data: VaultData, key: Buffer): void {
+export function installUnlocked(data: VaultData, key: Buffer): void {
   setUnlockedVault(data as unknown as Record<string, CredentialEntry>);
   sessionKey = key;
   // Make saveCredential durable: without this a rotation lives only in memory and is lost

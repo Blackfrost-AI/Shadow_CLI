@@ -19,7 +19,8 @@ const {
   persistWebOnboardTarget,
   webOnboardCredentialRef,
 } = await import('../src/onboard/webOnboard.js');
-const { GLOBAL_DIR, loadGlobalConfig } = await import('../src/state/globalStore.js');
+const { GLOBAL_DIR, loadGlobalConfig, vaultUnlocked, getCredential } =
+  await import('../src/state/globalStore.js');
 const { unlockWithPassword } = await import('../src/auth/vault.js');
 assertStoreIsolated(GLOBAL_DIR, home);
 test.after(() => rmSync(home, { recursive: true, force: true }));
@@ -92,7 +93,7 @@ test('onboarding page embeds the one-time token and the form fields', () => {
     assert.ok(html.includes(id), `has ${id}`);
   }
   assert.match(html, /Is this endpoint self-hosted\?/);
-  assert.match(html, /For ChatGPT or Claude subscriptions, run <code>shadow onboard<\/code>/);
+  assert.match(html, /<code>shadow onboard --terminal<\/code>/);
   assert.match(html, /Subscription account/);
   assert.ok(
     html.includes("fetch('/activity'"),
@@ -134,6 +135,57 @@ test('onboarding page loads NO external resources (CSP/offline safe — a key ca
   assert.doesNotMatch(html, /fetch\(\s*["']https?:/i, 'never fetches an external URL');
 });
 
+test('browser cancellation and terminal handoff require authentication and close the server', async () => {
+  for (const path of ['/cancel', '/terminal']) {
+    const wizard = await startWizard({ terminalAvailable: true });
+    try {
+      assert.equal((await wizard.post(path, { token: 'wrong' })).status, 403);
+      assert.equal((await wizard.post(path)).status, 200);
+      const result = await wizard.done;
+      assert.equal(result.ok, false);
+      assert.equal(result.terminal, path === '/terminal');
+    } finally {
+      await wizard.close();
+    }
+  }
+});
+
+test('a headless browser session refuses terminal handoff without discarding the form', async () => {
+  const wizard = await startWizard({ terminalAvailable: false });
+  try {
+    assert.equal((await wizard.post('/terminal')).status, 400);
+    assert.equal((await wizard.post('/activity')).status, 200);
+  } finally {
+    await wizard.close();
+  }
+});
+
+test('--no-open prints a working URL without invoking the browser launcher', async () => {
+  const controller = new AbortController();
+  let ready!: (url: string) => void;
+  const opened = new Promise<string>((resolve) => {
+    ready = resolve;
+  });
+  const done = runWebOnboard(
+    (text) => {
+      const url = /http:\/\/127\.0\.0\.1:\d+\/\?t=[\w-]+/.exec(text)?.[0];
+      if (url) ready(url);
+    },
+    {
+      signal: controller.signal,
+      launchBrowser: false,
+      hasVault: () => false,
+      openBrowser: () => assert.fail('browser must not launch'),
+    },
+  );
+  try {
+    assert.equal((await fetch(await opened)).status, 200);
+  } finally {
+    controller.abort();
+    await done;
+  }
+});
+
 test('the live form retains key and exact model after validation and transport errors', async () => {
   const html = page('test-token');
   const { document, window } = parseHTML(html);
@@ -147,7 +199,7 @@ test('the live form retains key and exact model after validation and transport e
   }
   let networkError = false;
   const sent: Array<Record<string, unknown>> = [];
-  runInNewContext(document.querySelector('script')!.textContent!, {
+  runInNewContext(document.querySelector('script')!.textContent! + '\nshowStep(2);', {
     document,
     fetch: async (path: string, init: RequestInit) => {
       if (path === '/save') {
@@ -524,5 +576,11 @@ test('endpoint-specific vault slots and model entries preserve other provider co
     assert.equal(data[ref].apiKey, `endpoint-key-${index}`);
     assert.equal(data[ref].baseUrl, baseUrl);
     assert.equal(models.find((entry) => entry.baseUrl === baseUrl)?.credRef, ref);
+    assert.equal(
+      getCredential(ref)?.apiKey,
+      `endpoint-key-${index}`,
+      'first-run session can use the saved key without restarting or a second password prompt',
+    );
   }
+  assert.equal(vaultUnlocked(), true);
 });

@@ -319,7 +319,9 @@ test('an exhausted parent yields a zero ceiling — the sub-agent stops BEFORE a
     const ctx: ToolContext = { workspaceRoot: ws, signal: new AbortController().signal, log: () => {}, dryRun: false, parentBudget };
     const res = await tool.run({ prompt: 'work' }, ctx);
 
-    assert.ok(res.ok, 'a budget-stopped sub-agent still returns a clean tool result');
+    assert.equal(res.ok, false, 'a budget-stopped sub-agent is incomplete, never ok');
+    assert.equal(res.error?.code, 'agent_partial');
+    assert.equal(res.error?.recoverable, true, 'incomplete, but an ordinary recoverable result');
     assert.match(res.summary, /budget/, 'the summary must say the sub-agent hit its ceiling');
     assert.ok(!res.summary.includes('should never run'), 'the provider must NOT have been called');
     assert.equal(parentBudget.accruedSubagentCostUSD, 0, 'zero spend accrues');
@@ -389,7 +391,8 @@ test('a sub-agent inherits the parent REMAINING cost ceiling, then its accrual t
     const ctx: ToolContext = { workspaceRoot: ws, signal: new AbortController().signal, log: () => {}, dryRun: false, parentBudget };
     const res = await tool.run({ prompt: 'burn' }, ctx);
 
-    assert.ok(res.ok);
+    assert.equal(res.ok, false, 'ceiling-stopped work is not ok');
+    assert.equal(res.error?.code, 'agent_partial');
     assert.match(res.summary, /budget/, 'the sub-agent reports it hit its (inherited) ceiling');
     // Two calls spent (30/1e6) before the check tripped — slightly past the inherited 20/1e6,
     // which is expected: the ceiling is enforced BETWEEN provider calls.

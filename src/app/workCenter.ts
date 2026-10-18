@@ -12,7 +12,17 @@ import type { TodoItem } from '../agent/todo.js';
 import type { EventBus, LoopEvent } from '../agent/events.js';
 import { redactString } from '../util/redact.js';
 
-export type WorkItemType = 'subagent' | 'bgshell' | 'plan' | 'connector';
+export type WorkItemType = 'subagent' | 'bgshell' | 'watcher' | 'plan' | 'connector';
+
+/** Minimal shape of a durable watcher record, kept structural to avoid a runtime dependency. */
+export interface WatcherView {
+  name: string;
+  command: string;
+  intervalSec: number;
+  startedAt: number;
+  logPath: string;
+  status: 'running' | 'stopped' | 'failed';
+}
 
 export type WorkItemStatus = 'queued' | 'running' | 'waiting' | 'paused' | 'partial' | 'interrupted' | 'completed' | 'failed' | 'cancelled';
 
@@ -99,6 +109,9 @@ export class WorkCenter {
   constructor(activityLimit?: number) {
     this.activityLimit = activityLimit ?? getActivityLimit();
   }
+
+  /** Injected durable watcher source; see attachWatchers. */
+  private watcherSource?: { list(): WatcherView[] };
 
   /** Subscribe to event bus lifecycle events to track work items */
   subscribe(bus: EventBus): void {
@@ -454,6 +467,49 @@ export class WorkCenter {
     }
   }
 
+  /**
+   * Attach the detached watcher registry. Watchers are NOT mirrored into the in-memory item map:
+   * they are the one work type whose authoritative state lives on disk, because a watcher can
+   * outlive both this process and the turn that created it. Projecting them at read time means the
+   * overlay reports what is genuinely running — including watchers armed by an earlier session —
+   * instead of only what this process happened to see.
+   */
+  attachWatchers(registry: { list(): WatcherView[] }): void {
+    this.watcherSource = registry;
+  }
+
+  /** Project durable watcher records into WorkItems. Read-only: never mutates the registry. */
+  private projectWatchers(): WorkItem[] {
+    if (!this.watcherSource) return [];
+    let records: WatcherView[];
+    try {
+      records = this.watcherSource.list();
+    } catch {
+      // A watcher registry that cannot be read must not break the whole work list.
+      return [];
+    }
+    return records.map((w) => {
+      const running = w.status === 'running';
+      // A record for a watcher nobody asked for in this session still shows up: that visibility is
+      // the entire reason the registry is durable. Elapsed time is the useful "activity" signal,
+      // since the loop itself is silent between ticks.
+      return {
+        id: w.name,
+        type: 'watcher' as const,
+        status: running ? ('running' as const) : w.status === 'failed' ? ('failed' as const) : ('completed' as const),
+        description: `${w.command} · every ${w.intervalSec}s (detached)`,
+        depth: 0,
+        startedAt: w.startedAt,
+        lastActivityAt: Date.now(),
+        currentActivity: running ? 'waiting for next tick' : undefined,
+        exitReason: running ? undefined : w.status === 'failed' ? 'failed to start' : 'process exited',
+        endedAt: running ? undefined : w.startedAt,
+        activities: [],
+        files: [w.logPath],
+      };
+    });
+  }
+
   /** Sync planning items from TodoList (called when todo updates) */
   /** Attach worker evidence to explicitly linked checklist items without completing the plan. */
   private projectJobEvidence(worker: WorkItem, only?: WorkItem): void {
@@ -529,12 +585,14 @@ export class WorkCenter {
 
   /** Get a single work item by ID */
   get(id: string): WorkItem | undefined {
-    return this.items.get(id);
+    return this.items.get(id) ?? this.projectWatchers().find((w) => w.id === id);
   }
 
   /** List all work items (optionally filtered) */
   list(filters?: WorkCenterFilters): WorkItem[] {
-    let results = Array.from(this.items.values());
+    // Watchers come from durable state, so they are appended at read time rather than tracked in
+    // the in-memory map. They survive a restart while every other item type does not.
+    let results = [...Array.from(this.items.values()), ...this.projectWatchers()];
 
     if (filters?.type) {
       const types = Array.isArray(filters.type) ? filters.type : [filters.type];

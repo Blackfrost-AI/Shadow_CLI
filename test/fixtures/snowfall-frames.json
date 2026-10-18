@@ -4,8 +4,6 @@
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                             ",
       "────────────────────────────────────────────────────────────────────────────────",
       "",
-      "◇ Finish the Snowfall build, then show me the result.                           ",
-      "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and",
@@ -36,15 +34,16 @@
       "▸                                                                               ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "0b45042418ecc31d35bdbaac9401392009fa8ef061c408d5a6f65f860a0ef679"
+    "attributes": "c995949d63d38ad7ee9776927ecc6994b1890328bca483f99e45e28a01bb460b"
   },
   "snowfall/120": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
       "◇ Finish the Snowfall build, then show me the result.                                                                   ",
       "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
@@ -72,20 +71,20 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "a036fb465eb4c56079327d96107dce4d3fbd615540207087e7539d52c7adf911"
+    "attributes": "524c8e734b3746c61914b1f5486dc3bd1c8501f7f5ed813ee908629ccc320f5a"
   },
   "snowfall/200": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                                                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
       "◇ Finish the Snowfall build, then show me the result.                                                                                                                                                   ",
       "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
@@ -113,22 +112,21 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "5b502fdb66b300b4ad398c3dfeff8780ad6d624976707ada51de2a7bfc7481d1"
+    "attributes": "3eda6ff825bb783de809557e4ad1c5e65990b8fdc513c40e8a7a922c2b6aedc7"
   },
   "og/80": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                             ",
       "────────────────────────────────────────────────────────────────────────────────",
       "",
-      "◇ Finish the Snowfall build, then show me the result.                           ",
-      "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and",
@@ -159,15 +157,16 @@
       "▸                                                                               ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "ada62f862abb5f6f5704edced05f562977fc626049e0ee0e37053857b71fdb5d"
+    "attributes": "4d4ed8fd8426428b4ceb12abed78e66084720176288253bcbabe9861366a5cdc"
   },
   "og/120": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
       "◇ Finish the Snowfall build, then show me the result.                                                                   ",
       "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
@@ -195,20 +194,20 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "042e7e5038161013c9a01cb7553ef3f61d950103ca47e4de57b4e9ce6a5e1030"
+    "attributes": "eedf85471f02ae44f5b160737fb9a8f8dafb1f0477863d73dc8f466eae1758fe"
   },
   "og/200": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                                                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
       "◇ Finish the Snowfall build, then show me the result.                                                                                                                                                   ",
       "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
@@ -236,22 +235,21 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "e4660ec915e26a5e6d1f7ddfd782a16ef9f84d95082630d696a6fa8765a9e9e2"
+    "attributes": "573e0f27f7da96e3f00613a7f165c724181526bfc70244cabed6d759803bc93a"
   },
   "shadow/80": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                             ",
       "────────────────────────────────────────────────────────────────────────────────",
       "",
-      "◇ Finish the Snowfall build, then show me the result.                           ",
-      "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and",
@@ -282,15 +280,16 @@
       "▸                                                                               ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "59ab9db3880c45aa51f2349077ad60c84b0b6e6ee6f5bde24f84667bc76ab54b"
+    "attributes": "7a8421ae76dc446447d249265a1ca70e4a919e3e43b3ba0b59dc7f15b2ebb7f6"
   },
   "shadow/120": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
       "◇ Finish the Snowfall build, then show me the result.                                                                   ",
       "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
@@ -318,20 +317,20 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "a48e1aa61570dd8383ea01f12c5a3dd5cca95635d86c55a93f7d74ae0fbdc271"
+    "attributes": "e4f9c78cbf086d985c4eabbe5ffb62e47c629427b6c7c3cb06873afc5c9d9f8a"
   },
   "shadow/200": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                                                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
       "◇ Finish the Snowfall build, then show me the result.                                                                                                                                                   ",
       "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
@@ -359,22 +358,21 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "492522cad04acf379756b688763d1c447b2c9998ae208f441388ac6a20062e38"
+    "attributes": "1837825eb72bbec905c0399e7401c7b944c95ed1f78467fe0988501f694d9779"
   },
   "pipboy/80": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                             ",
       "────────────────────────────────────────────────────────────────────────────────",
       "",
-      "◇ Finish the Snowfall build, then show me the result.                           ",
-      "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and",
@@ -405,15 +403,16 @@
       "▸                                                                               ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "9719e64adff3f23229276f4ee9fee3443acb3b1dc5c4a329e01525ea5d5b0f13"
+    "attributes": "7fb822a3473e3c086ebb77d3c4091f6e58ecf81c8e0dd51a598196f4865b2971"
   },
   "pipboy/120": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
       "◇ Finish the Snowfall build, then show me the result.                                                                   ",
       "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
@@ -441,20 +440,20 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "104901cfa93e2593351bfd1ad330409d5c1da83614aaeea072855aa41e74c6fc"
+    "attributes": "3a05fa347fd714e3b06b8c60d09e6035c5e39895d533f4f2dd2a57a4c1b661b8"
   },
   "pipboy/200": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                                                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
       "◇ Finish the Snowfall build, then show me the result.                                                                                                                                                   ",
       "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
@@ -482,22 +481,21 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "02a47e2a3459d89bc7d211bbe823d574e6238c16340907ab576d4c4e25dd0aa4"
+    "attributes": "c7883aaa59f3ae7c5f4a41559e0d70599e265ea7842748466b547890711ddff0"
   },
   "cyberpunk/80": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                             ",
       "────────────────────────────────────────────────────────────────────────────────",
       "",
-      "◇ Finish the Snowfall build, then show me the result.                           ",
-      "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and",
@@ -528,15 +526,16 @@
       "▸                                                                               ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "2dd20145fade81726ac518bf12bf04248afcb6707e3204abe9b552d93c25c3ba"
+    "attributes": "4512f8cfa4b80487a95257fcdcb1b878de82b5e94a1bb13fad79429970f251cc"
   },
   "cyberpunk/120": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
       "◇ Finish the Snowfall build, then show me the result.                                                                   ",
       "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
@@ -564,20 +563,20 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "47c0f805bebf5e2fa8a0d2f7cfc801c827a8472d70b28c182e8903318a014665"
+    "attributes": "1698e469cec43fd01945fa25227dfaf08000f889251fc06cd917102ce21768e1"
   },
   "cyberpunk/200": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                                                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
       "◇ Finish the Snowfall build, then show me the result.                                                                                                                                                   ",
       "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
@@ -605,22 +604,21 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "c9584c6b8504956e7b6b0455158c1d9ac4175617a5d42d959fcb3112f433b85b"
+    "attributes": "0ccb197c367c8720b4c9430cecb9f3e17a2c9b1ab2760e8a0e79074a3f81874b"
   },
   "coder-chick/80": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                             ",
       "────────────────────────────────────────────────────────────────────────────────",
       "",
-      "◇ Finish the Snowfall build, then show me the result.                           ",
-      "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and",
@@ -651,15 +649,16 @@
       "▸                                                                               ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "2e73de5f1f51612156ff0724eec7f053157762b0fee9eab57e887f5b98cab5f8"
+    "attributes": "c7e9999ba1d3a7b19773d5eec3860dd7ea2501b2a8f061af2e5d66431297e1a7"
   },
   "coder-chick/120": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
       "◇ Finish the Snowfall build, then show me the result.                                                                   ",
       "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
@@ -687,20 +686,20 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "9a64a0881995affeb136d3b7639f064c7ba1c8b97b5d8d32dbd0044e989d3a29"
+    "attributes": "ca92118d81fc5d59293fa2b2016cbacbe256c5afbb38d4dfd62f49d186451265"
   },
   "coder-chick/200": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                                                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
       "◇ Finish the Snowfall build, then show me the result.                                                                                                                                                   ",
       "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
@@ -728,22 +727,21 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "bbf3be5091d4a4a5ad19ac561207012c59feac9e1a3a2261763c52ba22acc2be"
+    "attributes": "417a06b8d41d9a6940dac4be09229114db06bb928a46b4f613ee1679921dfd72"
   },
   "matrix/80": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                             ",
       "────────────────────────────────────────────────────────────────────────────────",
       "",
-      "◇ Finish the Snowfall build, then show me the result.                           ",
-      "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and",
@@ -774,15 +772,16 @@
       "▸                                                                               ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "7d15fb00e0d3c85ce4824609854660bf0a07096db8a6633163d92c84ad4d1785"
+    "attributes": "8e7f38175d95964ebb0cd7fec5469d7eba39790b63681da321028988db73f934"
   },
   "matrix/120": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
       "◇ Finish the Snowfall build, then show me the result.                                                                   ",
       "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
@@ -810,20 +809,20 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "be0060f3f06a1448b8718e86946b2319dede5b622b3e19aa335f63c145a3edf3"
+    "attributes": "f023c2f2da89743bfdad0b9c34ff93c03d52be2c18a32c883cdcd8de47762e9b"
   },
   "matrix/200": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                                                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
       "◇ Finish the Snowfall build, then show me the result.                                                                                                                                                   ",
       "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
@@ -851,22 +850,21 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "b0e86f375f2dab1a89751c87e7b7471b46218cd19a208f859ce834f19858eaab"
+    "attributes": "b0503286b8e14f0425faa3d15b2955005c724096ac78fc1c3f16b436df8949b5"
   },
   "mono/80": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                             ",
       "────────────────────────────────────────────────────────────────────────────────",
       "",
-      "◇ Finish the Snowfall build, then show me the result.                           ",
-      "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and",
@@ -897,15 +895,16 @@
       "▸                                                                               ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "f5ce74756089b8385476516e17bbdb785cae0ec76cf7ba81a187a7013b476915"
+    "attributes": "327292b1130e0b275e96f8613a38c2bf02f7e0db67085fc2e0642c03fa6d7d37"
   },
   "mono/120": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
       "◇ Finish the Snowfall build, then show me the result.                                                                   ",
       "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
@@ -933,20 +932,20 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "d9c627803e6f819f2a9fc09b17383721d88bd0ebcc6a6687a2e1bdea38c5b84f"
+    "attributes": "94c6d0935aa78fff14b5da473919fcb9f2987bc18348a6394e330372f071a2d8"
   },
   "mono/200": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                                                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
       "◇ Finish the Snowfall build, then show me the result.                                                                                                                                                   ",
       "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
@@ -974,22 +973,21 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "62728801c2376704a0075035ce3b8d9086f8e11e9d82045a927e49a574740da9"
+    "attributes": "288a6c7eec7cb0a6a6cbd7823e92d4c00b26057598608dd8cdf1e6170c25ed64"
   },
   "light/80": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                             ",
       "────────────────────────────────────────────────────────────────────────────────",
       "",
-      "◇ Finish the Snowfall build, then show me the result.                           ",
-      "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and",
@@ -1020,15 +1018,16 @@
       "▸                                                                               ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "d1ee9bab1b8838ecb16477fb33c0dae9da0ff92b6bd6593786493dc9dc127754"
+    "attributes": "faf3c1f13510ebeb15016d089a2d62dd2659e96a4b69e0f39225621b21da5972"
   },
   "light/120": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
       "◇ Finish the Snowfall build, then show me the result.                                                                   ",
       "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
@@ -1056,20 +1055,20 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "2d118329459c903b00eaf591a1f0ec50b47648ac744341b865064839fe8c1825"
+    "attributes": "5d8b74d0e6071360a026ba7c38ba3628074982930c5270eb0d1092a56b31896c"
   },
   "light/200": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                                                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
       "◇ Finish the Snowfall build, then show me the result.                                                                                                                                                   ",
       "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
@@ -1097,22 +1096,21 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "833890c03e5efe7c89384aa1f504e1f9713d8dc16d931ebc9f39bce67391c766"
+    "attributes": "fc09c098fbd14a9054765962a93b19542642047fa24d82286bc39ab141c1507b"
   },
   "colorblind/80": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                             ",
       "────────────────────────────────────────────────────────────────────────────────",
       "",
-      "◇ Finish the Snowfall build, then show me the result.                           ",
-      "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and",
@@ -1143,15 +1141,16 @@
       "▸                                                                               ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "d703227ed563ae02ead02cd8ff3e6a1c293830c2a86971a55e92c94339b09183"
+    "attributes": "bc3914118511ea119594a29113c2d3f231cbe5c16010867793aab9c2f9b23f4c"
   },
   "colorblind/120": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
       "◇ Finish the Snowfall build, then show me the result.                                                                   ",
       "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
@@ -1179,20 +1178,20 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "9cb527cce97a2603077821c6f97caf9939fe65ef58896c44e66ef7e9b6c5edd3"
+    "attributes": "ac2242e23a475bbfa144113fc4a209c1987fdf285b5441a1dfa5dc27b5e58809"
   },
   "colorblind/200": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                                                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
       "◇ Finish the Snowfall build, then show me the result.                                                                                                                                                   ",
       "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
@@ -1220,22 +1219,21 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "e6aaf657bc45927ecf9c46e86b1d381775ddaf4b3c3c469a23e59c584dc6d527"
+    "attributes": "2b038aac9d235b45f1e9f61fac1734812ba9739bcce9fe133e72b62357763837"
   },
   "high-contrast/80": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                             ",
       "────────────────────────────────────────────────────────────────────────────────",
       "",
-      "◇ Finish the Snowfall build, then show me the result.                           ",
-      "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
       "",
       "  ✻ The new layout gives your conversation the full width, with task and",
@@ -1266,15 +1264,16 @@
       "▸                                                                               ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "a816db238e70586003da65df93c85e47c07f3021901c6dffc9ce2937aee81d7e"
+    "attributes": "a890c98fcd82939598dfe84015c54f20c7e96cb8e80bfa5c7d54fbbb4a3224a5"
   },
   "high-contrast/120": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
       "◇ Finish the Snowfall build, then show me the result.                                                                   ",
       "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
@@ -1302,20 +1301,20 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "435b47469aef3bdf91ff547005e5faab83a216e7d1b94fd6c2d468d26e51532a"
+    "attributes": "083698e511076630a66d44d1187bf87532caca051ad9d292d2a68d9c1800f422"
   },
   "high-contrast/200": {
     "lines": [
       "  ✻ SHADOW  10.0.0  ~/work/snowfall                                                                                                                                                Ctrl+Shift+F search  ",
       "────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────",
-      "",
       "◇ Finish the Snowfall build, then show me the result.                                                                                                                                                   ",
       "",
       "  ∴ Thought for 1m 5s · Ctrl+O expand",
@@ -1343,13 +1342,14 @@
       "    │ const renderer = \"snowfall\";",
       "    ",
       "    Use Ctrl+Shift+F to find a line, or End to return to the latest output.",
-      "",
       "╭ Message ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮",
       "▸                                                                                                                                                                                                       ",
       "╰ Enter send · Shift+Enter newline · / commands · @ files ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯",
       "",
+      "▸ reviewer [bg] Checking terminal behavior · read_file · 4 tools · 120 tok",
+      "",
       "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "169449a35440a51e056105735a85c69faa4b0678a769b87587cf274a394f286a"
+    "attributes": "78f7683f69e558b09a91ff38cb68c222cb816ef21abb495bcd3b5ce6efdbdee8"
   }
 }

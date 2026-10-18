@@ -130,10 +130,22 @@ export interface ToolSchema {
   parameters: Record<string, unknown>; // JSON Schema (object)
 }
 
-export type StopReason = 'end_turn' | 'tool_use' | 'max_tokens' | 'pause_turn';
+export type StopReason = 'end_turn' | 'tool_use' | 'max_tokens' | 'pause_turn' | 'refusal';
 
 export type ProviderEvent =
   | ProviderDiagnosticEvent
+  | {
+      /**
+       * A user-visible one-shot notice about how this request was ACTUALLY shaped, e.g. an ultra
+       * mode downgrade. Distinct from `diagnostic` (machine-readable internals, renderers ignore)
+       * because this one must reach the transcript: a plan the user cannot see is a plan that may
+       * as well not have been computed.
+       */
+      type: 'notice';
+      title: string;
+      body: string;
+      severity: 'info' | 'warn' | 'error';
+    }
   | { type: 'text'; delta: string }
   | { type: 'thinking'; delta: string } // streamed reasoning text (display)
   | { type: 'reasoning_block'; text: string; field: 'reasoning_content' | 'reasoning' } // complete OpenAI-compat reasoning (echo-back)

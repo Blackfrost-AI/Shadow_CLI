@@ -18,6 +18,9 @@ export function workActions(item: WorkItem): WorkAction[] {
     if (item.status === 'paused') actions.push({ label: 'Resume worker', command: `resume ${item.id}` });
   }
   if (item.type === 'bgshell' && item.status === 'running') actions.push({ label: 'Stop background command', command: `kill ${item.id}` });
+  // Watchers are detached by design, so stopping one is a durable-state action, not a signal to
+  // this process — it deletes the registration and kills the recorded PID.
+  if (item.type === 'watcher' && item.status === 'running') actions.push({ label: 'Stop watcher (removes it)', command: `kill ${item.id}`, confirm: true });
   if (item.type === 'subagent' && item.retryable && ['failed', 'partial', 'cancelled', 'interrupted', 'completed'].includes(item.status)) {
     actions.push({ label: 'Retry as a new attempt (may repeat effects)', command: `retry ${item.id} --confirm`, confirm: true });
   }

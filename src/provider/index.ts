@@ -122,6 +122,7 @@ export function createProvider(opts: ProviderOptions): Provider {
         idleTimeoutMs: opts.idleTimeoutMs,
         firstByteTimeoutMs: opts.firstByteTimeoutMs,
         streamRetries: opts.streamRetries,
+        capabilities: opts.capabilities,
       });
     case 'openai':
       // SHADOW_WIRE_API=responses selects /v1/responses (Codex-class); default is chat completions.

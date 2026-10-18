@@ -36,6 +36,26 @@ export interface ModelCapabilities {
   /** Explicit SGLang/Qwen chat-template control. On self-hosted OpenAI Chat Completions only,
    *  maps to `chat_template_kwargs.enable_thinking`; it is never inferred from a model id. */
   chatTemplateEnableThinking?: boolean;
+  /**
+   * Ultra-mode channels. Each is an independent promise that THIS endpoint accepts the matching
+   * wire feature; see `agent/ultraMode.ts` for how they fold into a plan.
+   *
+   * The rule for all of them is fail-closed: undeclared means "do not send". That is deliberately
+   * strict — a missing declaration costs depth, while a wrong one puts a field on the wire that
+   * the endpoint may reject or silently ignore, and either way Shadow would then be reporting a
+   * capability it never delivered.
+   *
+   * Note `effortScale` above is the authority for effort depth: an entry that declares other
+   * channels but omits `effortScale` is asserting it takes no effort parameter at all.
+   */
+  /** Server chooses its own thinking depth instead of a fixed budget. */
+  adaptiveThinking?: boolean;
+  /** A premium low-latency speed path exists. Opt-in: never enabled uninvited. */
+  fastMode?: boolean;
+  /** Prompt caching via `cache_control` breakpoints. */
+  promptCache?: boolean;
+  /** An extended (1h) prompt-cache TTL is available. Opt-in. */
+  extendedCache?: boolean;
 }
 
 const ModelPriceSchema = z.object({
@@ -204,6 +224,14 @@ export const ModelEntrySchema = z.object({
       vision: z.boolean().optional(),
       preserveThinking: z.boolean().optional(),
       chatTemplateEnableThinking: z.boolean().optional(),
+      // Ultra-mode channels. Declaring one is a promise that THIS endpoint accepts the
+      // corresponding wire feature; an undeclared channel is never sent (see agent/ultraMode.ts).
+      // `effortScale` doubles as the authority for effort: an endpoint that omits it is asserting
+      // it takes no effort parameter at all.
+      adaptiveThinking: z.boolean().optional(),
+      fastMode: z.boolean().optional(),
+      promptCache: z.boolean().optional(),
+      extendedCache: z.boolean().optional(),
     })
     .optional(),
   disabled: z.boolean().optional(),
@@ -733,6 +761,14 @@ export function loadConfig(
     'maxOutputTokens',
     'preserveThinking',
     'chatTemplateEnableThinking',
+    // Ultra-mode channels: every one of these changes what goes on the wire (effort depth,
+    // premium latency path, extended context/TTL, resume semantics, stop-reason handling). Same
+    // rule as the rest of this list — a cloned repo must not be able to attach them to a globally
+    // configured endpoint just by reusing a preset label.
+    'adaptiveThinking',
+    'fastMode',
+    'promptCache',
+    'extendedCache',
   ];
   if (Array.isArray(fromFile.models)) {
     let redacted = 0;

@@ -22,6 +22,24 @@ import type { ApprovalGate } from '../agent/approval.js';
 import type { ResolvedModelProfile } from '../agent/modelProfiles.js';
 import { checksForRegistry } from '../checks/registry.js';
 
+/** Upper bound for a requested sub-agent ceiling when the parent itself runs unlimited (maxIterations 0). */
+export const SUBAGENT_ITERATION_HARD_CAP = 100;
+const SUBAGENT_DEFAULT_ITERATIONS = 15;
+
+/**
+ * Resolve a sub-agent's iteration ceiling. A sub-agent always keeps at least one working backstop
+ * (never 0 = unlimited). Precedence: an explicit `max_iterations` request, then the agent
+ * definition's own value, then min(parent, 15). A request may raise the default but never exceeds
+ * the parent's ceiling — or SUBAGENT_ITERATION_HARD_CAP when the parent is unlimited — so a model
+ * cannot use delegation to escape the operator's iteration limit.
+ */
+export function resolveSubagentIterations(parentMax: number, defMax?: number, requested?: number): number {
+  const parentCap = parentMax > 0 ? parentMax : SUBAGENT_ITERATION_HARD_CAP;
+  const fallback = Math.min(parentCap, SUBAGENT_DEFAULT_ITERATIONS);
+  const selected = requested && requested > 0 ? requested : defMax && defMax > 0 ? defMax : fallback;
+  return Math.max(1, Math.min(Math.floor(selected), parentCap));
+}
+
 const inputSchema = z.object({
   require_priced_usage: z.boolean().optional().describe('Require configured model pricing before starting a dollar-limited collaboration stage.'),
   job_id: z.string().optional().describe('Prepared persistent job to claim. Stopped jobs require explicit retry preparation; work is never auto-replayed.'),
@@ -34,6 +52,9 @@ const inputSchema = z.object({
   isolation: z.enum(['none', 'worktree']).optional(),
   run_in_background: z.boolean().optional(),
   priority: z.enum(['low', 'normal', 'high']).optional().describe('Queue priority for background work.'),
+  max_iterations: z.number().int().positive().optional().describe(
+    `Iteration ceiling for this sub-agent (default 15). Raise it for deep reviews or large sweeps; bounded by the parent's own ceiling (or ${SUBAGENT_ITERATION_HARD_CAP} when the parent is unlimited).`,
+  ),
 });
 
 class CooperativePauseGate {
@@ -133,8 +154,11 @@ async function salvageFinalAnswer(deps: LoopDeps): Promise<string | null> {
           type: 'text',
           text:
             'You stopped because your iteration/budget ceiling was reached. Do NOT start new work and you have no tools. ' +
-            'From everything you have already done in this conversation, output your report or findings now, ' +
-            'clearly labeled as PARTIAL (produced under the ceiling). If you had nothing to report, say so.',
+            'Report COVERAGE, not a finished report: (1) what you actually read or ran, with exact paths/commands; ' +
+            '(2) only conclusions you directly verified from that evidence, each with its source; ' +
+            '(3) an explicit list of what you did NOT reach or could not verify. ' +
+            'Do not infer or reconstruct findings for anything you did not read. Label the whole answer PARTIAL. ' +
+            'If you verified nothing, say so.',
         },
       ],
     });
@@ -178,11 +202,14 @@ function agentOutcome(result: LoopResult, salvage: string | null, diagnostic: st
   }
   if (result.stopReason === 'budget' || result.stopReason === 'max_iterations') {
     return {
-      // A controlled ceiling still returns the existing clean tool-result contract, but is
-      // incomplete work: lifecycle events must not mark it completed.
-      ok: true,
-      answer: withPartial(`Sub-agent stopped by its ${result.stopReason} ceiling${hasPartial ? '.' : ' before producing an answer.'}`),
+      // A controlled ceiling is incomplete work, so it is NOT ok: a parent (or any consumer)
+      // reading the coarse signal must not see success beside a partial body. It stays
+      // recoverable — the loop treats it as an ordinary tool failure, never a fatal stop — and
+      // the partial coverage still travels in the answer and `data`.
+      ok: false,
+      answer: withPartial(`INCOMPLETE — sub-agent stopped by its ${result.stopReason} ceiling${hasPartial ? '; the text below is partial coverage, not a finished result.' : ' before producing an answer.'}`),
       status: 'partial',
+      errorCode: 'agent_partial',
     };
   }
   const reason = diagnostic.trim() || (result.stopReason === 'provider_error'
@@ -396,7 +423,13 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
       // yields 0 when the parent set maxIterations:0 ("unlimited"), which disabled EVERY Budget guard and
       // let a stuck sub-agent burn unbounded API cost. Clamp iterations to ≥1 AND always attach a
       // wall-clock ceiling so a runaway sub-agent can never run forever regardless of the iteration count.
-      const maxIter = Math.max(1, def?.maxIterations || Math.min(deps.maxIterations || 15, 15));
+      // This tool instance is shared by the delegation tree. deps holds the root ceiling,
+      // whereas the stamped parentBudget belongs to the immediate caller.
+      const rootCap = resolveSubagentIterations(deps.maxIterations, undefined, Number.MAX_SAFE_INTEGER);
+      const parentCap = resolveSubagentIterations(
+        ctx.parentBudget?.iterationLimit ?? deps.maxIterations, undefined, rootCap,
+      );
+      const maxIter = resolveSubagentIterations(parentCap, def?.maxIterations, input.max_iterations);
       const budget = new Budget(
         { maxIterations: maxIter, maxWallClockSec: 30 * 60 },
         profile?.model ?? base.model,
@@ -698,7 +731,7 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
             const output = finishArtifact(outcome.status, stopReason, outcome.answer);
             { const snap = budget.snapshot(Date.now()); base.bus.emit({ type: 'subagent_usage', costUSD: budget.currentCostUSD, subagent: agentType, taskId, inputTokens: snap.inputTokens, outputTokens: snap.outputTokens }); }
             base.bus.emit({ type: 'subagent_end', taskId, jobId, ok: outcome.status === 'completed', subagentType: agentType, status: outcome.status, stopReason, ...output });
-            base.bus.emit({ type: 'task_notification', taskId: taskId!, answer: output.answer, fromSubagent: agentType });
+            base.bus.emit({ type: 'task_notification', taskId: taskId!, answer: output.answer, fromSubagent: agentType, status: outcome.status, stopReason });
           } catch (e) {
             accrue(bgAccrualTarget); // P3-09: a thrown run still spent tokens/cost — roll it up.
             if (base.hooks?.subagent_stop?.length) {
@@ -710,7 +743,7 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
             const stopReason = cancelled ? 'interrupted' : 'provider_error';
             const output = finishArtifact(status, stopReason, queuedAbort ? 'agent cancelled while waiting for a slot' : `agent bg error: ${(e as Error).message}`);
             base.bus.emit({ type: 'subagent_end', taskId, jobId, ok: false, subagentType: agentType, status, stopReason, ...output });
-            base.bus.emit({ type: 'task_notification', taskId: taskId!, answer: output.answer, fromSubagent: agentType });
+            base.bus.emit({ type: 'task_notification', taskId: taskId!, answer: output.answer, fromSubagent: agentType, status, stopReason });
           } finally {
             permit?.();
             offCancel();

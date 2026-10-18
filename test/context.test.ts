@@ -268,6 +268,65 @@ function toolResult(ctx: Context, id: string): { content: string } | undefined {
   return undefined;
 }
 
+test('R0: a keepLastTurns tail larger than the whole history still CALLS the summarizer (the reproduced wedge)', async () => {
+  // The reported symptom was "compaction stopped working". Root cause was not the endpoint: the
+  // old guard computed `end = msgs.length - keepLastTurns` ONCE and, when that landed at or
+  // before the pin, returned 'failed' with ZERO model calls while the caller announced "the
+  // context summarizer failed" — naming a round trip that never happened. A bigger window
+  // appeared to fix it only because the `<= 40_000` keep-clamp moved off the boundary.
+  let calls = 0;
+  const provider: Provider = {
+    name: 'counting',
+    estimateTokens: (m) => JSON.stringify(m).length / 4,
+    async *send(): AsyncIterable<ProviderEvent> {
+      calls += 1;
+      yield { type: 'text', delta: 'TASK: keep going' };
+      yield { type: 'done', stopReason: 'end_turn' };
+    },
+  };
+  const ctx = new Context({ contextBudget: 1_000, triggerRatio: 0.75, keepLastTurns: 40, microcompact: false });
+  ctx.pinTask({ role: 'user', content: [{ type: 'text', text: 'objective' }] });
+  // Four unpinned turns: far fewer than keepLastTurns, which is what used to wedge the guard.
+  for (let i = 0; i < 4; i++) {
+    ctx.append({ role: 'assistant', content: [{ type: 'text', text: `turn ${i} `.repeat(60) }] });
+    ctx.append({ role: 'user', content: [{ type: 'text', text: `reply ${i} `.repeat(60) }] });
+  }
+
+  const did = await ctx.maybeSummarize(provider, 'counting', true);
+
+  assert.equal(did, 'summarized', 'the tail is capped at half the history, so there is always something to summarize');
+  assert.equal(calls, 1, 'exactly one summarizer round trip — the guard no longer bails out before calling');
+});
+
+test('R0b: the failure reason is recorded and read exactly once per episode', async () => {
+  // The single generic message for both causes is what made this misdiagnosable. The reason is
+  // read-and-clear so a persistent failure is not re-explained on every subsequent turn.
+  const throwing: Provider = {
+    name: 'boom',
+    // Realistic enough that tombstoning is measurable: a constant 1 would make the stop line
+    // report "already under budget" and reclaim nothing.
+    estimateTokens: (m) => JSON.stringify(m).length / 4,
+    async *send(): AsyncIterable<ProviderEvent> {
+      throw new Error('connection reset by peer');
+      // Unreachable, but a generator needs a yield to stay a generator under require-yield.
+      yield { type: 'done', stopReason: 'refusal' };
+    },
+  };
+  const ctx = new Context({ contextBudget: 1_000, triggerRatio: 0.75, keepLastTurns: 1, microcompact: false });
+  ctx.pinTask({ role: 'user', content: [{ type: 'text', text: 'objective' }] });
+  // Two fat results: the FINAL one is spared (the next turn reasons over it), so the older body
+  // is what pays — which is exactly the degraded path this asserts.
+  ctx.append({ role: 'assistant', content: [{ type: 'tool_use', id: 't0', name: 'echo', input: {} }] });
+  ctx.append({ role: 'user', content: [{ type: 'tool_result', toolCallId: 't0', ok: true, content: 'x'.repeat(4_000) }] });
+  ctx.append({ role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'echo', input: {} }] });
+  ctx.append({ role: 'user', content: [{ type: 'tool_result', toolCallId: 't1', ok: true, content: 'y'.repeat(4_000) }] });
+
+  assert.equal(await ctx.maybeSummarize(throwing, 'boom', true), 'truncated');
+  const reason = ctx.takeFailureReason();
+  assert.match(reason ?? '', /connection reset by peer/, 'the real cause survives, not flattened to "failed"');
+  assert.equal(ctx.takeFailureReason(), undefined, 'read-and-clear — the next turn does not repeat it');
+});
+
 test('degraded truncation spares state-bearing results while reproducible output can still pay', async () => {
   const ctx = new Context({ contextBudget: 1_000, triggerRatio: 0.75, keepLastTurns: 1 });
   ctx.pinTask({ role: 'user', content: [{ type: 'text', text: 'objective' }] });

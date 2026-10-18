@@ -10,7 +10,14 @@ const schema = z.object({
 }).strict();
 export function makeSecurityFindingsTool(checks?: (workspaceRoot: string) => ProjectCheckStore): Tool<z.infer<typeof schema>> {
   return {
-  name: 'security_findings', risk: 'write', deferred: true, inputSchema: schema,
+  name: 'security_findings', risk: 'write', deferred: true,
+  searchAliases: [
+    'security', 'finding', 'findings', 'vuln', 'vulnerability', 'vulnerabilities', 'bug',
+    'issue', 'evidence', 'sarif', 'report', 'triage', 'remediation', 'remediate', 'retest',
+    'verify', 'verification', 'cve', 'risk', 'assessment', 'audit', 'compliance', 'export',
+    'import', 'track', 'tracking',
+  ],
+  inputSchema: schema,
   description: 'Manage a local security evidence workspace. Import SARIF 2.1.0 or finding JSON, record scoped observations, attach redacted local text evidence, track remediation and retest using a current project_checks run id from this session, or export a local Markdown report. Never scans targets, executes commands or sends data. Historical/imported JSON check results cannot verify a finding. Verified requires a current recorded passed check; findings remain claims with evidence limitations.',
   async run(input, ctx) {
     if (ctx.dryRun && !['list', 'show'].includes(input.action)) return ok('security_findings', 'write', 0, `Dry run: would ${input.action} local security evidence.`);
@@ -40,6 +47,3 @@ export function makeSecurityFindingsTool(checks?: (workspaceRoot: string) => Pro
   },
   };
 }
-
-/** Compatibility for hosts without a live check registry: inspection works; retest fails closed. */
-export const securityFindings = makeSecurityFindingsTool();

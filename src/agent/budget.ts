@@ -70,6 +70,11 @@ export class Budget {
     this.startMs = now;
   }
 
+  /** Configured turn ceiling, not remaining turns; descendants may not raise it. */
+  get iterationLimit(): number {
+    return this.limits.maxIterations;
+  }
+
   /** Exclude an operator-requested cooperative pause from the wall-clock ceiling. */
   suspendClock(durationMs: number): void {
     if (Number.isFinite(durationMs) && durationMs > 0) this.startMs += durationMs;

@@ -60,6 +60,9 @@ function harness(options: {
       cfg: { temperature: options.temperature ?? 0.42 },
       sessionLog: { record: (record: unknown) => records.push(record) },
       context: {
+        // The caller distinguishes failure modes by asking for the stored reason, so the stub
+        // must expose the accessor or every degraded path reports "is not a function".
+        takeFailureReason: () => 'summarizer timeout',
         maybeSummarize: (
           receivedProvider: unknown,
           model: string,
@@ -148,14 +151,23 @@ test('pi /compact forwards the active model and temperature and refuses a concur
   assert.deepEqual(h.queued, []);
 });
 
+// Each failure mode must name its OWN cause. A single "the summarizer failed" string for both
+// "the endpoint threw" and "we never called it" is what sent a user chasing a serve-side problem
+// that did not exist; swapping models appeared to fix it only because a larger window moved the
+// tail guard off the boundary.
 for (const fixture of [
   {
     result: 'truncated' as const,
-    message: /context reclaimed by dropping the oldest tool results/,
+    message: /Summarizer unavailable.*context reclaimed by dropping the oldest tool results/,
   },
   {
     result: 'failed' as const,
-    message: /Compaction failed — summarizer unavailable and nothing left to reclaim/,
+    message: /Compaction failed.*Nothing left to reclaim\. Try \/clear\./,
+  },
+  {
+    // No model call was made: the remedy is a smaller active turn, NOT a different model.
+    result: 'failed-short-history' as const,
+    message: /Nothing to summarize — every message is pinned or part of the turn being answered/,
   },
 ]) {
   test(`pi /compact reports and records a degraded ${fixture.result} result`, async () => {

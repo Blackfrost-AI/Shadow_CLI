@@ -131,6 +131,38 @@ const TOOL_CALL_ENVELOPE =
   /<tool_call>[\s\S]*?<\/tool_call>|<tool_call>[\s\S]*$|<function(?:=|\s+name\s*=)[\s\S]*?<\/function\s*>|<[｜|]tool[▁_]calls?[▁_]begin[｜|][\s\S]*?<[｜|]tool[▁_]calls?[▁_]end[｜|]>/gi;
 
 /**
+ * SGR parameter values that must never be honored, even when `keepSgr` is true.
+ *
+ * `8` (conceal) makes the text that follows invisible to the operator **while it remains in the
+ * terminal's scrollback and in any captured transcript** — so a hidden payload survives review
+ * intact. That defeats the purpose of a transcript, so conceal is dropped even in tool output,
+ * where rendition codes are otherwise legitimate. `28` (reveal) is its paired inverse and is
+ * stripped with it.
+ *
+ * Parsed as exact numeric parameters (split on `;` and `:`), never a substring test: the
+ * truecolor forms `38;2;…` / `48;5;…` contain an 8 but are not conceal, and `38` !== `8`.
+ */
+function sgrHasConceal(params: string): boolean {
+  const groups = params.split(';');
+  for (let i = 0; i < groups.length; i++) {
+    const group = groups[i]!;
+    const head = group.split(':', 1)[0]!;
+    const numericHead = /^\d+$/.test(head) ? Number(head) : -1;
+    if (numericHead === 8 || numericHead === 28) return true;
+    // Extended-color arguments are data, not independent SGR attributes. Skip the palette index
+    // in `38;5;n` and RGB components in `38;2;r;g;b`; colon forms keep the whole color spec in
+    // this one group (`38:5:n`, `38:2:…`) and therefore need no additional skipping.
+    if ([38, 48, 58].includes(numericHead) && !group.includes(':')) {
+      const mode = groups[i + 1];
+      const numericMode = mode && /^\d+$/.test(mode) ? Number(mode) : -1;
+      if (numericMode === 5) i += 2;
+      else if (numericMode === 2) i += 4;
+    }
+  }
+  return false;
+}
+
+/**
  * F05-04: neutralize terminal escape sequences before text reaches `<Text>`.
  *
  * Tool output (shell stdout, live shell preview) and — rarer — model text can carry raw terminal
@@ -181,11 +213,14 @@ export function sanitizeTerminalEscapes(text: string, keepSgr: boolean): string 
         }
         const final = j < n ? text.codePointAt(j)! : -1;
         if (final >= 0x40 && final <= 0x7e) {
-          if (keepSgr && final === 0x6d) {
+          // SGR is kept only when it is rendition-only. Conceal (8) / reveal (28) are SGR, but
+          // they hide text from the operator while it stays in scrollback — not a rendition the
+          // transcript can afford, so they are dropped even for tool output.
+          if (keepSgr && final === 0x6d && !sgrHasConceal(text.slice(i + 2, j))) {
             out += text.slice(i, j + 1);
             sgrOnLine = true;
           }
-          i = j + 1; // complete CSI consumed (kept only if it was SGR)
+          i = j + 1; // complete CSI consumed (kept only if it was a safe SGR)
         } else {
           // Malformed or truncated CSI. Drop ONLY the partial sequence and resume scanning at
           // the offending byte — a mid-string partial escape (a tool that prints `ESC[3` then

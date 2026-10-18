@@ -58,6 +58,15 @@ export class Context {
   /** Latest exact provider-neutral request; in-memory only, never added to session snapshots. */
   private preparedRequest: PreparedContextRequest | undefined;
   private pinnedPrefix = 0;
+  /**
+   * Why the most recent compaction attempt failed, if it did.
+   *
+   * Exists because the previous code wrapped the summarizer round trip in a bare `catch {}`,
+   * throwing away the only evidence of what actually went wrong. A 500, a 413, a timeout and a
+   * never-attempted compaction all surfaced as the same sentence, which sent a real diagnosis
+   * down the wrong path (model swapping) instead of at the cause.
+   */
+  private lastFailureReason: string | undefined;
   /** Last REAL request size (input + cache tokens) from the provider's usage event. */
   private lastActualTokens = 0;
   /** Historical measured usage for inspection; independent from the compaction estimate floor. */
@@ -199,6 +208,19 @@ export class Context {
 
   messages(): Message[] {
     return this.msgs;
+  }
+
+  /**
+   * Consume the reason the last compaction failed, if it did.
+   *
+   * Read-and-clear so the caller reports a specific cause once rather than repeating a stale
+   * explanation on every subsequent turn. Returns undefined when the last attempt succeeded or
+   * never ran.
+   */
+  takeFailureReason(): string | undefined {
+    const reason = this.lastFailureReason;
+    this.lastFailureReason = undefined;
+    return reason;
   }
 
   /** Next provider request, not the transcript. Attachments cannot split tool/result pairs. */
@@ -463,8 +485,14 @@ export class Context {
    *  - 'summarized' — the summarizer produced a handoff and history was replaced.
    *  - 'truncated'  — the summarizer FAILED (or produced nothing); context was reclaimed
    *                   locally by dropping the oldest tool_result bodies. Degraded, but visible.
-   *  - 'failed'     — over budget and nothing could be reclaimed: the summarizer failed with
-   *                   nothing droppable left, or history is too short to compact at all.
+   *  - 'failed'     — over budget and nothing could be reclaimed after a REAL attempt: the
+   *                   summarizer was called and failed (or returned nothing) and nothing was
+   *                   droppable. This means the model was tried and did not deliver.
+   *  - 'failed-short-history' — over budget with nothing to summarize: every message is pinned
+   *                   or part of the un-droppable last turn. NO model call was made. Kept
+   *                   distinct from 'failed' because the remedies are opposite (make the tail
+   *                   smaller vs. fix the endpoint), and conflating them is what made a
+   *                   never-attempted compaction read as a serve-side outage.
    *  - false        — nothing to do (under the trigger).
    */
   async maybeSummarize(
@@ -491,6 +519,9 @@ export class Context {
     },
   ): Promise<CompactResult> {
     if (signal?.aborted) return false;
+    // Each attempt starts with a clean slate: a reason belongs to one compaction attempt and must
+    // never be reported against a later, unrelated one.
+    this.lastFailureReason = undefined;
     const trigger = this.opts.contextBudget * this.opts.triggerRatio;
     let tokens = this.estimateTokens(provider);
 
@@ -530,25 +561,44 @@ export class Context {
     }
 
     // Small windows: keep a shorter tail so one compact actually frees space.
-    let keep =
+    const maxKeep =
       this.opts.contextBudget <= 40_000
         ? Math.min(this.opts.keepLastTurns, 6)
         : this.opts.keepLastTurns;
-    if (countCtx?.aggressiveKeep) keep = Math.max(2, Math.floor(keep / 2));
-    let end = this.msgs.length - keep;
-    // Over budget but history too short to compact: a genuinely stuck state. Under the new
-    // contract that must be a VISIBLE failure, not a no-op indistinguishable from health.
-    if (end <= this.pinnedPrefix) return tokens > trigger ? 'failed' : false;
+    const keep = countCtx?.aggressiveKeep ? Math.max(2, Math.floor(maxKeep / 2)) : maxKeep;
 
-    // Don't begin the kept region on an orphaned tool_result: its matching tool_use lives
-    // in the preceding turn. Tool results are `tool_result` blocks inside role:'user' turns.
-    while (
-      end < this.msgs.length &&
-      this.msgs[end]!.content.some((b) => b.type === 'tool_result')
-    ) {
+    // Fix 2 — a flat TURN-COUNT tail can swallow the entire history: the old guard computed
+    // `end = msgs.length - keep` once and, when that landed at or before the pin, returned
+    // 'failed' WITHOUT EVER CALLING THE MODEL — while the caller reported "the summarizer
+    // failed", naming a round trip that never happened. That is why this was misdiagnosed as a
+    // serve-side problem: swapping to a model with a larger contextBudget moved the
+    // `<= 40_000` branch (keep clamped to 6) off the boundary and compaction ran again.
+    //
+    // Cap the tail at half the unpinned history instead of trusting keepLastTurns blindly. Two
+    // properties fall out: a compaction always summarizes at least half the working history (so
+    // one pass actually reclaims enough to make progress), and a history too short to split
+    // returns 'failed-short-history' with no model call so the overflow ladder can reclaim
+    // locally — which preserves more than summarizing a two-message session ever could.
+    const history = this.msgs.length - this.pinnedPrefix;
+    const tailCap = Math.max(1, Math.floor(history / 2));
+    const tail = Math.min(keep, tailCap);
+    let end = this.msgs.length - tail;
+    // Don't begin the kept region on a tool_result: its matching tool_use lives in the preceding
+    // turn, so the boundary would hand the summarizer the call and keep an answer to a call that
+    // no longer exists. Walking forward can only GROW the summarized region, never orphan a kept
+    // result.
+    while (end < this.msgs.length && this.msgs[end]?.content.some((b) => b.type === 'tool_result')) {
       end += 1;
     }
-    if (end <= this.pinnedPrefix) return tokens > trigger ? 'failed' : false;
+    // `end === msgs.length` (the walk ran off the end) is allowed, as it always was: the whole
+    // working history is summarized and the pinned objective plus the progress note carry the
+    // session. Only a boundary at or before the pin means there is genuinely nothing to send.
+    if (end <= this.pinnedPrefix) {
+      // Genuinely nothing summarizable: every message is pinned or part of the turn being
+      // answered. The overflow ladder answers this with LOCAL reclamation, which caps the fat
+      // tool_result/image bodies a short history is actually dominated by.
+      return tokens > trigger ? 'failed-short-history' : false;
+    }
 
     // F06-08: preserved provider reasoning (Qwen/Kimi wire state) is a CONTINUATION contract,
     // not history — the replay path keeps only the newest qualifying turn anyway (toOpenAIMessages),
@@ -586,9 +636,10 @@ export class Context {
     const middleLines = harvestInstructions(toSummarize);
     const allInstructions = mergeInstructions(objectiveLines, middleLines);
 
-    const oldTranscript = toSummarize
-      .map((m) => `${m.role}: ${m.content.map(blockText).join(' ')}`)
-      .join('\n');
+    const oldTranscript = capTranscript(
+      toSummarize.map((m) => `${m.role}: ${m.content.map(blockText).join(' ')}`),
+      SUMMARIZER_OLD_CAP,
+    );
     // CURRENT WORK lives overwhelmingly in the tail we keep. The old implementation hid this
     // from the summarizer while demanding CURRENT WORK/NEXT STEP, forcing it to invent a stale
     // continuation from the oldest slice. Show the tail with an explicit "retained" label.
@@ -645,11 +696,17 @@ export class Context {
       })) {
         if (ev.type === 'text') summary += ev.delta;
       }
-    } catch {
+    } catch (e) {
       // F04-11: the summarizer round trip failed. An abort is a user action, not a failure —
       // leave history untouched. Anything else degrades to local truncation instead of silently
       // handing the over-budget session back to a server 400.
       if (signal?.aborted) return false;
+      // The reason MUST survive: this was a bare `catch {}` and the discarding is why a
+      // never-called summarizer and a serve-side 500 produced the same message, sending the
+      // operator off to swap models. Recorded on the instance and surfaced by
+      // takeFailureReason() for the caller's finding.
+      const reason = e instanceof Error ? e.message : String(e);
+      this.lastFailureReason = `summarizer request failed: ${reason}`;
       return this.truncateLocally(provider, end, trigger);
     }
     // A provider can yield a partial summary before its fetch notices the abort. Never replace
@@ -657,7 +714,10 @@ export class Context {
     // usable for the next turn.
     if (signal?.aborted) return false;
     // An EMPTY summary is a failure too (a model that emitted nothing reclaimed nothing).
-    if (!summary.trim()) return this.truncateLocally(provider, end, trigger);
+    if (!summary.trim()) {
+      this.lastFailureReason = 'summarizer returned an empty summary';
+      return this.truncateLocally(provider, end, trigger);
+    }
 
     // Reframe the pin: a raw first user prompt after compact reads as a FRESH request and
     // models restart from it. Replace the pin with an explicit in-progress objective carrier,
@@ -732,6 +792,20 @@ export class Context {
   }
 
   /**
+   * Index of the newest message carrying a tool_result, or -1.
+   *
+   * The next turn reasons over this observation, so local reclamation spares it even when it is
+   * the single largest body in the window — a tombstoned final result is worse than a compact
+   * attempt that reports failure.
+   */
+  private lastToolResultIndex(): number {
+    for (let i = this.msgs.length - 1; i >= this.pinnedPrefix; i--) {
+      if (this.msgs[i]!.content.some((b) => b.type === 'tool_result')) return i;
+    }
+    return -1;
+  }
+
+  /**
    * F04-11 degraded path — the summarizer failed but the session is over budget. Reclaim space
    * locally instead of returning the session to a server 400: tombstone tool_result BODIES in
    * the summarization window, OLDEST FIRST, until the estimate is back under the trigger (or the
@@ -771,8 +845,20 @@ export class Context {
     const underStopLine = (): boolean => provider.estimateTokens(this.requestMessages()) <= trigger * 0.9;
 
     let droppedMessages = 0;
+    // 4 — LAST-RESORT TAIL RECLAMATION. The scan used to stop at `end`, the boundary of the kept
+    // tail, so when the overage lived IN the tail it reported "nothing to reclaim" while
+    // reclaimable content sat right in front of it. That is not a safety guarantee, it is a blind
+    // spot: the tail is protected because the model is reasoning over it, and giving up one stale
+    // body to keep the whole session alive is the better trade.
+    //
+    // Ordering is conservative — pass 1 (reproducible output) and pass 2 (state-bearing) both
+    // work the summarized region exactly as before; only pass 2 then walks into the tail. Inside
+    // the tail the FINAL tool_result is always spared: it is the observation the next turn
+    // reasons over, and tombstoning it turns a degraded turn into a nonsensical one.
+    const finalResult = this.lastToolResultIndex();
     for (const allowStateBearing of [false, true]) {
-      for (let i = this.pinnedPrefix; i < end && !underStopLine(); i++) {
+      for (let i = this.pinnedPrefix; i < this.msgs.length && !underStopLine(); i++) {
+        if (i >= end && (!allowStateBearing || i === finalResult)) continue;
         const m = this.msgs[i]!;
         if (!m.content.some((b) => droppable(b, allowStateBearing))) continue;
         this.msgs[i] = {
@@ -812,7 +898,12 @@ const MICROCOMPACT_SENTINEL = '[Old tool result content cleared]';
 export const TRUNCATED_RESULT_SENTINEL = '[Tool result dropped — summarizer unavailable; context reclaimed locally]';
 
 /** Outcome of a compaction attempt (F04-11: failure must be distinguishable from no-op). */
-export type CompactResult = 'summarized' | 'truncated' | 'failed' | false;
+export type CompactResult =
+  | 'summarized'
+  | 'truncated'
+  | 'failed'
+  | 'failed-short-history'
+  | false;
 /**
  * Tools whose results are bulky and cheaply reproducible, so microcompaction may clear their
  * stale bodies. Deliberately excludes state-bearing tools (todo_write/agent/ask_user_question/
@@ -835,9 +926,44 @@ const MICROCOMPACT_KEEP_RECENT = 8;
 /** Default microcompaction gate as a fraction of contextBudget (below summarizeTriggerRatio). */
 const MICROCOMPACT_DEFAULT_RATIO = 0.7;
 
+/**
+ * How much of the older history the summarizer is handed. Budgeted in characters, sized to fit a
+ * small-window endpoint alongside the retained tail and the instruction block (~4 chars/token).
+ * Big enough to carry decisions and file paths; small enough that the compactor never re-creates
+ * the overflow it exists to fix.
+ */
+const SUMMARIZER_OLD_CAP = 120_000;
+
 /** Validate a microcompaction ratio (0,1]; fall back to the default when absent/out of range. */
 function normalizeMicrocompactRatio(v: number | undefined): number {
   return Number.isFinite(v) && (v ?? 0) > 0 && (v ?? 0) <= 1 ? v! : MICROCOMPACT_DEFAULT_RATIO;
+}
+
+/**
+ * Cap the OLDER-HISTORY transcript handed to the summarizer.
+ *
+ * The compactor's request used to carry the entire to-be-replaced history verbatim, so on a
+ * genuinely over-budget session the summarizer was asked to read roughly the whole over-budget
+ * conversation in order to make it smaller — and threw. Compaction then silently failed at
+ * exactly the moment it was needed, which is the one failure mode that must not happen.
+ *
+ * Truncation keeps BOTH ends: the head carries the original objective and early decisions, the
+ * middle is where bulk sits, and the tail of this slice abuts the retained tail (so the seam
+ * stays continuous). A visible marker records the cut so the model cannot mistake absence of
+ * evidence for absence of events.
+ */
+function capTranscript(lines: string[], cap: number): string {
+  const joined = lines.join('\n');
+  if (joined.length <= cap) return joined;
+  const head = Math.floor(cap * 0.3);
+  const tail = cap - head;
+  const omitted = joined.length - cap;
+  return (
+    joined.slice(0, head) +
+    `\n\n[... ${omitted} characters of older history elided to fit the summarizer window; ` +
+    `the elided span is mid-session detail, and the retained tail below carries current state ...]\n\n` +
+    joined.slice(joined.length - tail)
+  );
 }
 
 /**

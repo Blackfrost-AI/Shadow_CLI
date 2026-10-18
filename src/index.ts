@@ -47,7 +47,7 @@ import {
   resolveActiveModelPreset,
 } from './config/modelPresets.js';
 import type { Message } from './provider/provider.js';
-import { runWebOnboard } from './onboard/webOnboard.js';
+import { runOnboarding } from './onboard/command.js';
 import { runWeb, parseWebArgs, WEB_USAGE } from './web/cli.js';
 import { runLock, CLI_HOLDER } from './web/runLock.js';
 import { updateInstalledBinary } from './update/binary.js';
@@ -123,7 +123,6 @@ import {
 import { DEV_UNRESTRICTED, resolveUnrestricted } from './buildProfile.js';
 import { unconfinedBanner } from './safety/sandbox.js';
 import { runTui, attachRenderer } from './tui.js';
-import { runOnboard } from './onboard/onboard.js';
 import { INSTALL_DIR } from './installDir.js';
 import { readVersion } from './version.js';
 import { runAcp } from './acp/cli.js';
@@ -189,8 +188,9 @@ function helpText(): string {
     'Usage: shadow [command] [options]',
     '',
     'Commands:',
-    '  onboard              guided setup — probe endpoint, select models, test + save',
-    '  onboard --web        secure setup in a local browser form → encrypted vault + master password',
+    '  onboard              browser setup — connect, discover models, verify + encrypt',
+    '  onboard --terminal   terminal-only setup (headless / SSH; also --cli)',
+    '  onboard --no-open    print the local setup URL without opening a browser',
     '  update               self-update: git checkout → pull+rebuild; binary install → re-fetch from host',
     '  export [path]        export session log to markdown, or standalone HTML with --html (--session, --out)',
     '  mcp <list|enable|disable>  manage MCP servers (e.g. `mcp enable browser`)',
@@ -1263,20 +1263,7 @@ async function main(): Promise<void> {
   }
 
   if (argv[0] === 'onboard') {
-    // `--web` opens the browser-based SECURE onboarding (encrypted vault + master password); the plain
-    // form stays the terminal flow. Keys go into ~/.shadow/vault.enc, not a plaintext file.
-    if (argv.includes('--web')) {
-      const r = await runWebOnboard((s) => stdout.write(s));
-      if (r.ok) {
-        const what = r.merged ? `Key added to your vault (${r.provider})` : `Vault created (${r.provider})`;
-        stdout.write(lc.green(`✓ ${what}${r.cached ? ', unlocked via keychain' : ''}. Run \`shadow\` to start.`) + '\n');
-      } else {
-        stdout.write(lc.gray(`onboarding not completed${r.reason ? ` — ${r.reason}` : ''}.`) + '\n');
-        process.exitCode = 1;
-      }
-      return;
-    }
-    await runOnboard();
+    if (!(await runOnboarding(argv.slice(1), (s) => stdout.write(s)))) process.exitCode = 1;
     return;
   }
   if (argv[0] === 'web') {
@@ -1515,7 +1502,7 @@ async function main(): Promise<void> {
       process.stderr.write(NO_PROVIDER_HINT + '\n');
       process.exit(1);
     }
-    const ok = await runOnboard();
+    const ok = await runOnboarding([], (s) => stdout.write(s));
     if (!ok) {
       // A cancelled wizard used to die silently with exit 0 — indistinguishable from success.
       process.stderr.write(NO_PROVIDER_HINT + '\n');
@@ -1627,7 +1614,7 @@ async function main(): Promise<void> {
 
   // Destructured so the rest of main() reads exactly as it did before the extraction.
   cfg = session.cfg;
-  const { provider, registry, bg, memory, todoList, planMode, mission, wakeup, skills, facts, sessionLog, offline, context } =
+  const { provider, registry, bg, watchers, memory, todoList, planMode, mission, wakeup, skills, facts, sessionLog, offline, context } =
     session;
   const fullSystemForStyle = session.systemForStyle;
   const fullSystem = session.system;
@@ -1646,6 +1633,9 @@ async function main(): Promise<void> {
   const bus = new EventBus();
   const workCenter = new WorkCenter();
   workCenter.subscribe(bus);
+  // Watchers are durable, so the Work Center projects them at read time instead of mirroring them;
+  // this is what makes a watcher armed in a previous session still visible now.
+  workCenter.attachWatchers(watchers);
   workCenter.restore(resumeSessionPath ? readSessionState(resumeSessionPath).workCenter ?? null : readLatestWorkCenterSnapshot(sessionLog.path));
   workCenter.syncTodos(todoList.snapshot());
   const stateOwners = { mission, planMode, todoList, workCenter, harness: session.harnessState };
@@ -2357,6 +2347,7 @@ async function main(): Promise<void> {
       }),
       onApprovalGate: (gate, approvals) => { currentGate = gate; if (approvals) nativeApprovals = approvals; },
       bgRegistry: bg,
+      watchers,
       workHistory: (sessionId) => queryWorkHistory(workspaceRoot, sessionId),
       planMode,
       mission,

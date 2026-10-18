@@ -41,7 +41,7 @@ eval/FINDINGS-*.md
 *.pfx
 .shadow-signing/
 
-# Local backup bundles.
+# Local backup bundles (see docs/internal/deployment_instructions.md A5).
 *.bundle
 
 # Evaluation endpoint definitions are machine-specific; only the template is shared.

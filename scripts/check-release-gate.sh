@@ -114,6 +114,42 @@ if [ -f package.json ]; then
   echo "release-gate OK: test script globs all TS + TSX tests (quoted for node, not sh) with a timeout."
 fi
 
+# --- static analysis must actually run ----------------------------------------------------
+# `npm run lint` and `npm run typecheck:all` were release-CHECKLIST items only: this gate never
+# invoked them, so a release could go green with a lint error or a type error in a scope that
+# tsconfig.json does not cover (test/ and eval/ live in tsconfig.all.json). Both are cheap and
+# already green, so enforcing them here costs nothing and closes the hole.
+#
+# Fail CLOSED once this looks like a real TypeScript project. The obvious guard —
+# `if node -e "...script exists..."; then run; fi` — silently SKIPS the check when node itself is
+# missing, because "script absent" and "node not found" both make the condition false. A repo that
+# has a manifest AND a tsconfig must prove static analysis ran, or the gate must stop.
+#
+# The `package.json && tsconfig.json` guard is deliberate: the gate is also exercised against
+# minimal fixtures (test/release-workflow.test.ts, test/p0-4-guardrails-default.test.ts) that copy
+# this script into a tree containing only the file under test. Static analysis is genuinely not
+# applicable there — there is no tsconfig to check — and failing those fixtures for it would be
+# testing a fake rather than testing the gate.
+if [ -f package.json ] && [ -f tsconfig.json ]; then
+  if ! command -v node >/dev/null 2>&1; then
+    echo "RELEASE BLOCKED: node not found; cannot verify typecheck:all or lint." >&2
+    exit 1
+  fi
+
+  for gate_script in "typecheck:all" "lint"; do
+    if ! node -e "process.exit(require('./package.json').scripts?.['$gate_script']?0:1)" 2>/dev/null; then
+      echo "RELEASE BLOCKED: package.json has no '$gate_script' script, so the gate cannot run it." >&2
+      echo "  Restore the script or update this check — do not silently skip static analysis." >&2
+      exit 1
+    fi
+    if ! npm run --silent "$gate_script"; then
+      echo "RELEASE BLOCKED: $gate_script failed." >&2
+      exit 1
+    fi
+    echo "release-gate OK: $gate_script clean."
+  done
+fi
+
 # Validate the full SemVer, including prereleases and build metadata.
 if [ -f package.json ] && [ -f README.md ]; then
   node scripts/release-version.mjs

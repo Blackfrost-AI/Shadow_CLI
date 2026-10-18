@@ -12,6 +12,12 @@ import { BgRegistry, makeBashOutput, makeKillShell } from './bgShell.js';
 import { webFetch } from './webFetch.js';
 import { webSearch } from './webSearch.js';
 import { makeWorktreeCreateTool, makeWorktreeRemoveTool, makeWorktreeListTool } from './worktree.js';
+import { binRecon } from './binRecon.js';
+import { patchBytes } from './patchBytes.js';
+import { targetSnapshot } from './targetSnapshot.js';
+import { engagementOps } from './engagementOps.js';
+import { makeWatcherTool } from './watcherTool.js';
+import type { WatcherRegistry } from '../agent/watcher.js';
 
 export {
   makeEnterPlanModeTool,
@@ -25,6 +31,7 @@ export { makeSkillTool } from './skillTool.js';
 export { makeSkillManageTool } from './skillManage.js';
 export { makeRepositoryContextTool } from './repositoryContext.js';
 export { makeScheduleWakeupTool } from './scheduleWakeup.js';
+export { makeWatcherTool } from './watcherTool.js';
 export { makeAgentTool, type AgentToolDeps } from './agentTool.js';
 export { makeToolSearch } from './toolSearch.js';
 
@@ -61,6 +68,8 @@ export function registerBuiltinTools(
     sandboxNetwork?: boolean;
     /** Background-shell registry; pass one to enable run_in_background + bash_output/kill_shell. */
     bg?: BgRegistry;
+    /** Detached watcher registry; pass one to enable the `watcher` tool (survives the session). */
+    watchers?: WatcherRegistry;
   } = {},
 ): void {
   const bg = opts.bg ?? new BgRegistry();
@@ -92,4 +101,13 @@ export function registerBuiltinTools(
   registry.register(makeWorktreeCreateTool());
   registry.register(makeWorktreeRemoveTool());
   registry.register(makeWorktreeListTool());
+  // Phase 1 redteam toolbelt (facts-only; receipts in the SQL evidence ledger)
+  registry.register(binRecon);
+  registry.register(patchBytes);
+  registry.register(targetSnapshot);
+  // Phase 2 targeting doctrine (F3EAD engagement state machine)
+  registry.register(engagementOps);
+  // Detached watchers: registered only when the caller supplies a registry, because the registry is
+  // workspace-scoped and this function has no workspace root of its own.
+  if (opts.watchers) registry.register(makeWatcherTool(opts.watchers));
 }

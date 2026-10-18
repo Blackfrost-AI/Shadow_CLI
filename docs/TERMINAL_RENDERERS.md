@@ -230,7 +230,8 @@ Generated from the same inventory used by `/help` and `/keybindings`.
 | Ctrl+C | abort work or clear draft; twice on an empty draft exits |
 | Ctrl+G | edit draft in $VISUAL/$EDITOR while idle; next match in search |
 | Ctrl+O | expand or collapse transcript details |
-| Ctrl+T | show all tasks |
+| Ctrl+N | open the live work overlay: sub-agents, background shells, watchers |
+| Ctrl+T | open the anchored task snapshot overlay |
 | Up / Down | composer history at the draft boundary |
 | PgUp / PgDn | scroll transcript; wheel also scrolls the pane under the pointer |
 | Home / End | transcript start / latest output |
