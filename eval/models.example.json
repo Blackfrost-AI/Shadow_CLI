@@ -4,7 +4,7 @@
   "baseUrl": "http://your-host:11434/v1",
   "apiKey": "ollama-local",
   "models": [
-    { "label": "local", "model": "my-model:latest" },
+    { "label": "qwen", "model": "qwen3:8b" },
     { "label": "gemma", "model": "gemma3:27b" },
     { "label": "glm", "model": "glm-4.6:latest" }
   ]

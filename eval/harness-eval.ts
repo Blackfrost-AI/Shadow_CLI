@@ -17,6 +17,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { SessionLog } from '../src/state/session.js';
 import { TASKS, DIALECT_TASKS } from './tasks.js';
+import { SECURITY_TASKS } from './security-tasks.js';
 import type { EvalTask, ModelCfg, RunResult } from './types.js';
 
 const SRC_INDEX = fileURLToPath(new URL('../src/index.ts', import.meta.url));
@@ -212,7 +213,7 @@ function scorecard(model: ModelCfg, rows: Row[]): string {
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   const models = loadModels(args);
-  const allTasks = [...TASKS, ...DIALECT_TASKS];
+  const allTasks = [...TASKS, ...DIALECT_TASKS, ...SECURITY_TASKS];
   const tasks = args.only ? allTasks.filter((t) => args.only!.includes(t.id)) : allTasks;
   if (tasks.length === 0) throw new Error('no tasks selected (check --only ids)');
 
