@@ -1,5 +1,43 @@
 # Shadow release notes
 
+## 10.3.1 — 2026-10-18
+
+- Add a working indicator to the terminal tab title: a braille frame leads the title while a turn
+  is in flight, and the title is rewritten bare the moment it ends, so an idle tab is completely
+  still. The glyph leads because tab strips truncate on the right. `--reduced-motion` shows a
+  single static `●` that still reads as busy.
+- Settle `running` and the title inside a `finally` so a failing display helper can never leave the
+  tab animating forever, and route mid-turn renames through the activity path so the spinner is not
+  dropped.
+- Add a pty test that drives the real interactive TUI against a mock streaming provider and asserts
+  the frame changes mid-turn and the last title written is idle.
+
+## 10.3.0 — 2026-10-18
+
+- Add contained detonation (`sample_run`): run an untrusted sample under an OS sandbox whose only
+  writable path is a private scratch directory — workspace read-only, `/tmp` a private tmpfs, no
+  inherited environment, network denied unless the engagement authorises it. Every dropped file is
+  enumerated and hashed and the receipt is bound to the sample's SHA-256. With no sandbox
+  available it refuses to run rather than detonating unconfined.
+- Thread an exclusive write root through both the seatbelt and bwrap backends so containment is the
+  same guarantee on macOS and Linux.
+- Fix `tool_search`: it now matches intent aliases and natural language, returns the full argument
+  schema, and promotes what it finds into the active tool list. Previously it ignored aliases,
+  returned a bare name and never promoted, so a model could discover a tool it could not call.
+- Fix a detonation shell argument off-by-one and validate containment before the sample runs rather
+  than after.
+
+## 10.2.0 — 2026-10-17
+
+- Make the security toolkit discoverable: `tool_search` resolves `malware`, `ransomware`,
+  `shellcode`, `c2`, `ioc`, `reverse`, `pentest`, `redteam`, `vuln`, `sarif`, `drift` and
+  `triage` to the right tool, where `bin_recon` was previously reachable only by already knowing
+  the word "recon".
+- Add a security engagement policy covering when to reach for each security tool and which
+  verification rules are not optional: a finding is verified only by a current recorded
+  `project_checks` run, `retest` fails closed without a live registry, and a patch receipt is the
+  record.
+
 ## 10.1.0 — 2026-10-12
 
 - Add reusable project checks and bounded completion corrections under existing permissions,
