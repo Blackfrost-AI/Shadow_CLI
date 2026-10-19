@@ -884,6 +884,18 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   }
   sessionLog.bindSessionState(context, () => captureSessionState({ mission, planMode, todoList, harness: harnessState }));
 
+  // Provenance: record once, up front, which model/provider/harness/version produced this
+  // session. Written for new sessions only — a resumed session keeps the header it was born
+  // with, so `/model` switches across a resume never rewrite history.
+  if (!opts.resumeSessionPath) {
+    sessionLog.recordProvenance({
+      model: cfg.model,
+      provider: cfg.provider,
+      baseUrl: configuredBaseUrl,
+      cwd: workspaceRoot,
+    });
+  }
+
   const connectMcp = async (): Promise<Array<{ stop(): void }>> => {
     // Offline mode: skip MCP servers entirely — they are outbound connectors (another egress
     // vector), so an offline session keeps nothing but the local model.

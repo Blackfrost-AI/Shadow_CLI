@@ -46,6 +46,8 @@ export type LoopEvent =
       outputTokens: number;
       costUSD: number;
       contextPct: number;
+      /** Model that produced this turn. Present so a mid-session `/model` switch is attributable. */
+      model?: string;
       cacheReadTokens?: number;
       cacheWriteTokens?: number;
       ttftMs?: number;

@@ -36,25 +36,73 @@ function releaseBase(): string {
   return parsed.toString().replace(/\/+$/, '');
 }
 
-async function download(url: string, maxBytes: number): Promise<Buffer> {
-  const response = await shadowFetch(url, { redirect: 'error', signal: AbortSignal.timeout(60_000) }, {
-    purpose: 'update-binary',
-    origin: 'user',
-  });
-  if (!response.ok) throw new Error(`download failed (${response.status}) for ${url}`);
-  const declared = Number(response.headers.get('content-length') ?? 0);
-  if (declared > maxBytes) throw new Error(`download exceeds ${maxBytes} byte limit: ${url}`);
-  if (!response.body) throw new Error(`empty response body: ${url}`);
+/**
+ * Idle timeout for a release download, and the total ceiling.
+ *
+ * `AbortSignal.timeout(60_000)` was applied to the whole response, which is wrong for the
+ * binary: 74 MB over a slow-but-healthy link takes longer than 60 s, so `shadow update`
+ * aborted mid-download and exited 0 having replaced nothing — a silent no-op update. The
+ * timeout must bound *inactivity*, not elapsed time, so a slow transfer still completes while a
+ * genuinely stalled one still fails.
+ */
+const DEFAULT_TIMEOUTS: DownloadTimeouts = { idleMs: 60_000, totalMs: 30 * 60_000 };
 
-  const chunks: Buffer[] = [];
-  let total = 0;
-  for await (const chunk of response.body as AsyncIterable<Uint8Array>) {
-    total += chunk.byteLength;
-    if (total > maxBytes) throw new Error(`download exceeds ${maxBytes} byte limit: ${url}`);
-    chunks.push(Buffer.from(chunk));
+export interface DownloadTimeouts {
+  idleMs: number;
+  totalMs: number;
+}
+
+/**
+ * Exported for tests: the timeout semantics (idle, not total) are the thing that broke
+ * `shadow update` silently, so they need direct coverage without standing up release signing.
+ */
+export async function download(
+  url: string,
+  maxBytes: number,
+  timeouts: DownloadTimeouts = DEFAULT_TIMEOUTS,
+): Promise<Buffer> {
+  const { idleMs, totalMs } = timeouts;
+  const controller = new AbortController();
+  let idle: NodeJS.Timeout | undefined;
+  const bump = (): void => {
+    if (idle) clearTimeout(idle);
+    idle = setTimeout(
+      () => controller.abort(new Error(`download stalled (no data for ${idleMs / 1000}s): ${url}`)),
+      idleMs,
+    );
+    idle.unref?.();
+  };
+  const total = setTimeout(
+    () => controller.abort(new Error(`download exceeded ${totalMs / 60_000}min: ${url}`)),
+    totalMs,
+  );
+  total.unref?.();
+  bump();
+
+  try {
+    const response = await shadowFetch(url, { redirect: 'error', signal: controller.signal }, {
+      purpose: 'update-binary',
+      origin: 'user',
+    });
+    if (!response.ok) throw new Error(`download failed (${response.status}) for ${url}`);
+    const declared = Number(response.headers.get('content-length') ?? 0);
+    if (declared > maxBytes) throw new Error(`download exceeds ${maxBytes} byte limit: ${url}`);
+    if (!response.body) throw new Error(`empty response body: ${url}`);
+
+    const chunks: Buffer[] = [];
+    let received = 0;
+    for await (const chunk of response.body as AsyncIterable<Uint8Array>) {
+      bump();
+      received += chunk.byteLength;
+      if (received > maxBytes) throw new Error(`download exceeds ${maxBytes} byte limit: ${url}`);
+      chunks.push(Buffer.from(chunk));
+    }
+    if (received === 0) throw new Error(`downloaded file is empty: ${url}`);
+    return Buffer.concat(chunks, received);
+  } finally {
+    if (idle) clearTimeout(idle);
+    clearTimeout(total);
   }
-  if (total === 0) throw new Error(`downloaded file is empty: ${url}`);
-  return Buffer.concat(chunks, total);
 }
 
 function expectedHash(manifest: string, asset: string): string {

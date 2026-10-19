@@ -193,6 +193,8 @@ function helpText(): string {
     '  onboard --no-open    print the local setup URL without opening a browser',
     '  update               self-update: git checkout → pull+rebuild; binary install → re-fetch from host',
     '  export [path]        export session log to markdown, or standalone HTML with --html (--session, --out)',
+    '  corpus <on|off|status|export|stats>  capture YOUR OWN sessions as training data — local only,',
+    '                       opt-in per workspace, redacted on write and on export, no network path',
     '  mcp <list|enable|disable>  manage MCP servers (e.g. `mcp enable browser`)',
     '  plugin <add|list|enable|disable|remove|search>  local-first plugin manager (data-only markdown bundles)',
     '  harness <list|show|validate|enable|disable|use>  manage trusted local harness add-ons',
@@ -1292,6 +1294,11 @@ async function main(): Promise<void> {
   }
   if (argv[0] === 'export') {
     await runExport(argv.slice(1), process.cwd());
+    return;
+  }
+  if (argv[0] === 'corpus') {
+    const { runCorpus } = await import('./cli/corpus.js');
+    await runCorpus(argv.slice(1), process.cwd());
     return;
   }
   if (argv[0] === 'mcp') {

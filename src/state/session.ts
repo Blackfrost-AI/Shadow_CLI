@@ -19,6 +19,7 @@ import type { Context } from '../agent/context.js';
 import { serializeContext } from './snapshot.js';
 import { deriveSessionTitle, normalizeSessionTitle } from './sessionTitle.js';
 import type { SessionStateSnapshot } from './sessionState.js';
+import { captureProvenance, type CaptureInput } from './provenance.js';
 
 // Append-only JSONL session log. Each run gets its own file under
 // <workspaceRoot>/.shadow/sessions/, one JSON object per line: user inputs,
@@ -419,6 +420,9 @@ export class SessionLog {
   /** Cumulative bytes written by this instance === current file size (append-only, sole writer). */
   private bytesWritten = 0;
 
+  /** Guards the one-time provenance header (see `recordProvenance`). */
+  private provenanceWritten = false;
+
   // P2-13 delta bookkeeping — PER CONTEXT, keyed by the Context object itself. The main loop and
   // its sub-agents share THIS SessionLog but snapshot DIFFERENT contexts interleaved; a single
   // "last snapshot" field would bounce between the two lineages and force every snapshot to
@@ -524,6 +528,20 @@ export class SessionLog {
     const log = new SessionLog(path);
     log.bytesWritten = st.size;
     return log;
+  }
+
+  /**
+   * Write the immutable provenance header for this session. Called once, immediately after
+   * `open()`, so every session log says which model/provider/harness/version produced it.
+   *
+   * Idempotent: a second call is a no-op, because two writers racing on one log (resume, fork)
+   * must not append conflicting headers. Sessions that predate this feature simply have no
+   * `provenance` record — readers treat that as "unknown", never as "no model".
+   */
+  recordProvenance(input: CaptureInput): void {
+    if (this.provenanceWritten) return;
+    this.provenanceWritten = true;
+    this.record(captureProvenance({ ...input, sessionId: input.sessionId ?? this.path }) as unknown as Record<string, unknown>);
   }
 
   /** Append one redacted event line via the persistent fd. Never throws — records `lastError`.

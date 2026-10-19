@@ -1,581 +1,151 @@
-<p align="center">
-  <img src="assets/hero.png" alt="Shadow — a true gift of freedom and privacy" width="100%">
-</p>
+# Shadow CLI
 
-# Shadow
+Current build: **`v10.5.1`** — `shadow corpus`: capture your own sessions as training data. Local-only, opt-in per workspace, redacted on write and on export, with no network path anywhere in it.
 
-> **A true gift of freedom and privacy.**
-> Zero-telemetry · provider-neutral · phone home to no one.
-> Current build: **`v10.5.0`** — a readability pass on the TUI markdown viewer: tables hold their shape at every terminal width, all six heading levels are distinguishable, and nested ordered lists keep their numbers.
+Shadow is a local-first, provider-neutral security engineering agent. Its built-in Security
+foundation covers investigation, hardening, incident response, defensive automation, secure coding,
+and the systems work those tasks require. It connects a model you choose to tools that read, edit,
+search, and run commands in your workspace. Permissions, budgets, session history, and connection
+receipts stay under your control. Shadow requires no Shadow account and includes no telemetry service.
 
-**Shadow is a zero-telemetry, provider-neutral security engineering agent that runs on your terms.** Point it at any model — Anthropic, any OpenAI-compatible endpoint, Gemini, or a local model on your own box. Its built-in Security foundation covers investigation, hardening, incident response, defensive automation, secure coding, and supporting systems work. **No Shadow account, no signup, no phone-home:** network access follows your provider, tool and update choices. Your config stays local and readable (`~/.shadow/config.json`), credentials are sent to their configured services, and you can switch models mid-session **without losing context**.
+Snowfall is v10's default terminal: a full-screen conversation with search,
+prompt navigation, a compact session footer, and a pinned composer. Start this checkout with
+`npm start` after building. Use `/theme snowfall` for the ice palette; saved themes remain active.
+`SHADOW_TUI=ink npm start` retains the compatibility renderer. The
+[terminal contract](docs/TERMINAL_RENDERERS.md) lists commands, keys and migration decisions.
+See the [10.5.0 release notes](https://github.com/Blackfrost-AI/Shadow_CLI/releases/tag/v10.5.0)
+for the published release.
 
-We're not competing for "coding-tool" mindshare — we're handing you back control: local-first autonomy, real guardrails, and full ownership of your workspace and your data.
+Shadow names conversations from their opening prompt and shows the active name in the
+terminal title. Find names through `/resume`, or use `/rename Website launch` to choose one.
+`/new` keeps the previous named conversation available to resume.
 
-Under the hood it's a **tool-calling agentic runtime**: the model reasons, emits tool calls, Shadow executes them against the OS through a bounded, observable loop with a configurable permission model and enforced guardrails (workspace jail + OS sandbox), and loops until the task is done or a stop condition fires.
+Run `shadow onboard` for local browser setup: connect an endpoint, discover and select models,
+then verify and save into the encrypted vault. First-run interactive sessions open the same flow.
+Use `shadow onboard --terminal` for terminal-only setup, including **Subscription account**
+for ChatGPT / official Claude Code sign-in and **Local file** for GGUF / MLX. The browser offers
+a handoff to that wizard in the same process, without running the command again.
 
-This is **not a chat app** — it is a tool-calling runtime.
+Shadow includes live `/work`, durable `/jobs`, retained worktree artifacts,
+scoped `/review`, profile-based `/consult` and bounded `/team` workflows. See the
+[collaboration guide](docs/COLLABORATION.md) for controls and current limitations.
 
-## What's new in v10.5.0
+## What Shadow does
 
-- **Tables hold their shape at every terminal width.** The `MIN_COL` floor pushed `Σwidths` back over budget, so one 4-column table gridded at 78 and 88 columns but fell back to a key:value wall at 82 and 84 — widening the window could break the table. The grid decision is now monotonic: grid below a single threshold, never above it.
-- **All six heading levels are distinguishable,** and nested ordered lists keep their numbers instead of restarting at 1.
-
-## Previous highlights: v10.4.0
-
-- **Real read-only confinement** (Seatbelt, bubblewrap, Landlock), tool output spilled to a file instead of truncated, and a runtime-context block that tells the model its own sandbox.
-
-## Previous highlights: v10.3.2
-
-- **A slow resolver no longer reads as a missing host.** Every egress lookup ran under a 1.5s budget and the timeout was swallowed, so on a cold resolver (fresh Linux install, VPN, container DNS) `shadow update` could report the release bucket as permanently gone while it was perfectly reachable. The budget is now 5s and overridable with `SHADOW_EGRESS_DNS_BUDGET_MS`, and a timeout is reported as a timeout — naming the budget — rather than as `could not be resolved`. Both failures still fail closed.
-
-## Previous highlights: v10.3.1
-
-- **Working indicator in the tab title:** a braille frame leads the tab title while a turn is in flight and the title is rewritten bare the moment it finishes, so an idle tab is completely still. The glyph leads because terminal tab strips truncate on the right. `--reduced-motion` swaps the animation for a single static `●` that still reads as busy.
-
-## Previous highlights: v10.3.0
-
-- **Contained detonation (`sample_run`):** run an untrusted sample and observe what it actually does. The sample executes under an OS sandbox whose only writable path is a private scratch directory — workspace read-only, `/tmp` a private tmpfs, no inherited environment, network denied unless the engagement authorises it. Every dropped file is enumerated and hashed, and the receipt is bound to the sample's SHA-256. If no sandbox is available it **refuses to run** rather than detonating unconfined.
-- **Tool discovery actually works:** `tool_search` previously reimplemented its own filter, ignored intent aliases, returned a bare name with no argument schema, and never promoted what it found into the active tool list — so a model could "discover" a tool it then could not call. It now matches on aliases and natural language, returns full schemas, and promotes matches for the rest of the session.
-- **Detonation sandbox mode:** `exclusiveWriteRoot` threads a single-writable-root mode through both the macOS seatbelt profile and the Linux bubblewrap flag list.
-- **Ten security eval tasks:** the four new ones cover snapshot drift and contained detonation (benign execution, containment escape, network denial).
-
-## Previous highlights: v10.2.0
-
-- **Security toolkit is now discoverable:** `tool_search` matches intent aliases as well as tool names, so `malware`, `ransomware`, `shellcode`, `c2`, `ioc`, `reverse`, `pentest`, `redteam`, `vuln`, `sarif`, `drift` and `triage` all resolve to the right tool. Previously five working tools were reachable only by already knowing their exact names.
-- **Security engagement policy:** `prompts/policies/security-engagement.md` documents when to reach for each security tool, and the verification rules that are not optional.
-- **Six security eval tasks:** scoring on workspace state and tool telemetry, covering Mach-O triage, fail-closed patching, a correct patch landing, F3EAD engagement persistence, the findings ledger, and integrity baselines.
-- **Honoured capability declarations:** `adaptiveThinking` and `promptCache` are now read by the Anthropic adapter — a declaration is the authority and the model-id regex is the fallback.
-- **Hardened release gate:** `typecheck:all` and `lint` now run as part of the gate, so a release can no longer go green with a type error in `test/` or `eval/`.
-
-## Previous highlights: v10.1.0
-
-- **Workflows and checks:** run typed local workflows, preview their inputs, and verify work with reusable project checks and bounded completion corrections.
-- **Context controls:** inspect the captured request, pin files across compaction and resume, and exclude exact managed sources from future context.
-- **Review and recovery:** preview file or hunk staging, unstaging and restore; stale-state protection and retained backups cover review actions and guarded rewind.
-- **Session library:** search explicitly selected projects, pin sessions, add tags, and follow session lineage without changing the active workspace.
-- **Automation:** use versioned JSON/JSONL output, final JSON-schema validation, stable exit codes and ephemeral transcripts.
-- **Security evidence:** keep local findings, import SARIF/JSON, retain evidence history, and export redacted reports. Verification uses current host-recorded checks.
-- **Everyday controls:** optional onboarding capability probes, extension and learned-skill review menus, queued follow-ups during active work, and local tmux discovery, autocomplete and Codex terminal controls.
-
-Everything above runs locally through your chosen provider and existing permissions. No telemetry or hosted coordination was added. See the [functionality guide](docs/FUNCTIONALITY.md), [automation guide](docs/AUTOMATION.md), and [release notes](CHANGELOG.md).
-
-## Previous highlights: v10.0.4
-
-- **Subscription accounts:** sign in with ChatGPT directly or connect the official Claude Code CLI. Account identity survives model/profile changes and never silently falls back to API billing.
-- **Reliable onboarding:** choose a subscription, cloud provider, local model server, or local file through one keyboard-driven flow. Endpoint checks are bounded and retryable, and failed entries remain editable.
-- **Security foundation and harness add-ons:** every session starts from Shadow's provider-neutral Security foundation. Trusted packages under `~/.shadow/harnesses` can add scoped instructions, skills, and tools for new sessions without choosing your model, endpoint, credentials, permissions, or sandbox.
-- **Local skill learning:** `/learn` creates evidence-linked skill candidates; `/skills` supports explicit review, activation, revision history, and rollback. Shadow adds no telemetry or callback service.
-- **Hardened self-hosting:** trusted profiles can pair a model preset with a harness and runtime limits. Self-hosted SGLang/Qwen presets can explicitly control chat-template thinking without leaking that extension to cloud providers.
-- **Cleaner terminal output:** completed reasoning collapses into one expandable row, models that emit no reasoning create no empty panel, and repeated grep activity is grouped. Escape interruption remains covered during text, first-token, and thinking streams.
-
-Harness selection is fixed when a session starts; mid-session harness switching remains future work. See the [user guide](USER_GUIDE.md), [terminal contract](TERMINAL_RENDERERS.md), and [release notes](CHANGELOG.md).
-
-## Previous highlights: v10.0.3
-
-- **Recoverable work:** browse active workers through `/work`, inspect persistent attempts and blockers in `/jobs`, and exchange local project messages through `/room`. Restarting a session never automatically repeats commands or edits.
-- **Review and retain changes:** `/review` browses working changes, branch comparisons and commits. Worker worktrees and patches remain available to inspect, apply, keep or discard explicitly.
-- **Independent consultations:** `/consult` uses a separate read-only conversation with a selected model profile. Follow-ups survive session resume without changing the lead session's model.
-- **Bounded collaboration:** `/team` offers second opinion, implement-and-review and parallel-team presets, with pipeline, debate and plan/solve options. Child workers inherit permissions, cancellation and budgets; recorded checks remain separate from model opinions.
-- **Context and connectors:** ranked repository excerpts, semantic navigation with labeled lexical fallback, scoped instructions, skill origins and memory provenance. Snowfall's `/mcp` adds live reconnect/disable controls, progress, deadlines and large-result retrieval.
-- **Terminal and response fixes:** more footer spacing, elapsed minutes, visible `/effort` choices, separate thinking blocks, preserved structured tool calls and partial results, and clearer interrupted/cancelled states.
-- **Privacy by default:** jobs, rooms and progress records are stored locally. No analytics or crash uploads; update discovery is off unless enabled in trusted user configuration. Project files cannot enable it.
-
-Start with the [collaboration guide](docs/COLLABORATION.md), [user guide](USER_GUIDE.md) and
-[terminal contract](TERMINAL_RENDERERS.md). Workers stop when Shadow exits; remote MCP cancellation
-is best effort, and missing provider usage remains unknown. See [release notes](CHANGELOG.md).
-
-## Previous highlights: v10.0.1
-
-- **Guided setup in the Snowfall style:** choose Local file, Model server or Cloud, with compact menus, arrow keys, search and a review before saving.
-- **Reliable endpoint setup:** cancellable checks, clear time limits, masked keys, and retry/edit controls that keep your entries when a server fails. Each endpoint keeps its own credentials.
-- **More providers:** Cerebras, Fireworks, DeepInfra, Hugging Face, NVIDIA NIM, vLLM, SGLang and llama.cpp join the catalog without crowding the first screen.
-- **Named conversations:** sessions take a name from the opening prompt. Use `/rename` to choose one, find it in `/resume`, and see it in the terminal title. `/new` preserves the previous conversation.
-
-See the [10.0.1 verification record](docs/V10_0_1_VERIFICATION.md) and [release notes](CHANGELOG.md).
-
-## Previous highlights: v10.0.0 — Snowfall
-
-- **Snowfall is now the default terminal:** a full-width conversation, pinned composer and compact footer keep your work centered. The original thick SHADOW wordmark returns in cyan with responsive fallbacks for narrow terminals.
-- **A navigable transcript:** page and wheel scrolling, prompt jumps, text selection, search, folded tool details and scrollback restoration on normal exit.
-- **Everyday controls:** queued follow-ups, permission dialogs, custom slash commands, external-editor access and accessible themes share the existing agent runtime.
-- **Work Center stays available:** v9 agent, shell and task tracking, persisted history, and explicit controls continue across terminal, web and ACP.
-- **Compatibility:** `SHADOW_TUI=ink shadow` retains Vim mode, round-table mode, custom status lines and configurable key mappings. Headless, REPL, web and editor integrations keep their existing entrypoints.
-
-See the [terminal contract](TERMINAL_RENDERERS.md), [release verification](docs/V10_VERIFICATION.md), and [release notes](CHANGELOG.md).
-
-## Previous highlights: v9.0.0
-
-- **Work Center:** `/work` lists agents, background shells and plan items with status, ownership, elapsed time and bounded activity history. Inspect details, filter by type/status/tool/file, and view persisted cross-session history without restarting old work.
-- **Explicit controls:** pause/resume background agents at safe boundaries, adjust queued priority, cancel active background agents, stop owned shells, and request a linked retry with explicit confirmation. Historical work remains read-only.
-- **Shared state:** terminal, web companion and the versioned ACP Work Center extension use the same work state and control boundaries.
-- **Full SHADOW wordmark:** the two-tone 51-column mark is restored; medium-width layouts stack the full mark before falling back to a compact header.
-- **Renderer contract:** In v9, Ink was the supported default and `SHADOW_TUI=pi shadow` selected the experimental preview. Its daily commands and session transitions are covered by regression tests; `/vim`, `/table`, `/statusline`, custom commands and custom key mappings remain Ink-only. See [Terminal renderers](TERMINAL_RENDERERS.md).
-- Approval previews make terminal and invisible controls visible without altering the original tool inputs. Session resume, rewind, fork and exports preserve the documented context and ownership boundaries.
-
-See the [release notes](CHANGELOG.md) and [Work Center guide](USER_GUIDE.md#everyday-use).
-
-## Previous transition: v8.7.1
-
-- Installers and standalone updates now use Blackfrost's signed release bucket.
-- Existing binary users can run `shadow update` once through the legacy host to receive this transition, then future updates use Blackfrost.
-- Windows PowerShell 5.1 remains supported. Signature checks are mandatory by default; no extra PowerShell installation is required. Standalone self-update verifies and replaces the binary directly without spawning PowerShell.
-- `shadow doctor --privacy` identifies manual release downloads separately from optional version checks.
-- `shadow update --offline` refuses before making a request.
-- Updated compatible dependency versions to resolve the reported Undici and js-yaml advisories.
-- Includes the previously published fix for preserving partial sub-agent findings at the iteration limit.
-
-The product page and installer entrypoints are at [blackfrostai.com/shadow](https://blackfrostai.com/shadow). Source releases and binary releases have separate publication steps.
-
-## Previous highlights: v8.7.0
-
-- **🔑 Subscription auth that carries its own endpoint.** An imported Codex/ChatGPT credential is now used *whole*: the bearer travels with the base URL, the account/product identity headers and the wire it is bound to, instead of being recombined by hand. If a configured `baseUrl` is not the backend that token belongs to, Shadow **refuses** it and says so rather than quietly sending a ChatGPT credential somewhere else. Tokens refresh themselves before they expire (they live about an hour), and `shadow login status` reports the stored credential, its endpoint, its expiry and the opt-in gate — a stored-but-inactive credential used to be indistinguishable from no credential at all. `shadow login import codex` imports; `shadow login codex` explains.
-- **🔌 Inference boxes that describe themselves.** Mark a preset `autoModel` (or run `shadow local add --endpoint http://<host>:<port>/v1`) and Shadow asks the box what it is serving on **every start**, using that model id and the context window the endpoint reports — so restarting a self-hosted box with a different model needs no config edit at all. A base URL written with or without `/v1` self-corrects, and the three failure causes are told apart: unreachable, reachable-with-nothing-loaded, and an unrecognized catalogue. All of them are non-fatal: Shadow names the box, keeps the model id the preset declares, and boots.
-- **🛡 A 26-fix deep-review hardening pass.** An adversarial review of the runtime found and fixed real defects across the stack: a filesystem-jail escape where `..` was resolved before the symlink walk (`<ws>/link/../outside/x` was judged inside while the OS opened a file outside); shell commands that rode input redirection or a session grant out of the jail; a read-before-edit guard that forgot every file the moment you sent a second message; redaction that returned a shared object reference raw and missed PEM private keys; `run_shell` leaving stdin an open pipe, so `cat`/`read`/`python` blocked for the full timeout; a text-recovery scanner that was **cubic in the reply length** (a degenerate repetition cost 41s at 30 KB and 149s at 45 KB — now about a millisecond); tool-call arguments that several OpenAI-compatible servers send as a JSON object being silently dropped; and terminals that batch keypresses into one read typing a key's bytes into the draft. Plus LSP diagnostics that stopped for a file after a server restart, and session retention that ranked the newest log by filename instead of by time.
-
-Earlier highlights:
-
-- **v8.6 — the endpoint harness:** the web console's Endpoints pane (pinned permanent hosts with a port-resolver doctor, quick-pick probes, an opt-in bounded LAN scan, one-click promotion), editable + testable saved connections, source-faithful `Ctrl+X C` draft copying with display-column caret navigation, and a first-class self-hosting guide with a no-network provider doctor.
-
-- **v8.5 — discovery + hardening:** onboarding model discovery (the wizard probes your endpoint and saves your allowlist as `/model` presets), the deep-review hardening line (25 adversarially-verified findings fixed), and the correctness sweep.
-- **v8.4 — the UX parity line:** first-run auto-onboard, Shift+Tab plan mode, Ctrl+X M model picker, `/export html`, stable `web.token`, auto-format after writes, Claude-session import, spend guardrails, LSP diagnostics after writes, and `/goal` mission mode.
-- **v8.0–8.3 — the web console era:** `shadow web` (sessions sidebar, streaming transcript, approval dock, inspector), toasts + context gauge, stream resilience, self-documenting config + instruction-file autopilot.
-- **🎭 Collaboration Mode — a live model round-table.** `/table gpt glm` seats 2–4 models in **one shared conversation**; you hold the baton and route each turn with `@handle`. Compare reasoning side by side, or let a strong model check a fast one.
-- **📊 Charts, tables & a genuinely beautiful TUI.** Fenced `chart` blocks render as real unicode **bar / line / sparkline** graphs; GFM tables get rounded grids with ledger-aligned numbers; markdown, code, and diffs are calm and readable.
-- **♿ Accessibility, first-class.** A `colorblind` (Okabe–Ito) palette and a `high-contrast` theme; user prompts have a filled background band and failed tools a `✗` marker.
-- **📋 Copy & paste that just works.** Multi-line paste is atomic (embedded newlines never fire a stray send), `Ctrl-V` pastes from the system clipboard, `Alt-C` copies the last answer, `/copy code` grabs the last code block.
-- **⌨ A slash menu that anticipates you.** Fuzzy matching (`/thm` → `/theme`), inline argument completion (`/theme ␣` lists every theme with a `✓ current` marker), and did-you-mean on typos.
-- **🖥 Three local backends, auto-served.** `.gguf` (llama.cpp), **MLX** (Apple Silicon — text *and* multimodal via mlx-vlm), and **vLLM** (Linux + CUDA) — point an entry at a model and Shadow launches the server for you.
-- **🧠 Never loses the plot.** Context compaction now pins your task verbatim, so a long session (or a weak local summarizer) can't make the model forget what it's doing.
-
-## Status
-
-| Milestone | What | State |
-|---|---|---|
-| M0 | Skeleton, config, provider-neutral block model, mock provider, headless loop (termination + budget), approval gate, REPL | ✅ |
-| M1 | Tools: `read_file` `write_file` `edit_file` `grep` `glob` `run_shell` (zod-validated, structured results) | ✅ |
-| M2 | Safety: symlink-aware workspace jail, catastrophic-command denylist, autonomy levels, approval flow, dry-run, SSRF netguard | ✅ |
-| M3 | Ink TUI HUD (streaming output / status bar / inline approval dialog / two-stage Ctrl-C) | ✅ |
-| M4 | Append-only redacted session logs + project-facts memory (`memory` tool) | ✅ |
-| M5 | Real providers (Anthropic + OpenAI-compatible, streaming, prompt caching, retry), web tools | ✅ |
-| M6 | Anthropic-compatible harness parity: plan/ask/export, approval taxonomy, fallback, permission rules, hooks, MCP/skills/agent | ✅ |
-| M7 | **Format-adaptive universality** — dual transport + auto-detect, text-tool-call recovery, control-token scrub, three tool-call signature regimes (Anthropic signed / Gemini `thought_signature` / plain OpenAI); validated against a 9-model test program | 🚧 |
-
-Per-version detail ships with each release.
+- Runs coding tasks interactively in the terminal or through `--task`.
+- Connects to ChatGPT/Claude subscriptions, API providers, and self-hosted model endpoints.
+- Supports workspace edits, shell commands, tool approvals, plan mode, and bounded agent runs.
+- Keeps sessions, checkpoints, memory, and context compaction for ongoing work.
+- Loads trusted local harness add-ons for new sessions without choosing or restricting your endpoint.
+- Uses `/learn` to prepare evidence-linked local skill candidates for explicit operator review and activation.
+- Extends the runtime with MCP servers, skills, and data-only plugins.
+- Offers a local web companion through `shadow web` and an ACP editor bridge through `shadow acp`.
 
 ## Install
 
-Shadow ships as a single self-contained binary (no Node needed to run it). The installers are served from **blackfrostai.com/shadow**, with reviewed copies in this repository. They verify the signed manifest using a pinned release key.
+The public installers download standalone binaries and verify their signed checksums.
 
-### macOS / Linux
+Shadow's website and installers are at [blackfrostai.com/shadow](https://blackfrostai.com/shadow).
+The current signed release is [10.5.0](https://github.com/Blackfrost-AI/Shadow_CLI/releases/tag/v10.5.0).
+Existing standalone installations can upgrade with `shadow update`.
 
-```bash
+macOS / Linux:
+
+```sh
 curl -fsSL https://blackfrostai.com/shadow/install.sh | sh
 ```
 
-### Windows (PowerShell)
+Windows PowerShell:
 
 ```powershell
 irm https://blackfrostai.com/shadow/install.ps1 | iex
 ```
 
-The installer detects your platform, downloads the matching binary, **verifies it** (see below), and drops it on your `PATH`. **Update:** `shadow update`. **Uninstall:** delete the binary (`rm "$(command -v shadow)"`).
+For development or a source installation, use Node **22.19.0 or newer** and npm:
 
-### Verifying the download 🔒
-
-Shadow is a security tool, so the installer **fails closed**. It downloads `SHASUMS256.txt` plus an ECDSA‑P256 signature (`SHASUMS256.txt.sig`) made with an **offline** release key, verifies that signature against the public key **pinned in the installer**, and only then checks the binary's SHA‑256 against the signed manifest. A compromised download host can't forge the signature, so a tampered binary is rejected — the install aborts. (Verification uses `openssl` on macOS/Linux; on Windows, PowerShell 7.1+ verifies via `ImportFromPem` and Windows PowerShell 5.1 — stock Windows — verifies via .NET Framework's native ECDSA; runtimes with neither abort.) The release public key is [`public/bin/SHASUMS256.pub`](https://storage.googleapis.com/blackfrost-ai-prod-shadow-releases/bin/SHASUMS256.pub) and is embedded in `install.sh`/`install.ps1` — read them before piping to a shell.
-
-### Build from source (optional)
-
-Requires **Node.js ≥ 22.19** and **git**:
-
-```bash
-git clone https://github.com/Blackfrost-AI/Shadow_CLI.git && cd Shadow_CLI && npm install && npm run build && npm link
+```sh
+npm ci
+npm run build
+node dist/index.js --help
 ```
 
-Then `shadow --help` from anywhere.
+Standalone-binary development uses Bun **1.4.2**: `npm run build:binary`. Set `BUN` to a
+compatible executable if it is not on your PATH. Run tests with Node (`npm test`), never Bun.
 
-## First run — connect your model
+## Start a session
 
-A fresh install ships with **no provider configured** — Shadow won't run until you connect one. Just launch it:
-
-```bash
+```sh
+shadow onboard
 shadow
 ```
 
-On first run it opens with the **mode chooser** — the real first question:
+`shadow onboard` opens local browser setup; `--web` remains an alias. `shadow onboard --terminal`
+(also `--cli`) keeps setup in the terminal. `shadow onboard --no-open` prints a local URL without
+launching a browser; on SSH, forward its loopback port. Subscription setup runs in the terminal.
+Subscription connections keep their selected account and never automatically fall back to API billing.
+Environment variables and CLI flags can override other saved configuration; the
+[user guide](docs/USER_GUIDE.md) explains the available settings and credential paths.
 
-```
-1. Local file    — a .gguf or MLX model on this machine (auto-served)
-2. Local server  — Ollama / LM Studio / llama.cpp already running
-3. Cloud         — Anthropic, OpenAI, Alibaba Qwen (DashScope), Z.ai (GLM), OpenRouter, …
-```
-
-**Local file** asks for a `.gguf` path, registers + activates it, and offers a live test — no key, no cloud, done. **Local server** and **Cloud** open the provider menu filtered to what fits (Anthropic, OpenAI, Alibaba Qwen/DashScope, OpenRouter, Groq, DeepSeek, Mistral, xAI, Gemini, Together, Z.ai (GLM), Ollama, LM Studio, or a custom endpoint), where you paste your API key (masked as you type), choose a model, and Shadow runs a **live connection test** before saving. Type `back` or `b` at any onboarding prompt to return to the previous step without restarting. Re-run it anytime to switch:
-
-```bash
-shadow onboard          # change provider / model / key (terminal flow)
-shadow onboard --web     # secure setup in a local browser form → encrypted vault + master password
-```
-
-For encrypted-at-rest keys, use `shadow onboard --web`: it opens a self-contained form on `127.0.0.1` and seals your key into a password-protected vault (`~/.shadow/vault.enc`) rather than a plaintext file — see [Security model](#security-model). Re-running it **merges** another provider's key into the same vault. The plain `shadow onboard` terminal flow remains available.
-
-Your choice is saved per-machine to `~/.shadow/` — `config.json` (provider + model) and either the encrypted `vault.enc` (with `--web`) or `credentials.json` (key/token, `chmod 600`). **Nothing is committed to the repo; every machine sets up its own.** Environment variables (`ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `OPENAI_API_KEY`, …) and CLI flags still override the saved config, so CI and scripted runs can stay key-in-env. In a non-interactive context (`--task`, piped, no TTY) with nothing configured, Shadow exits with `Run \`shadow onboard\` to set one up` instead of hanging.
-
-## Quickstart
-
-```bash
-shadow                                   # interactive HUD in the current directory
-shadow --task "fix the failing tests"    # one-shot, scriptable
-shadow --yolo --task "build the app"     # fully autonomous — no prompts (see Autonomy)
-shadow --provider mock --task hi         # no API key needed (deterministic mock)
-shadow web                               # browser console on 127.0.0.1 (see below)
-shadow export                            # export latest session to exports/*.md
+```sh
+shadow --task "Explain the code in this workspace"
+shadow web
+shadow doctor
+shadow doctor --privacy
 ```
 
-### The web console (`shadow web`)
+To exercise the source checkout without a model endpoint:
 
-A browser workspace for the same agent: sessions sidebar, a chat transcript with tool cards
-and approvals, an inspector with local usage records, and a settings sheet covering models, agents,
-MCP servers and the project allowlist. The access token travels only in the URL fragment (never
-sent to the server), the listener binds loopback only, sessions run inside the same allowlist
-jail as the CLI, and every asset is served from the binary — no CDN, no external requests.
-
-### Session export
-
-Export the current (or a past) conversation as readable markdown:
-
-```bash
-/export                    # in the TUI — writes <workspace>/exports/shadow-<timestamp>.md
-/export reports/run.md     # optional output path (resolved within the workspace)
-shadow export              # CLI — latest session in cwd
-shadow export --session .shadow/sessions/<file>.jsonl --out reports/run.md
+```sh
+node dist/index.js --provider mock --model mock-1 --task "Hello"
 ```
 
-Source of truth is the append-only session log (`.shadow/sessions/*.jsonl`), not the TUI render cache.
-
-## Run from source
-
-```bash
-npm install
-npm run typecheck && npm run lint && npm test   # all green
-
-# Interactive (TTY) — launches the Snowfall terminal:
-ANTHROPIC_API_KEY=sk-ant-... npm run dev -- --system ./prompts/SHADOW.md --autonomy auto-edit
-
-# One-shot, non-interactive (plain renderer, scriptable):
-ANTHROPIC_API_KEY=sk-ant-... npm run dev -- --task "add a test for parseConfig and run it"
-
-# No API key needed — deterministic mock provider:
-npm run dev -- --provider mock --task "scan repo"
-
-# Build a runnable binary:
-npm run build && node dist/index.js --help   # or link `shadow` via package.json bin
-```
-
-`npm run dev` runs the TypeScript entry directly via `tsx`; `npm run build` compiles to `dist/`.
-
-## CLI flags
-
-```
---system <path>      external system-prompt markdown
---autonomy <level>   manual | auto-read | auto-edit | full      (default auto-edit)
---provider <name>    anthropic | openai | mock
---model <id>         model id (default claude-opus-4-8)
---base-url <url>     override provider base URL (also ANTHROPIC_BASE_URL / OPENAI_BASE_URL)
---max-output-tokens <n>  per-call output cap (raise for verbose "thinking" models)
---max-iterations <n>     loop iteration cap (default 200; raise for big multi-file tasks)
---context-budget <n>     token budget before summarization (default 128000)
---max-wall-sec <n>       wall-clock ceiling in seconds (safety stop for long autonomous runs)
---workspace <path>   workspace root (default cwd) — all file paths resolve under this
---style <name>       proactive | explanatory | learning | procedural
---plan-mode          start in explore/plan mode before implementation
---dry-run            write/exec tools become no-ops that report what they WOULD do
---task "<text>"      run a single task non-interactively and exit (plain renderer)
---repl               force the plain REPL even in a TTY (skip the Ink HUD)
---yolo               bypass ALL permission checks (autonomy=full, auto-approve
-                     everything incl. denylisted, never ask). Aliases: --nuke,
-                     --dangerously-skip-permissions
---log-level <l>      silent | error | info | debug
--v, --version        print version
--h, --help           show this help
-```
-
-## Autonomy levels
-
-Set with `--autonomy` (or `SHADOW_AUTONOMY`), toggle mid-session in the HUD with **Shift+Tab**.
-
-| Level | Behavior |
-|---|---|
-| `manual` | confirm **every** tool call |
-| `auto-read` | auto-approve read/search/glob; confirm write/exec/network |
-| `auto-edit` *(default)* | auto-approve reads + writes inside the workspace; confirm exec/network |
-| `full` | auto-approve everything **except** denylisted/destructive ops, which are always confirmed |
-
-A catastrophic shell command (`rm -rf /`, `mkfs`, `dd of=/dev/…`, fork bombs, `chmod -R 777 /`, …) triggers an explicit confirmation **regardless of level** — even at `full`. The list is extendable via `denylistExtra` in config.
-
-**`--yolo`** (aliases `--nuke`, `--dangerously-skip-permissions`) is the explicit sandbox-off + guardrails-off flag: forces `full` autonomy, auto-approves everything (incl. denylist), grants root to bypass workspace jail, and disables OS sandbox for run_shell (writes anywhere OS allows). Prints warning. Use only on trusted/throwaway envs. --no-sandbox is lower-level for just disabling the shell sandbox while keeping other guards.
-
-**Non-interactive runs (`--task`)** have no human to ask, so anything that *would* reach the approval gate is **denied** (and fed back to the model as a recoverable error) rather than run blindly. Capability is therefore set entirely by `--autonomy`: use `--autonomy full` to let the agent run shell/network unattended; a denylisted command is still refused, never executed. This makes `--task` safe to script and to run in CI.
-
-### Agent behavior
-
-Shadow's system prompt (`prompts/SHADOW.md`, or the built-in default) instructs the driven model to **keep the workspace organized** — files go in logical subdirectories (`src/`, `tests/`, `docs/`, `plans/`, `research/`), not dumped in the root, and scratch is cleaned up — and to **persist its thinking as markdown**: a short `plans/<name>.md` before multi-step work (checked off as it goes), and `research/<topic>.md` for findings with concrete references. Substantial deliverables are written as files, not buried in chat. Point `--system` at your own prompt to override.
-
-## Keybindings (interactive HUD)
-
-| Key | Action |
-|---|---|
-| `Ctrl-C` (1st, while running) | graceful stop — abort the in-flight tool/turn |
-| `Ctrl-C` (2nd, or when idle) | quit |
-| `Shift+Tab` / `Tab` | cycle autonomy level (applies live to a running loop) |
-| `←` / `→` | move the caret within the composer (edit mid-line) |
-| `↑` / `↓` | input history |
-| `Esc` | abort the running task, or clear the composer when idle |
-| `\` + `Enter` | insert a newline in the composer (multiline prompt) |
-| `Ctrl-O` | toggle collapse of the latest reasoning block (when idle) |
-| `Enter` while running | interrupt the active turn and queue the typed text as the next prompt |
-| `y` / `n` / `a` | in a permission dialog: approve / deny / always (approve + raise autonomy) |
-| `s` / `f` | in a permission dialog: approve for session / approve shell command prefix |
-| `1`–`9` / `Enter` | in an `ask_user_question` dialog: pick an option / confirm (Esc to skip) |
-
-### Slash commands
-
-Type `/` in the composer to open a command menu (with descriptions). Filter by
-typing (`/cl` → `/clear`), `↑`/`↓` to select, `Tab` to autocomplete, `Enter` to run,
-`Esc` to dismiss.
-
-| Command | Action |
-|---|---|
-| `/help` | show keybindings and the command list |
-| `/clear` | clear the screen and reset the conversation |
-| `/model` | switch between configured models (picker when multiple) |
-| `/style` | cycle output style |
-| `/autonomy` | cycle the autonomy level |
-| `/fast` | toggle Anthropic fast mode (lower latency; next turn) |
-| `/compact` | summarize earlier turns to free context |
-| `/cost` / `/usage` | show session token usage and cost |
-| `/context` | show context-window usage |
-| `/export` | export the session to markdown (optional path) |
-| `/resume` | resume a prior session (optional session id/path) |
-| `/rewind` | rewind to a turn index (e.g. `/rewind 2`) |
-| `/init` | scaffold `SHADOW.md` in the workspace |
-| `/agents` | list agent definitions |
-| `/work` | inspect work, filter current/history items, and use explicit background controls |
-| `/memory` | show project memory facts |
-| `/permissions` | list or edit permission rules |
-| `/doctor` | diagnose environment, credentials, and guardrails |
-| `/quit` | exit Shadow |
-
-While the agent is running, informational commands (`/help`, `/cost`, `/usage`, `/context`, `/fast`, `/work`) work without interrupting the turn. Renderer-specific commands and keys are documented in [Terminal renderers](TERMINAL_RENDERERS.md).
-
-## Configuration
-
-📖 **New here?** The [**User Guide**](USER_GUIDE.md) is the task-oriented walkthrough — connecting a model, tuning output length, reasoning effort, autonomy, and troubleshooting.
-
-Layered precedence: **CLI flags > env > `shadow.config.json` > defaults**, validated with zod (fails fast with a readable message). `maxOutputTokens` (the per-call output cap) defaults to **`65536`** so reasoning models don't hit the cap before answering — change it per-run with `--max-output-tokens <n>`, live with `/config set maxOutputTokens <n>`, or permanently in the config file ([details](USER_GUIDE.md#output-length-maxoutputtokens)). Example `shadow.config.json`:
-
-```json
-{
-  "provider": "anthropic",
-  "model": "claude-opus-4-8",
-  "autonomy": "auto-edit",
-  "maxIterations": 25,
-  "maxOutputTokens": 65536,
-  "contextBudget": 100000,
-  "maxToolResultChars": 16384,
-  "shellEnvAllowlist": ["PATH", "HOME", "USER", "LANG", "TERM", "TMPDIR", "SHELL"],
-  "denylistExtra": [],
-  "fallbackModel": "claude-sonnet-4-6",
-  "parallelTools": true,
-  "permissionRules": [
-    { "tool": "run_shell", "pattern": "rm -rf", "action": "ask" }
-  ],
-  "hooks": {
-    "pre_tool_use": ["scripts/pre-hook.sh"],
-    "post_tool_use": []
-  },
-  "mcpServers": {
-    "example": { "command": "npx", "args": ["-y", "some-mcp-server"] }
-  },
-  "models": [
-    { "label": "opus", "provider": "anthropic", "model": "claude-opus-4-8", "fallback": "claude-sonnet-4-6" },
-    { "label": "sonnet", "provider": "anthropic", "model": "claude-sonnet-4-6", "disabled": false }
-  ],
-  "budget": { "maxTotalTokens": 2000000, "maxCostUSD": 5, "maxWallClockSec": 1800 },
-  "priceTable": {
-    "claude-opus-4-8":   { "input": 5, "output": 25, "cacheReadMult": 0.1, "cacheWriteMult": 1.25 },
-    "claude-sonnet-4-6": { "input": 3, "output": 15 },
-    "claude-haiku-4-5":  { "input": 1, "output": 5 }
-  }
-}
-```
-
-The loop always terminates — on natural completion, the iteration cap (`maxIterations`), a budget ceiling (`maxTotalTokens` / `maxCostUSD` / `maxWallClockSec`), or Ctrl-C — and never hangs silently on a provider error (retryable errors back off and surface; 400/401/403 surface immediately).
-
-### Anthropic-compatible harness parity
-
-Shadow implements the same tool/mode contracts as the reference Anthropic client, so Anthropic models (and compatible endpoints) run without feature surprises.
-
-| Capability | Shadow tool / surface |
-|---|---|
-| Enter plan mode | `enter_plan_mode` (user must approve) + `Shift+Tab` / `--plan-mode` |
-| Write plan | `plan_write` |
-| Exit plan mode | `exit_plan_mode` (separate approval kind from permissions) |
-| Structured questions | `ask_user_question` (numbered options in TUI/REPL) |
-| Session export | `/export`, `shadow export` |
-| Model fallback | `fallbackModel` + per-model `fallback` / `disabled` in `models[]`; one auto-retry per session on 529/overloaded |
-| Permission rules | `permissionRules`: per-tool `deny` / `ask` / `allow` with optional regex on preview |
-| Hooks | `hooks.pre_tool_use` / `post_tool_use` — shell scripts, JSON on stdin; non-zero pre-hook denies |
-| Live shell output | `shell_output` bus events (TUI + headless renderer) |
-| Sub-agents | `agent` tool (isolated context sub-loop) |
-| Scheduled wakeups | `schedule_wakeup` (in-session timer → queued prompt) |
-| MCP | `mcpServers` in config (stdio or HTTP) → tools registered as `mcp_<server>_<name>` |
-| Fast mode | `--fast` / `/fast` / `SHADOW_FAST=1` — Anthropic low-latency path |
-| Extended cache | `cacheTtl: "1h"` / `SHADOW_CACHE_TTL=1h` — prompt cache breakpoints |
-| Multi-root | `--add-dir` / `additionalDirectories` — widen jail + shell sandbox |
-| Background shells | `run_in_background`, `bash_output`, `kill_shell` tools |
-| Multi-edit | `multi_edit` — atomic multi-hunk file edits |
-| Skills tool | `skill` — invoke bundled skill scripts |
-| Skills | `skills/<name>/SKILL.md` or `.shadow/skills/` — indexed in system prompt |
-| Parallel tools | `parallelTools` (default on; sequential during plan mode / gate tools) |
-
-### Scaling to your hardware
-
-Shadow's limits are tunable, not hard-coded — on a self-hosted model where tokens are free and the context window is large, dial them up to match the box. For an ambitious multi-file build:
-
-```bash
-shadow --task "<big task>" --autonomy full \
-  --max-iterations 40 --max-output-tokens 24000 --context-budget 200000 --max-wall-sec 1800
-```
-
-`--max-iterations` raises the turn cap (default 200 suits most tasks; a multi-file build with a test→fix loop wants more); `--context-budget` is how many tokens accumulate before summarization kicks in (a self-hosted model with a 256K window rarely needs to summarize at all); `--max-wall-sec` is a wall-clock safety stop so a long autonomous run still terminates. The termination guarantee is preserved at every setting — you can always raise the ceilings, but there is always *a* ceiling (and Ctrl-C).
-
-API keys are read from the environment only: `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`.
-
-### Custom & self-hosted endpoints
-
-Both providers accept a base-URL override (`--base-url`, or `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL` / `baseUrl` in config). The Anthropic provider also accepts a bearer token via `ANTHROPIC_AUTH_TOKEN` (which takes precedence over `x-api-key`) — so Shadow is a drop-in against any Anthropic-Messages-compatible endpoint, including a local **Ollama** server:
-
-```bash
-ANTHROPIC_BASE_URL=http://your-host:11434 ANTHROPIC_AUTH_TOKEN=ollama ANTHROPIC_API_KEY="" \
-  npm run dev -- --provider anthropic --model <your-model> --autonomy auto-edit
-```
-
-This has been verified end to end (multi-step `read_file`→`write_file` tool calling, plus larger multi-file builds) against a self-hosted Ollama model. Note: smaller "thinking" models emit verbose reasoning that Shadow discards — give them generous `maxOutputTokens` so the budget isn't consumed before the tool call. OpenAI-compatible endpoints (e.g. Ollama's `/v1`) work the same way via `--provider openai --base-url http://your-host:11434/v1`.
-
-### Local models — auto-served: `.gguf` and MLX
-
-> **MLX on Apple Silicon:** `shadow local add` also takes an MLX model *folder* or an `mlx-community/<model>` repo id — a repo id downloads from HuggingFace once, then serves fully local via `mlx_lm.server` (`uv tool install mlx-lm`):
->
-> ```bash
-> shadow local add mlx-community/Qwen2.5-0.5B-Instruct-4bit   # repo id (one-time download)
-> shadow local add ~/models/My-MLX-Model                       # or a local MLX folder
-> shadow local test <name> && shadow local use <name>
-> ```
-
-
-> **Requires [llama.cpp](https://github.com/ggml-org/llama.cpp)** — Shadow *launches and manages* the server for you, but the `llama-server` binary must be installed. Install it with `brew install llama.cpp` (macOS/Linux) or build from source, or point Shadow at an existing binary via `ggufServer` / `$SHADOW_LLAMA_SERVER`. When it's missing, `shadow local add`/`test` offers to install it for you.
-
-Point a model entry at a local `.gguf` and Shadow starts a `llama.cpp` server for it on activation (and shuts it down on exit), then talks to it over the OpenAI endpoint — no Ollama/LM Studio process to run:
-
-```jsonc
-"models": [
-  {
-    "label": "my-model (local)",
-    "provider": "openai",          // ignored for gguf entries; routed to the local server
-    "model": "my-model",
-    "gguf": "/opt/models/my-model-Q8_0.gguf",
-    // optional:
-    "ggufPort": 8123,              // default: a deterministic per-path port
-    "ggufArgs": ["-ngl", "999", "-c", "32768", "--jinja"],  // default shown
-    "ggufServer": "/usr/local/bin/llama-server"             // default: PATH or $SHADOW_LLAMA_SERVER
-  }
-]
-```
-
-Pick it from `/model` (or set it as the default) and Shadow serves it locally — first load shows a "loading the model into memory" note. An already-running server on the same port is reused. The context budget is capped under the server's `-c` automatically.
-
-## Vision — give any model eyes
-
-**Point Shadow at a vision model you run, and every model you drive can see — even a text-only one.** Vision in Shadow is a capability you plug in, not a property of your model: run any VLM behind an OpenAI-compatible endpoint (Ollama, vLLM, llama.cpp), add a `vision` block to `~/.shadow/config.json`, and the driving model gains eyes by *delegating*. Ask *"what's in this screenshot?"* and it calls the `describe_media` tool — Shadow sends the image to **your** endpoint, gets a text description back, and the model reasons over it. A small local coder with no native vision can now read a UI mockup, a diagram, or a chart. The image goes only to the vision model you chose and host — nothing to a coding-model provider. `vision` is a project-untrusted key (a cloned repo can't redirect your images), and the tool is off under `--offline`. See **[VISION.md](VISION.md)** for setup.
-
-## Collaboration Mode — the model round-table
-
-`/table <model> <model> …` seats **2–4 models in one shared conversation**. You hold the baton and route each turn with `@handle <question>`; `/pass @handle` forwards it, `/table done` restores your single model. Each seat's turn is drawn under a colored `⏺ handle  provider/model` header, so a multi-model thread reads as a legible group chat. Compare a fast local model against a frontier cloud one, or let a strong reasoner check a cheap coder — all in one context. (`@mention` routing is whitelist-only, so tool output can't hijack the baton.)
-
-## Model compatibility — tested models
-
-Shadow is **format-adaptive, not capability-guaranteed**. It speaks both the Anthropic Messages and OpenAI-Chat wire formats, recovers tool calls a model emits as plain text, scrubs leaked control tokens, and round-trips all three tool-call signature regimes (Anthropic signed thinking, Gemini `thought_signature`, plain OpenAI). What it **can't** do is make a weak model capable or turn a chat model into an agent. The rule of thumb: **Shadow is for agentic, tool-calling models, run over the wire format they were trained for.**
-
-Shadow works with **any agentic, tool-calling model** — cloud frontier models (Claude, GPT, Gemini) or capable local models served over an OpenAI- or Anthropic-compatible endpoint (Ollama, LM Studio, llama.cpp, vLLM). The harness is model-neutral: it recovers tool calls emitted as plain text, scrubs stray control tokens, and round-trips all three tool-call signature regimes (Anthropic signed thinking, Gemini `thought_signature`, plain OpenAI), so a broad range of models drive the loop well.
-
-**Picking a local model:**
-
-- Use an **instruct / tool-calling** build, not a base or chat-only model — a chat model narrates but never calls a tool.
-- **Match the wire format to the model.** Most local models speak OpenAI-Chat; a few are trained to emit Anthropic-format calls and should be routed over the Anthropic transport. First-run onboarding detects common cases and offers to switch.
-- **A dedicated GPU and more parameters mean more reliable multi-step work,** but capable ~12B–35B instruct models handle everyday tasks well.
-
-Rules of thumb: if a model calls tools cleanly but produces the wrong work, that's a capability limit no harness can fix — reach for a stronger model. If it never emits a tool call, it's a chat model, not an agent.
-
-## State & memory
-
-Per workspace, under `<workspace>/.shadow/`:
-- `sessions/<timestamp>.jsonl` — append-only, **redacted** event log (replayable; source for `/export`).
-- `memory.json` — durable "known facts" (build/test commands, key files, conventions). The agent reads these at startup and writes new ones via the `memory` tool; they survive restarts.
-- `exports/` — markdown session exports (created by `/export` or `shadow export`).
-- `skills/` — optional `SKILL.md` files for progressive-disclosure skill injection.
-
-## Security model
-
-> **The full picture — including what Shadow does *not* protect against — lives in
-> [THREAT_MODEL.md](THREAT_MODEL.md).** Limits are stated with the same prominence as guarantees.
-
-
-- **Workspace jail** — every file path resolves to an absolute path contained within the workspace root; `..` traversal, absolute-outside paths, and symlinks pointing outside the root are rejected (including for not-yet-created files).
-- **Shell** — `spawn` (never `exec`) with `cwd` = workspace root and an **env allowlist**; provider API keys are never passed into subprocesses.
-- **OS sandbox for `run_shell`** — on macOS (seatbelt / `sandbox-exec`) and Linux (bubblewrap / `bwrap`), shell commands run confined: **filesystem writes are restricted to the workspace + `/tmp`**, and reads of `~/.shadow` (the credentials store) are denied — so a command can't trash files outside the workspace or read your API key. Network is allowed by default (installs/fetches); set `sandboxNetwork: false` to deny it, or `sandbox: "off"` / `--no-sandbox` to disable confinement entirely. This is the real boundary; the env-allowlist + denylist are defense-in-depth. (No OS sandbox on Windows — `run_shell` is unconfined there.)
-- **Web tools** — gated as `network` risk; an SSRF guard blocks `file://`/non-http schemes and any host resolving to loopback / private / link-local / cloud-metadata (`169.254.169.254`) addresses, **pins the connection to the validated IP** (defeats DNS-rebinding), and re-validates + re-pins each redirect hop. Fetched content is treated as untrusted **data** — instructions inside it are never followed.
-- **Secret hygiene** — keys from env/credentials store only; the project `shadow.config.json` cannot set security-critical fields (baseUrl/autonomy/etc.); session logs and surfaced errors are redacted (resolved keys masked by value; best-effort, not a guarantee).
-- **Encrypted credential vault (optional)** — instead of a plaintext `credentials.json`, keys can be sealed in `~/.shadow/vault.enc` with a **master password**: scrypt (N=2¹⁶) → AES-256-GCM (authenticated — a wrong password or a tampered file simply fails to open). Set it up with `shadow onboard --web`, which opens a **local, self-contained browser form** (bound to `127.0.0.1`, one-time token, a strict CSP that blocks *any* outbound request — a key typed there physically cannot leave the machine) and encrypts on submit; re-running it merges more providers into the same vault. On the next run Shadow unlocks the vault via the **OS keychain** (macOS Keychain / libsecret / Windows DPAPI) so you type the password once; on a box with no keychain it falls back to prompting each session, or reads `SHADOW_VAULT_PASSWORD` for headless/CI. If you already have a plaintext `credentials.json`, the first interactive run **offers to encrypt it into the vault and then shreds the plaintext** (overwrite-then-remove). Env vars still override everything, so nothing about existing key-in-env workflows changes.
-
-## Zero telemetry
-
-Shadow includes **no analytics service, crash uploads or hosted coordination service**. Sessions,
-jobs, rooms and progress records are stored locally. Prompts and selected context/tool output go
-to your configured model provider. Enabled MCP servers, invoked web tools, plugin operations,
-model downloads and updates have their own network behavior. Programs you configure can also
-access the network under their own settings.
-
-**Verify it yourself:** `shadow doctor --privacy` prints exactly what the active config can send — every outbound egress path (model provider, web tools, MCP servers, the opt-in update check) with each marked live or inactive, plus where your keys live (encrypted vault vs plaintext) and whether offline mode is usable. The report **makes no network calls** — it inspects your config and local state only. Add `--offline` to see the offline posture (everything but a local model blocked).
-
-**Update discovery is off by default.** To enable notices, set `"updateCheck": true` in your
-trusted global `~/.shadow/config.json`; a project-local config cannot change this choice.
-When enabled, Shadow checks the public repository's version on launch, with a local daily cache,
-and displays a notice. The request contains no analytics payload, persistent identifier or
-credentials, but the destination receives normal connection metadata such as your IP address.
-It does not install a release automatically. `shadow update` is a separate explicit download;
-offline mode blocks both network paths. With discovery disabled, no discovery request is made.
-
-## OS support
-
-Shadow runs on **macOS, Linux, and Windows** — the runtime is Node, and the platform-specific surface is handled:
-
-- **`run_shell`** runs in your shell (`$SHELL`/`/bin/sh`) on macOS/Linux and in **PowerShell** on Windows, with a per-platform env allowlist (Windows gets `SYSTEMROOT`/`PATHEXT`/etc.; provider API keys are never passed on any platform).
-- **`grep`** uses `rg` (ripgrep) when a real binary is on `PATH`, otherwise a built-in cross-platform Node scanner.
-- The workspace jail, file tools, and provider streaming are platform-neutral.
-
-macOS and Linux are the most battle-tested (incl. a live multi-model stress suite). Windows support is newer — the install path and PowerShell `run_shell` are in place; the catastrophic-command denylist patterns are unix-oriented, so on Windows add PowerShell equivalents via `denylistExtra` if you rely on it.
+## Permissions and privacy
+
+The default autonomy level is `auto-edit`. Use `--autonomy manual` for explicit tool approvals.
+`--autonomy full` grants broader filesystem and shell access; `--yolo` also waives the destructive
+command denylist. Choose these modes with their actual authority in mind.
+
+Provider requests send conversation data and authentication to your configured endpoint. Optional
+web tools, MCP servers, plugin operations, and updates have their own network behavior. Use
+`shadow doctor --privacy`, `shadow egress`, and `--offline` to inspect or restrict it.
+Claude subscription requests run through your installed official Claude Code engine, which owns
+its credentials and network connections. Shadow disables its nonessential traffic; those child-process
+sockets are outside Shadow’s fetch receipt. See the [subscription guide](docs/USER_GUIDE.md#subscription-accounts).
+
+The [threat model](docs/security/THREAT_MODEL.md) describes the workspace jail, sandbox, approvals,
+credential storage, egress policy, and their limits. OS sandbox support differs by platform.
+
+## Documentation
+
+- [User guide](docs/USER_GUIDE.md): workflows, configuration, keys, and commands.
+- [Terminal renderers](docs/TERMINAL_RENDERERS.md): Snowfall layout, command/key matrix, and Ink migration paths.
+- [Self-hosting](docs/SELF_HOSTING.md): local endpoints and the web companion.
+- [Model compatibility](docs/COMPAT_MATRIX.md): recorded provider and model checks.
+- [Vision](docs/VISION.md): connect a vision endpoint.
+- [Testing](docs/TESTING.md): test runner and verification details.
+- [Release assessment](docs/RELEASE_ASSESSMENT_2026-09-27.md): cleanup record, blockers, and makeover plan.
+- [Documentation index](docs/README.md): current guides, security material, and historical records.
+- [Changelog](CHANGELOG.md): prior release history and unreleased cleanup.
 
 ## Development
 
-```bash
-npm run typecheck   # tsc --noEmit, strict
-npm run lint        # eslint
-npm test            # node:test — unit + headless integration of the full loop (mock provider, no network/API key)
-npm run format      # prettier
+```sh
+npm run typecheck
+npm run typecheck:all
+npm run lint
+npm test
+npm run build
+npm run check:release-gate
 ```
 
-The agent loop runs **headless** (no Ink) under test, driven by a deterministic mock provider and a scripted approval gate — see `test/`. Layers are decoupled: the loop never imports Ink; tools never import the provider.
+Run tests with `npm test`. The suite relies on Node honoring its isolated test homes; running
+`bun test` can operate on real credential files. Bun is used separately to compile standalone
+binaries with `npm run build:binary`.
 
-See `DECISIONS.md` for every default and deviation.
+The private working repository and public source mirror have separate histories. Follow the
+internal release procedure before publishing; the assessment records the current remote problem
+and the checks needed to establish a reliable release process.
+
+## License
+
+[MIT](LICENSE).

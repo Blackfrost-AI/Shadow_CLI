@@ -1445,6 +1445,10 @@ export class AgentLoop {
               outputTokens: snap.outputTokens,
               costUSD: snap.costUSD,
               contextPct: Math.min(1, pct),
+              // Per-turn model attribution. Captured here rather than only at session start so a
+              // mid-session `/model` switch is visible in the log instead of silently blending two
+              // models into one corpus. `deps.model` is read fresh each turn for exactly this.
+              model: this.deps.model,
               // This request's detail (see events.ts): undefined fields simply haven't been
               // measured yet at this point in the stream (e.g. an input-only early usage frame).
               cacheReadTokens: iterUsage.cacheReadTokens,
