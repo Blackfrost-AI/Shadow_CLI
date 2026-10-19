@@ -38,7 +38,7 @@
       "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "c995949d63d38ad7ee9776927ecc6994b1890328bca483f99e45e28a01bb460b"
+    "attributes": "4121df4324a914e96da95cefb5cca20ef49ef8200c874da5f5b64c0a1d633dea"
   },
   "snowfall/120": {
     "lines": [
@@ -79,7 +79,7 @@
       "",
       "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "524c8e734b3746c61914b1f5486dc3bd1c8501f7f5ed813ee908629ccc320f5a"
+    "attributes": "0eb6b8f59f9dc62397aabcdbf3f8041293edb494da5ff209358085cebcb0760d"
   },
   "snowfall/200": {
     "lines": [
@@ -120,7 +120,7 @@
       "",
       "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "3eda6ff825bb783de809557e4ad1c5e65990b8fdc513c40e8a7a922c2b6aedc7"
+    "attributes": "ee90d29efa14b678238ffab15fd959537c7bec2e73844582731e0e7657f83ff2"
   },
   "og/80": {
     "lines": [
@@ -161,7 +161,7 @@
       "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "4d4ed8fd8426428b4ceb12abed78e66084720176288253bcbabe9861366a5cdc"
+    "attributes": "6326e75a88a0a8ec5739ec6270257f55f6d0b42a26ff27e08cb20e17e6840499"
   },
   "og/120": {
     "lines": [
@@ -202,7 +202,7 @@
       "",
       "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "eedf85471f02ae44f5b160737fb9a8f8dafb1f0477863d73dc8f466eae1758fe"
+    "attributes": "9642c62358638d43f26721ac5c5f112d9b98bb5dc3c624987eccb3869023e672"
   },
   "og/200": {
     "lines": [
@@ -243,7 +243,7 @@
       "",
       "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "573e0f27f7da96e3f00613a7f165c724181526bfc70244cabed6d759803bc93a"
+    "attributes": "710fca77e7c6e9ff3dfdebc00f8e42a1e20e85b9cff0f3be403573e08b6ff856"
   },
   "shadow/80": {
     "lines": [
@@ -284,7 +284,7 @@
       "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "7a8421ae76dc446447d249265a1ca70e4a919e3e43b3ba0b59dc7f15b2ebb7f6"
+    "attributes": "c9be5ce98d648bb21ae49e66fe808b9bd102aeefa76f41770f75be89694248a9"
   },
   "shadow/120": {
     "lines": [
@@ -325,7 +325,7 @@
       "",
       "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "e4f9c78cbf086d985c4eabbe5ffb62e47c629427b6c7c3cb06873afc5c9d9f8a"
+    "attributes": "add7796c0aa75b66da8fb8a64fe85d8da39bcd4ce0aab8836c6419216c58921d"
   },
   "shadow/200": {
     "lines": [
@@ -366,7 +366,7 @@
       "",
       "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "1837825eb72bbec905c0399e7401c7b944c95ed1f78467fe0988501f694d9779"
+    "attributes": "8af73e60ce986e9c7f1d84d6c6b5d0b7f1e7d527b998d8431f9a56e55bbbbed6"
   },
   "pipboy/80": {
     "lines": [
@@ -407,7 +407,7 @@
       "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "7fb822a3473e3c086ebb77d3c4091f6e58ecf81c8e0dd51a598196f4865b2971"
+    "attributes": "22273ff2ccf7733b616cc963d2bb447acd9eeb6a9678a2780ee34f1ba4510d40"
   },
   "pipboy/120": {
     "lines": [
@@ -448,7 +448,7 @@
       "",
       "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "3a05fa347fd714e3b06b8c60d09e6035c5e39895d533f4f2dd2a57a4c1b661b8"
+    "attributes": "0c00d820ac51cc0999033f58f261d0ad2bd5de88309ded16bd102cf45833db6c"
   },
   "pipboy/200": {
     "lines": [
@@ -489,7 +489,7 @@
       "",
       "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "c7883aaa59f3ae7c5f4a41559e0d70599e265ea7842748466b547890711ddff0"
+    "attributes": "570e19ec94553673b9e3bf7dfa08a73a41f2ed006788d887df15e9d5949de445"
   },
   "cyberpunk/80": {
     "lines": [
@@ -530,7 +530,7 @@
       "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "4512f8cfa4b80487a95257fcdcb1b878de82b5e94a1bb13fad79429970f251cc"
+    "attributes": "e73fa682f8b7265f926f2f225814bb4c005bb69520cce3c37d97b4461ea41c55"
   },
   "cyberpunk/120": {
     "lines": [
@@ -571,7 +571,7 @@
       "",
       "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "1698e469cec43fd01945fa25227dfaf08000f889251fc06cd917102ce21768e1"
+    "attributes": "eff1e45aed5ca9f925f39f00ee6432cee26f9e0caac503d94cca91ba1b012b9f"
   },
   "cyberpunk/200": {
     "lines": [
@@ -612,7 +612,7 @@
       "",
       "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "0ccb197c367c8720b4c9430cecb9f3e17a2c9b1ab2760e8a0e79074a3f81874b"
+    "attributes": "6035bb3b7ebc468003d967e8e9435bcf572c53ca053fda92cb03017b4902d457"
   },
   "coder-chick/80": {
     "lines": [
@@ -653,7 +653,7 @@
       "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "c7e9999ba1d3a7b19773d5eec3860dd7ea2501b2a8f061af2e5d66431297e1a7"
+    "attributes": "36ef901c28af44e1109dec17c28917139ea2e228c80b41478a63c8b8c787e03b"
   },
   "coder-chick/120": {
     "lines": [
@@ -694,7 +694,7 @@
       "",
       "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "ca92118d81fc5d59293fa2b2016cbacbe256c5afbb38d4dfd62f49d186451265"
+    "attributes": "08d53cc4e121fc0f08d0f08f0a1a15d4749773aa030447149844c4ea66a00528"
   },
   "coder-chick/200": {
     "lines": [
@@ -735,7 +735,7 @@
       "",
       "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "417a06b8d41d9a6940dac4be09229114db06bb928a46b4f613ee1679921dfd72"
+    "attributes": "42f3730da1e4bd61caa639a6b385fafb9dcae51618a7cfd30bf11d987b357720"
   },
   "matrix/80": {
     "lines": [
@@ -776,7 +776,7 @@
       "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "8e7f38175d95964ebb0cd7fec5469d7eba39790b63681da321028988db73f934"
+    "attributes": "af5b3cc49ac6e4bd371bf6902ec5c9ff08798f8d0be4d78689ae0d3b33579cdc"
   },
   "matrix/120": {
     "lines": [
@@ -817,7 +817,7 @@
       "",
       "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "f023c2f2da89743bfdad0b9c34ff93c03d52be2c18a32c883cdcd8de47762e9b"
+    "attributes": "2eae472c03a2096a3ba2881184991fcb88e71b49362ade4af47a1a618b4e8506"
   },
   "matrix/200": {
     "lines": [
@@ -858,7 +858,7 @@
       "",
       "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "b0503286b8e14f0425faa3d15b2955005c724096ac78fc1c3f16b436df8949b5"
+    "attributes": "856863dfc9ec57884e25c254a115100d4a0a6f427e21b7b3e5c14e69cc3e645c"
   },
   "mono/80": {
     "lines": [
@@ -899,7 +899,7 @@
       "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "327292b1130e0b275e96f8613a38c2bf02f7e0db67085fc2e0642c03fa6d7d37"
+    "attributes": "ccfbbc18a178cbe94c59a54ca458ff63832c76cef06c93e53082b65f68836310"
   },
   "mono/120": {
     "lines": [
@@ -940,7 +940,7 @@
       "",
       "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "94c6d0935aa78fff14b5da473919fcb9f2987bc18348a6394e330372f071a2d8"
+    "attributes": "6b2f08cc672fd78b329c82ee9d36b1cda6c52161ec5c1aad401fb4ef10d8f595"
   },
   "mono/200": {
     "lines": [
@@ -981,7 +981,7 @@
       "",
       "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "288a6c7eec7cb0a6a6cbd7823e92d4c00b26057598608dd8cdf1e6170c25ed64"
+    "attributes": "b7fdef8155f1cfc7d0d18416e40e42927dfa5badc1023682c15dd2f9a513d8e6"
   },
   "light/80": {
     "lines": [
@@ -1022,7 +1022,7 @@
       "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "faf3c1f13510ebeb15016d089a2d62dd2659e96a4b69e0f39225621b21da5972"
+    "attributes": "9da802b019c1b40f34235ca53a58413c96ee9057134e711e1c5b71265f8b4ea9"
   },
   "light/120": {
     "lines": [
@@ -1063,7 +1063,7 @@
       "",
       "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "5d8b74d0e6071360a026ba7c38ba3628074982930c5270eb0d1092a56b31896c"
+    "attributes": "02cccbb4b6694b619865182dd64adbc1347f29391b2017fc5a8917439b1b9398"
   },
   "light/200": {
     "lines": [
@@ -1104,7 +1104,7 @@
       "",
       "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "fc09c098fbd14a9054765962a93b19542642047fa24d82286bc39ab141c1507b"
+    "attributes": "d671a86a8dff9d89465482eb1e9129c975a9bd80016667f0ab0b0d6faeee8266"
   },
   "colorblind/80": {
     "lines": [
@@ -1145,7 +1145,7 @@
       "",
       "  auto-read · local / frost-coder                1 agent · 1/3 tasks · ctx 28%  "
     ],
-    "attributes": "bc3914118511ea119594a29113c2d3f231cbe5c16010867793aab9c2f9b23f4c"
+    "attributes": "aa5827e2d9ed6caf038c925a01ccd4f17793b9d6dfa25ea36203e860c756fb84"
   },
   "colorblind/120": {
     "lines": [
@@ -1186,7 +1186,7 @@
       "",
       "  auto-read  ·  local / frost-coder                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "ac2242e23a475bbfa144113fc4a209c1987fdf285b5441a1dfa5dc27b5e58809"
+    "attributes": "f9e8005f339cbd5c466dc9616d40d2773ad48da619291ebb9353089d6ba87507"
   },
   "colorblind/200": {
     "lines": [
@@ -1227,7 +1227,7 @@
       "",
       "  auto-read  ·  local / frost-coder                                                                                                                      1 agent  ·  1/3 tasks  ·  ctx 28%  ·  $0.0123  "
     ],
-    "attributes": "2b038aac9d235b45f1e9f61fac1734812ba9739bcce9fe133e72b62357763837"
+    "attributes": "317eae4243baf18be563b09ee24993741f390dd52d0285703665d490a13b713b"
   },
   "high-contrast/80": {
     "lines": [

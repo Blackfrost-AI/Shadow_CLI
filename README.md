@@ -6,7 +6,7 @@
 
 > **A true gift of freedom and privacy.**
 > Zero-telemetry · provider-neutral · phone home to no one.
-> Current build: **`v10.4.0`** — real read-only confinement (Seatbelt, bubblewrap, Landlock), tool output spilled to a file instead of truncated, and a runtime-context block that tells the model its own sandbox.
+> Current build: **`v10.5.0`** — a readability pass on the TUI markdown viewer: tables hold their shape at every terminal width, all six heading levels are distinguishable, and nested ordered lists keep their numbers.
 
 **Shadow is a zero-telemetry, provider-neutral security engineering agent that runs on your terms.** Point it at any model — Anthropic, any OpenAI-compatible endpoint, Gemini, or a local model on your own box. Its built-in Security foundation covers investigation, hardening, incident response, defensive automation, secure coding, and supporting systems work. **No Shadow account, no signup, no phone-home:** network access follows your provider, tool and update choices. Your config stays local and readable (`~/.shadow/config.json`), credentials are sent to their configured services, and you can switch models mid-session **without losing context**.
 
@@ -16,7 +16,16 @@ Under the hood it's a **tool-calling agentic runtime**: the model reasons, emits
 
 This is **not a chat app** — it is a tool-calling runtime.
 
-## What's new in v10.3.2
+## What's new in v10.5.0
+
+- **Tables hold their shape at every terminal width.** The `MIN_COL` floor pushed `Σwidths` back over budget, so one 4-column table gridded at 78 and 88 columns but fell back to a key:value wall at 82 and 84 — widening the window could break the table. The grid decision is now monotonic: grid below a single threshold, never above it.
+- **All six heading levels are distinguishable,** and nested ordered lists keep their numbers instead of restarting at 1.
+
+## Previous highlights: v10.4.0
+
+- **Real read-only confinement** (Seatbelt, bubblewrap, Landlock), tool output spilled to a file instead of truncated, and a runtime-context block that tells the model its own sandbox.
+
+## Previous highlights: v10.3.2
 
 - **A slow resolver no longer reads as a missing host.** Every egress lookup ran under a 1.5s budget and the timeout was swallowed, so on a cold resolver (fresh Linux install, VPN, container DNS) `shadow update` could report the release bucket as permanently gone while it was perfectly reachable. The budget is now 5s and overridable with `SHADOW_EGRESS_DNS_BUDGET_MS`, and a timeout is reported as a timeout — naming the budget — rather than as `could not be resolved`. Both failures still fail closed.
 

@@ -536,13 +536,44 @@ function blockToLines(
   const out: ViewportLine[] = [];
   switch (block.type) {
     case 'heading': {
-      // Hierarchy: EVERY heading is bold (WCAG 1.4.1 — state without color); tint by level
-      // (H1 purple, H2 cyan, H3+ bright). H1 gets a SHORT underline matching the title width —
-      // a full-terminal rule was the loudest thing in the transcript and fought the content.
-      const hue = block.level <= 1 ? theme.purple : block.level === 2 ? theme.cyan : theme.bright ?? theme.fg;
-      const spans = block.spans.map(s => ({ text: s.text, color: hue, bold: true, italic: s.italic }));
+      // Hierarchy: EVERY heading is bold (WCAG 1.4.1 — state without color); cue depth by hue,
+      // underline and italic.
+      //
+      // Before: H3, H4, H5 and H6 all resolved to the SAME style (bright + bold), so a long
+      // answer gave you no way to tell a sub-sub-section from a sub-sub-sub-section — three of
+      // the six levels were pixel-identical. That is the "get lost while reading" failure: you
+      // can see a heading but not where you are in the structure.
+      //
+      // The ladder deliberately avoids `theme.bright`, because the theme reserves bright for
+      // INLINE BOLD text — parking any heading there made `### Subsection` indistinguishable
+      // from a `**bold phrase**` on its own line. Each level now differs from its neighbours on
+      // two independent channels, so no heading can be confused with body bold or with a
+      // sibling level:
+      //   H1  purple + bold + underline   (document title, heaviest)
+      //   H2  cyan   + bold + underline   (section)
+      //   H3  fg     + bold               (subsection — underline stops here)
+      //   H4  fg     + bold + italic
+      //   H5  dim    + bold               (dim is AA+ gray, never faint SGR-2)
+      //   H6  dim    + bold + italic      (deepest)
+      // H1/H2 get a SHORT underline matching the title width — a full-terminal rule was the
+      // loudest thing in the transcript and fought the content.
+      const hue =
+        block.level <= 1
+          ? theme.purple
+          : block.level === 2
+            ? theme.cyan
+            : block.level >= 5
+              ? theme.dim
+              : theme.fg;
+      const deepItalic = block.level === 4 || block.level >= 6;
+      const spans = block.spans.map(s => ({
+        text: s.text,
+        color: hue,
+        bold: true,
+        italic: s.italic || deepItalic,
+      }));
       out.push(...wrapLine(`${keyPrefix}h`, spans, cols));
-      if (block.level <= 1) {
+      if (block.level <= 2) {
         const titleW = Math.min(
           cols,
           // displayWidth, not .length — a CJK/emoji title underlined 1-per-char was shorter than
@@ -566,10 +597,20 @@ function blockToLines(
       block.items.forEach((itemSpans, j) => {
         const depth = block.depths?.[j] ?? 0;
         const indent = '  '.repeat(depth);
-        const marker =
-          block.ordered && depth === 0
-            ? `${ordinal++}. `
-            : `${bullets[Math.min(depth, bullets.length - 1)]} `;
+        // Numbering must follow the ITEM, not the block. A block-level `ordered` flag took its
+        // value from the first item only, so a numbered sub-list (`1. a / 1. sub / 2. b`) rendered
+        // its sub-steps as bullets — a numbered procedure with numbered sub-steps read as a
+        // bulleted list and the model's structure was lost. `orderedItems`/`ordinals` come from
+        // the parser; the old block-level expression stays as the fallback for ASTs built before
+        // those fields existed (and for the flat, unmixed case where it is still correct).
+        const itemOrdered = block.orderedItems?.[j] ?? (block.ordered && depth === 0);
+        const itemOrdinal = block.ordinals?.[j] ?? ordinal;
+        let marker: string;
+        if (itemOrdered) {
+          marker = `${depth === 0 ? ordinal++ : itemOrdinal}. `;
+        } else {
+          marker = `${bullets[Math.min(depth, bullets.length - 1)]} `;
+        }
         // Hanging wrap: continuation rows align under the TEXT (not the bullet), and the nested
         // indent survives because it lives in the prefix, not in wrappable body spans.
         out.push(
@@ -587,15 +628,53 @@ function blockToLines(
     case 'quote': {
       // The │ bar repeats on EVERY wrapped row — a quote whose second line loses the bar just reads
       // as a stray dim paragraph.
-      out.push(
-        ...wrapHanging(
-          `${keyPrefix}q`,
-          [{ text: '│ ', color: theme.yellow }],
-          [{ text: '│ ', color: theme.yellow }],
-          reflowSoftBreaks(block.spans.map(s => ({ text: s.text, color: theme.dim, italic: s.italic }))),
-          cols,
-        ),
-      );
+      //
+      // Paragraph structure inside the quote is preserved. `reflowSoftBreaks` correctly turns a
+      // single `\n` (the model's own hard wrap) into a space so the text re-flows to terminal
+      // width, but it also swallowed `\n\n`, so:
+      //     > First quoted paragraph.
+      //     >
+      //     > Second quoted paragraph.
+      // rendered as ONE run-on line with a doubled space where the paragraph break was. Split on
+      // blank lines first, emit a spacer row between paragraphs, and reflow each paragraph
+      // independently.
+      const quoteStyle = (s: { text: string; italic?: boolean }): StyledSpan => ({
+        text: s.text,
+        color: theme.dim,
+        italic: s.italic,
+      });
+      const paragraphs: StyledSpan[][] = [];
+      let current: StyledSpan[] = [];
+      for (const s of block.spans) {
+        // A span may itself carry the blank-line break; split it across paragraphs.
+        const parts = s.text.split(/\n[ \t]*\n/);
+        parts.forEach((part, pi) => {
+          if (pi > 0) {
+            if (current.length) paragraphs.push(current);
+            current = [];
+          }
+          if (part !== '') current.push(quoteStyle({ ...s, text: part }));
+        });
+      }
+      if (current.length) paragraphs.push(current);
+      if (paragraphs.length === 0) paragraphs.push([]);
+
+      paragraphs.forEach((paraSpans, pi) => {
+        if (pi > 0) {
+          // Blank quote row: the bar with nothing after it, so the paragraphs read as separate
+          // quoted blocks rather than one wrapped run.
+          out.push({ key: `${keyPrefix}qgap${pi}`, spans: [{ text: '│', color: theme.yellow }] });
+        }
+        out.push(
+          ...wrapHanging(
+            `${keyPrefix}q${pi}`,
+            [{ text: '│ ', color: theme.yellow }],
+            [{ text: '│ ', color: theme.yellow }],
+            reflowSoftBreaks(paraSpans),
+            cols,
+          ),
+        );
+      });
       break;
     }
     case 'code': {
@@ -657,10 +736,14 @@ function blockToLines(
       // separator (wrapped header cells span several lines). Borders/│ stay dim; cells are fg.
       const isGrid = /^[╭┌]/.test(lines[0] ?? '');
       const sepIdx = isGrid ? lines.findIndex((l) => l.startsWith('├')) : -1;
+      // A grid line is already laid out to exactly `cols`, so wrapping is a no-op there. The
+      // VERTICAL fallback emits `Label: value` prose lines that can exceed the width, and those
+      // must wrap on WORD boundaries — char-wrapping them produced `Op`/`enAI` and
+      // `executio`/`n`, which reads as corruption rather than a wrap.
+      const wrapMode = isGrid ? 'char' : 'word';
       lines.forEach((l, j) => {
         const isHeader = isGrid && j > 0 && (sepIdx < 0 || j < sepIdx);
-        // Char-wrap: wide vertical-fallback lines must not terminal-hard-wrap mid-word.
-        out.push(...wrapLine(`${keyPrefix}t${j}`, tableLineSpans(l, theme, isHeader), cols, 'char'));
+        out.push(...wrapLine(`${keyPrefix}t${j}`, tableLineSpans(l, theme, isHeader), cols, wrapMode));
       });
       break;
     }

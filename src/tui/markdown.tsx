@@ -49,12 +49,25 @@ export function Markdown({ source, color = C.fg, width = PROSE_MAX_COLS }: { sou
     <Box flexDirection="column" width={width}>
       {blocks.map((b, i) => {
         switch (b.type) {
-          case 'heading':
+          case 'heading': {
+            // Mirror flatten.ts's heading ladder so the LIVE preview matches the committed block
+            // ("Live preview ≡ committed"). This used to paint EVERY level C.purple + bold with no
+            // underline, so the same answer visibly re-styled the moment it committed, and H3-H6
+            // were indistinguishable from each other in the preview.
+            const hue =
+              b.level <= 1 ? C.purple : b.level === 2 ? C.cyan ?? C.purple : b.level >= 5 ? C.dim ?? C.fg : C.fg;
+            const deepItalic = b.level === 4 || b.level >= 6;
             return (
-              <Box key={i} marginTop={i === 0 ? 0 : 1}>
-                <Inline spans={b.spans} color={C.purple} bold />
+              <Box key={i} marginTop={i === 0 ? 0 : 1} flexDirection="column">
+                <Inline spans={deepItalic ? b.spans.map((s) => ({ ...s, italic: true })) : b.spans} color={hue} bold />
+                {b.level <= 2 ? (
+                  <Text color={C.dim} wrap="truncate">
+                    {'─'.repeat(Math.min(width, Math.max(3, b.spans.reduce((n, s) => n + s.text.length, 0))))}
+                  </Text>
+                ) : null}
               </Box>
             );
+          }
           case 'paragraph':
             return (
               <Box key={i} flexDirection="column" marginTop={i === 0 ? 0 : 1}>
@@ -74,10 +87,13 @@ export function Markdown({ source, color = C.fg, width = PROSE_MAX_COLS }: { sou
                 {b.items.map((it, j) => {
                   const depth = b.depths?.[j] ?? 0;
                   const indent = '  '.repeat(depth);
-                  const marker =
-                    b.ordered && depth === 0
-                      ? `${ordinal++}. `
-                      : `${bullets[Math.min(depth, bullets.length - 1)]} `;
+                  // Item-level numbering, matching flatten.ts: a numbered sub-list keeps its own
+                  // numbers instead of collapsing to bullets while the preview is still streaming.
+                  const itemOrdered = b.orderedItems?.[j] ?? (b.ordered && depth === 0);
+                  const itemOrdinal = b.ordinals?.[j] ?? ordinal;
+                  const marker = itemOrdered
+                    ? `${depth === 0 ? ordinal++ : itemOrdinal}. `
+                    : `${bullets[Math.min(depth, bullets.length - 1)]} `;
                   const lead = indent + marker;
                   const wrapped = wrapSpans(it, Math.max(1, width - lead.length));
                   return (
