@@ -31,6 +31,7 @@ import { cycleAutonomy } from '../../safety/permissions.js';
 import type { ContextName } from '../keybindings/types.js';
 import type { SlashMenuItem } from '../slashMenu.js';
 import { pushHistory, queuedTaskKind } from './common.js';
+import { queuedAhead } from '../../agent/steerQueue.js';
 import { FORWARD_DELETE, HOME_KEYS, END_KEYS, SHIFT_ENTER, insertChunk } from './common.js';
 
 /**
@@ -476,9 +477,11 @@ function handleComposer(env: KeyEnv, ch: string, key: InkKey): boolean {
       return true;
     }
     if (env.runningRef.current) {
-      // Informational slash commands run live. State-changing commands remain deferred, but
-      // a human message requests a model-only interrupt and resumes at the next safe history
-      // boundary (an in-flight tool is allowed to settle first).
+      // Informational slash commands run live. State-changing commands remain deferred. A human
+      // message, by contrast, STEERS the running turn: its text is folded into the active
+      // conversation at the next paired history boundary and the turn then CONTINUES — model work
+      // is not thrown away. (An in-flight tool is still allowed to settle, so the steer can never
+      // land between a tool_use and its tool_result.)
       if (task.startsWith('/')) {
         const cmdName = task.split(/\s+/)[0] ?? '';
         const cmd = env.findSlashCommand(cmdName);
@@ -497,10 +500,29 @@ function handleComposer(env: KeyEnv, ch: string, key: InkKey): boolean {
         // Ask the CURRENT loop every time. A queued message left over from an earlier loop must
         // not suppress steering a newer active loop. If no loop exists yet we are only waiting
         // for the process run lock: preserve A→B FIFO instead of aborting and silently dropping A.
-        const steered = env.loopRef.current?.requestSteer() ?? false;
+        //
+        // FAIRNESS: a steer injects into the RUNNING turn and immediately issues a new provider
+        // request, so it would jump ahead of work already queued — most importantly a manual
+        // `/compact`, which rewrites the very context a new request would be built from. When
+        // anything else is already waiting, this message must wait its turn: end the current turn
+        // instead (bare steer, no text) so the queue drains in submission order. Without this a
+        // message typed after `/compact` starts a request against half-rewritten context.
+        const ahead = queuedAhead(env.queuedTasksRef.current);
+        let steered = false;
+        if (ahead === 0) {
+          // The text rides WITH the steer so the loop injects it and continues the turn; the entry
+          // stays in the FIFO until `steer_applied` confirms it landed in history.
+          steered = env.loopRef.current?.requestSteer(task) ?? false;
+        } else if (!env.loopRef.current?.hasPendingSteer()) {
+          // Break the turn so the backlog can run — but only if no steer is already in flight,
+          // otherwise this would discard the text that steer is about to inject.
+          env.loopRef.current?.requestSteer();
+        }
         env.pushLine({
+          // Name the injected text: after this message the running turn CHANGES direction, and the
+          // user needs to see exactly what was folded into it. Matches the non-TUI frontend's copy.
           text: steered
-            ? '  ↪ pending message — steering at the next safe boundary'
+            ? `  ↪ steering this turn: ${task.replace(/\s+/g, ' ').trim().slice(0, 70)}`
             : '  ↪ pending message — queued in order',
           dimColor: true,
         });

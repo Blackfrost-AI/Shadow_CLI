@@ -270,8 +270,49 @@ export class AgentLoop {
    * run to completion — see the F04-07 dispatch comment.)
    */
   private steerRequested = false;
-  private readonly modelAbort = new AbortController();
-  private readonly modelSignal: AbortSignal;
+  /**
+   * Text the user sent WITH the steer, drained into the running turn at the next paired history
+   * boundary instead of ending it. A bare interrupt (no text) keeps the escape behaviour below.
+   */
+  private pendingSteers: string[] = [];
+  /**
+   * Controller for the CURRENT provider request only. Replaced with a fresh one at every request
+   * and whenever a steer is consumed, so one steer cannot abort the remainder of the turn.
+   */
+  private modelAbort = new AbortController();
+  /**
+   * Cached composition of deps.signal with the current modelAbort. This used to be built once in
+   * the constructor; AbortSignal.any() latches, so the first steer left the loop permanently
+   * aborted and no later request could run — which is why steering ended the turn instead of
+   * retargeting it. Invalidate via `resetModelAbort()` whenever modelAbort is replaced.
+   */
+  private modelSignalCache: AbortSignal | null = null;
+  /** Steer-scoped controller for TOOLS; see `steerSignal`. */
+  private steerSignalAbort = new AbortController();
+  private steerSignalCache: AbortSignal | null = null;
+  private get modelSignal(): AbortSignal {
+    if (!this.modelSignalCache) {
+      this.modelSignalCache = AbortSignal.any([this.deps.signal, this.modelAbort.signal]);
+    }
+    return this.modelSignalCache;
+  }
+  /** Fresh request controller, so a consumed steer does not poison every later request. */
+  private resetModelAbort(): void {
+    this.modelAbort = new AbortController();
+    this.modelSignalCache = null;
+    // A new controller means no steer is outstanding for TOOLS either; the next steer swaps in
+    // another one, so long-running tools see each steer exactly once.
+    this.steerSignalAbort = new AbortController();
+    this.steerSignalCache = null;
+  }
+  /**
+   * Signal handed to TOOLS as `steerSignal`: aborted when the user steers the turn. Distinct from
+   * `deps.signal` (hard interrupt) so a tool can yield the conversation WITHOUT treating its work
+   * as cancelled — a sync sub-agent promotes itself to background, a shell child gets adopted.
+   */
+  private get steerSignal(): AbortSignal {
+    return this.steerSignalCache ?? (this.steerSignalCache = this.steerSignalAbort.signal);
+  }
   /**
    * Index of the assistant turn being executed. SESSION-scoped, not instance-scoped: an AgentLoop
    * is constructed per user message, so a plain `= 0` made turn 1 and turn 5 of the same session
@@ -305,7 +346,6 @@ export class AgentLoop {
     private readonly deps: LoopDeps,
     autonomy: AutonomyLevel,
   ) {
-    this.modelSignal = AbortSignal.any([deps.signal, this.modelAbort.signal]);
     this.autonomy = autonomy;
     this.approvals = deps.approvals ?? new SessionApprovals();
     this.readTracker = deps.readTracker ?? createReadTracker();
@@ -346,16 +386,77 @@ export class AgentLoop {
   }
 
   /**
-   * Yield this loop to a newly submitted user message at the next safe boundary.
+   * Yield this loop to a newly submitted user message at the next safe boundary, WITHOUT ending
+   * the turn when the user supplied text to steer with.
+   *
    * Provider streaming and automatic compaction stop immediately; an active tool is allowed to
-   * finish so its side effects cannot overlap the replacement turn.
+   * finish so its side effects cannot overlap the injected instruction. Then the text is appended
+   * as a user message at the next paired history boundary and the SAME turn continues, so work in
+   * progress is retargeted rather than discarded.
+   *
+   * With no text this stays a plain interrupt: the turn stops at the boundary and the host starts
+   * a new one. That is the deliberate "stop this" escape and is unchanged.
+   *
+   * CONTRACT: `requestSteer(text)` returning true means the loop has taken ownership of `text` —
+   * it will be appended to history and announced with a `steer_applied` event. The host must then
+   * NOT resubmit that text as a new turn. Returning false means the loop did not take it (no
+   * active loop, or a steer already pending) and the host's own FIFO still owns delivery.
    */
-  requestSteer(): boolean {
-    if (this.steerRequested) return false;
+  /** True while a steer is in flight for this turn (text queued for injection, not yet absorbed). */
+  hasPendingSteer(): boolean {
+    return this.steerRequested;
+  }
+
+  requestSteer(text?: string): boolean {
+    const steer = text?.trim() ? text : undefined;
+    if (this.steerRequested) {
+      // A steer is ALREADY pending for this turn. Do NOT fold this text in: two user messages
+      // injected as one would be answered as one, so the second message would never get its own
+      // reply (and the host could not tell which of its FIFO entries was consumed). Per the
+      // contract above, return false and leave delivery entirely to the host's FIFO, which runs
+      // it as the next turn in submission order.
+      return false;
+    }
     this.steerRequested = true;
+    if (steer) this.pendingSteers.push(steer);
+    // Signal BOTH: the provider request stops streaming, and any tool holding the turn open
+    // yields (a sync sub-agent promotes itself to background; a shell child is adopted).
+    this.steerSignalAbort.abort('user_steer');
     this.modelAbort.abort('user_steer');
+    return steer !== undefined;
+  }
+
+  /**
+   * Called at a paired history boundary (an assistant message is committed and every tool_use has
+   * its tool_result). Returns true when a steer was absorbed and the loop should continue the same
+   * turn; false when the caller must stop as before.
+   *
+   * Ordering matters: a hard abort always wins over a steer, so SIGINT during a steer still exits.
+   */
+  private absorbSteerAtBoundary(): boolean {
+    if (!this.steerRequested) return false;
+    if (this.deps.signal.aborted) return false;
+    if (!this.pendingSteers.length) {
+      // A bare interrupt (ESC / Ctrl-C / empty Enter): deliberately NOT absorbed. Clear the
+      // latch so a stop initiated here does not poison a later turn on this loop instance.
+      this.steerRequested = false;
+      return false;
+    }
+    const texts = this.pendingSteers;
+    this.pendingSteers = [];
+    this.steerRequested = false;
+    // The aborted controller belonged to the request we just abandoned.
+    this.resetModelAbort();
+    // One user message keeps the history alternating; one event PER text lets each host drop its
+    // own FIFO entry by exact string, so a delivered steer is never also run as a fresh turn.
+    this.deps.context.append({
+      role: 'user',
+      content: [{ type: 'text', text: texts.join('\n\n') }],
+    });
+    for (const text of texts) this.deps.bus.emit({ type: 'steer_applied', text });
     return true;
   }
+
 
   /**
    * Every approval goes through here so all four call sites get an id and an abort race for
@@ -546,7 +647,13 @@ export class AgentLoop {
     }
 
     for (;;) {
-      if (this.deps.signal.aborted || this.steerRequested) return this.stop('interrupted', finalAnswer);
+      if (this.deps.signal.aborted) return this.stop('interrupted', finalAnswer);
+      // A queued user message with text STEERS this turn: history is paired at the top of the
+      // loop, so absorb it and make the next request with the new instruction in place instead
+      // of ending the turn. A bare interrupt (no text) keeps the old stop-and-restart escape.
+      if (this.steerRequested && !this.absorbSteerAtBoundary()) {
+        return this.stop('interrupted', finalAnswer);
+      }
 
       if (this.deps.pauseGate) {
         const pausedMs = await this.deps.pauseGate.wait(this.deps.signal);
@@ -621,7 +728,10 @@ export class AgentLoop {
       // A steering message can arrive while automatic compaction is streaming. Context keeps the
       // rewrite atomic, but without this boundary check we still sent the now-obsolete model turn
       // immediately afterwards (and signal-ignoring local providers could then hang indefinitely).
-      if (this.deps.signal.aborted || this.steerRequested) return this.stop('interrupted', finalAnswer);
+      if (this.deps.signal.aborted) return this.stop('interrupted', finalAnswer);
+      if (this.steerRequested && !this.absorbSteerAtBoundary()) {
+        return this.stop('interrupted', finalAnswer);
+      }
       const req: CompletionRequest = {
         model: this.deps.model,
         system: sys,
@@ -815,7 +925,10 @@ export class AgentLoop {
         const snapTurn = this.turnIndex;
         this.toolTurn = snapTurn;
         if (this.deps.sessionLog) {
-          this.deps.sessionLog.recordSnapshot(context, snapTurn);
+          // Optional-chained: partial test doubles provide only `record()`, and a missing snapshot
+          // must never crash a turn (this call sits on the new steer-continue path, so any run
+          // that continues after injection reaches it).
+          this.deps.sessionLog.recordSnapshot?.(context, snapTurn);
           this.turnIndex = snapTurn + 1;
         }
       }
@@ -824,7 +937,23 @@ export class AgentLoop {
       // Interrupted mid-turn (ESC / Ctrl-C broke the stream) → report it as such,
       // not as a natural end_turn. This takes precedence over an error frame emitted while an
       // aborted adapter unwinds: the user steered; Shadow did not independently fail the turn.
-      if (this.deps.signal.aborted || this.steerRequested) return this.stop('interrupted', finalAnswer);
+      if (this.deps.signal.aborted) return this.stop('interrupted', finalAnswer);
+      if (this.steerRequested) {
+        // Safe to absorb only when history is PAIRED. A turn that completed normally and
+        // committed tool_use blocks is paired once those run below, so such a steer always
+        // waits for the results: runCalls stops enlisting at the first cancellation check,
+        // every unrun call is paired by synthesizeMissingResults, and the steer is absorbed at
+        // the results boundary. Skipping that would inject a user message between a tool_use and
+        // its tool_result — the exact shape that 400s every later request.
+        const unpaired = !turnIncomplete && turn.toolCalls.length > 0;
+        if (!unpaired) {
+          // Absorbed: the steer text is now in history, so make the next request with it in
+          // place. Falling through here would return the ABORTED turn's stop reason and end the
+          // turn anyway — which is the original defect. Not absorbed: a bare interrupt, stop.
+          if (this.absorbSteerAtBoundary()) continue;
+          return this.stop('interrupted', finalAnswer);
+        }
+      }
 
       // A provider-error frame poisons the WHOLE turn even if useful-looking text or tool calls
       // arrived first. Partial text was committed above for recovery/audit, but tool calls were
@@ -1081,7 +1210,9 @@ export class AgentLoop {
         if (guardStop) return guardStop;
         return this.stop('fatal_tool_error', finalAnswer);
       }
-      if (this.steerRequested) return this.stop('interrupted', finalAnswer);
+      if (this.steerRequested && !this.absorbSteerAtBoundary()) {
+        return this.stop('interrupted', finalAnswer);
+      }
 
       const stop2 = budget.check(this.now());
       if (stop2) return this.stop(stop2, finalAnswer);
@@ -1913,6 +2044,9 @@ export class AgentLoop {
       // their spend up here so it reaches a living budget even if intermediate ancestors finished.
       rootBudget: this.deps.rootBudget ?? this.deps.budget,
       signal: this.deps.signal,
+      // Steer-scoped: tools that hold the turn open (a sync sub-agent) yield when the user sends a
+      // new message, rather than blocking the conversation until they finish.
+      steerSignal: this.steerSignal,
       log: () => {},
       dryRun: this.deps.dryRun,
       maxToolResultChars: this.deps.maxToolResultChars,

@@ -66,6 +66,9 @@ export type LoopEvent =
   | { type: 'debug'; code: string; message: string }
   | { type: 'error'; message: string }
   | { type: 'stop'; reason: StopReasonExt; finalAnswer: string }
+  // A user message was absorbed into the RUNNING turn instead of ending it (steering). Renderers
+  // show it as user input mid-turn; the text is already appended to the context by the loop.
+  | { type: 'steer_applied'; text: string }
   | { type: 'shell_output'; callId: string; stream: 'stdout' | 'stderr'; chunk: string }
   | { type: 'shell_pid'; pid: number | null; warn: string | null } // active run_shell child + interrupt warning
   | { type: 'model_fallback'; from: string; to: string; reason: string }

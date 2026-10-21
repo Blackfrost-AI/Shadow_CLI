@@ -16,7 +16,7 @@ import { evaluateAcceptance } from '../agent/acceptance.js';
 import { runHookPhase } from '../hooks/runner.js';
 import { SubagentBus } from '../agent/events.js';
 import { Semaphore } from '../util/semaphore.js';
-import type { EventBus } from '../agent/events.js';
+import type { EventBus, StopReasonExt } from '../agent/events.js';
 import type { Effort } from '../provider/provider.js';
 import type { ApprovalGate } from '../agent/approval.js';
 import type { ResolvedModelProfile } from '../agent/modelProfiles.js';
@@ -562,9 +562,13 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         if (e.type === 'error') lastStopError = e.message;
       });
       // F10-02 (cancellation half): a BACKGROUND agent outlives its launching turn, so ctx.signal
-      // (the turn's signal) can no longer stop it. Give a bg agent its OWN abort, chained under
-      // ctx.signal, that a `cancel_subagent` bus request (from /agents kill) can trip.
-      const bgAbort = isBg ? new AbortController() : null;
+      // (the turn's signal) can no longer stop it. Give it its OWN abort, chained under ctx.signal,
+      // that a `cancel_subagent` bus request (from /agents kill) can trip.
+      //
+      // This is now created for EVERY agent, not just background ones: a sync agent that the user
+      // steers away from is promoted to background mid-run (see promotedToBackground below), and it
+      // must become cancellable the moment it is no longer holding the turn.
+      const cancelAbort = new AbortController();
       const pauseGate = isBg
         ? new CooperativePauseGate(
             () => base.bus.emit({ type: 'subagent_paused', taskId }),
@@ -584,7 +588,7 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
           ? base.checks : base.checks ? checksForRegistry(base.registry, subWorkspaceRoot) : undefined,
         context: subContext,
         budget,
-        signal: AbortSignal.any([ctx.signal, jobAbort.signal, ...(bgAbort ? [bgAbort.signal] : [])]),
+        signal: AbortSignal.any([ctx.signal, jobAbort.signal, cancelAbort.signal]),
         system: systemPrefix + base.system,
         model: profile?.model ?? base.model,
         effort: profile?.effort ?? def?.effort ?? base.effort,
@@ -675,6 +679,13 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
       // the combined total onward. No level is ever counted twice: the bg agent's own accrual is
       // its total, and the intermediate parent already accrued WITHOUT it.
       const bgAccrualTarget = ctx.rootBudget ?? parentBudget;
+      // Set when a STEER hands a SYNC agent off to the background. Ownership of the permit, the
+      // workspace refcount, the admission slot and the stop-error subscription then moves to the
+      // promotion continuation, so the sync `finally` must not release them out from under it.
+      let promotedToBackground = false;
+      // Cancel subscription for the SYNC path (the background path has its own `offCancel`).
+      // Declared here so both the subscribe site and the two teardown sites below can see it.
+      let offCancelSync: (() => void) | null = null;
 
       if (isBg) {
         // record launch metadata via bus to main context (the real persisted one in outer scope); base.context here is throwaway from makeLoopDeps
@@ -695,7 +706,7 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         // stops the sub-loop at its next boundary; unsubscribed in finally so a completed agent's id
         // can't be re-triggered.
         const offCancel = base.bus.on((e) => {
-          if (e.type === 'cancel_subagent' && (e.taskId === taskId || e.taskId === '*')) bgAbort?.abort('cancelled');
+          if (e.type === 'cancel_subagent' && (e.taskId === taskId || e.taskId === '*')) cancelAbort.abort('cancelled');
         });
 
         // fire and forget; deliver via bus as task_notification (main context listener will turn into user msg)
@@ -790,9 +801,76 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         }
         base.bus.emit({ type: 'subagent_start', ...profileIdentity, taskId, jobId, subagentType: agentType, description: input.description, background: false, parentId, depth: workDepth, priority });
       }
+      // A SYNC agent is cancellable while it holds the turn, and — crucially — stays cancellable
+      // after a steer promotes it to background. This MUST sit outside the admission block above:
+      // an agent admitted immediately (permit free) never enters it, and would otherwise be
+      // uncancellable. The background branch has its own `offCancel`; this is the sync counterpart.
+      offCancelSync = base.bus.on((e) => {
+        if (e.type === 'cancel_subagent' && (e.taskId === taskId || e.taskId === '*')) cancelAbort.abort('cancelled');
+      });
       try {
         inheritCeilings(); // P3-09: admission point — parent's remaining ceilings become this agent's
-        const result = await loop.run();
+        const runPromise = loop.run();
+        // THE FIX for "a reviewer holds up the session": while a SYNC sub-agent runs, the parent
+        // turn is parked here, so a user message cannot reach the model at all — no boundary is
+        // ever reached and steering has nothing to steer. Race the run against the turn's steer
+        // signal; when a steer lands first, keep the run going in the BACKGROUND and return now,
+        // so the parent turn can absorb the user's message instead of waiting out the agent's
+        // whole run (iteration ceiling, salvage pass and all).
+        if (ctx.steerSignal) {
+          const steer = ctx.steerSignal;
+          const winner = await Promise.race([
+            runPromise.then(() => 'ran' as const, () => 'ran' as const),
+            new Promise<'steer'>((resolve) => {
+              if (steer.aborted) resolve('steer');
+              else steer.addEventListener('abort', () => resolve('steer'), { once: true });
+            }),
+          ]);
+          if (winner === 'steer' && !loopDeps.signal.aborted) {
+            promotedToBackground = true;
+            // Re-announce as a background agent so the HUD keeps the row alive after this turn
+            // (same reasoning as F10-02 for an agent launched with run_in_background).
+            base.bus.emit({ type: 'subagent_start', ...profileIdentity, taskId, jobId, subagentType: agentType, description: input.description, background: true, parentId, depth: workDepth, priority });
+            void (async () => {
+              let status: 'completed' | 'partial' | 'failed' | 'cancelled' = 'failed';
+              let stopReasonFinal: StopReasonExt = 'provider_error';
+              let output = finishArtifact('failed', 'provider_error', '');
+              try {
+                const result = await runPromise;
+                const salvage = result.stopReason === 'max_iterations' && !loopDeps.signal.aborted ? (await salvageFinalAnswer(loopDeps)) ?? null : null;
+                accrue(parentBudget);
+                const outcome = agentOutcome(result, salvage, lastStopError, loopDeps.signal.aborted);
+                status = outcome.status;
+                stopReasonFinal = outcome.status === 'cancelled' ? 'interrupted' : result.stopReason;
+                if (base.hooks?.subagent_stop?.length) {
+                  runHookPhase('subagent_stop', base.hooks.subagent_stop, { workspaceRoot: subWorkspaceRoot, extra: { agentType, result: outcome.status === 'completed' ? 'deferred_done' : `deferred_${outcome.status}` } });
+                }
+                output = finishArtifact(outcome.status, stopReasonFinal, outcome.answer);
+                { const snap = budget.snapshot(Date.now()); base.bus.emit({ type: 'subagent_usage', costUSD: budget.currentCostUSD, subagent: agentType, taskId, inputTokens: snap.inputTokens, outputTokens: snap.outputTokens }); }
+                base.bus.emit({ type: 'subagent_end', taskId, jobId, ok: outcome.status === 'completed', subagentType: agentType, status: outcome.status, stopReason: stopReasonFinal, ...output });
+              } catch (e) {
+                accrue(parentBudget); // a thrown run still spent tokens/cost
+                status = loopDeps.signal.aborted ? 'cancelled' : 'failed';
+                stopReasonFinal = loopDeps.signal.aborted ? 'interrupted' : 'provider_error';
+                output = finishArtifact(status, stopReasonFinal, `agent error: ${(e as Error).message}`);
+                base.bus.emit({ type: 'subagent_end', taskId, jobId, ok: false, subagentType: agentType, status, stopReason: stopReasonFinal, ...output });
+              } finally {
+                offCancelSync?.();
+                offStopError();
+                admissionGates.delete(taskId);
+                releaseWorkspace();
+                permit?.();
+                // Normally emitted by the parent loop after a background agent; here the tool
+                // returned early, so the continuation delivers the result itself.
+                base.bus.emit({ type: 'task_notification', taskId: taskId!, answer: output.answer, fromSubagent: agentType, status, stopReason: stopReasonFinal });
+              }
+            })();
+            return ok('agent', 'read', Date.now() - start,
+              `A new user message arrived while this ${agentType} sub-agent was working, so it is now running in the BACKGROUND as ${taskId} instead of holding the turn. Its result will arrive as a task-notification. Continue with the user's latest instruction now; do not wait for it.`,
+              { ...profileIdentity, taskId, jobId, status: 'started' });
+          }
+        }
+        const result = await runPromise;
         // P3-09: roll the spend up even if the run ended in error/cancel — it was still spent.
         // Sync target: the IMMEDIATE parent budget — alive for this agent's whole run, and its own
         // finish-time roll-up carries the combined total onward.
@@ -827,10 +905,15 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         base.bus.emit({ type: 'subagent_end', taskId, jobId, ok: false, subagentType: agentType, status, stopReason, ...output });
         return { ...fail('agent', 'read', Date.now() - start, 'agent_failed', output.answer), data: { ...output, taskId, jobId, ...profileIdentity, status, stopReason } };
       } finally {
-        offStopError();
-        admissionGates.delete(taskId);
-        releaseWorkspace();
-        permit?.(); // released back to whichever gate admitted this agent; null = gateless bypass
+        // A promoted agent's continuation owns all of this now — releasing here would free its
+        // concurrency slot and drop its workspace refcount while it is still working.
+        if (!promotedToBackground) {
+          offCancelSync?.();
+          offStopError();
+          admissionGates.delete(taskId);
+          releaseWorkspace();
+          permit?.(); // released back to whichever gate admitted this agent; null = gateless bypass
+        }
       }
     },
   };

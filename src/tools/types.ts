@@ -35,6 +35,14 @@ export interface ToolContext {
   /** Extra absolute roots (from additionalDirectories / --add-dir) file tools + the sandbox may read/write. */
   additionalRoots?: string[];
   signal: AbortSignal; // for timeouts / Ctrl-C
+  /**
+   * Aborts when the user STEERS the running turn (a new message typed while the model is working),
+   * as opposed to `signal`, which is a hard interrupt. Tools that hold the turn open for a long
+   * time — notably the `agent` tool running a sync sub-agent — must listen to THIS and yield, so
+   * the user can keep talking to the model while a reviewer or sub-agent is still running.
+   * A steer never cancels work: for run_shell it promotes the child to the background registry.
+   */
+  steerSignal?: AbortSignal;
   log: (msg: string) => void;
   dryRun: boolean; // when true, write/exec tools no-op and report what they WOULD do
   /** P3-05: the loop's tool-result size budget. Untrusted payloads are clamped to it BEFORE

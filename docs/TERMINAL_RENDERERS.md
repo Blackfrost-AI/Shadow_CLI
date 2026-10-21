@@ -222,7 +222,7 @@ Generated from the same inventory used by `/help` and `/keybindings`.
 
 | Key | Behavior |
 | --- | --- |
-| Enter | send; steer at the next safe boundary while busy |
+| Enter | send; fold the message into the running turn while busy, continuing it |
 | Shift+Enter / Ctrl+J | insert a newline |
 | Tab | complete /commands, arguments and @files |
 | Shift+Tab | toggle plan mode |

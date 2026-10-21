@@ -29,6 +29,7 @@ import type { WatcherRegistry } from './agent/watcher.js';
 import type { WorkCenter } from './app/workCenter.js';
 import type { HistoricalWorkItem } from './state/workCenterPersistence.js';
 import { EventBus, type StopReasonExt } from './agent/events.js';
+import { dropOneQueuedByText } from './agent/steerQueue.js';
 import { Budget } from './agent/budget.js';
 import { maybeNotifyUpdate } from './update/checkUpdate.js';
 import { providerErrorHint } from './util/errorHints.js';
@@ -652,9 +653,10 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const routeInFlightRef = useRef(false); // a seat route is building/running — block a second concurrent route
   const [pickerOpen, setPickerOpen] = useState(false); // model-picker has focus
   const [pickerIndex, setPickerIndex] = useState(0); // selected row in the model picker
-  // Pending input remains FIFO, but human messages now STEER the active loop: model-side work is
-  // cancelled immediately and the message starts at the next safe boundary. Commands and wakeups
-  // remain deferred until turn-end. `queued` mirrors the ref for the live pending indicator.
+  // Pending input remains FIFO, but human messages now STEER the active loop: the text is folded
+  // into the RUNNING turn at the next model/history boundary and that turn continues — work is not
+  // stopped and restarted. Commands and wakeups remain deferred until turn-end, and anything
+  // already queued still drains in submission order (a later message never overtakes it).
   const queuedTasksRef = useRef<QueuedTask[]>([]);
   const [queued, setQueuedState] = useState<QueuedTask[]>([]);
   const setQueued = useCallback((next: QueuedTask[]) => {
@@ -2631,6 +2633,16 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             color: 'cyan',
           });
           break;
+        case 'steer_applied': {
+          // The loop injected this text into the RUNNING turn. Drop exactly ONE entry so the
+          // post-turn drain does not run it AGAIN as a fresh turn; everything else queued keeps
+          // its order. Shared helper: both frontends must remove one entry, never every entry with
+          // the same text (the user may have queued "yes" twice).
+          const next = dropOneQueuedByText(queuedTasksRef.current, e.text);
+          if (next) setQueued(next);
+          pushLine({ text: `  ↪ steered: ${oneLine(e.text)}`, color: 'cyan' });
+          break;
+        }
         case 'stop':
           { drainUnitsRef.current?.(); const closed = activity.close(); if (closed) pushLine(closed); }
           lastStopReasonRef.current = e.reason;

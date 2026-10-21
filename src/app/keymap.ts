@@ -1,6 +1,6 @@
 // One published inventory for /help, /keybindings and the generated renderer contract.
 export const PI_KEYS = [
-  { key: 'Enter', action: 'send; steer at the next safe boundary while busy' },
+  { key: 'Enter', action: 'send; fold the message into the running turn while busy, continuing it' },
   { key: 'Shift+Enter / Ctrl+J', action: 'insert a newline' },
   { key: 'Tab', action: 'complete /commands, arguments and @files' },
   { key: 'Shift+Tab', action: 'toggle plan mode' },

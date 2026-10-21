@@ -1843,18 +1843,25 @@ async function main(): Promise<void> {
     );
   }
 
-  // Shutdown cleanup: kill orphaned background shells + stdio MCP children + gguf servers on exit.
-  // killAll() and client.stop() previously had no call sites, so every session leaked stray processes
-  // holding ports/FDs across launches. All calls are synchronous (safe in an 'exit' handler). Registered
-  // once and idempotent, so multiple exit paths (natural return, SIGINT-abort, SIGTERM) all clean up.
+  // Shutdown cleanup: DETACH background shells so they outlive us, stop stdio MCP children and
+  // gguf/LSP servers (infrastructure we own and must not leak).
+  //
+  // Background shells are user WORK, not orphans: each is spawned `detached: true` as its own
+  // process-group leader precisely so it can survive the turn. SIGKILLing them here converted every
+  // detached shell into turn-scoped work and is why a long download died mid-progress at 35/84 with
+  // no traceback and no error line — no `nohup`/`setsid`/separate terminal could survive it, because
+  // the killer was this process. They are unref'd instead, and remain reachable with `shadow`'s
+  // bash_output/kill_shell within the session, or by pid afterwards.
+  //
+  // MCP/LSP/gguf children stay in this list: those really are infrastructure with no owner left.
   let coreCleanedUp = false;
   const shutdownCore = (): void => {
     if (coreCleanedUp) return;
     coreCleanedUp = true;
     try {
-      bg.killAll();
+      bg.releaseForExit();
     } catch {
-      /* best effort */
+      /* best effort — leaving a shell alive is the desired outcome anyway */
     }
     for (const c of mcpClients) {
       try {

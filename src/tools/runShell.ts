@@ -1,10 +1,12 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { closeSync } from 'node:fs';
 import { z } from 'zod';
 import type { Tool, ToolResult } from './types.js';
 import { fail } from './types.js';
 import { clamp } from './util.js';
 import { wrapCommand } from '../safety/sandbox.js';
 import type { BgRegistry } from './bgShell.js';
+import { createShellLog, FileTail } from './shellLog.js';
 import { scrubbedEnv, UNIX_SAFE_ENV } from '../util/safeEnv.js';
 
 const DEFAULT_TIMEOUT_MS = 60_000;
@@ -22,6 +24,15 @@ const IS_WIN = process.platform === 'win32';
  * runs cannot exfiltrate the keys that power the agent. Per-platform: Windows
  * shells need SYSTEMROOT/PATHEXT/etc. or they fail to start.
  */
+/** Close an fd we handed to a child, ignoring an already-closed descriptor. */
+function closeQuietly(fd: number): void {
+  try {
+    closeSync(fd);
+  } catch {
+    /* already closed */
+  }
+}
+
 /** Kill the child's whole process group (POSIX) so grandchildren can't orphan. */
 function killTree(child: ChildProcess, signal: NodeJS.Signals): void {
   try {
@@ -300,6 +311,11 @@ export interface RunShellData {
   aborted: boolean;
   sandboxed: boolean; // true when the OS sandbox actually confined the command
   backgroundId?: string; // set when run_in_background started a detached shell
+  /**
+   * Set when a FOREGROUND command outlived its timeout and was promoted to the background
+   * registry instead of being killed. The work is still running; poll it with bash_output.
+   */
+  promotedId?: string;
 }
 
 function describeRunShell(defaultTimeoutMs: number): string {
@@ -409,16 +425,24 @@ export function makeRunShell(
 
       // Background: spawn detached, register, and return the id immediately.
       if (input.run_in_background && opts.bg) {
+        // FILE-BACKED stdio, not pipes. A piped child dies of SIGPIPE the moment Shadow's read
+        // end closes, which is what silently killed long downloads mid-progress. See shellLog.ts.
+        const logId = `bg_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+        const log = createShellLog(ctx.workspaceRoot, logId);
         const child = spawn(sandbox.argv[0]!, sandbox.argv.slice(1), {
           cwd: ctx.workspaceRoot,
           env: scrubbedEnv(allowlist),
-          // Empty stdin (see the foreground spawn below): a detached background job that reads
-          // stdin would otherwise hold a pipe open for the life of the session.
-          stdio: ['ignore', 'pipe', 'pipe'],
+          // The child owns real files: nothing it writes can fail because we exited. stdin stays
+          // 'ignore' so a detached job that reads stdin cannot wedge on a pipe nobody closes.
+          stdio: ['ignore', log.outFd, log.errFd],
           detached: !IS_WIN,
           windowsHide: true,
         });
-        const proc = opts.bg.add(input.command, child);
+        // The child holds its own duplicate of each fd; ours must be closed or the log file never
+        // reaches EOF and we leak a descriptor per background shell.
+        closeQuietly(log.outFd);
+        closeQuietly(log.errFd);
+        const proc = opts.bg.add(input.command, child, undefined, { stdout: log.outPath, stderr: log.errPath });
         return result(
           start,
           true,
@@ -440,6 +464,13 @@ export function makeRunShell(
       }
 
       return await new Promise<ToolResult<RunShellData>>((resolve) => {
+        // FILE-BACKED stdio on the foreground path too. A foreground child that is still running
+        // when Shadow exits (a long build, a download) dies the same way a background one did —
+        // SIGPIPE on the closed pipe — and that is precisely the reported "stopped at 35/84 with
+        // no traceback". With real files the child is unaffected by our lifetime; the tool still
+        // streams because we tail the log.
+        const fgLogId = `fg_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+        const log = createShellLog(ctx.workspaceRoot, fgLogId);
         const child = spawn(sandbox.argv[0]!, sandbox.argv.slice(1), {
           cwd: ctx.workspaceRoot,
           env: scrubbedEnv(allowlist),
@@ -448,19 +479,14 @@ export function makeRunShell(
           // `python`/`node` REPL, `ssh`, `npm login` all block until the timeout (60s by default,
           // and the reported failure is a misleading "timed out"). The sibling spawn sites in
           // agent/diagnostics.ts and agent/formatter.ts already do exactly this.
-          stdio: ['ignore', 'pipe', 'pipe'],
+          stdio: ['ignore', log.outFd, log.errFd],
           detached: !IS_WIN, // process-group leader so killTree can take the whole tree
           windowsHide: true,
         });
-
-        if (!child.stdout || !child.stderr) {
-          resolve(
-            fail('run_shell', 'exec', Date.now() - start, 'spawn_failed', 'child process has no stdio pipes'),
-          );
-          return;
-        }
-        const childStdout = child.stdout;
-        const childStderr = child.stderr;
+        // The child holds its own duplicates; ours would otherwise leak one fd per command and
+        // keep the log from reaching EOF.
+        closeQuietly(log.outFd);
+        closeQuietly(log.errFd);
 
         // Surface the child PID (for the HUD) and warn if the command can outlive an ESC.
         if (typeof child.pid === 'number') {
@@ -481,6 +507,25 @@ export function makeRunShell(
         let settled = false;
         let graceTimer: ReturnType<typeof setTimeout> | undefined;
         const GRACE_MS = 3000;
+
+        // Stream from the log files instead of pipes. `stdout`/`stderr` remain the accumulators the
+        // result is built from, so downstream behaviour is unchanged. Declared here — before every
+        // settling closure — so each exit path can flush and stop them.
+        const fgTailOut = new FileTail(log.outPath, (chunk) => {
+          if (ctx.streamShell && ctx.onShellOutput) ctx.onShellOutput(chunk, 'stdout');
+          if (stdout.length < MAX_CAPTURE) stdout += chunk;
+        });
+        const fgTailErr = new FileTail(log.errPath, (chunk) => {
+          if (ctx.streamShell && ctx.onShellOutput) ctx.onShellOutput(chunk, 'stderr');
+          if (stderr.length < MAX_CAPTURE) stderr += chunk;
+        });
+        fgTailOut.start();
+        fgTailErr.start();
+        /** Stop tailing, draining final bytes first so nothing a child wrote is lost. */
+        const stopTails = (flush = true): void => {
+          fgTailOut.stop(flush);
+          fgTailErr.stop(flush);
+        };
 
         // If killTree can't actually stop the child (an unkillable root/sudo process — the EPERM is
         // swallowed by killTree), the 'close' event never fires and this Promise would never settle,
@@ -511,17 +556,28 @@ export function makeRunShell(
         // Assigned once; graceResolve/cleanup close over it and only run after this line.
         const timer = setTimeout(() => {
           timedOut = true;
+          // A foreground command that simply needs LONGER is not a failure — killing it is what
+          // destroyed the user's in-flight download. When the registry is available the child is
+          // ADOPTED from its log files: it is already a detached process-group leader with
+          // FILE-BACKED stdio, so nothing about it depends on this turn staying alive.
+          if (opts.bg) {
+            promoteToBackground();
+            return;
+          }
           killTree(child, 'SIGKILL');
           graceTimer = setTimeout(graceResolve, GRACE_MS);
         }, timeoutMs);
 
         const onAbort = (): void => {
           aborted = true;
+          // Same reasoning as the timeout: interrupt the TURN, not the user's work.
+          if (opts.bg) {
+            promoteToBackground();
+            return;
+          }
           killTree(child, 'SIGKILL');
           graceTimer = setTimeout(graceResolve, GRACE_MS);
         };
-        if (ctx.signal.aborted) onAbort();
-        else ctx.signal.addEventListener('abort', onAbort, { once: true });
 
         const cleanup = (): void => {
           clearTimeout(timer);
@@ -529,25 +585,78 @@ export function makeRunShell(
           ctx.signal.removeEventListener('abort', onAbort);
         };
 
-        childStdout.on('data', (d: Buffer) => {
-          const chunk = d.toString();
-          if (ctx.streamShell && ctx.onShellOutput) ctx.onShellOutput(chunk, 'stdout');
-          if (stdout.length < MAX_CAPTURE) stdout += chunk;
-        });
-        childStderr.on('data', (d: Buffer) => {
-          const chunk = d.toString();
-          if (ctx.streamShell && ctx.onShellOutput) ctx.onShellOutput(chunk, 'stderr');
-          if (stderr.length < MAX_CAPTURE) stderr += chunk;
-        });
+        /**
+         * Hand the LIVE child to the background registry and settle the tool call now.
+         *
+         * The child was spawned as its own process-group leader with FILE-BACKED stdio (see
+         * shellLog.ts), so nothing about it depends on this turn continuing: BgRegistry.add() tails
+         * the same log files from the offsets already consumed and makes the job pollable with
+         * bash_output. This is the difference between "your download died at 60s" and "your download
+         * kept going and you can check on it" — the tool call ends, the WORK does not.
+         *
+         * Output captured before the hand-off is replayed into the registry first so nothing the
+         * model already saw is lost from bash_output's buffer — and the registry resumes tailing at
+         * the byte offset we already consumed, so nothing is emitted twice.
+         */
+        const promoteToBackground = (): void => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          // Drain what the child has written so far, then hand over at the exact consumed offset.
+          // The child's stdio is FILE-BACKED (see shellLog.ts), so the registry cannot attach pipe
+          // listeners — it tails the same files, and these offsets stop it re-reading our output.
+          stopTails(false);
+          const proc = opts.bg!.add(input.command, child, { stdout, stderr }, { stdout: log.outPath, stderr: log.errPath }, {
+            stdout: fgTailOut.consumed,
+            stderr: fgTailErr.consumed,
+          });
+          const reason = aborted ? 'the turn was interrupted' : `the foreground timeout (${timeoutMs}ms) elapsed`;
+          const lead = aborted
+            ? `Command was still running when ${reason}, so it was NOT killed.`
+            : `Command exceeded ${reason}, so it was NOT killed.`;
+          const data: RunShellData = {
+            command: input.command,
+            stdout: clamp(stdout, STDOUT_CLAMP),
+            stderr: clamp(stderr, STDERR_CLAMP),
+            exitCode: null,
+            signal: null,
+            // NOT reported as timedOut/aborted: the work is alive and is meant to be resumed, and
+            // a failure flag here makes weaker models conclude the command died.
+            timedOut: false,
+            aborted: false,
+            sandboxed: sandbox.sandboxed,
+            backgroundId: proc.id,
+            promotedId: proc.id,
+          };
+          resolve(
+            result(
+              start,
+              true,
+              '',
+              sbWarn +
+                `${lead} It is still running as background shell ${proc.id}. ` +
+                `Poll it with bash_output("${proc.id}"); stop it with kill_shell("${proc.id}").`,
+              data,
+            ),
+          );
+        };
+        // Registered only now, after promoteToBackground and cleanup exist: ctx.signal may already
+        // be aborted, which calls onAbort SYNCHRONOUSLY.
+        if (ctx.signal.aborted) onAbort();
+        else ctx.signal.addEventListener('abort', onAbort, { once: true });
 
         child.on('error', (err) => {
           if (settled) return;
           settled = true;
+          stopTails();
           cleanup();
           resolve(fail('run_shell', 'exec', Date.now() - start, 'spawn_failed', `failed to start command: ${err.message}`));
         });
 
         child.on('close', (code, sig) => {
+          // Drain final bytes before deciding anything: a child's last output is usually the most
+          // informative (traceback, exit summary) and must not be lost to a tail interval boundary.
+          stopTails();
           if (settled) return;
           settled = true;
           cleanup();

@@ -100,7 +100,10 @@ test('fullscreen follow-up steers a stalled response without Escape and preserve
     const messages = f.context.messages();
     assert.ok(messages.some((m) => m.role === 'assistant' && m.interrupted && m.content.some((b) => b.type === 'text' && b.text === 'Partial first answer.')));
     assert.equal(f.inspect.items.filter((item) => item.text === 'Partial first answer.').length, 1);
-    assert.match(f.inspect.items.map((item) => item.text).join('\n'), /next safe boundary/);
+    // The steer is injected INTO the running turn (not deferred to a new one), so the transcript
+    // must say so and name the injected text — that is what distinguishes steering from a
+    // follow-up that merely ends the turn and starts over.
+    assert.match(f.inspect.items.map((item) => item.text).join('\n'), /steering this turn: Change the next step\./);
     assert.equal(f.inspect.items.find((item) => item.kind === 'reasoning')?.reasoningState, 'complete', 'reasoning finished before the partial answer');
   } finally { await f.close(); }
 });

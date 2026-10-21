@@ -113,3 +113,62 @@ test('cancel with the * wildcard cancels a running background agent', async () =
     rmSync(ws, { recursive: true, force: true });
   }
 });
+
+test('a steer promotes a SYNC sub-agent to background instead of holding the turn', async () => {
+  // The defect: the default (sync) agent path awaits loop.run() to completion, so the parent turn
+  // is parked for the agent's entire run and a user message cannot reach the model at all — a
+  // reviewer at its iteration ceiling blocks the session outright. A steer must free the turn.
+  const ws = mkdtempSync(join(tmpdir(), 'agent-steer-promote-'));
+  try {
+    const bus = new EventBus();
+    const events: LoopEvent[] = [];
+    bus.on((e) => events.push(e));
+    const makeLoopDeps = (): LoopDeps => ({
+      provider: blockingProvider,
+      registry: new ToolRegistry(),
+      gate: new ScriptedApprovalGate([], 'approve'),
+      bus,
+      budget: new Budget({ maxIterations: 2 }, 'mock', PRICE, Date.now()),
+      context: new Context({ contextBudget: 100000, triggerRatio: 0.75, keepLastTurns: 2 }),
+      signal: new AbortController().signal,
+      model: 'mock',
+      system: 'test',
+      maxOutputTokens: 256,
+      workspaceRoot: ws,
+      dryRun: false,
+      maxToolResultChars: 1000,
+      contextBudget: 100000,
+    });
+    const tool = makeAgentTool({ makeLoopDeps, getAutonomy: () => 'full', contextBudget: 100000, triggerRatio: 0.75, keepLastTurns: 2, maxIterations: 2, priceTable: PRICE });
+    const steer = new AbortController();
+    const ctx: ToolContext = { workspaceRoot: ws, signal: new AbortController().signal, steerSignal: steer.signal, log: () => {}, dryRun: false };
+
+    // SYNC (no run_in_background): this would block for 30s before the fix.
+    const running = tool.run({ prompt: 'review this code' } as any, ctx);
+    // Give it a moment to start, then steer — as the user typing a new message would.
+    await tick(80);
+    steer.abort('user_steer');
+    const res = await running; // must return NOW, not after the 30s block
+
+    assert.ok(res.ok, res.summary);
+    assert.match(res.summary, /BACKGROUND/);
+    const taskId = (res.data as { taskId: string }).taskId;
+    assert.ok(taskId.includes('_sync'), 'the promoted agent keeps its task id');
+    // The turn got its answer immediately and the agent is still running, announced as bg.
+    const start = events.filter((e) => e.type === 'subagent_start' && e.taskId === taskId);
+    assert.equal(start.length, 2, 're-announced on promotion');
+    assert.equal((start.at(-1) as { background?: boolean }).background, true, 'now a background agent');
+    // It did NOT finish with the turn — it is still working.
+    assert.equal(events.some((e) => e.type === 'subagent_end' && e.taskId === taskId), false, 'still running');
+
+    // And it is still cancellable/observable, then ends on its own terms.
+    bus.emit({ type: 'cancel_subagent', taskId });
+    assert.ok(
+      await until(() => events.some((e) => e.type === 'subagent_end' && e.taskId === taskId)),
+      'the promoted agent completes its own lifecycle',
+    );
+    assert.ok(events.some((e) => e.type === 'task_notification' && e.taskId === taskId), 'result still delivered');
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});

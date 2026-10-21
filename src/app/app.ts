@@ -14,6 +14,7 @@ import type { EditorTheme, OverlayHandle, SelectListTheme, Terminal } from '@ear
 import { truncateToWidth, visibleWidth } from '@earendil-works/pi-tui';
 
 import { AgentLoop } from '../agent/loop.js';
+import { dropOneQueuedByText, queuedAhead } from '../agent/steerQueue.js';
 import { buildLoopDeps } from '../agent/loopDeps.js';
 import { Budget } from '../agent/budget.js';
 import { SessionApprovals, type ApprovalDecision, type ApprovalGate, type ApprovalRequest } from '../agent/approval.js';
@@ -1146,6 +1147,15 @@ export class ShadowApp {
         break;
       case 'stop':
         break; // handled by the turn's finally
+      case 'steer_applied':
+        // The loop injected this text into the RUNNING turn. Drop exactly ONE entry so flushQueue
+        // does not run it again as a fresh turn; anything else queued stays in order. The helper is
+        // shared with the Ink frontend so the two can never drift on how many entries to remove.
+        {
+          const keep = dropOneQueuedByText(this.queued.map((text) => ({ text })), e.text as string);
+          if (keep) this.queued = keep.map((q) => q.text);
+        }
+        break;
       default:
         break;
     }
@@ -1424,15 +1434,42 @@ export class ShadowApp {
     // Enqueue before signalling: the loop's finally drains this queue once model work has
     // stopped and every already-started tool has settled. Never hard-abort an active tool or
     // cancel a prompt still waiting for the run lock (there is no loop to steer yet).
+    //
+    // FAIRNESS: a steer injects into the RUNNING turn, so it would jump ahead of anything already
+    // waiting — a `/compact` with async work in flight, a scheduled wakeup, an earlier follow-up.
+    // Queue order is the user's stated intent and must not be reordered by a later message, so a
+    // message only steers when NOTHING is ahead of it. Anything ahead means this message waits its
+    // turn and the current turn is ended instead (see the caller), so `/compact` still runs before
+    // the message it was submitted ahead of.
     this.queued.push(task);
+    // Shared with the Ink frontend so the two can never drift on what "ahead" means.
+    const ahead = queuedAhead(this.queued.map((text) => ({ text })));
     this.hudRef = this.hudState();
-    const steered = !task.startsWith('/') && this.running && (this.loopRef?.requestSteer() ?? false);
+    // Pass the text WITH the steer: the loop injects it at the next paired history boundary and
+    // continues this turn, instead of ending the turn and letting flushQueue start a new one.
+    //
+    // `ahead === 0` is the fairness rule above. When other human work is already waiting, this
+    // message must NOT overtake it — it joins the back of the queue. The turn then still has to
+    // END, or the queue could never drain (a stalled provider plus a non-steering message is a
+    // deadlock), so that case falls back to the bare steer, which stops the turn and lets
+    // flushQueue run the backlog in submission order.
+    const steered = ahead === 0
+      ? !task.startsWith('/') && this.running && (this.loopRef?.requestSteer(task) ?? false)
+      : false;
+    // Only break the turn when this is the FIRST thing to steer. If a steer is already pending for
+    // the running turn, force-aborting again would discard the text that steer is about to inject
+    // (B would lose its turn to C). The pending injection ends the turn naturally when it lands,
+    // and flushQueue then runs the backlog in submission order.
+    if (ahead > 0 && this.running && !task.startsWith('/') && !this.loopRef?.hasPendingSteer()) {
+      this.loopRef?.requestSteer();
+    }
     if (steered) {
+      // Stream closure only — the turn itself continues with the user's text in place.
       this.finishReasoning('interrupted');
       this.flushStreamToTranscript();
     }
     this.pushLine({ text: steered
-      ? `  ↪ pending at the next safe boundary: ${oneLine(task, 70)}`
+      ? `  ↪ steering this turn: ${oneLine(task, 70)}`
       : `  ⏳ queued: ${oneLine(task, 70)}`, dimColor: true });
     this.tui.requestRender();
   }

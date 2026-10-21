@@ -1,6 +1,6 @@
 # Shadow CLI
 
-Current build: **`v10.5.1`** — `shadow corpus`: capture your own sessions as training data. Local-only, opt-in per workspace, redacted on write and on export, with no network path anywhere in it.
+Current build: **`v10.5.2`** — steering that continues the turn, detached shells that outlive the session, and sub-agents that no longer block the conversation.
 
 Shadow is a local-first, provider-neutral security engineering agent. Its built-in Security
 foundation covers investigation, hardening, incident response, defensive automation, secure coding,

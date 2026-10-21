@@ -237,7 +237,9 @@ test('type-ahead: a pending message interrupts model streaming and steers the ne
   assert.equal(maxActiveRequests, 1, 'the replacement request starts only after the first unwinds');
   assert.deepEqual(prompts, ['first', 'second'], 'the steering message becomes the next provider turn');
   assert.doesNotMatch(seen(), /stale first completion/, 'the obsolete completion never reaches the transcript');
-  assert.match(seen(), /↪ pending message — steering at the next safe boundary/);
+  // Steering now injects the text into the RUNNING turn rather than ending it at the next safe
+  // boundary, so the transcript names the injected text directly.
+  assert.match(seen(), /↪ steering this turn: ?second/);
   assert.match(seen(), new RegExp(`${GLYPHS.promptPrefix}second`, ""), 'the steering message commits its user line like an idle send');
 
   const messages = context.messages();

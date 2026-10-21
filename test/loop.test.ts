@@ -1030,6 +1030,98 @@ test('steering during a tool lets the active call settle, skips later calls, and
   if (skipped?.type === 'tool_result') assert.match(skipped.content, /new message/i);
 });
 
+test('steering WITH TEXT during a tool continues the turn and lands after the tool_result pairing', async () => {
+  // The user's core complaint: sending a message while work is in flight stopped everything. With
+  // text attached the turn must CONTINUE — the tool settles, its result is committed (keeping the
+  // tool_use/tool_result pair intact), the steer is injected AFTER that pairing, and a new provider
+  // request runs inside the same turn.
+  let sends = 0;
+  let firstStarted!: () => void;
+  const started = new Promise<void>((resolve) => (firstStarted = resolve));
+  let firstFinished = false;
+  let secondRan = false;
+  let promptOnSecondRequest = '';
+  const slowFirst: Tool<Record<string, never>, { done: boolean }> = {
+    name: 'slow_first',
+    description: 'finishes one already-started side effect',
+    risk: 'read',
+    inputSchema: z.object({}),
+    async run() {
+      firstStarted();
+      await new Promise((resolve) => setTimeout(resolve, 80));
+      firstFinished = true;
+      return ok('slow_first', 'read', 80, 'first finished', { done: true });
+    },
+  };
+  const second: Tool<Record<string, never>, { done: boolean }> = {
+    name: 'second',
+    description: 'must be skipped after steering',
+    risk: 'read',
+    inputSchema: z.object({}),
+    async run() {
+      secondRan = true;
+      return ok('second', 'read', 1, 'second ran', { done: true });
+    },
+  };
+  const provider: Provider = {
+    name: 'tool-steer-text',
+    estimateTokens: () => 0,
+    async *send(req): AsyncIterable<ProviderEvent> {
+      sends += 1;
+      if (sends === 1) {
+        yield { type: 'tool_call', call: { id: 'first', name: 'slow_first', input: {} } };
+        yield { type: 'tool_call', call: { id: 'second', name: 'second', input: {} } };
+        yield { type: 'done', stopReason: 'tool_use' };
+        return;
+      }
+      promptOnSecondRequest = req.messages
+        .flatMap((m) => m.content)
+        .filter((b) => b.type === 'text')
+        .map((b) => (b as { text: string }).text)
+        .join('\n');
+      yield { type: 'text', delta: 'Continuing with your new instruction.' };
+      yield { type: 'done', stopReason: 'end_turn' };
+    },
+  };
+  const hardAbort = new AbortController();
+  const { loop, context, events } = buildLoop(provider, [slowFirst, second], new AutoApproveGate(), {
+    signal: hardAbort.signal,
+    parallelTools: false,
+  });
+
+  const running = loop.run();
+  await started;
+  assert.equal(loop.requestSteer('also check /etc/hosts'), true, 'text steer is accepted');
+  const res = await running;
+
+  assert.equal(hardAbort.signal.aborted, false, 'steering never hard-aborts');
+  assert.equal(firstFinished, true, 'the already-running call settles');
+  assert.equal(secondRan, false, 'a not-yet-started serial call is still skipped');
+  // The turn CONTINUED: a second provider request ran inside the same run() call.
+  assert.equal(sends, 2, 'the turn continues with a fresh request instead of ending');
+  assert.equal(res.stopReason, 'end_turn');
+  assert.match(promptOnSecondRequest, /also check \/etc\/hosts/, 'steer text reached the model');
+
+  // Every committed tool_use is paired — the steer was NOT injected mid-pair.
+  const msgs = context.messages();
+  const results = msgs.flatMap((m) => m.content).filter((b) => b.type === 'tool_result');
+  assert.equal(results.length, 2, 'both tool_use blocks keep a tool_result');
+  assert.equal(results.find((b) => b.type === 'tool_result' && b.toolCallId === 'first')?.ok, true);
+  assert.equal(
+    results.find((b) => b.type === 'tool_result' && b.toolCallId === 'second')?.ok,
+    false,
+    'the skipped call is recorded as skipped, not silently dropped',
+  );
+
+  // The steer text sits AFTER the last tool_result in history: pairing survives injection.
+  const lastResultIdx = msgs.findLastIndex((m) => m.content.some((b) => b.type === 'tool_result'));
+  const steerIdx = msgs.findIndex((m) =>
+    m.content.some((b) => b.type === 'text' && b.text === 'also check /etc/hosts'),
+  );
+  assert.ok(steerIdx > lastResultIdx, 'steer lands after the tool_result it followed');
+  assert.equal(events.filter((e) => e.type === 'steer_applied').length, 1, 'announced once');
+});
+
 test('steering an error-frame unwind suppresses fallback and remains an interrupt', async () => {
   let errorSeen!: () => void;
   const sawError = new Promise<void>((resolve) => (errorSeen = resolve));
@@ -1253,4 +1345,157 @@ test('plan capability errors naming token caps do not trigger overflow retries',
   const { loop } = buildLoop(provider, [], new AutoApproveGate());
   assert.equal((await loop.run()).stopReason, 'provider_error');
   assert.equal(sends, 1);
+});
+
+// ── Steering: a queued message with TEXT continues the turn instead of ending it ──────────────
+
+test('steering with text injects it at the next boundary and CONTINUES the same turn', async () => {
+  // Request 1 streams text, then blocks until the steer aborts it.
+  let ready!: () => void;
+  const streamReady = new Promise<void>((resolve) => (ready = resolve));
+  let sends = 0;
+  let promptOnSecondRequest = '';
+  const provider: Provider = {
+    name: 'steer-continue',
+    estimateTokens: () => 0,
+    async *send(req): AsyncIterable<ProviderEvent> {
+      sends += 1;
+      if (sends === 1) {
+        yield { type: 'text', delta: 'Looking into it.' };
+        ready();
+        await new Promise<void>((resolve) => {
+          if (req.signal?.aborted) resolve();
+          else req.signal?.addEventListener('abort', () => resolve(), { once: true });
+        });
+        return;
+      }
+      promptOnSecondRequest = req.messages
+        .filter((m) => m.role === 'user')
+        .map((m) => m.content.map((b) => (b.type === 'text' ? b.text : '')).join(''))
+        .join('\n');
+      yield { type: 'text', delta: 'Steered: checking the other path.' };
+      yield { type: 'done', stopReason: 'end_turn' };
+    },
+  };
+  const { loop, events, context } = buildLoop(provider, [], new AutoApproveGate());
+
+  const running = loop.run();
+  await streamReady;
+  assert.equal(loop.requestSteer('also check /etc/hosts'), true, 'text steer is accepted');
+  const res = await running;
+
+  // The turn did not end — it continued with a fresh request in the SAME run.
+  assert.equal(sends, 2, 'a second provider request is made inside the same turn');
+  assert.equal(res.stopReason, 'end_turn');
+  assert.match(res.finalAnswer, /Steered:/);
+  assert.match(promptOnSecondRequest, /also check \/etc\/hosts/, 'the steer text reached the model');
+  // Announced exactly once, and the text is in history exactly once (no host re-delivery).
+  assert.equal(events.filter((e) => e.type === 'steer_applied').length, 1);
+  const occurrences = context
+    .messages()
+    .flatMap((m) => m.content)
+    .filter((b) => b.type === 'text' && b.text === 'also check /etc/hosts').length;
+  assert.equal(occurrences, 1, 'steer text appears in history exactly once');
+});
+
+test('a bare interrupt still stops the turn (ESC / no text) — the escape is unchanged', async () => {
+  let ready!: () => void;
+  const streamReady = new Promise<void>((resolve) => (ready = resolve));
+  let sends = 0;
+  const provider: Provider = {
+    name: 'steer-bare',
+    estimateTokens: () => 0,
+    async *send(req): AsyncIterable<ProviderEvent> {
+      sends += 1;
+      yield { type: 'text', delta: 'Working.' };
+      ready();
+      await new Promise<void>((resolve) => {
+        if (req.signal?.aborted) resolve();
+        else req.signal?.addEventListener('abort', () => resolve(), { once: true });
+      });
+    },
+  };
+  const { loop, events } = buildLoop(provider, [], new AutoApproveGate());
+  const running = loop.run();
+  await streamReady;
+  assert.equal(loop.requestSteer(), false, 'bare interrupt takes no text');
+  const res = await running;
+  assert.equal(res.stopReason, 'interrupted');
+  assert.equal(sends, 1, 'no further request is made');
+  assert.equal(events.some((e) => e.type === 'steer_applied'), false);
+});
+
+test('steer does not poison later requests: the pre-steer abort latch is gone', async () => {
+  // Regression for the one-way latch: modelSignal was built once with AbortSignal.any(), so after
+  // ONE steer every later request arrived pre-aborted and the turn could only end.
+  let steerDone = false;
+  let sends = 0;
+  const provider: Provider = {
+    name: 'steer-latch',
+    estimateTokens: () => 0,
+    async *send(req): AsyncIterable<ProviderEvent> {
+      sends += 1;
+      if (!steerDone) {
+        steerDone = true;
+        yield { type: 'text', delta: 'Start.' };
+        // Abort ourselves while the loop is mid-request.
+        setImmediate(() => loop.requestSteer('narrow it to reads only'));
+        await new Promise<void>((resolve) => {
+          if (req.signal?.aborted) resolve();
+          else req.signal?.addEventListener('abort', () => resolve(), { once: true });
+        });
+        return;
+      }
+      // Oversized input, held inside the request, proves THIS request was not born aborted.
+      assert.equal(req.signal?.aborted, false, 'later requests must not inherit the steer abort');
+      yield { type: 'text', delta: 'Narrowed.' };
+      yield { type: 'done', stopReason: 'end_turn' };
+    },
+  };
+  const { loop } = buildLoop(provider, [], new AutoApproveGate(), {});
+  const res = await loop.run();
+  assert.equal(sends, 2);
+  assert.equal(res.stopReason, 'end_turn');
+  assert.equal(res.finalAnswer, 'Narrowed.');
+});
+
+test('a second steer while one is pending is refused, so each message gets its own reply', async () => {
+  let ready!: () => void;
+  const streamReady = new Promise<void>((resolve) => (ready = resolve));
+  let sends = 0;
+  let saw = '';
+  const provider: Provider = {
+    name: 'steer-multi',
+    estimateTokens: () => 0,
+    async *send(req): AsyncIterable<ProviderEvent> {
+      sends += 1;
+      if (sends === 1) {
+        ready();
+        await new Promise<void>((resolve) => {
+          if (req.signal?.aborted) resolve();
+          else req.signal?.addEventListener('abort', () => resolve(), { once: true });
+        });
+        return;
+      }
+      saw = req.messages.at(-1)!.content.map((b) => (b.type === 'text' ? b.text : '')).join('');
+      yield { type: 'text', delta: 'ok' };
+      yield { type: 'done', stopReason: 'end_turn' };
+    },
+  };
+  const { loop, events, context } = buildLoop(provider, [], new AutoApproveGate());
+  const running = loop.run();
+  await streamReady;
+  // The first steer is accepted and its text is in flight for injection.
+  assert.equal(loop.requestSteer('first'), true, 'first steer is accepted and carries its text');
+  // The second is REFUSED rather than folded in. Folding two messages into one injected turn
+  // would answer them as a single message, so the second user message would never get its own
+  // reply. Returning false hands delivery back to the host's FIFO, which runs it as the next turn
+  // in submission order.
+  assert.equal(loop.requestSteer('second'), false, 'second steer is refused, not folded in');
+  await running;
+  assert.equal(saw, 'first', 'only the accepted steer is injected');
+  // Two user messages total: the original prompt, plus exactly ONE injected steer. The refused
+  // second steer must not add a third.
+  assert.equal(context.messages().filter((m) => m.role === 'user').length, 2, 'one injected user message');
+  assert.equal(events.filter((e) => e.type === 'steer_applied').length, 1, 'one event, for host FIFO dedupe');
 });

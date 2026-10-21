@@ -33,12 +33,12 @@ function handleDialog(env: KeyEnv, ch: string, key: InkKey): boolean {
     // abort resolves the pending gate through settleWithAbort), so the message is queued and
     // model work redirected without a phantom denial the user never chose.
     if (Date.now() - env.dialogShownAtRef.current < dialogArmMs()) {
-      env.loopRef.current?.requestSteer();
+      env.loopRef.current?.requestSteer(task);
       env.pushLine({ text: '  ↪ pending message — steering (dialog not yet seen)', dimColor: true });
       return true;
     }
     g.respond('deny');
-    const steered = taskKind === 'steer' ? (env.loopRef.current?.requestSteer() ?? false) : false;
+    const steered = taskKind === 'steer' ? (env.loopRef.current?.requestSteer(task) ?? false) : false;
     env.pushLine({
       text: steered
         ? '  ↪ pending message — current action denied; steering now'

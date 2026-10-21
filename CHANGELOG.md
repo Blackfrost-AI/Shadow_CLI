@@ -7,6 +7,40 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [10.5.2] — 2026-10-20
+
+Steering, detachment and sub-agent work. All three shared one shape: work the user had already
+started was being killed by the machinery responsible for carrying it.
+
+### Fixed
+- **A message sent mid-turn stopped the model instead of steering it.** With text attached, a
+  steer now aborts only the current *provider request*, injects the text at a paired history
+  boundary, and the turn **continues** — in-flight work survives. Injection is pairing-aware and
+  never lands between a `tool_use` and its `tool_result`; an in-flight call settles first. A bare
+  steer with no text still stops, as before, and a hard signal always wins over steering.
+- **A queued message could be silently discarded.** The Ink frontend dropped *every* queue entry
+  matching the steer text, so typing `yes` twice produced one reply. Both frontends now share
+  `src/agent/steerQueue.ts` and remove exactly one entry per confirmed steer.
+- **Queue order could be violated.** A steer injects into the running turn and immediately issues
+  a new request, so it would jump the queue. A message now only steers when nothing is queued
+  ahead of it, so a later message can never overtake an earlier one or a pending `/compact`.
+- **Long commands died with the session that started them.** Foreground children were killed on
+  timeout or abort, and all stdio was piped to the parent: when a session went away the child took
+  SIGPIPE and stopped mid-progress with no error — the "download just stopped at 63%, no
+  traceback" failure. Shells now run as detached process-group leaders with **file-backed** stdio
+  under `.shadow/shell-logs/`, a foreground command that needs longer is promoted to the
+  background registry instead of killed, and shutdown calls `releaseForExit()` instead of
+  `killAll()`, so exiting no longer reaps work the user started.
+- **A running sub-agent blocked the whole session.** Running an agent or reviewer held the main
+  loop, so the user could not talk to Shadow until it finished. A steer now promotes a synchronous
+  agent to the background and frees the conversation; every agent's cancel path is wired, not just
+  background ones, so a promoted agent stays cancellable.
+
+### Changed
+- Key-map copy for `Enter` now reads "send; fold the message into the running turn while busy,
+  continuing it". `Ctrl+N` and `/agents` list every running agent, sub-agents and reviewers
+  included.
+
 ## [10.5.1] — 2026-10-19
 
 `shadow corpus` — a local-only tool for capturing **your own** sessions as training data. Shadow
