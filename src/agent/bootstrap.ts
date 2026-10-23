@@ -521,6 +521,8 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
       root: skill.root,
       body: skill.body,
     })),
+    // Opt-in scoping: unset means every skill is indexed, exactly as before.
+    mode: process.env.SHADOW_SKILLS_MODE?.trim() || undefined,
   });
   const skillsBlock = capabilityAwareSkillsIndex(skills, promptCapabilities);
   const baseSystem = [

@@ -7,6 +7,64 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [10.6.0] — 2026-10-23
+
+Plugin packaging and provider adaptation. The theme: Shadow should absorb what varies between
+installs — a plugin built for another tool, a serve with a smaller output ceiling — instead of
+refusing to run or asking you to pre-compute its limits.
+
+### Added
+- **`shadow plugin doctor [<name>|<path>]`** — explains what Shadow will and won't load from a
+  plugin, so you find out at install time instead of wondering why a skill is missing. Reports
+  content surfaces (commands / skills / agents / workflows), files **dropped** by the
+  markdown-only boundary grouped by extension, **dangling** references introduced by those drops,
+  symlinked or unreadable paths, and cap usage. Diagnoses the recorded **source** tree when
+  provenance points at one that still exists — the installed copy has already been stripped, so
+  diagnosing it reports every script reference as missing and hides the drops entirely.
+- **Skill `mode:` scoping** — a skill's frontmatter may declare `mode: security` (or a
+  comma-separated list such as `security, coding`), and `SHADOW_SKILLS_MODE` selects which set
+  indexes into the system prompt. Opt-in and additive: a skill with no `mode` is available
+  everywhere, so existing installs are unchanged. On a 311-skill plugin this took the security
+  session's skill index from ~26k tokens to ~1.4k — a 19× reduction, and the reason a large
+  plugin stops being a tax on every unrelated task.
+- **`onOutputCapDiscovered` → `learnedOutputCap`** — a serve that advertises its output ceiling in
+  a 400 is now remembered for the session, so later turns build *under* the cap on first contact
+  instead of re-discovering the same number every turn. Folded with `tighterOutputCap` (tightest
+  wins) and wired into **both** provider wires, Chat Completions and Responses, through one shared
+  rule so they cannot diverge.
+
+### Changed
+- **Plugin caps raised**: `PLUGIN_MAX_BYTES` 8 MB → 32 MB and `PLUGIN_MAX_FILES` 500 → 5000,
+  measured against a real 2579-file / 16.6 MB plugin rather than a guess.
+- Plugin internals take an optional `home` (`pluginsDir`, `listPlugins`, `describePlugin`,
+  `enabledPluginDirs`, `discoverSkills`), so plugin tests can run hermetically instead of reading
+  whatever happens to be installed in the developer's own `~/.shadow`.
+
+### Fixed
+- **A serve with a smaller output ceiling made the model unusable.** Requesting more output than a
+  serve accepts returned a terminal `http_400` on turn 1:
+  `max_completion_tokens is too large: 128000. This model supports at most 65536 completion
+  tokens.` A token-overflow recovery ladder already existed and claimed to cover OpenAI-compatible
+  servers, but three separate gaps meant it never fired here. (1) The predicate missed the message
+  — it has no "context" word, and `max(?:imum)?[ _]?tokens` cannot match `max_completion_tokens`
+  because `_completion` sits between `max` and `tokens`, so the 400 fell through every recovery
+  branch. (2) Even when the ladder did fire it **halved blindly**: the serve states its ceiling in
+  the same message that rejects us, and halving ignored that, walking 128000 → 64000 → 32000 for
+  three round-trips and then throttling the model to *half* the ceiling it would have accepted.
+  (3) Nothing was remembered, so every turn paid it again. Shadow now parses the ceiling the serve
+  **accepts** — never the one it rejected, since the message carries both — and clamps to it in a
+  single retry. `TOKEN_SHRINK_FLOOR` is deliberately not applied here: a serve that says "at most
+  512" gets 512, and flooring would re-request a value just refused. The clamp only fires after a
+  real rejection, so an untouched serve still receives its full reasoning floor — removing that
+  guard breaks four pre-existing byte-identical wire-contract tests, which is how we know it is
+  load-bearing.
+- **`plugin doctor` cried wolf.** Its reference matcher flagged *any* `*.md` token, so prose naming
+  a file in the **consuming** project — `CLAUDE.md`, `SOUL.md`, `todo.md` — was reported as a
+  dangling plugin path: 378 of 819 findings on one well-formed plugin. Markdown references now
+  require a path separator. Suppressing unresolvable bare basenames loses nothing, because a bare
+  `.md` that *does* resolve is copied and was never reported anyway. 819 → 406 findings, and the
+  dropped-file section now shows the real 1970 files instead of 1.
+
 ## [10.5.2] — 2026-10-20
 
 Steering, detachment and sub-agent work. All three shared one shape: work the user had already

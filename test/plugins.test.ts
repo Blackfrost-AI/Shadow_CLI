@@ -17,6 +17,7 @@ const { home, shadowDir } = isolateHome('plugins');
 const {
   parseManifest, installPluginFromPath, installPluginFromArg, listPlugins, describePlugin,
   setPluginEnabled, removePlugin, enabledPluginDirs, pluginsDir, displaySafe, assertAllowedGitUrl,
+  PLUGIN_MAX_BYTES, PLUGIN_MAX_FILES,
 } = await import('../src/plugins/manager.js');
 const { discoverCustomCommands } = await import('../src/tui/customCommands.js');
 const { discoverCustomStyles } = await import('../src/agent/outputStyles.js');
@@ -144,7 +145,7 @@ test('a name collision refuses and tells you to remove first', () => {
 
 test('the byte cap stops a disk-bomb and leaves NOTHING behind', () => {
   const src = makePluginSource('pack-bomb');
-  writeFileSync(join(src, 'commands', 'big.md'), 'x'.repeat(9 * 1024 * 1024));
+  writeFileSync(join(src, 'commands', 'big.md'), 'x'.repeat(PLUGIN_MAX_BYTES + 1024 * 1024));
   assert.throws(() => installPluginFromPath(src), /cap/);
   assert.ok(!existsSync(join(pluginsDir(), 'pack-bomb')), 'failed install must clean up');
 });
@@ -154,6 +155,37 @@ test('installPluginFromArg routes an existing directory to the path installer', 
   const info = installPluginFromArg(src);
   assert.equal(info.name, 'pack-arg');
   assert.equal(info.meta.source.kind, 'path');
+});
+
+test('installPluginFromArg surfaces the REAL install error instead of "not a recognized git URL"', () => {
+  // Regression: the path install used to run INSIDE the stat probe's try, so every failure
+  // (already-installed, file cap, bad manifest) was swallowed and re-reported as a URL problem.
+  const src = makePluginSource('pack-arg-err');
+  installPluginFromArg(src); // first install succeeds
+  assert.throws(
+    () => installPluginFromArg(src),
+    /already installed/,
+    'a re-install must report "already installed", not a bogus URL error',
+  );
+  assert.throws(
+    () => installPluginFromArg(src),
+    (err: Error) => !/not a recognized git URL/.test(err.message),
+  );
+});
+
+test('installPluginFromArg reports the file cap for an oversized local dir', () => {
+  const src = makePluginSource('pack-overflow');
+  const skills = join(src, 'skills');
+  for (let i = 0; i <= PLUGIN_MAX_FILES; i++) {
+    mkdirSync(join(skills, `s${i}`), { recursive: true });
+    writeFileSync(join(skills, `s${i}`, 'SKILL.md'), `---\nname: s${i}\ndescription: d\n---\nbody\n`);
+  }
+  // Match the cap MESSAGE, not just the word "cap" — the temp path can contain it too.
+  assert.throws(
+    () => installPluginFromArg(src),
+    /exceeds the \d+-file cap/,
+    'the cap must reach the user, not a URL error',
+  );
 });
 
 test('data-only is literal: non-markdown files in content dirs are never copied or counted', () => {

@@ -43,11 +43,16 @@ export type PluginContentKind = (typeof PLUGIN_CONTENT_DIRS)[number];
 
 const PLUGIN_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
 const MANIFEST_MAX_BYTES = 64 * 1024;
-/** Disk-bomb guard: a plugin is markdown; anything bigger is not a plugin. */
-const PLUGIN_MAX_BYTES = 8 * 1024 * 1024;
-const PLUGIN_MAX_FILES = 500;
+/**
+ * Disk-bomb guard: a plugin is markdown; anything bigger is not a plugin. Raised from
+ * 8 MB/500 files — real catalogues (ECC is 2863 files / 18.8 MB) exceeded the old ceiling,
+ * and a cap that refuses every genuine plugin is not a safety boundary, it is a bug.
+ */
+export const PLUGIN_MAX_BYTES = 32 * 1024 * 1024;
+export const PLUGIN_MAX_FILES = 5000;
 const CLONE_TIMEOUT_MS = 120_000;
 const META_FILE = '.shadow-plugin-meta.json';
+export const PLUGIN_META_FILE = META_FILE;
 
 /**
  * Keys a manifest must NEVER carry. These are the EXECUTABLE extension surfaces — a plugin that
@@ -89,8 +94,8 @@ export interface PluginInfo {
 }
 
 /** Recomputed on call (not a module const) so HOME-isolated tests always see their own dir. */
-export function pluginsDir(): string {
-  return join(homedir(), '.shadow', 'plugins');
+export function pluginsDir(home?: string): string {
+  return join(home ?? homedir(), '.shadow', 'plugins');
 }
 
 function metaPath(name: string): string {
@@ -396,12 +401,16 @@ export function installPluginFromGit(url: string, opts: { offline?: boolean } = 
 export function installPluginFromArg(arg: string, opts: { offline?: boolean } = {}): PluginInfo {
   const trimmed = arg.trim();
   if (!trimmed) throw new Error('usage: shadow plugin add <git-url|path>');
+  // Probe ONLY the stat. Installing inside the try would swallow every real failure
+  // (already-installed, file/byte cap, bad manifest, unreadable dir) and re-report it as
+  // "not a recognized git URL", sending the user chasing the wrong problem.
+  let isLocalDir = false;
   try {
-    if (lstatSync(resolve(trimmed)).isDirectory()) return installPluginFromPath(trimmed);
+    isLocalDir = lstatSync(resolve(trimmed)).isDirectory();
   } catch {
     /* not a local dir — treat as URL */
   }
-  return installPluginFromGit(trimmed, opts);
+  return isLocalDir ? installPluginFromPath(trimmed) : installPluginFromGit(trimmed, opts);
 }
 
 // ── query + lifecycle ────────────────────────────────────────────────────────
@@ -420,11 +429,11 @@ function countSurface(dir: string, kind: PluginContentKind): number {
 }
 
 /** Read one installed plugin; null if the directory is absent or the manifest/meta are broken. */
-export function describePlugin(name: string): PluginInfo | null {
+export function describePlugin(name: string, home?: string): PluginInfo | null {
   // The name regex is the traversal wall: every lifecycle op (enable/disable/remove) funnels
   // through here, so `../foo` can never reach writeMeta/renameSync.
   if (!PLUGIN_NAME_RE.test(name)) return null;
-  const dir = join(pluginsDir(), name);
+  const dir = join(pluginsDir(home), name);
   try {
     if (!lstatSync(dir).isDirectory()) return null;
   } catch {
@@ -444,10 +453,10 @@ export function describePlugin(name: string): PluginInfo | null {
 }
 
 /** All installed plugins, sorted by name. Directories with broken manifests are skipped silently. */
-export function listPlugins(): PluginInfo[] {
+export function listPlugins(home?: string): PluginInfo[] {
   let entries: string[];
   try {
-    entries = readdirSync(pluginsDir(), { withFileTypes: true })
+    entries = readdirSync(pluginsDir(home), { withFileTypes: true })
       .filter((d) => d.isDirectory() && !d.name.startsWith('.'))
       .map((d) => d.name);
   } catch {
@@ -455,7 +464,7 @@ export function listPlugins(): PluginInfo[] {
   }
   const out: PluginInfo[] = [];
   for (const name of entries.sort((a, b) => a.localeCompare(b))) {
-    const info = describePlugin(name);
+    const info = describePlugin(name, home);
     if (info) out.push(info);
   }
   return out;
@@ -488,9 +497,9 @@ export function removePlugin(name: string): string {
  * follows listPlugins() (name-sorted); loaders insert these BETWEEN the workspace roots and the
  * user's own home dirs, so the user's own files win collisions and plugins win over repos.
  */
-export function enabledPluginDirs(subdir: PluginContentKind): string[] {
+export function enabledPluginDirs(subdir: PluginContentKind, home?: string): string[] {
   const out: string[] = [];
-  for (const p of listPlugins()) {
+  for (const p of listPlugins(home)) {
     if (!p.meta.enabled) continue;
     const d = join(p.dir, subdir);
     try {

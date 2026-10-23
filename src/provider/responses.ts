@@ -7,7 +7,7 @@ import {
   type ResponsesReasoningItem,
   type StopReason,
 } from './provider.js';
-import { streamWithRetry, streamLines, resolveIdleBudget } from './stream.js';
+import { streamWithRetry, streamLines, resolveIdleBudget, tighterOutputCap } from './stream.js';
 import { sseEvents, parseSseData, nonEmptyParts } from './sse.js';
 import { buildOpenAIBody, escapeMultimodalControlTokens } from './openai.js';
 import { parseToolArgs } from './toolJson.js';
@@ -23,6 +23,12 @@ interface ResponsesOptions {
   stripParams?: ReadonlySet<string>;
   reasoningRoundtrip?: 'last' | 'none';
   chatgptPlan?: boolean;
+  /**
+   * Output-token ceiling this endpoint advertised in a 400 earlier this session. Undefined on first
+   * contact so an untouched serve still receives its full reasoning floor. Passed through to
+   * buildOpenAIBody, which derives this wire's max_output_tokens from it.
+   */
+  learnedOutputCap?: number;
 }
 
 /** Preserve message/block order; Responses tool history is not Chat Completions history. */
@@ -449,6 +455,10 @@ export class ResponsesProvider implements Provider {
   private readonly firstByteTimeoutMs: number | undefined;
   private readonly streamRetries: number | undefined;
   private readonly strippedParams = new Set<string>();
+  // The output-token ceiling this endpoint advertised when it 400-rejected a larger request. Kept
+  // separate from the Chat Completions provider's copy because it describes THIS endpoint and wire;
+  // the fold rule is shared so the two cannot diverge.
+  private learnedOutputCap: number | undefined;
   private readonly reasoningRoundtrip: 'last' | 'none';
   private readonly chatgptPlan: boolean;
 
@@ -492,6 +502,7 @@ export class ResponsesProvider implements Provider {
     const opts: ResponsesOptions = {
       selfHosted: this.selfHosted, stripParams: this.strippedParams,
       reasoningRoundtrip: this.reasoningRoundtrip, chatgptPlan: this.chatgptPlan,
+      learnedOutputCap: this.learnedOutputCap,
     };
     if (this.chatgptPlan) {
       yield* this.sendPlan(req, headers, buildResponsesBody(req, model, true, opts));
@@ -504,6 +515,9 @@ export class ResponsesProvider implements Provider {
       selfHosted: this.selfHosted, idleTimeoutMs: this.idleTimeoutMs,
       firstByteTimeoutMs: this.firstByteTimeoutMs, streamRetries: this.streamRetries,
       onParamStripped: (param) => { this.strippedParams.add(param); },
+      // Same remember-for-the-session shape as the Chat Completions wire: a serve with a 64k output
+      // ceiling against a 128k config would otherwise eat a 400 + shrink retry on EVERY turn.
+      onOutputCapDiscovered: (cap) => { this.learnedOutputCap = tighterOutputCap(this.learnedOutputCap, cap); },
     });
   }
 

@@ -18,7 +18,7 @@ import {
   type ProviderEvent,
   type StopReason,
 } from './provider.js';
-import { streamWithRetry } from './stream.js';
+import { clampMaxTokens, streamWithRetry, tighterOutputCap } from './stream.js';
 import { sseEvents, parseSseData, nonEmptyParts } from './sse.js';
 import { eventsFromOpenAICompletion } from './nonStream.js';
 import { parseToolArgs } from './toolJson.js';
@@ -56,6 +56,11 @@ export class OpenAIProvider implements Provider {
   // Remembered for the session: later turns build WITHOUT them instead of eating a 400 + retry
   // every turn (same remember-for-the-session shape as toolChoiceUnsupported above).
   private readonly strippedParams = new Set<string>();
+  // The output-token ceiling this endpoint advertised when it 400-rejected a larger request
+  // (`supports at most 65536 completion tokens`). Remembered for the session so later turns build
+  // under it instead of re-discovering the same number every turn. Instance-scoped: it describes
+  // THIS endpoint. Only set by a real rejection, never inferred from a model id.
+  private learnedOutputCap: number | undefined;
   // F06-08: reasoning round-trip mode from config ('last' default, 'none' = capture+replay off).
   private readonly reasoningRoundtrip: 'last' | 'none';
 
@@ -109,6 +114,7 @@ export class OpenAIProvider implements Provider {
       capabilities: this.capabilities,
       toolChoiceNone: this.toolChoiceUnsupported,
       stripParams: this.strippedParams as ReadonlySet<string>,
+      learnedOutputCap: this.learnedOutputCap,
       reasoningRoundtrip: this.reasoningRoundtrip,
     };
     yield* streamWithRetry({
@@ -130,6 +136,9 @@ export class OpenAIProvider implements Provider {
       onToolChoiceUnsupported: () => { this.toolChoiceUnsupported = true; },
       // P2-03: remember a 400-rejected optional param for the rest of the session.
       onParamStripped: (param) => { this.strippedParams.add(param); },
+      // Remember the serve's own advertised output ceiling. A serve with a 64k output limit and a
+      // 128k config would otherwise eat a 400 + shrink retry on EVERY turn for the whole session.
+      onOutputCapDiscovered: (cap) => { this.learnedOutputCap = tighterOutputCap(this.learnedOutputCap, cap); },
     });
   }
 }
@@ -538,6 +547,11 @@ export function buildOpenAIBody(
     toolChoiceNone?: boolean;
     /** P2-03: params this endpoint already 400-rejected this session — stripped up-front. */
     stripParams?: ReadonlySet<string>;
+    /**
+     * Output-token ceiling this endpoint advertised in a 400 earlier this session. Undefined on
+     * first contact, so an untouched serve still receives its full reasoning floor.
+     */
+    learnedOutputCap?: number;
     /** F06-08: reasoning round-trip mode ('last' default; 'none' = capture+replay off). */
     reasoningRoundtrip?: 'last' | 'none';
   } = {},
@@ -645,6 +659,15 @@ export function buildOpenAIBody(
     // way so the model knows what's available.
     body.tool_choice = opts.toolChoiceNone ? 'none' : 'auto';
   }
+  // A ceiling this endpoint TOLD us about in a prior 400 (`supports at most 65536 completion
+  // tokens`). Applied after every emitter above so it wins over the reasoning floors, which are
+  // deliberate minimums for hidden thinking and would otherwise re-request a value the server has
+  // already refused — that is the "every turn eats a 400 + retry" loop this breaks.
+  //
+  // Scoped to LEARNED caps only. It never fires on first contact, so an untouched serve still gets
+  // the full floor (hosted Qwen's byte-identical 262144 contract, AC3). Only a serve that has
+  // actually rejected us is clamped, and only to the number it advertised.
+  if (opts.learnedOutputCap != null) clampMaxTokens(body, opts.learnedOutputCap);
   // P2-03 (F01-05): params proven rejected by this endpoint are stripped up-front — the stream
   // ladder proved the recovery on first contact; later turns skip the 400 entirely. Applied
   // LAST so it wins over every emitter above (including tool_choice, which the generic ladder

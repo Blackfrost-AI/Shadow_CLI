@@ -231,6 +231,13 @@ export interface StreamAttempt {
    * {@link onToolChoiceUnsupported}.
    */
   onParamStripped?: (param: StrippableParam) => void;
+  /**
+   * Called when a 400 reveals this serve's actual output-token ceiling — the number in its own
+   * words (`supports at most 65536 completion tokens`). The provider remembers it for the session so
+   * later turns build UNDER the cap instead of re-requesting 128000 and eating a 400 + retry every
+   * single turn. Same remember-for-the-session shape as {@link onToolChoiceUnsupported}.
+   */
+  onOutputCapDiscovered?: (cap: number) => void;
 }
 
 /** A 400 that specifically rejects `tool_choice: "auto"` (missing vLLM/SGLang tool-parser flags). */
@@ -410,9 +417,21 @@ export async function* streamWithRetry(a: StreamAttempt): AsyncIterable<Provider
       // the whole window). Shrink the output cap and retry, up to MAX_TOKEN_SHRINKS times, before
       // surfacing a terminal error — so the harness self-corrects instead of dying on the first turn.
       if (res.status === 400 && shrinks < MAX_TOKEN_SHRINKS && looksLikeTokenOverflow(message)) {
-        const shrank = shrinkMaxTokens(a.body);
-        if (a.nonStreamBody) shrinkMaxTokens(a.nonStreamBody);
-        if (shrank) {
+        // The serve often STATES its ceiling in the same message that rejected us. Clamping to that
+        // number lands in ONE retry; halving is a blind search that can take three and then leaves
+        // the model throttled below what it would actually have accepted. Try the stated cap first.
+        const advertised = parseAdvertisedOutputCap(message);
+        let changed = false;
+        if (advertised != null) {
+          changed = clampMaxTokens(a.body, advertised);
+          if (a.nonStreamBody) clampMaxTokens(a.nonStreamBody, advertised);
+          if (changed) a.onOutputCapDiscovered?.(advertised);
+        }
+        if (!changed) {
+          changed = shrinkMaxTokens(a.body);
+          if (a.nonStreamBody) shrinkMaxTokens(a.nonStreamBody);
+        }
+        if (changed) {
           shrinks++;
           continue;
         }
@@ -656,12 +675,65 @@ export function parseRetryAfter(v: string | null): number | undefined {
   return undefined;
 }
 
+/**
+ * A 400 that names an OUTPUT-token param as too large for what this serve accepts.
+ *
+ * This is the family the original predicate missed, which is why a model served with a 64k output
+ * ceiling was *unusable* rather than merely noisy: OpenAI-compatible servers report an over-cap
+ * output request as `max_completion_tokens is too large: 128000. This model supports at most 65536
+ * completion tokens.` — no "context" word anywhere, and `max(?:imum)?[ _]?tokens` cannot match
+ * `max_completion_tokens` because `_completion` sits between `max` and `tokens`. The 400 fell
+ * through every recovery branch and surfaced as a terminal `http_400` on turn 1.
+ */
+const OUTPUT_PARAM_OVER_CAP =
+  /\bmax(?:imum)?(?:[_ -](?:completion|output|new|gen|generation))?[_ -]?tokens?\b[^.]{0,48}\b(?:too (?:large|big)|exceed|greater than|more than|above|over|beyond|limit)/i;
+
+/**
+ * The serve's OWN advertised output ceiling, when the message states one.
+ *
+ * Parses the number the server says it will accept — never the number it rejected. That
+ * distinction is the whole point: `too large: 128000 … at most 65536` carries both, and clamping
+ * to the wrong one either 400s again or needlessly throttles the model to half its real ceiling.
+ */
+export function parseAdvertisedOutputCap(msg: string): number | undefined {
+  const patterns = [
+    // "supports at most 65536 completion tokens" / "up to 8192 output tokens" / "a maximum of 4096 tokens"
+    /\b(?:at most|up to|a maximum of|no more than|max(?:imum)? of)\s+([\d,]+)\s*(?:completion|output|new|generation|response)?\s*tokens\b/i,
+    // "max_tokens must be <= 8192" / "max_completion_tokens cannot exceed 4096" / "must be at most N"
+    // The keyword-or-operator group is MANDATORY, not optional: without it this pattern would match
+    // the rejected value in "too large: 128000" and clamp the request to the very number the serve
+    // just refused. `[^.]{0,60}?` also cannot cross a sentence period, which keeps the rejected
+    // value on the far side of the boundary from the advertised ceiling.
+    /\bmax(?:imum)?(?:[_ -](?:completion|output|new|gen|generation))?[_ -]?tokens?\b[^.]{0,60}?(?:must be|should be|cannot exceed|must not exceed|is limited to|limited to|at most|<=|<|≤)\s*(?:at most\s*)?(?:<=|<|≤)?\s*([\d,]+)/i,
+    // "output token limit is 8192" / "the cap is 4096 tokens"
+    /\b(?:output|completion|generation)\s+token\s+(?:limit|cap|maximum)\s+(?:is|of|:)?\s*([\d,]+)/i,
+  ];
+  for (const re of patterns) {
+    const m = re.exec(msg);
+    if (!m) continue;
+    const n = Number(m[1].replace(/,/g, ''));
+    // Reject the degenerate/absurd rather than clamping a request to 0 and wedging the run.
+    if (Number.isFinite(n) && n >= 1) return n;
+  }
+  return undefined;
+}
+
 /** True if a 4xx message indicates the request exceeded the model's context/token budget. */
 export function looksLikeTokenOverflow(msg: string): boolean {
   // Includes llama.cpp / many locals: "request (32925 tokens) exceeds the available context size (32768 tokens)"
-  return /context[ _-]?(length|window|size)|maximum context|available context|context_length_exceeded|max(?:imum)?[ _]?(?:new[ _])?tokens|too many tokens|reduce the (?:length|number)|prompt is too long|requested about \d+ tokens|exceeds? the (?:maximum|model|available)|n_keep|n_ctx/i.test(
-    msg,
-  );
+  if (
+    /context[ _-]?(length|window|size)|maximum context|available context|context_length_exceeded|max(?:imum)?[ _]?(?:new[ _])?tokens|too many tokens|reduce the (?:length|number)|prompt is too long|requested about \d+ tokens|exceeds? the (?:maximum|model|available)|n_keep|n_ctx/i.test(
+      msg,
+    )
+  ) {
+    return true;
+  }
+  // An output param rejected as over-cap is the same recoverable condition — ask for fewer output
+  // tokens — reported in different words by OpenAI-compatible serves.
+  if (OUTPUT_PARAM_OVER_CAP.test(msg)) return true;
+  // A stated ceiling is strong evidence on its own, but only when the message is actually about
+  // tokens: "at most 5 requests per minute" is a rate limit and must stay on the 429 path.
+  return parseAdvertisedOutputCap(msg) != null && /\btokens?\b/i.test(msg);
 }
 
 /**
@@ -690,6 +762,54 @@ export function shrinkMaxTokens(body: unknown): boolean {
     }
   }
   return changed;
+}
+
+/** The output-token params a body may carry, across the Chat Completions and Responses wires. */
+const OUTPUT_TOKEN_FIELDS = ['max_tokens', 'max_completion_tokens', 'max_output_tokens'] as const;
+
+/**
+ * Clamp every output-token cap on a request body DOWN to a ceiling the server itself advertised.
+ * Returns true only if it actually reduced something, so the caller knows a retry is worth making
+ * (and so an already-conforming body terminates the loop instead of spinning).
+ *
+ * Why this exists alongside {@link shrinkMaxTokens}: halving is a *search*, and a search costs a
+ * round-trip per guess. When the 400 says `supports at most 65536 completion tokens`, the answer is
+ * already in the message — clamping lands on it in ONE retry instead of walking 128000 → 64000 →
+ * 32000 and silently throttling the model to half the ceiling it was actually willing to give.
+ *
+ * Deliberately clamps to the advertised value rather than below it, and does NOT apply
+ * TOKEN_SHRINK_FLOOR: a serve that says "at most 512" gets 512. Honoring the floor there would
+ * re-request a value the server just refused and burn the ladder for nothing.
+ */
+export function clampMaxTokens(body: unknown, cap: number): boolean {
+  if (!body || typeof body !== 'object') return false;
+  if (!Number.isFinite(cap) || cap < 1) return false;
+  const b = body as Record<string, unknown>;
+  let changed = false;
+  for (const field of OUTPUT_TOKEN_FIELDS) {
+    const v = b[field];
+    if (typeof v === 'number' && v > cap) {
+      b[field] = cap;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+/**
+ * Fold a newly advertised ceiling into a remembered one: TIGHTEST WINS.
+ *
+ * Shared by both wires (Chat Completions in openai.ts, Responses in responses.ts) because the rule
+ * must be identical in each — if a serve reports 65536 once and 8192 on a later request, 8192 is the
+ * ceiling that actually holds. Inlining this in two providers is how they silently diverge, and a
+ * diverged cap means one wire keeps eating 400s the other learned to avoid.
+ *
+ * Ignores a non-positive or non-finite cap rather than poisoning the memory with a value that would
+ * clamp every later request to 0 and wedge the run.
+ */
+export function tighterOutputCap(current: number | undefined, cap: number): number | undefined {
+  if (!Number.isFinite(cap) || cap < 1) return current;
+  return current == null ? cap : Math.min(current, cap);
 }
 
 /**

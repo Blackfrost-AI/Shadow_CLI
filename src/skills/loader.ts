@@ -13,6 +13,12 @@ export interface SkillEntry {
   /** Origin remains visible to callers and on-demand refreshes. */
   source?: 'workspace' | 'global' | 'plugin' | 'harness';
   root?: string;
+  /**
+   * Declared operating mode, from `mode:` frontmatter. Absent means "always available".
+   * Used to keep a large catalogue from taxing every session: a security skill should not
+   * cost tokens in a session doing nothing security related.
+   */
+  mode?: string;
 }
 
 export interface SkillCatalog {
@@ -24,6 +30,11 @@ export interface DiscoverSkillsOptions {
   pluginDirs?: string[];
   /** Bodies captured by the validated harness scan selected at session start. */
   harnessSkills?: ReadonlyArray<Pick<SkillEntry, 'name' | 'path' | 'root' | 'body'>>;
+  /**
+   * Active mode filter. When set, only skills declaring this mode (or no mode at all) are
+   * returned. Unset means no filtering — the default, so existing installs are unaffected.
+   */
+  mode?: string;
 }
 
 const SKILL_DIRS = ['skills', '.shadow/skills'];
@@ -92,7 +103,7 @@ export function discoverSkillCatalog(workspaceRoot: string, opts: DiscoverSkills
   const roots: Array<{ root: string; source: NonNullable<SkillEntry['source']> }> = [
     ...SKILL_DIRS.map((dir) => ({ root: resolve(workspaceRoot, dir), source: 'workspace' as const })),
     { root: globalSkillsRoot, source: 'global' },
-    ...(opts.pluginDirs ?? enabledPluginDirs('skills')).map((dir) => ({ root: dir, source: 'plugin' as const })),
+    ...(opts.pluginDirs ?? enabledPluginDirs('skills', opts.homedir)).map((dir) => ({ root: dir, source: 'plugin' as const })),
   ];
   for (const { root, source } of roots) {
     if (!existsSync(root)) continue;
@@ -135,7 +146,15 @@ export function discoverSkillCatalog(workspaceRoot: string, opts: DiscoverSkills
           conflicts.push({ name, selected: selected.path, shadowed: skillPath });
           continue;
         }
-        const skill: SkillEntry = { name, path: skillPath, description: desc, body: body.trim(), source, root };
+        const skill: SkillEntry = {
+          name,
+          path: skillPath,
+          description: desc,
+          body: body.trim(),
+          source,
+          root,
+          mode: parseMode(body),
+        };
         seen.set(name, skill);
         out.push(skill);
       } catch {
@@ -143,7 +162,60 @@ export function discoverSkillCatalog(workspaceRoot: string, opts: DiscoverSkills
       }
     }
   }
-  return { skills: out, conflicts };
+  if (!opts.mode) return { skills: out, conflicts };
+  // Mode filter: a skill with no `mode:` is always available, so an unscoped catalogue
+  // behaves exactly as before. Only explicitly scoped skills are hidden.
+  const active = opts.mode.toLowerCase();
+  return { skills: out.filter((s) => modeMatches(s.mode, active)), conflicts };
+}
+
+/**
+ * Filter an already-discovered list by mode. Exposed so callers that cache discovery can
+ * re-scope without re-reading the filesystem.
+ */
+export function filterByMode<T extends { mode?: string }>(skills: T[], mode?: string): T[] {
+  if (!mode) return skills;
+  return skills.filter((s) => modeMatches(s.mode, mode));
+}
+
+/** True when a skill declaring `declared` should appear under `active`. */
+export function modeMatches(declared: string | undefined, active: string): boolean {
+  if (!declared) return true; // unscoped skills are always available
+  const want = active.toLowerCase();
+  return declared
+    .toLowerCase()
+    .split(',')
+    .some((m) => m.trim() === want);
+}
+
+/**
+ * Read the `mode:` frontmatter scalar. Returns undefined when absent, which means
+ * "available in every mode" — the default, so scoping is purely opt-in.
+ *
+ * Accepts a comma-separated list (`mode: security, coding`) because a security session
+ * still needs general coding skills; single-value remains the common case.
+ *
+ * Kept deliberately narrow: bare scalars only. No nesting, no executable tags.
+ */
+export function parseMode(md: string): string | undefined {
+  const front = md.replace(/^\uFEFF/, '').match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/);
+  if (!front) return undefined;
+  for (const line of front[1]!.split(/\r?\n/)) {
+    const m = line.match(/^mode\s*:\s*(.*)$/);
+    if (!m) continue;
+    let value = m[1]!.replace(/\s+#.*$/, '').trim();
+    if (value.startsWith('"') && value.endsWith('"')) {
+      try { value = JSON.parse(value) as string; } catch { value = value.slice(1, -1); }
+    } else if (value.startsWith("'") && value.endsWith("'")) {
+      value = value.slice(1, -1).replace(/''/g, "'");
+    }
+    const parts = value
+      .split(',')
+      .map((p) => p.trim().toLowerCase())
+      .filter((p) => /^[a-z0-9][a-z0-9_-]{0,31}$/.test(p));
+    return parts.length ? parts.join(',') : undefined;
+  }
+  return undefined;
 }
 
 export function parseDescription(md: string): string | null {

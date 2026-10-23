@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { GLYPHS } from './tui/glyphs.js';
-import { existsSync, unlinkSync } from 'node:fs';
+import { existsSync, lstatSync, unlinkSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { resolve, parse, join } from 'node:path';
@@ -549,6 +549,7 @@ function pluginUsage(): string {
     '  disable <name>         disable a plugin (files stay installed)',
     '  remove <name>          archive the plugin under ~/.shadow/plugins/.removed/',
     '  search [query]         search the configured index (pluginIndexUrl — none by default)',
+    '  doctor <name | path>   report what a plugin ships vs what Shadow installs (drops, dangling refs)',
     '',
     'Plugins are DATA-only: they contribute markdown to the five declarative surfaces',
     '(commands, output-styles, skills, agents, workflows). Hooks and MCP servers can NEVER',
@@ -651,6 +652,37 @@ async function runPlugin(args: string[], offline = false): Promise<void> {
       const archive = removePlugin(name);
       stdout.write(`archived plugin "${name}" → ${archive}\n`);
       stdout.write(lc.gray('(remove archives, never deletes — the folder can be restored or inspected)\n'));
+    } catch (err) {
+      return fail((err as Error).message);
+    }
+    return;
+  }
+
+  if (sub === 'doctor') {
+    // Read-only: reports what a plugin ships versus what Shadow actually installs. Never
+    // executes plugin content and never writes to the plugin tree.
+    const target = (args[1] ?? '').trim();
+    if (!target) return fail('usage: shadow plugin doctor <name | path>');
+    const { diagnosePlugin, formatDoctorReport, resolveDiagnosisRoot } = await import(
+      './plugins/doctor.js'
+    );
+    const { pluginsDir } = await import('./plugins/manager.js');
+    // Resolve an installed name to its directory; otherwise treat the argument as a path.
+    let root = target;
+    try {
+      const installed = join(pluginsDir(), target);
+      if (lstatSync(installed).isDirectory()) root = installed;
+    } catch {
+      /* not an installed name — use the path as given */
+    }
+    try {
+      // An installed copy has already lost its non-markdown files, so diagnosing it would
+      // report every script reference as missing. Prefer the recorded local source when it
+      // still exists — that is the tree that answers "what gets dropped".
+      const resolved = resolveDiagnosisRoot(resolve(root));
+      const report = diagnosePlugin(resolved.root);
+      stdout.write(formatDoctorReport(report, resolved.sourceOf) + '\n');
+      if (!report.clean) process.exitCode = 1;
     } catch (err) {
       return fail((err as Error).message);
     }
