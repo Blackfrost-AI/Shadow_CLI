@@ -19,6 +19,11 @@ A calmer wide-terminal layout and live streaming feedback.
 - **The footer shows live output throughput.** While the root model streams, a windowed estimated
   tok/s chip measures text and reasoning deltas, excluding idle gaps, tool time, and sub-agent
   output. It freezes on completion or interruption, resets on the next turn, and hides while idle.
+- **Release installers preserve signed bytes.** macOS artifacts are signed before hashing; the
+  installer no longer rewrites their signatures after download. Release builds can bind an explicit
+  full commit SHA with `SHADOW_RELEASE_REVISION`.
+- **Compatible dependency patches.** Updated `undici` to 8.12.3 and `fast-uri` to 3.1.9 for current
+  security advisories. The remaining `zod` 3 advisory requires a separate, tested schema migration.
 
 ## [10.6.1] — 2026-10-24
 

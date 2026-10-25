@@ -130,6 +130,11 @@ test('release build injects process.env version metadata and no empty external',
   const version = readFileSync(join(f.cwd, 'src/version.ts'), 'utf8');
   assert.match(script, /--define "process\.env\.SHADOW_BUILD_VERSION=/);
   assert.match(script, /--define "process\.env\.SHADOW_BUILD_REVISION=/);
+  assert.match(script, /REVISION="\$\{SHADOW_RELEASE_REVISION:-\$\(git rev-parse HEAD\)\}"/);
+  assert.match(script, /! "\$SHADOW_RELEASE_REVISION" =~ \^\[a-f0-9\]\{40\}\$/);
+  const installer = readFileSync(join(root, 'install.sh'), 'utf8');
+  assert.doesNotMatch(installer, /codesign/, 'installer must preserve authenticated artifact bytes');
+  assert.match(installer, /signed before their checksums/);
   assert.match(version, /process\.env\.SHADOW_BUILD_VERSION/);
   assert.match(script, /STUB="node_modules\/react-devtools-core"/);
   assert.match(script, /connectToDevTools\(\) \{\}/);

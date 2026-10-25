@@ -49,9 +49,12 @@
     "ink": "^5.1.0",
     "re2js": "2.8.6",
     "react": "^18.3.1",
-    "undici": "^8.11.2",
+    "undici": "^8.12.3",
     "zod": "^3.24.1",
     "zod-to-json-schema": "^3.23.0"
+  },
+  "overrides": {
+    "fast-uri": "3.1.9"
   },
   "devDependencies": {
     "@eslint/js": "^9.17.0",

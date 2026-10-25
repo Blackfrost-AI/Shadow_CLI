@@ -37,6 +37,11 @@ fi
 VERSION="$(node -p "require('./package.json').version")"
 OUT="${1:-dist-bin/shadow}"
 TARGET="${2:-}"
+if [[ -n "${SHADOW_RELEASE_REVISION:-}" && ! "$SHADOW_RELEASE_REVISION" =~ ^[a-f0-9]{40}$ ]]; then
+  echo "error: SHADOW_RELEASE_REVISION must be a full lowercase Git commit SHA" >&2
+  exit 1
+fi
+REVISION="${SHADOW_RELEASE_REVISION:-$(git rev-parse HEAD)}"
 mkdir -p "$(dirname "$OUT")"
 
 echo "→ embedding prompts (binary has no prompts/ dir on disk)…"
@@ -58,7 +63,6 @@ if [ ! -e "$STUB/index.js" ]; then
 fi
 
 # Keep the production export shape used by src/version.ts; Bun replaces these property reads.
-REVISION="$(git rev-parse HEAD)"
 EXTERNALS=()
 for EXTERNAL in react-native @lydell/node-pty-napi node-pty @parcel/watcher lightningcss @mariozechner/clipboard napi-macos @node-llama-cpp/node-llama-cpp @homebridge/node-pty-prebuilt-multiarch fsevents ssh2 cpu-features; do
   if [ -e "node_modules/$EXTERNAL/package.json" ]; then EXTERNALS+=(--external "$EXTERNAL"); fi
