@@ -48,10 +48,19 @@ npx tsc -p tsconfig.web.json
 echo "→ embedding web UI (binary has no src/web/ui/ on disk)…"
 node scripts/embed-webui.mjs
 
+# Ink's development-only reconciler import must resolve in the single-file binary.
+STUB="node_modules/react-devtools-core"
+if [ ! -e "$STUB/index.js" ]; then
+  echo "→ stubbing react-devtools-core (Ink dev-only dep)…"
+  mkdir -p "$STUB"
+  printf '{"name":"react-devtools-core","version":"0.0.0-stub","type":"module","main":"index.js"}\n' > "$STUB/package.json"
+  printf 'export default { connectToDevTools() {} };\nexport function connectToDevTools() {}\n' > "$STUB/index.js"
+fi
+
 # Keep the production export shape used by src/version.ts; Bun replaces these property reads.
 REVISION="$(git rev-parse HEAD)"
 EXTERNALS=()
-for EXTERNAL in react-devtools-core react-native @lydell/node-pty-napi node-pty @parcel/watcher lightningcss @mariozechner/clipboard napi-macos @node-llama-cpp/node-llama-cpp @homebridge/node-pty-prebuilt-multiarch fsevents ssh2 cpu-features; do
+for EXTERNAL in react-native @lydell/node-pty-napi node-pty @parcel/watcher lightningcss @mariozechner/clipboard napi-macos @node-llama-cpp/node-llama-cpp @homebridge/node-pty-prebuilt-multiarch fsevents ssh2 cpu-features; do
   if [ -e "node_modules/$EXTERNAL/package.json" ]; then EXTERNALS+=(--external "$EXTERNAL"); fi
 done
 TARGET_ARGS=()

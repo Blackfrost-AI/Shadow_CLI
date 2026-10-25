@@ -131,6 +131,8 @@ test('release build injects process.env version metadata and no empty external',
   assert.match(script, /--define "process\.env\.SHADOW_BUILD_VERSION=/);
   assert.match(script, /--define "process\.env\.SHADOW_BUILD_REVISION=/);
   assert.match(version, /process\.env\.SHADOW_BUILD_VERSION/);
+  assert.match(script, /STUB="node_modules\/react-devtools-core"/);
+  assert.match(script, /connectToDevTools\(\) \{\}/);
   assert.doesNotMatch(script, /--external "\$EXTERNALS"/);
 });
 
