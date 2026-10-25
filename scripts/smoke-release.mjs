@@ -63,6 +63,9 @@ try {
   const release = await metadata(base);
   const binary = await get(`${base}/${asset}`);
   assert.equal(hash(binary), release.checksum);
+  const rawArtifact = join(dir, asset);
+  writeFileSync(rawArtifact, binary, { mode: 0o755 });
+  assert.equal((await run(rawArtifact, ['--version'])).trim(), `shadow ${version}`, 'Raw artifact must report its release version');
   let installerCommand = 'sh';
   let installerArgs = [resolve('install.sh')];
   if (process.platform === 'win32') {

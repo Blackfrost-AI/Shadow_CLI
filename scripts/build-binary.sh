@@ -48,35 +48,34 @@ npx tsc -p tsconfig.web.json
 echo "→ embedding web UI (binary has no src/web/ui/ on disk)…"
 node scripts/embed-webui.mjs
 
-# Ink's reconciler only `import('./devtools.js')` when DEV=true (never in production), but the
-# bundler must still resolve the static `import 'react-devtools-core'` inside it. Drop in an empty
-# stub so the build is offline + lean (the real DevTools package never runs in a shipped binary).
-STUB="node_modules/react-devtools-core"
-if [ ! -e "$STUB/index.js" ]; then
-  echo "→ stubbing react-devtools-core (Ink dev-only dep)…"
-  mkdir -p "$STUB"
-  printf '{"name":"react-devtools-core","version":"0.0.0-stub","type":"module","main":"index.js"}\n' > "$STUB/package.json"
-  printf 'export default { connectToDevTools() {} };\nexport function connectToDevTools() {}\n' > "$STUB/index.js"
-fi
-
+# Keep the production export shape used by src/version.ts; Bun replaces these property reads.
+REVISION="$(git rev-parse HEAD)"
+EXTERNALS=()
+for EXTERNAL in react-devtools-core react-native @lydell/node-pty-napi node-pty @parcel/watcher lightningcss @mariozechner/clipboard napi-macos @node-llama-cpp/node-llama-cpp @homebridge/node-pty-prebuilt-multiarch fsevents ssh2 cpu-features; do
+  if [ -e "node_modules/$EXTERNAL/package.json" ]; then EXTERNALS+=(--external "$EXTERNAL"); fi
+done
 TARGET_ARGS=()
 [ -n "$TARGET" ] && TARGET_ARGS=(--target "$TARGET")
 
 echo "→ compiling v$VERSION ${TARGET:+($TARGET) }→ $OUT"
 "$BUN" build ./src/index.ts \
-  --compile \
+  --compile --no-compile-autoload-dotenv --no-compile-autoload-bunfig \
+  --production --minify --sourcemap=none \
+  ${EXTERNALS[@]+"${EXTERNALS[@]}"} \
   ${TARGET_ARGS[@]+"${TARGET_ARGS[@]}"} \
   --define "process.env.SHADOW_BUILD_VERSION=\"$VERSION\"" \
+  --define "process.env.SHADOW_BUILD_REVISION=\"$REVISION\"" \
+  --define "process.env.SHADOW_BUILD_CHANNEL=\"release\"" \
   --outfile "$OUT"
 
 chmod +x "$OUT" 2>/dev/null || true
 SIZE="$(du -h "$OUT" 2>/dev/null | cut -f1)"
 if [ -z "$TARGET" ]; then
-  if ! SHADOW_BINARY_VERSION="$("$OUT" --version)"; then
-    echo "build-binary: compiled executable failed its --version smoke" >&2
+  if [ "$("$OUT" --version)" != "shadow $VERSION" ]; then
+    echo "build-binary: compiled executable reported the wrong --version" >&2
     exit 1
   fi
-  echo "✓ built $OUT ($SIZE) — $SHADOW_BINARY_VERSION"
+  echo "✓ built $OUT ($SIZE) — shadow $VERSION"
 else
   echo "✓ built $OUT ($SIZE) for $TARGET (cross-compiled; not run on host)"
 fi

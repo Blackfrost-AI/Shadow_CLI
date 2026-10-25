@@ -8,7 +8,7 @@ on:
       legacy_bridge:
         description: Verify the old-host transition after both origins are promoted
         type: boolean
-        default: false
+        default: true
 permissions:
   contents: read
 jobs:

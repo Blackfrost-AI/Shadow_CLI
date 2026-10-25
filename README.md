@@ -13,7 +13,7 @@ prompt navigation, a compact session footer, and a pinned composer. Start this c
 `npm start` after building. Use `/theme snowfall` for the ice palette; saved themes remain active.
 `SHADOW_TUI=ink npm start` retains the compatibility renderer. The
 [terminal contract](docs/TERMINAL_RENDERERS.md) lists commands, keys and migration decisions.
-See the [10.6.0 release notes](https://github.com/Blackfrost-AI/Shadow_CLI/releases/tag/v10.6.0)
+See the [10.6.2 release notes](https://github.com/Blackfrost-AI/Shadow_CLI/releases/tag/v10.6.2)
 for the published release.
 
 Shadow names conversations from their opening prompt and shows the active name in the

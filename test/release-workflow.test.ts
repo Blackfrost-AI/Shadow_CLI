@@ -25,6 +25,8 @@ function fixture(t: { after(fn: () => void): void }, version = '9.0.0-dev.0') {
     'scripts/release-version.mjs',
     'scripts/check-push.mjs',
     'scripts/check-release-gate.sh',
+    'scripts/build-binary.sh',
+    'src/version.ts',
     '.githooks/pre-push',
   ]) {
     copyFileSync(join(root, file), join(cwd, file));
@@ -34,7 +36,8 @@ function fixture(t: { after(fn: () => void): void }, version = '9.0.0-dev.0') {
     scripts: { test: 'node --test --test-timeout=60000 "test/**/*.test.ts" "test/**/*.test.tsx"' },
   };
   writeFileSync(join(cwd, 'package.json'), JSON.stringify(pkg));
-  writeFileSync(join(cwd, 'README.md'), `Current build: **v${version}** (previous v8.7.0)\n`);
+  writeFileSync(join(cwd, 'README.md'), `Current build: **v${version}**\n`);
+  writeFileSync(join(cwd, 'DEPLOYMENT.md'), `**Release version:** \`v${version}\`\n`);
   writeFileSync(
     join(cwd, 'src/safe.ts'),
     "export const DEV_UNRESTRICTED = process.env.SHADOW_DEV_UNRESTRICTED === '1';\n",
@@ -117,6 +120,38 @@ test('version preparation updates only the current build and never pushes', (t) 
   const pkg = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'));
   for (const key of ['release:dev', 'release:patch', 'release:minor'])
     assert.doesNotMatch(pkg.scripts[key], /\bpush\b/);
+});
+
+test('release build injects process.env version metadata and no empty external', { skip: process.platform === 'win32' }, (t) => {
+  const f = fixture(t);
+  const result = spawnSync('bash', ['-n', 'scripts/build-binary.sh'], { cwd: f.cwd, encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  const script = readFileSync(join(f.cwd, 'scripts/build-binary.sh'), 'utf8');
+  const version = readFileSync(join(f.cwd, 'src/version.ts'), 'utf8');
+  assert.match(script, /--define "process\.env\.SHADOW_BUILD_VERSION=/);
+  assert.match(script, /--define "process\.env\.SHADOW_BUILD_REVISION=/);
+  assert.match(version, /process\.env\.SHADOW_BUILD_VERSION/);
+  assert.doesNotMatch(script, /--external "\$EXTERNALS"/);
+});
+
+test('release gate rejects stale release links and deployment versions', (t) => {
+  const f = fixture(t);
+  writeFileSync(join(f.cwd, 'README.md'), 'Current build: **v9.0.0-dev.0**\n[10.6.0 release notes](https://github.com/Blackfrost-AI/Shadow_CLI/releases/tag/v10.6.0)\n');
+  assert.equal(spawnSync(process.execPath, ['scripts/release-version.mjs'], { cwd: f.cwd }).status, 1);
+  writeFileSync(join(f.cwd, 'README.md'), 'Current build: **v9.0.0-dev.0**\n');
+  writeFileSync(join(f.cwd, 'DEPLOYMENT.md'), '**Release version:** `v10.6.0`\n');
+  assert.equal(spawnSync(process.execPath, ['scripts/release-version.mjs'], { cwd: f.cwd }).status, 1);
+});
+
+test('version preparation updates the current build, release link, and deployment version', (t) => {
+  const f = fixture(t);
+  writeFileSync(join(f.cwd, 'README.md'), 'Current build: **v8.7.0**\n[10.6.0 release notes](https://github.com/Blackfrost-AI/Shadow_CLI/releases/tag/v10.6.0)\n');
+  writeFileSync(join(f.cwd, 'DEPLOYMENT.md'), '**Release version:** `v10.6.0`\n');
+  const result = spawnSync(process.execPath, ['scripts/release-version.mjs', '--sync'], { cwd: f.cwd, encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(readFileSync(join(f.cwd, 'README.md'), 'utf8'), /Current build: \*\*v9\.0\.0-dev\.0\*\*/);
+  assert.match(readFileSync(join(f.cwd, 'README.md'), 'utf8'), /releases\/tag\/v9\.0\.0-dev\.0/);
+  assert.match(readFileSync(join(f.cwd, 'DEPLOYMENT.md'), 'utf8'), /\*\*Release version:\*\* `v9\.0\.0-dev\.0`/);
 });
 
 test('public main requires its own version tag at the pushed commit', (t) => {

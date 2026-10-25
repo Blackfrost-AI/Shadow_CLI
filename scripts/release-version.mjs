@@ -38,11 +38,21 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
       readme = readme.replace(
         /^(.*Current build:.*?\bv)[0-9][0-9A-Za-z.+-]*/m,
         (_match, prefix) => prefix + version,
+      ).replace(
+        /(release notes\]\(https:\/\/github\.com\/Blackfrost-AI\/Shadow_CLI\/releases\/tag\/v)[^)]+\)/i,
+        (_match, prefix) => `${prefix}${version})`,
       );
       checkReadmeVersion(version, readme);
       writeFileSync('README.md', readme);
     } else {
       checkReadmeVersion(version, readme);
+    }
+    const releaseLink = /release notes\]\(https:\/\/github\.com\/Blackfrost-AI\/Shadow_CLI\/releases\/tag\/v([^)]+)\)/i.exec(readme);
+    if (releaseLink && releaseLink[1] !== version) throw new Error(`README release link v${releaseLink[1]} != v${version}`);
+    const deployment = readFileSync('DEPLOYMENT.md', 'utf8');
+    if (!deployment.includes(`**Release version:** \`v${version}\``)) {
+      if (process.argv[2] !== '--sync') throw new Error(`DEPLOYMENT.md release version != v${version}`);
+      writeFileSync('DEPLOYMENT.md', deployment.replace(/\*\*Release version:\*\* `v[^`]+`/, `**Release version:** \`v${version}\``));
     }
     console.log(`release-gate OK: README 'Current build' matches package.json (v${version}).`);
   } catch (error) {
