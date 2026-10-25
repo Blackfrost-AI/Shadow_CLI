@@ -1,6 +1,6 @@
 # Shadow CLI
 
-Current build: **`v10.6.0`** — `shadow plugin doctor`, per-mode skill scoping so a large plugin stops taxing every task, and providers that adapt to a serve's real output-token ceiling instead of failing on it.
+Current build: **`v10.6.1`** — the question / approval dialog rebuilt: centered, fully framed, and it always shows the whole question (PgUp/PgDn when it is long), with approvals that stay safe on small terminals.
 
 Shadow is a local-first, provider-neutral security engineering agent. Its built-in Security
 foundation covers investigation, hardening, incident response, defensive automation, secure coding,

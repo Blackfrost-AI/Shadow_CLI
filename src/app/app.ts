@@ -1727,7 +1727,9 @@ export class ShadowApp {
       () => ({ cols: this.terminal.columns, rows: this.terminal.rows }),
     );
     this.dialog = dlg;
-    this.dialogHandle = this.tui.showOverlay(dlg, { anchor: 'bottom-center', width: '100%' });
+    // Full-width overlay row band; the dialog centers its own panel horizontally and sizes its
+    // height to the terminal, so it reads the same on every model and every terminal size.
+    this.dialogHandle = this.tui.showOverlay(dlg, { anchor: 'center', width: '100%' });
     this.tui.requestRender();
   }
 

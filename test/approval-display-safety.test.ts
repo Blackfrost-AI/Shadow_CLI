@@ -97,7 +97,7 @@ test('tool names, descriptions, operative arguments and fallback previews all re
 });
 
 test('Ink and pi sanitize direct approval requests before clipping and retain a long command tail', () => {
-  const req = request('echo \x1b[8mhead\u202e ' + 'x'.repeat(800) + '; echo ACTUAL_TAIL');
+  const req = request('echo \x1b[8mhead\u202e ' + 'x'.repeat(3000) + '; echo ACTUAL_TAIL');
   const snapshot = JSON.stringify(req);
   for (const frame of [ink(req), pi(req).frame]) {
     assert.doesNotMatch(frame, controls);
@@ -174,3 +174,15 @@ for (const plainMode of [false, true]) {
     }
   });
 }
+
+test('previewRows: wrapped rows rejoin to the exact command (no characters skipped per row)', () => {
+  // truncateToWidth() appends an SGR reset; slicing by its length silently dropped 4 chars per
+  // wrapped row, so the approval dialog showed a command other than the one being approved.
+  const cmd = 'cp build/out.tar /srv/www && chmod 777 /srv/www/out.tar; rm -rf ~/Documents';
+  for (const width of [8, 13, 20, 33]) {
+    const { rows } = previewRows(cmd, width, width, 64);
+    const joined = rows.join('').replace(/\x1b\[[0-9;]*m/g, '');
+    assert.equal(joined, cmd, `width ${width}`);
+    for (const r of rows) assert.ok(!r.includes('\x1b'), `row carries no escape bytes at width ${width}`);
+  }
+});
