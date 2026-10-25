@@ -113,7 +113,8 @@ def exercise(command, label, key, partial, thinking=False, followup=False):
             os.write(master, key)
             wait_for(Provider.closed.is_set, 'interrupt did not close the connection', 3)
             if followup:
-                wait_for(lambda: contains(b'next safe boundary'), 'follow-up handoff notice missing', 3)
+                # Accepted steering keeps the turn alive and reports the injected request.
+                wait_for(lambda: contains(b'steering this turn: A new request'), 'follow-up steering notice missing', 3)
             else:
                 wait_for(lambda: contains(b'interrupted'), 'interrupt notice missing', 3)
                 os.write(master, b'A new request\r')
