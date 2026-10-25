@@ -40,6 +40,45 @@ test('Snowfall golden VT frames at 80, 120 and 200 columns in every palette', as
   }
 });
 
+test('wide content reflows through a shrink/grow round-trip and preserves editor mouse input', async () => {
+  const f = fixture('snowfall', 120);
+  try {
+    f.tui.setLayoutRoot(f.root);
+    f.tui.setFocus(f.editor);
+    f.editor.setText('abcdef');
+    f.tui.renderNow(true);
+    await f.terminal.flush();
+    const wide = f.terminal.lines();
+    const editorRow = wide.findIndex((line) => line.includes('abcdef'));
+    assert.ok(editorRow >= 0, 'the real editor is visible in the native layout');
+    const textColumn = wide[editorRow]!.indexOf('abcdef');
+    assert.ok(textColumn >= 10, 'the editor is centered inside the wide terminal');
+    f.terminal.resize(100, f.terminal.screen.rows);
+    f.tui.renderNow(true);
+    await f.terminal.flush();
+    const boundary = f.terminal.lines();
+    const boundaryText = boundary.find((line) => line.includes('abcdef'));
+    assert.ok(boundaryText?.startsWith('▸ abcdef'), 'the boundary width has no artificial left margin');
+    f.terminal.resize(120, f.terminal.screen.rows);
+    f.tui.renderNow(true);
+    await f.terminal.flush();
+    assert.deepEqual(f.terminal.lines(), wide, 'returning to the original viewport restores its rendered grid');
+
+    // pi-tui synthesizes a click from a press/release at one cell. Coordinates are one-based.
+    f.terminal.input(`\x1b[<0;${textColumn + 4};${editorRow + 1}M`);
+    f.terminal.input(`\x1b[<0;${textColumn + 4};${editorRow + 1}m`);
+    await f.terminal.flush();
+    assert.deepEqual(f.editor.getCursor(), { line: 0, col: 3 });
+    f.editor.handleInput('X');
+    assert.equal(f.editor.getText(), 'abcXdef', 'typing inserts at the clicked character');
+
+    f.terminal.input('\x1b[<0;2;2M');
+    f.terminal.input('\x1b[<0;2;2m');
+    await f.terminal.flush();
+    assert.deepEqual(f.editor.getCursor(), { line: 0, col: 4 }, 'margin clicks never reach the editor');
+  } finally { f.tui.stop({ preserveScreen: true }); f.terminal.screen.dispose(); }
+});
+
 test('fullscreen scroll, search, semantic prompt jumps, short resize, paste and complete exit document', async () => {
   const f = fixture('snowfall', 120);
   try {

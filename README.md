@@ -1,6 +1,6 @@
 # Shadow CLI
 
-Current build: **`v10.6.1`** — the question / approval dialog rebuilt: centered, fully framed, and it always shows the whole question (PgUp/PgDn when it is long), with approvals that stay safe on small terminals.
+Current build: **`v10.6.2`** — wide terminals center a 100-column conversation, and the footer shows a live estimated tok/s while the model streams.
 
 Shadow is a local-first, provider-neutral security engineering agent. Its built-in Security
 foundation covers investigation, hardening, incident response, defensive automation, secure coding,

@@ -4,6 +4,7 @@ import type { Component, EditorTheme, TUI, TuiMouseEvent, TuiMouseEventResult } 
 import type { TodoItem } from '../agent/todo.js';
 import type { SubAgentView } from '../tui/subagentPanel.js';
 import { BORDER, GLYPHS, SPACING } from '../tui/glyphs.js';
+import { centeredRow } from './contentLayout.js';
 import { C } from '../tui/theme.js';
 import { formatDuration } from '../tui/format.js';
 import { approvalText } from '../util/approvalText.js';
@@ -34,6 +35,8 @@ export interface SnowfallState {
   missionLine: string;
   mcpConnecting: boolean;
   mcpFailed: boolean;
+  /** Null while idle; an em dash means a running stream has no reliable rate yet. */
+  tokPerSec: string | null;
 }
 
 const safe = (text: string) => approvalText(text).replace(/\s+/g, ' ').trim();
@@ -94,6 +97,7 @@ export class SnowfallStatus implements Component {
     const activeAgents = s.agents.filter((agent) => !agent.done).length;
     if (activeAgents) summaries.push(style.dim(`${activeAgents} agent${activeAgents === 1 ? '' : 's'}`));
     if (s.todos.length) summaries.push(style.dim(`${s.todos.filter((t) => t.status === 'completed').length}/${s.todos.length} tasks`));
+    if (s.running && s.tokPerSec) summaries.push(style.dim(s.tokPerSec));
     if (width >= 70) {
       const pct = Math.max(0, Math.min(100, Math.round(s.contextPct * 100)));
       summaries.push(style.fg(pct > 85 ? C.red : pct > 70 ? C.yellow : C.dim, `ctx ${pct}%`));
@@ -167,14 +171,15 @@ export function snowfallLayout(
   // Toast stack: non-blocking, max 2, rendered above the dock so a passing notice never covers
   // in-flight work. Also zero-height when empty.
   const toasts = new ToastCell(() => state().toasts);
+  const content = (component: Component): Component => centeredRow(component);
   const root = new VStack([
-    { component: new SnowfallHeader(state), basis: 2, shrink: 0, visible: ({ height }) => height >= 10 },
-    { component: scroll, basis: 0, grow: 1, shrink: 1, minSize: 0 },
-    { component: editor, basis: 'auto', shrink: 0 },
-    { component: toasts, basis: 'auto', shrink: 0, visible: ({ height }) => height >= 12 },
-    { component: agents, basis: 'auto', shrink: 0, visible: ({ height }) => height >= 12 },
-    { component: new Spacer(1), basis: 1, shrink: 0, visible: ({ height }) => height >= STATUS_SPACER_MIN_ROWS },
-    { component: new SnowfallStatus(state), basis: 1, shrink: 0 },
+    { component: content(new SnowfallHeader(state)), basis: 2, shrink: 0, visible: ({ height }) => height >= 10 },
+    { component: content(scroll), basis: 0, grow: 1, shrink: 1, minSize: 0 },
+    { component: content(editor), basis: 'auto', shrink: 0 },
+    { component: content(toasts), basis: 'auto', shrink: 0, visible: ({ height }) => height >= 12 },
+    { component: content(agents), basis: 'auto', shrink: 0, visible: ({ height }) => height >= 12 },
+    { component: content(new Spacer(1)), basis: 1, shrink: 0, visible: ({ height }) => height >= STATUS_SPACER_MIN_ROWS },
+    { component: content(new SnowfallStatus(state)), basis: 1, shrink: 0 },
   ]);
   return { root, scroll, agents };
 }

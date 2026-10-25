@@ -7,6 +7,35 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [10.6.2] — 2026-10-25
+
+A calmer wide-terminal layout and live streaming feedback.
+
+### Changed
+- **Wide terminals center the conversation.** The header, transcript, composer, live activity, and
+  footer share a 100-column content measure with equal outer margins. Narrow terminals retain
+  their full-width layout. Native layout boxes preserve editor mouse clicks, selection, and resize
+  behavior, including repeated shrink/grow transitions across the 100-column boundary.
+- **The footer shows live output throughput.** While the root model streams, a windowed estimated
+  tok/s chip measures text and reasoning deltas, excluding idle gaps, tool time, and sub-agent
+  output. It freezes on completion or interruption, resets on the next turn, and hides while idle.
+
+## [10.6.1] — 2026-10-24
+
+The question / approval dialog, rebuilt. It was anchored to the bottom half of the screen and cut
+a long question off after a fixed number of rows, so on some models you never saw the end of what
+you were being asked. Now it is centered, fully framed, and always shows the whole question
+(PgUp/PgDn when it is long). Approvals get the same treatment, with explicit click targets and
+keyboard shortcuts that stay safe on small terminals.
+
+### Changed
+- **Question dialog redesigned.** Centered framed card, question wrapped into the frame, scroll
+  when long, options with keys and shortcuts. No more bottom-half card that eats the question.
+- **Approval dialog redesigned.** Same frame treatment, explicit Allow / Always allow / Deny /
+  Dismiss targets, keyboard shortcuts, and safe behavior on small terminals.
+- **Layout refactors.** Native Snowfall chrome keeps its boxes through resize; the 100-column
+  centered measure lands in 10.6.2.
+
 ## [10.6.0] — 2026-10-23
 
 Plugin packaging and provider adaptation. The theme: Shadow should absorb what varies between
