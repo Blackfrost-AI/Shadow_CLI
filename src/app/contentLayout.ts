@@ -3,10 +3,13 @@ import { LAYOUT_NODE } from '@earendil-works/pi-tui/dist/layout-node.js';
 import type { StackLayoutEntry, StackLayoutNode } from '@earendil-works/pi-tui/dist/layout-node.js';
 
 export const CONTENT_MAX_WIDTH = 100;
+// Preserve the original narrow layout and gentle 120-column centering. Beyond that, grow with
+// the viewport instead of leaving most of an ultrawide terminal unused. Dialogs size separately.
+export const WIDE_CONTENT_PERCENT = 80;
 
 export function contentMetrics(width: number): { contentWidth: number; left: number; right: number } {
   const terminalWidth = Math.max(1, Math.floor(width));
-  const contentWidth = Math.min(terminalWidth, CONTENT_MAX_WIDTH);
+  const contentWidth = Math.min(terminalWidth, Math.max(CONTENT_MAX_WIDTH, Math.floor(terminalWidth * WIDE_CONTENT_PERCENT / 100)));
   const left = Math.floor((terminalWidth - contentWidth) / 2);
   return { contentWidth, left, right: terminalWidth - contentWidth - left };
 }

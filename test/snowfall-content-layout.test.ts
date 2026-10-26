@@ -13,13 +13,14 @@ function fixed(text: string): Component {
   return cell;
 }
 
-test('the shared reading measure keeps narrow widths and caps wide content at 100', () => {
+test('the shared reading measure preserves existing widths and uses wide terminals proportionally', () => {
   assert.deepEqual(snowfallContentMetrics(1), { contentWidth: 1, left: 0, right: 0 });
   assert.deepEqual(snowfallContentMetrics(80), { contentWidth: 80, left: 0, right: 0 });
   assert.deepEqual(snowfallContentMetrics(100), { contentWidth: 100, left: 0, right: 0 });
   assert.deepEqual(snowfallContentMetrics(101), { contentWidth: 100, left: 0, right: 1 });
   assert.deepEqual(snowfallContentMetrics(120), { contentWidth: 100, left: 10, right: 10 });
-  assert.deepEqual(snowfallContentMetrics(200), { contentWidth: 100, left: 50, right: 50 });
+  assert.deepEqual(snowfallContentMetrics(200), { contentWidth: 160, left: 20, right: 20 });
+  assert.deepEqual(snowfallContentMetrics(300), { contentWidth: 240, left: 30, right: 30 });
 });
 
 test('centered rows expose identical visual and mouse geometry at resize boundaries', () => {

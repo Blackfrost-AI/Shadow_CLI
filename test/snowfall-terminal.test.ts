@@ -79,6 +79,25 @@ test('wide content reflows through a shrink/grow round-trip and preserves editor
   } finally { f.tui.stop({ preserveScreen: true }); f.terminal.screen.dispose(); }
 });
 
+test('ultrawide startup and editor use proportional gutters instead of a fixed 100-column window', async () => {
+  const f = fixture('snowfall', 300, 30, true);
+  try {
+    f.editor.setText('abcdef');
+    f.tui.renderNow(true);
+    await f.terminal.flush();
+    const lines = f.terminal.lines();
+    const editorRow = lines.findIndex((line) => line.includes('abcdef'));
+    assert.ok(editorRow >= 0, 'the startup editor is visible');
+    assert.equal(lines[editorRow]!.indexOf('▸ abcdef'), 30, 'the 300-column viewport uses a 240-column content area');
+    f.terminal.resize(120, 30);
+    f.tui.renderNow(true);
+    await f.terminal.flush();
+    const narrow = f.terminal.lines();
+    const narrowEditor = narrow.find((line) => line.includes('abcdef'));
+    assert.ok(narrowEditor?.startsWith(' '.repeat(10) + '▸ abcdef'), 'the existing 120-column layout is unchanged');
+  } finally { f.tui.stop({ preserveScreen: true }); f.terminal.screen.dispose(); }
+});
+
 test('fullscreen scroll, search, semantic prompt jumps, short resize, paste and complete exit document', async () => {
   const f = fixture('snowfall', 120);
   try {
