@@ -1,6 +1,6 @@
 # Shadow CLI
 
-Current build: **`v10.6.1`** — the question / approval dialog rebuilt: centered, fully framed, and it always shows the whole question (PgUp/PgDn when it is long), with approvals that stay safe on small terminals.
+Current build: **`v11.0.0`** — content spans the full terminal width again; the 10.6.2/10.6.3 centered reading measure is removed. The footer still shows estimated live output throughput while the model streams.
 
 Shadow is a local-first, provider-neutral security engineering agent. Its built-in Security
 foundation covers investigation, hardening, incident response, defensive automation, secure coding,
@@ -13,7 +13,7 @@ prompt navigation, a compact session footer, and a pinned composer. Start this c
 `npm start` after building. Use `/theme snowfall` for the ice palette; saved themes remain active.
 `SHADOW_TUI=ink npm start` retains the compatibility renderer. The
 [terminal contract](docs/TERMINAL_RENDERERS.md) lists commands, keys and migration decisions.
-See the [10.6.0 release notes](https://github.com/Blackfrost-AI/Shadow_CLI/releases/tag/v10.6.0)
+See the [10.5.0 release notes](https://github.com/Blackfrost-AI/Shadow_CLI/releases/tag/v10.5.0)
 for the published release.
 
 Shadow names conversations from their opening prompt and shows the active name in the
@@ -46,7 +46,7 @@ scoped `/review`, profile-based `/consult` and bounded `/team` workflows. See th
 The public installers download standalone binaries and verify their signed checksums.
 
 Shadow's website and installers are at [blackfrostai.com/shadow](https://blackfrostai.com/shadow).
-The current signed release is [10.6.0](https://github.com/Blackfrost-AI/Shadow_CLI/releases/tag/v10.6.0).
+The current signed release is [10.5.0](https://github.com/Blackfrost-AI/Shadow_CLI/releases/tag/v10.5.0).
 Existing standalone installations can upgrade with `shadow update`.
 
 macOS / Linux:

@@ -442,3 +442,35 @@ test('endpoint routes require the token', async () => {
     for (const r of [qp, known, probe, scan, resolve]) assert.equal(r.status, 401);
   });
 });
+
+// ── credentialRef is a vault slot pointer, never a secret ────────────────────────
+
+test('a raw key pasted as credentialRef is rejected, a vault slot name is accepted', async () => {
+  seed([]);
+  await withServer(async (h) => {
+    const base = { label: 'slot-test', provider: 'openai', baseUrl: `http://127.0.0.1:${PORT}` };
+    // A live-looking key: rejected before it can reach config.json.
+    const keyed = await post(h, '/api/endpoints/registry', { ...base, credentialRef: 'sk-live-abcdef1234567890' });
+    assert.equal(keyed.status, 400);
+    assert.match(JSON.parse(keyed.body).error as string, /vault slot, not hold a key/);
+
+    const spaced = await post(h, '/api/endpoints/registry', { ...base, credentialRef: 'Bearer abc123' });
+    assert.equal(spaced.status, 400);
+
+    const slot = await post(h, '/api/endpoints/registry', { ...base, credentialRef: 'vault:openai' });
+    assert.equal(slot.status, 201, slot.body);
+    const saved = JSON.parse(slot.body).endpoint as { id: string; credentialRef?: string };
+    assert.equal(saved.credentialRef, 'vault:openai');
+
+    const patched = await raw(
+      h.port,
+      'PATCH',
+      `/api/endpoints/registry/${encodeURIComponent(saved.id)}`,
+      auth(h, 'application/json'),
+      JSON.stringify({ expectedRevision: 1, credentialRef: 'ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }),
+    );
+    assert.equal(patched.status, 400);
+    const onDisk = JSON.parse(readFileSync(CONFIG, 'utf8')) as { endpoints?: { endpoints: { credentialRef?: string }[] } };
+    assert.equal(onDisk.endpoints?.endpoints[0]?.credentialRef, 'vault:openai', 'rejected patch left the slot untouched');
+  });
+});

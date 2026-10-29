@@ -69,6 +69,7 @@ export async function endpointsPane(body) {
   const S = {
     quickpicks: [],
     known: [], // [{host,label?,ports?}]
+    registry: { revision: 0, endpoints: [] },
     knownResolved: {}, // host -> {loading, result}
     results: [], // [{origin, baseUrl, r}]
     scanning: false,
@@ -84,6 +85,7 @@ export async function endpointsPane(body) {
 
   const knownHost = el('div', { class: 'ep-section' }, []);
   const resultsHost = el('div', { class: 'ep-section' }, []);
+  const savedHost = el('div', { class: 'ep-section' }, []);
 
   const row = (nameNodes, hints, actions) =>
     el('div', { class: 'set-row' }, [
@@ -111,6 +113,40 @@ export async function endpointsPane(body) {
     };
     return btn;
   };
+
+  async function saveRegistryEndpoint(baseUrl, models) {
+    const model = models?.[0]?.id;
+    const label = hostPortLabel(baseUrl);
+    const res = await postJson('/api/endpoints/registry', {
+      expectedRevision: S.registry.revision,
+      label,
+      provider: 'openai',
+      model,
+      baseUrl,
+      selfHosted: true,
+    });
+    S.registry.revision = res.revision;
+    S.registry.endpoints = [...S.registry.endpoints, res.endpoint];
+    renderSaved();
+    say(`✓ saved endpoint — ${label}`, 'ok');
+  }
+
+  function renderSaved() {
+    const kids = [el('h3', {}, ['Saved endpoints']), el('p', { class: 'desc' }, ['Stable endpoint identities are separate from model presets. Saving never stores an API key; activation remains an explicit action.'])];
+    if (!S.registry.endpoints.length) kids.push(el('p', { class: 'desc' }, ['No saved endpoints yet. Save a probe result or add one through onboarding.']));
+    for (const endpoint of S.registry.endpoints) {
+      kids.push(row([endpoint.label, el('span', { class: 'tag-chip', style: 'margin-left:8px;' }, ['saved'])], [endpoint.baseUrl, endpoint.model || 'model not selected'], [
+        action('Use as active', () => useAsActive(endpoint.baseUrl, endpoint.model ? [{ id: endpoint.model }] : []), { primary: true }),
+        action('Forget', async () => {
+          const res = await del(`/api/endpoints/registry/${encodeURIComponent(endpoint.id)}`, { expectedRevision: S.registry.revision });
+          S.registry.revision = res.revision;
+          S.registry.endpoints = S.registry.endpoints.filter((item) => item.id !== endpoint.id);
+          renderSaved();
+        }, { danger: true }),
+      ]));
+    }
+    savedHost.replaceChildren(...kids);
+  }
 
   // ── use as active: the only config-write path (POST /api/models → PATCH default) ──
   async function useAsActive(baseUrl, models) {
@@ -247,7 +283,10 @@ export async function endpointsPane(body) {
           ok
             ? [`${lat.text} · ${r.server ?? r.serverHeader ?? 'unknown backend'}${r.reached ? ` · answered ${r.reached}` : ''}`, servedText(r)]
             : [`${r?.errorKind ?? 'error'} — ${r?.error ?? 'unreachable'}`],
-          ok ? [action('Use as active', () => useAsActive(baseUrl, servedList(r)), { primary: true })] : [],
+          ok ? [
+            action('Use as active', () => useAsActive(baseUrl, servedList(r)), { primary: true }),
+            action('Save endpoint', () => saveRegistryEndpoint(baseUrl, servedList(r))),
+          ] : [],
         ),
       );
     }
@@ -315,6 +354,7 @@ export async function endpointsPane(body) {
     el('h3', {}, ['Endpoints']),
     el('p', { class: 'desc' }, ['Discover and verify API + self-hosted inference servers. All probing runs server-side through the egress broker — the browser never leaves this origin, and nothing leaves this machine.']),
     status,
+    savedHost,
     knownHost,
     el('h3', { style: 'margin-top:24px;' }, ['Probe an endpoint']),
     el('div', { class: 'set-form-row', style: 'max-width:520px;' }, [el('div', { class: 'field' }, [urlInput]), probeBtn]),
@@ -330,13 +370,15 @@ export async function endpointsPane(body) {
 
   // ── initial load: quick-picks + pinned hosts (auto-resolve = "select what's running") ──
   try {
-    const [qp, kn] = await Promise.all([
+    const [qp, kn, registry] = await Promise.all([
       getJson('/api/endpoints/quickpicks').catch(() => ({ quickpicks: [] })),
       getJson('/api/endpoints/known').catch(() => ({ known: [] })),
+      getJson('/api/endpoints/registry').catch(() => ({ revision: 0, endpoints: [] })),
     ]);
     if (cancelled) return;
     S.quickpicks = qp.quickpicks || [];
     S.known = kn.known || [];
+    S.registry = registry;
     chips.replaceChildren(
       ...S.quickpicks.map((q) => {
         const b = el('button', { class: 'btn btn-sm btn-ghost', title: q.baseUrl }, [q.name]);
@@ -348,6 +390,7 @@ export async function endpointsPane(body) {
       }),
     );
     renderKnown();
+    renderSaved();
     for (const k of S.known) void resolveHostNow(k.host);
   } catch (e) {
     if (!cancelled) say(`Failed to load: ${e.message}`, 'error');

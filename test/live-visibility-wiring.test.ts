@@ -15,20 +15,20 @@ const read = (p: string) => readFileSync(join(ROOT, p), 'utf8');
 test('the sub-agent dock is mounted in the Snowfall layout', () => {
   const src = read('src/app/snowfall.ts');
   assert.match(src, /new SubAgentsCell\(/, 'SubAgentsCell must be constructed by the layout');
-  assert.match(src, /component:\s*agents/, 'the dock component must be an item in the VStack');
+  assert.match(src, /component:\s*(?:content\()?agents\)?/, 'the dock component must be an item in the VStack');
 });
 
 test('the toast channel is mounted in the Snowfall layout', () => {
   const src = read('src/app/snowfall.ts');
   assert.match(src, /new ToastCell\(/, 'ToastCell must be constructed by the layout');
-  assert.match(src, /component:\s*toasts/, 'the toast component must be an item in the VStack');
+  assert.match(src, /component:\s*(?:content\()?toasts\)?/, 'the toast component must be an item in the VStack');
 });
 
 test('both live cells sit between the editor and the status row, never above the composer', () => {
   const src = read('src/app/snowfall.ts');
-  const editorAt = src.indexOf('component: editor');
-  const toastsAt = src.indexOf('component: toasts');
-  const agentsAt = src.indexOf('component: agents');
+  const editorAt = src.indexOf('component: content(editor)');
+  const toastsAt = src.indexOf('component: content(toasts)');
+  const agentsAt = src.indexOf('component: content(agents)');
   assert.ok(editorAt > 0 && toastsAt > 0 && agentsAt > 0, 'all three must be present');
   // Pushing the composer around while the user is typing is the failure mode to avoid.
   assert.ok(editorAt < toastsAt, 'toasts must render below the editor');

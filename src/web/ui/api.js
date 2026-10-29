@@ -77,8 +77,12 @@ export async function putJson(path, body) {
   return await r.json();
 }
 
-export async function del(path) {
-  const r = await req(path, { method: 'DELETE' });
+export async function del(path, body) {
+  const r = await req(path, {
+    method: 'DELETE',
+    headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
   if (!r.ok) throw new Error(`${path}: ${r.status} ${await r.text().catch(() => '')}`);
   return await r.json().catch(() => ({}));
 }

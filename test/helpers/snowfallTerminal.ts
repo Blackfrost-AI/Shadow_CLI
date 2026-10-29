@@ -60,7 +60,7 @@ export const snowfallFixtureState = (): SnowfallState => ({
   version: '10.0.0', workspace: '~/work/snowfall', providerModel: 'local / frost-coder',
   autonomy: 'auto-read', planMode: false, bypass: false, running: false, startedAt: 0,
   tick: 0, reducedMotion: true, queued: 0, toolLine: null, contextPct: 0.28, costUSD: 0.0123,
-  goal: 'Make the terminal feel like Shadow.', missionLine: '', mcpConnecting: false, mcpFailed: false,
+  goal: 'Make the terminal feel like Shadow.', missionLine: '', mcpConnecting: false, mcpFailed: false, tokPerSec: null,
   todos: [
     { id: '1', subject: 'Build the crystalline layout', status: 'completed' },
     { id: '2', subject: 'Check narrow terminals', status: 'in_progress' },

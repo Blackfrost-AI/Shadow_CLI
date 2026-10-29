@@ -13,6 +13,13 @@ import {
 } from '../../config.js';
 import { findModelPreset } from '../../config/modelPresets.js';
 import { contextValue } from '../../gguf.js';
+import {
+  EndpointConflictError,
+  createEndpointId,
+  loadEndpointRegistry,
+  updateEndpointRegistry,
+} from '../../endpoints/store.js';
+import { normalizeEndpointUrl, type EndpointPatch, type SavedEndpoint } from '../../endpoints/types.js';
 
 /**
  * Endpoint harness for `shadow web`. The browser runs under CSP `connect-src 'self'`
@@ -690,7 +697,107 @@ function allEntries(): ModelEntry[] {
   return Array.isArray(cfg.models) ? (cfg.models as ModelEntry[]) : [];
 }
 
+/**
+ * A credential reference names a VAULT SLOT, never a secret. Anything that still looks like key
+ * material (a bearer token, an `sk-…` key, a long unbroken blob) is rejected here so a stray paste
+ * from the UI cannot persist a live credential into config.json. Mirrors the credRef slug rule.
+ */
+function validateCredentialRef(raw: unknown): { ok: true; value?: string } | { ok: false; error: string } {
+  if (raw === undefined || raw === null || raw === '') return { ok: true };
+  if (typeof raw !== 'string') return { ok: false, error: 'credentialRef must be a string' };
+  const value = raw.trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/.test(value)) {
+    return { ok: false, error: 'credentialRef must be a vault slot name (letters, digits, . _ : -)' };
+  }
+  if (/^(sk-|pk-|rk-|ghp_|gho_|github_pat_|xox[bpas]-|AKIA|ASIA)/i.test(value) || value.startsWith('Bearer ')) {
+    return { ok: false, error: 'credentialRef must name a vault slot, not hold a key' };
+  }
+  return { ok: true, value };
+}
+
 export function registerEndpointsRoutes(route: RouteFn, _ctx: ApiContext): void {
+  // Stable endpoint inventory. This is deliberately separate from model presets: the registry
+  // owns endpoint identity and observations, while the existing models API owns activation and
+  // credential-vault migration. Responses contain credential references only, never secret values.
+  route('GET', /^\/api\/endpoints\/registry$/, async () => {
+    return { status: 200, body: loadEndpointRegistry() };
+  });
+
+  route('POST', /^\/api\/endpoints\/registry$/, async (req: IncomingMessage) => {
+    const body = (await readJsonBody(req)) as Record<string, unknown> | null;
+    if (!body || typeof body !== 'object') return { status: 400, body: { error: 'invalid body' } };
+    const baseUrl = typeof body.baseUrl === 'string' ? body.baseUrl : '';
+    const label = typeof body.label === 'string' ? body.label.trim().slice(0, 120) : '';
+    const provider = typeof body.provider === 'string' ? body.provider : '';
+    if (!label || !provider || !baseUrl) return { status: 400, body: { error: 'label, provider, and baseUrl are required' } };
+    let normalized: string;
+    try {
+      normalized = normalizeEndpointUrl(baseUrl);
+    } catch (error) {
+      return { status: 400, body: { error: error instanceof Error ? error.message : 'invalid endpoint URL' } };
+    }
+    const credRef = validateCredentialRef(body.credentialRef);
+    if (!credRef.ok) return { status: 400, body: { error: credRef.error } };
+    const now = new Date().toISOString();
+    const endpoint: SavedEndpoint = {
+      id: createEndpointId(),
+      label,
+      provider: provider as SavedEndpoint['provider'],
+      baseUrl: normalized,
+      model: typeof body.model === 'string' ? body.model.slice(0, 256) : undefined,
+      credentialRef: credRef.value,
+      selfHosted: body.selfHosted === true,
+      createdAt: now,
+      updatedAt: now,
+    };
+    try {
+      const state = updateEndpointRegistry({ expectedRevision: Number(body.expectedRevision ?? 0), add: endpoint });
+      return { status: 201, body: { endpoint, revision: state.revision } };
+    } catch (error) {
+      if (error instanceof EndpointConflictError) return { status: 409, body: { error: error.message, code: error.code, revision: error.actualRevision } };
+      return { status: 400, body: { error: error instanceof Error ? error.message : 'could not save endpoint' } };
+    }
+  });
+
+  route('PATCH', /^\/api\/endpoints\/registry\/([^/]+)$/, async (req: IncomingMessage, _res: ServerResponse, match: RegExpMatchArray) => {
+    const body = (await readJsonBody(req)) as Record<string, unknown> | null;
+    if (!body || typeof body !== 'object') return { status: 400, body: { error: 'invalid body' } };
+    const id = decodeURIComponent(match[1] ?? '');
+    const update: EndpointPatch['update'] = { id };
+    if (body.credentialRef !== undefined) {
+      const credRef = validateCredentialRef(body.credentialRef);
+      if (!credRef.ok) return { status: 400, body: { error: credRef.error } };
+      update.credentialRef = credRef.value;
+    }
+    for (const key of ['label', 'model', 'selfHosted', 'follow'] as const) {
+      if (body[key] !== undefined) (update as Record<string, unknown>)[key] = body[key];
+    }
+    if (body.baseUrl !== undefined) {
+      if (typeof body.baseUrl !== 'string') return { status: 400, body: { error: 'baseUrl must be text' } };
+      try { update.baseUrl = normalizeEndpointUrl(body.baseUrl); }
+      catch (error) { return { status: 400, body: { error: error instanceof Error ? error.message : 'invalid endpoint URL' } }; }
+    }
+    try {
+      const state = updateEndpointRegistry({ expectedRevision: Number(body.expectedRevision), update });
+      return { status: 200, body: { endpoint: state.endpoints.find((item) => item.id === id), revision: state.revision } };
+    } catch (error) {
+      if (error instanceof EndpointConflictError) return { status: 409, body: { error: error.message, code: error.code, revision: error.actualRevision } };
+      return { status: 400, body: { error: error instanceof Error ? error.message : 'could not update endpoint' } };
+    }
+  });
+
+  route('DELETE', /^\/api\/endpoints\/registry\/([^/]+)$/, async (req: IncomingMessage, _res: ServerResponse, match: RegExpMatchArray) => {
+    const body = (await readJsonBody(req)) as Record<string, unknown> | null;
+    const id = decodeURIComponent(match[1] ?? '');
+    try {
+      const state = updateEndpointRegistry({ expectedRevision: Number(body?.expectedRevision), removeId: id });
+      return { status: 200, body: { revision: state.revision } };
+    } catch (error) {
+      if (error instanceof EndpointConflictError) return { status: 409, body: { error: error.message, code: error.code, revision: error.actualRevision } };
+      return { status: 400, body: { error: error instanceof Error ? error.message : 'could not remove endpoint' } };
+    }
+  });
+
   // POST /api/endpoints/probe — ad-hoc, no credential. 200 with ok:false for unreachable (a probe
   // ran = data); 400 only for an invalid URL / bad body.
   route('POST', /^\/api\/endpoints\/probe$/, async (req: IncomingMessage) => {

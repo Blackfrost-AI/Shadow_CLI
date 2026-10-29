@@ -40,6 +40,64 @@ test('Snowfall golden VT frames at 80, 120 and 200 columns in every palette', as
   }
 });
 
+test('wide content reflows through a shrink/grow round-trip and preserves editor mouse input', async () => {
+  const f = fixture('snowfall', 120);
+  try {
+    f.tui.setLayoutRoot(f.root);
+    f.tui.setFocus(f.editor);
+    f.editor.setText('abcdef');
+    f.tui.renderNow(true);
+    await f.terminal.flush();
+    const wide = f.terminal.lines();
+    const editorRow = wide.findIndex((line) => line.includes('abcdef'));
+    assert.ok(editorRow >= 0, 'the real editor is visible in the native layout');
+    const textColumn = wide[editorRow]!.indexOf('abcdef');
+    assert.equal(textColumn, 2, 'the editor starts at the viewport edge, not a centered gutter');
+    f.terminal.resize(100, f.terminal.screen.rows);
+    f.tui.renderNow(true);
+    await f.terminal.flush();
+    const boundary = f.terminal.lines();
+    const boundaryText = boundary.find((line) => line.includes('abcdef'));
+    assert.ok(boundaryText?.startsWith('▸ abcdef'), 'the boundary width has no artificial left margin');
+    f.terminal.resize(120, f.terminal.screen.rows);
+    f.tui.renderNow(true);
+    await f.terminal.flush();
+    assert.deepEqual(f.terminal.lines(), wide, 'returning to the original viewport restores its rendered grid');
+
+    // pi-tui synthesizes a click from a press/release at one cell. Coordinates are one-based.
+    f.terminal.input(`\x1b[<0;${textColumn + 4};${editorRow + 1}M`);
+    f.terminal.input(`\x1b[<0;${textColumn + 4};${editorRow + 1}m`);
+    await f.terminal.flush();
+    assert.deepEqual(f.editor.getCursor(), { line: 0, col: 3 });
+    f.editor.handleInput('X');
+    assert.equal(f.editor.getText(), 'abcXdef', 'typing inserts at the clicked character');
+
+    f.terminal.input('\x1b[<0;2;2M');
+    f.terminal.input('\x1b[<0;2;2m');
+    await f.terminal.flush();
+    assert.deepEqual(f.editor.getCursor(), { line: 0, col: 4 }, 'a click near the viewport origin still lands in the editor');
+  } finally { f.tui.stop({ preserveScreen: true }); f.terminal.screen.dispose(); }
+});
+
+test('ultrawide startup and editor span the full terminal instead of a fixed 100-column window', async () => {
+  const f = fixture('snowfall', 300, 30, true);
+  try {
+    f.editor.setText('abcdef');
+    f.tui.renderNow(true);
+    await f.terminal.flush();
+    const lines = f.terminal.lines();
+    const editorRow = lines.findIndex((line) => line.includes('abcdef'));
+    assert.ok(editorRow >= 0, 'the startup editor is visible');
+    assert.equal(lines[editorRow]!.indexOf('▸ abcdef'), 0, 'the 300-column viewport uses the full content area');
+    f.terminal.resize(120, 30);
+    f.tui.renderNow(true);
+    await f.terminal.flush();
+    const narrow = f.terminal.lines();
+    const narrowEditor = narrow.find((line) => line.includes('abcdef'));
+    assert.ok(narrowEditor?.startsWith('▸ abcdef'), 'the 120-column layout is also full width');
+  } finally { f.tui.stop({ preserveScreen: true }); f.terminal.screen.dispose(); }
+});
+
 test('fullscreen scroll, search, semantic prompt jumps, short resize, paste and complete exit document', async () => {
   const f = fixture('snowfall', 120);
   try {

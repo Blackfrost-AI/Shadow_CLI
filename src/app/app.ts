@@ -120,6 +120,7 @@ import type { MissionSnapshot } from '../agent/mission.js';
 import { PendingDialog, dialogArmMs } from './dialogs.js';
 import { ModelSwitcher } from './modelSwitch.js';
 import { SnowfallEditor, snowfallLayout, type SnowfallState } from './snowfall.js';
+import { StreamRate, formatTokPerSec } from './streamRate.js';
 import { emitNotification } from '../util/notify.js';
 import type { SubAgentView } from '../tui/subagentPanel.js';
 import { modelRows, type PickerRow } from '../util/modelGroups.js';
@@ -192,6 +193,8 @@ interface HudState {
   mcpConnecting: boolean;
   mcpFailed: boolean;
   planMode: boolean;
+  /** Estimated live root-agent output rate; null until decode has enough signal. */
+  tokPerSec: string | null;
   /** Live toast rows; empty array when nothing is showing. */
   toasts: Toast[];
 }
@@ -281,6 +284,9 @@ export class ShadowApp {
   private loopRef: AgentLoop | null = null;
   private runStart = 0;
   private tick = 0;
+  private readonly streamRate = new StreamRate();
+  /** Only runTurn streams the root model; other `running` activities are not throughput turns. */
+  private rootStreamActive = false;
   private ticker: ReturnType<typeof setInterval> | null = null;
   /** Last OSC title written while working — the spinner frame changes every tick. */
   private lastActivityTitle = '';
@@ -512,6 +518,7 @@ export class ShadowApp {
         mcpConnecting: false,
         mcpFailed: false,
         planMode: false,
+        tokPerSec: null,
         toasts: [],
       };
     }
@@ -530,6 +537,7 @@ export class ShadowApp {
     s.mcpConnecting = this.mcpConnecting;
     s.mcpFailed = this.mcpFailed;
     s.planMode = this.planMode;
+    s.tokPerSec = this.running && this.rootStreamActive ? formatTokPerSec(this.streamRate.read(Date.now(), true)) : null;
     const now = this.toastClock();
     this.toasts.tick(now);
     s.toasts = this.toasts.live(now);
@@ -909,6 +917,7 @@ export class ShadowApp {
     const sub = e.subagent as string | undefined;
     switch (type) {
       case 'text':
+        if (!sub && this.rootStreamActive && typeof e.delta === 'string') this.streamRate.append(e.delta, Date.now());
         if (!sub && typeof e.delta === 'string') this.onTextDelta(e.delta);
         break;
       case 'assistant_done':
@@ -917,6 +926,7 @@ export class ShadowApp {
         this.flushStreamToTranscript();
         break;
       case 'thinking':
+        if (!sub && this.rootStreamActive && typeof e.delta === 'string') this.streamRate.append(e.delta, Date.now());
         if (!sub && typeof e.delta === 'string') this.onThinkingDelta(e.delta);
         break;
       case 'reasoning_done': {
@@ -1528,6 +1538,8 @@ export class ShadowApp {
     const controller = new AbortController();
     this.controller = controller;
     this.runStart = Date.now();
+    this.streamRate.reset();
+    this.rootStreamActive = true;
     this.answerOpen = false;
     this.padCarry = false;
     this.streamBuf = '';
@@ -1647,12 +1659,14 @@ export class ShadowApp {
       }
     } finally {
       this.running = false;
+      this.rootStreamActive = false;
       // Clear the working glyph before the ticker stops — otherwise the last frame stays frozen
       // in the tab title and an idle session looks busy forever.
       this.refreshTitleActivity();
       this.stopTicker();
     }
     this.controller = null;
+    this.streamRate.finish(Date.now());
     this.toolLine = null;
     const secs = Math.max(0, Math.round((Date.now() - this.runStart) / 1000));
     if (secs >= 1) this.pushLine({ text: `${GLYPHS.tool} done · ${formatDuration(secs)}`, dimColor: true });
@@ -1666,6 +1680,8 @@ export class ShadowApp {
     this.ticker = setInterval(() => {
       this.tick++;
       this.refreshTitleActivity();
+      // The estimator reads the current clock without mutating its active-decode samples.
+      this.hudRef = this.hudState();
       const trace = this.reasoning;
       if (trace?.startedAt != null) {
         const durationMs = trace.elapsedMs + Math.max(0, Date.now() - trace.startedAt);

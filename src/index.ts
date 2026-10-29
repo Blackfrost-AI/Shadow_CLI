@@ -58,6 +58,7 @@ import { makeCollaborationTool } from './agent/collaboration.js';
 import type { Tool, ToolContext, ToolResult } from './tools/types.js';
 import type { RunShellData } from './tools/runShell.js';
 import { createMcpManager } from './mcp/manager.js';
+import { runEndpointDiscoveryServer } from './mcp/endpointDiscovery.js';
 import {
   disableMcpServer,
   enableContextCooler,
@@ -195,7 +196,7 @@ function helpText(): string {
     '  export [path]        export session log to markdown, or standalone HTML with --html (--session, --out)',
     '  corpus <on|off|status|export|stats>  capture YOUR OWN sessions as training data — local only,',
     '                       opt-in per workspace, redacted on write and on export, no network path',
-    '  mcp <list|enable|disable>  manage MCP servers (e.g. `mcp enable browser`)',
+    '  mcp <list|enable|disable|endpoint-discovery>  manage MCP servers or serve saved endpoint inventory',
     '  plugin <add|list|enable|disable|remove|search>  local-first plugin manager (data-only markdown bundles)',
     '  harness <list|show|validate|enable|disable|use>  manage trusted local harness add-ons',
     '  local <add|list|test|use|remove>  manage local models — .gguf or MLX (no Ollama/LM Studio needed)',
@@ -496,6 +497,10 @@ function needsOnboarding(cfg: ShadowConfig, lastPicked?: ModelEntry): boolean {
  */
 function runMcp(args: string[]): void {
   const sub = args[0];
+  if (sub === 'endpoint-discovery') {
+    void runEndpointDiscoveryServer();
+    return;
+  }
   const servers = loadGlobalMcpServers();
 
   if (sub === 'list') {

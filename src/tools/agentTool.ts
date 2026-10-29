@@ -207,7 +207,10 @@ function agentOutcome(result: LoopResult, salvage: string | null, diagnostic: st
       // recoverable — the loop treats it as an ordinary tool failure, never a fatal stop — and
       // the partial coverage still travels in the answer and `data`.
       ok: false,
-      answer: withPartial(`INCOMPLETE — sub-agent stopped by its ${result.stopReason} ceiling${hasPartial ? '; the text below is partial coverage, not a finished result.' : ' before producing an answer.'}`),
+      answer: withPartial(
+        `INCOMPLETE — sub-agent stopped by its ${result.stopReason} ceiling${hasPartial ? '; the text below is partial coverage, not a finished result.' : ' before producing an answer.'}` +
+        `\n\nRecovery: this run is incomplete, not automatically resumed. An operator can retry it from the work center with /work retry <task_id> --confirm; use /consult to start a new consultation.`,
+      ),
       status: 'partial',
       errorCode: 'agent_partial',
     };
@@ -379,7 +382,13 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
       const def = resolveAgentDef(agentType, ctx.workspaceRoot);
       const consultation = input.consultation_id ? deps.getConsultation?.(input.consultation_id) : undefined;
       if (input.consultation_id && !consultation) {
-        return fail('agent', 'read', Date.now() - start, 'consultation_missing', 'Consultation is unavailable. Start a new consultation.');
+        return fail(
+          'agent',
+          'read',
+          Date.now() - start,
+          'consultation_missing',
+          `Consultation ${input.consultation_id} is unavailable. consultation_id must be a live consult_* ID; a sub-agent task ID is not a consultation ID. Use /consult to start a new consultation.`,
+        );
       }
       const profileReference = consultation?.profile ?? input.profile ?? def?.profile ?? def?.model;
       let profile: ResolvedModelProfile | undefined;

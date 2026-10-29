@@ -7,6 +7,115 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [11.0.0] — 2026-10-28
+
+Endpoint management: Shadow can now inventory, probe, and switch between the model endpoints you
+actually run — local vLLM / llama.cpp / LM Studio / Ollama boxes, LAN servers, and hosted providers
+— without hand-editing config. Upgrading from 10.6.x is in place; existing config, profiles, and
+vault slots keep working.
+
+### Added
+- **Endpoint registry** behind `shadow web`: save an endpoint once and it keeps its identity across
+  probes, so reachability and served-model changes are diffable instead of guessed. Rows carry an
+  observation history, not just a last-seen timestamp.
+- **Probe** with typed failures (`refused`, `timeout`, `auth-required`, `redirect`, `bad-json`)
+  instead of a bare boolean. Backend detection prefers the `owned_by` field over the HTTP `server`
+  header, so a vLLM box behind a generic `uvicorn` banner is reported correctly. Redirects are
+  never followed.
+- **LAN discovery** across the machine's private subnets with a bounded host cap that round-robins
+  subnets first, so truncation still covers every interface rather than exhausting the first one.
+- **Follow mode** and a switch controller: observe an endpoint, compare a declared deployment
+  identity, and change the active model endpoint through the same path a manual switch takes.
+- **Quickpicks** for the common local servers, plus pinned "known" endpoints that survive restarts.
+- **MCP endpoint discovery resource** so an editor-integrated agent can enumerate endpoints. The
+  resource is allowlisted to non-secret fields — credential references are references only.
+
+### Fixed
+- **Concurrent registry writes no longer drop an endpoint.** The production registry lives inside
+  `~/.shadow/config.json`; writes there were an unlocked read-modify-write, so two overlapping
+  requests could both pass the revision check and the second silently overwrite the first. Writes
+  are now serialized across processes under an exclusive lock. The previous lock guarded only a
+  standalone file that production never used.
+- **A malformed `endpoints` block no longer bricks the API.** Previously any schema mismatch made
+  every endpoint route answer `400` permanently; it now reads as an empty registry so you can add
+  endpoints again, and the next write replaces the bad block.
+- **`credentialRef` is validated as a vault slot name.** A pasted raw API key is rejected instead
+  of being persisted into `config.json`.
+
+### Notes
+- A session with unlimited iterations (`maxIterations: 0`) and no explicit budget still receives
+  the documented 6-hour wall-clock safety backstop. Set `budget.maxWallClockSec` (or
+  `--max-wall-sec`) to change it; per-turn and provider deadlines are independent of this.
+
+## [10.6.4] — 2026-10-26
+
+A layout correction: Snowfall is full width again.
+
+### Fixed
+- **The app no longer opens in a shrunken, centered column.** 10.6.2 introduced a fixed
+  100-column reading measure that applied on every platform, not just ultrawide terminals, so
+  normal-width windows rendered as a narrow box with large empty gutters. Header, transcript,
+  composer, live activity, and footer now span the full terminal width again, matching 10.6.0 and
+  10.6.1. This affects macOS and Windows as much as Linux; it was never a Linux-specific bug.
+- **10.6.3's proportional 80% measure is removed too.** Growing to 80% of the viewport still left
+  visible gutters on ordinary terminals. The shared layout policy now returns the full width.
+- Question and approval dialogs are unchanged: they keep their own independent, centered panel
+  sizing from 10.6.1.
+
+### Notes
+- 80-column rendering is byte-identical to 10.6.3. Wider terminals regain the full canvas.
+- Regression tests pin the full-width contract at 1–300 columns and assert that no left gutter is
+  reintroduced.
+
+## [10.6.3] — 2026-10-26
+
+A focused wide-terminal layout fix.
+
+### Fixed
+- **Ultrawide terminals no longer shrink the app into a small centered window.** The 10.6.2
+  reading-measure cap made the transcript, composer, and footer only 100 columns wide regardless
+  of available space. Content now grows proportionally to 80% of wide terminals while retaining
+  centered margins; terminals at 120 columns or below keep their existing layout. Question and
+  approval dialogs retain their independent, readable panel sizing.
+
+## [10.6.2] — 2026-10-25
+
+A calmer wide-terminal layout and live streaming feedback.
+
+### Changed
+- **Wide terminals center the conversation.** The header, transcript, composer, live activity, and
+  footer share a 100-column content measure with equal outer margins. Narrow terminals retain
+  their full-width layout. Native layout boxes preserve editor mouse clicks, selection, and resize
+  behavior, including repeated shrink/grow transitions across the 100-column boundary.
+- **The footer shows live output throughput.** While the root model streams, a windowed estimated
+  tok/s chip measures text and reasoning deltas, excluding idle gaps, tool time, and sub-agent
+  output. It freezes on completion or interruption, resets on the next turn, and hides while idle.
+
+## [10.6.1] — 2026-10-24
+
+The question / approval dialog, rebuilt. It was anchored to the bottom half of the screen and cut
+a long question off after a fixed number of rows, so on some models you never saw the end of
+what you were being asked.
+
+### Fixed
+- **The whole question is always readable.** The dialog is a centered, fully framed panel (up to
+  100 columns) that reflows on resize. The question word-wraps and is shown in full; when it is
+  taller than the space available it scrolls with **PgUp/PgDn** behind explicit
+  "↓ N more lines" markers instead of being truncated.
+- **Option descriptions wrap** under their label rather than being cut on one row. The highlighted
+  option always stays on screen; long option lists scroll around it.
+- **Approval safety on small terminals.** Height is allocated up front, never trimmed afterwards —
+  trimming is how the "characters not shown" warning, and on very short terminals the command
+  itself, used to disappear. The label reads **⚠ partial** whenever any of the command is hidden,
+  the risk/reason line (BLOCKED / UNCONFINED) always stays, and when even that cannot fit the
+  dialog says *terminal too small* and every approve key is inert (Esc still denies).
+- **Emoji no longer hide command text.** Width is measured per grapheme; `❤️` was counted as one
+  column but drawn as two, so a row overflowed and the frame hid real characters uncounted.
+- **Wrapped command previews no longer drop 4 characters per row.**
+- **Blocked (acknowledge-only) commands** in the default terminal now match the compatibility
+  terminal: no approve verbs are offered and every key answers deny.
+- A question with zero options no longer crashes the dialog.
+
 ## [10.6.0] — 2026-10-23
 
 Plugin packaging and provider adaptation. The theme: Shadow should absorb what varies between
@@ -3693,7 +3802,7 @@ The work landed incrementally in dev.20–dev.24; this is the summary of what no
 - **Onboarding redesign + scope disclaimer** (dev.22–dev.23) — centered SHADOW banner, boxed disclaimer stating Shadow is for agentic models (a chat model won't call tools), `The_Red_Pill (coming soon)` placeholder pointing nowhere.
 - **Three tool-call signature regimes, all round-tripped** — Anthropic signed thinking, **Gemini `thought_signature`** (dev.24), and plain OpenAI.
 
-**Test program findings (9 models):** a clean tool-caller (e.g. base Gemma 4 12B at 94%, or a local model's uncensored builds at 10/10 hard) gives a strong local agent. The three failures are *distinct*: **FORMAT** (Opus-distilled Gemma — harness-addressable; same family base scores 9×), **CAPABILITY** (GLM-4.7-Flash — not addressable), and **NOT AGENTIC** (GLM-4 chat model — out of scope). Clean uncensoring preserves capability; botched distillation/quant is what breaks models.
+**Test program findings (9 models):** a clean tool-caller (e.g. base Gemma 4 12B at 94%, or tuned uncensored builds at 10/10 hard) gives a strong local agent. The three failures are *distinct*: **FORMAT** (Opus-distilled Gemma — harness-addressable; same family base scores 9×), **CAPABILITY** (GLM-4.7-Flash — not addressable), and **NOT AGENTIC** (GLM-4 chat model — out of scope). Clean uncensoring preserves capability; botched distillation/quant is what breaks models.
 
 ## [0.5.0-dev.24] - 2026-06-22
 _Internal development build — not for release._
@@ -3731,7 +3840,7 @@ Local-model robustness, straight from the 50-prompt probe (`eval/FINDINGS-local-
 - **Text-embedded tool-call recovery.** When a model emits a tool call as assistant *text* instead of via the native channel — `<tool_call>{…}</tool_call>`, `call:NAME{…}`, `{"tool_calls":[…]}`, `{"writables":[{"tool_calls":[…]}]}` (single- or double-quoted) — the loop now recovers it into a real call (`src/provider/textToolCalls.ts`). Fires only when the turn produced no native call, and only for registered tool names (no false positives on prose). Recovered args go through the same repair ladder; invalid ones still surface as `invalid_input` for the model to retry. This reclaims the dominant gemma-class failure mode.
 
 ### Fixed
-- **Leaked control/template tokens are scrubbed** from the committed answer (`src/util/scrub.ts`): bare `</think>` (local-n2), `<channel|>` / `<tool_call|>` (gemma4-opus), and the ChatML family (`<|tool_response>`, `<|im_start|>`, …). Native Anthropic thinking is unaffected (handled upstream).
+- **Leaked control/template tokens are scrubbed** from the committed answer (`src/util/scrub.ts`): bare `</think>` (a reasoning model), `<channel|>` / `<tool_call|>` (a Gemma-4 distill), and the ChatML family (`<|tool_response>`, `<|im_start|>`, …). Native Anthropic thinking is unaffected (handled upstream).
 
 ## [0.5.0-dev.19] - 2026-06-21
 _Internal development build — not for release._
