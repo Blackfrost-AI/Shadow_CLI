@@ -40,6 +40,7 @@ import {
 } from './protocol.js';
 import type { StopReasonExt } from '../agent/events.js';
 import type { ApprovalGate } from '../agent/approval.js';
+import { AUTONOMY_LEVELS, type AutonomyLevel } from '../safety/permissions.js';
 import { redact } from '../util/redact.js';
 import { resolveJail as defaultResolveJail } from '../web/projects.js';
 import type { JailCapability, SessionRegistry, WebSession } from '../web/registry.js';
@@ -94,6 +95,7 @@ export function createAcpServer(deps: AcpServerDeps): AcpServer {
     currentModeId: session.autonomy(),
     availableModes: [
       { id: 'manual', name: 'Manual', description: 'Ask before write, execution, and network actions.' },
+      { id: 'auto-read', name: 'Auto read', description: 'Allow read-only actions; gate workspace edits, execution, and network actions.' },
       { id: 'auto-edit', name: 'Auto edit', description: 'Allow reads and workspace edits; gate execution and network actions.' },
       { id: 'full', name: 'Full', description: 'Allow normal actions while retaining the denylist and jail.' },
     ],
@@ -316,8 +318,8 @@ export function createAcpServer(deps: AcpServerDeps): AcpServer {
           {
             const p = (params ?? {}) as { sessionId?: unknown; modeId?: unknown };
             if (typeof p.sessionId !== 'string' || typeof p.modeId !== 'string') throw new RpcFailure(E_INVALID_PARAMS, 'sessionId and modeId are required');
-            if (!['manual', 'auto-edit', 'full'].includes(p.modeId)) throw new RpcFailure(E_INVALID_PARAMS, 'unknown modeId');
-            if (!deps.registry.setAutonomy(p.sessionId, p.modeId as 'manual' | 'auto-edit' | 'full')) throw new RpcFailure(E_INVALID_PARAMS, 'unknown or read-only session');
+            if (!AUTONOMY_LEVELS.includes(p.modeId as AutonomyLevel)) throw new RpcFailure(E_INVALID_PARAMS, 'unknown modeId');
+            if (!deps.registry.setAutonomy(p.sessionId, p.modeId as AutonomyLevel)) throw new RpcFailure(E_INVALID_PARAMS, 'unknown or read-only session');
             deps.notify(M_SESSION_UPDATE, { sessionId: p.sessionId, update: { sessionUpdate: 'current_mode_update', currentModeId: p.modeId } });
             return {};
           }

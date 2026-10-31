@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync, statSync, writeSync } from 'node:fs';
 import Ajv, { type ValidateFunction } from 'ajv';
 import type { EventBus, LoopEvent, StopReasonExt } from '../agent/events.js';
+import { VALUE_TAKING_FLAGS } from './flags.js';
 import { redact, redactString } from '../util/redact.js';
 
 export const AUTOMATION_VERSION = 1;
@@ -16,11 +17,14 @@ export function requestedMachineFormat(argv: string[]): MachineFormat | undefine
     const arg = argv[i]!;
     if (arg === '--') break;
     if (arg === '--json') format = 'jsonl';
-    else if (arg === '--output-schema' || arg.startsWith('--output-schema=')) schema = true;
+    else if (arg === '--output-schema') {
+      schema = true;
+      i++;
+    } else if (arg.startsWith('--output-schema=')) schema = true;
     else if (arg === '--output-format') format = argv[++i] ?? 'json';
     else if (arg.startsWith('--output-format=')) format = arg.slice('--output-format='.length);
     // Do not mistake the contents of another option's value for an output flag.
-    else if (['--task', '--system', '--provider', '--model', '--profile', '--harness', '--addon', '--workspace', '--add-dir', '--base-url', '--style', '--effort', '--autonomy', '--log-level', '--max-output-tokens', '--max-iterations', '--max-wall-sec', '--context-budget', '--web-port'].includes(arg)) i++;
+    else if (VALUE_TAKING_FLAGS.has(arg)) i++;
   }
   if (format === 'text') return undefined;
   return format === 'jsonl' ? 'jsonl' : format !== undefined || schema ? 'json' : undefined;

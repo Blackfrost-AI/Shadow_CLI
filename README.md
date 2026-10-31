@@ -1,6 +1,6 @@
 # Shadow CLI
 
-Current build: **`v11.0.0`** — content spans the full terminal width again; the 10.6.2/10.6.3 centered reading measure is removed. The footer still shows estimated live output throughput while the model streams.
+Current build: **`v11.1.0`** — content spans the full terminal width again; the 10.6.2/10.6.3 centered reading measure is removed. The footer still shows estimated live output throughput while the model streams.
 
 Shadow is a local-first, provider-neutral security engineering agent. Its built-in Security
 foundation covers investigation, hardening, incident response, defensive automation, secure coding,
@@ -13,7 +13,7 @@ prompt navigation, a compact session footer, and a pinned composer. Start this c
 `npm start` after building. Use `/theme snowfall` for the ice palette; saved themes remain active.
 `SHADOW_TUI=ink npm start` retains the compatibility renderer. The
 [terminal contract](docs/TERMINAL_RENDERERS.md) lists commands, keys and migration decisions.
-See the [11.0.0 release notes](https://github.com/Blackfrost-AI/Shadow_CLI/releases/tag/v11.0.0)
+See the [11.1.0 release notes](https://github.com/Blackfrost-AI/Shadow_CLI/releases/tag/v11.1.0)
 for the published release.
 
 Shadow names conversations from their opening prompt and shows the active name in the

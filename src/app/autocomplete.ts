@@ -13,7 +13,7 @@
 
 import { readdir } from 'node:fs/promises';
 import { statSync } from 'node:fs';
-import { join, relative, sep } from 'node:path';
+import { join, relative, resolve, sep } from 'node:path';
 import type {
   AutocompleteItem,
   AutocompleteProvider,
@@ -67,13 +67,37 @@ class WorkspaceIndex {
   private builtAt = 0;
   private building: Promise<string[]> | null = null;
   private generation = 0;
+  private extraRoots: string[];
 
-  constructor(private root: string) {}
+  constructor(private root: string, additionalRoots: readonly string[] = []) {
+    this.extraRoots = [...additionalRoots];
+  }
 
   setRoot(root: string): void {
     if (root === this.root) return;
     this.root = root;
-    this.generation++; // abandon any in-flight walk for the old root
+    this.invalidate();
+  }
+
+  setAdditionalRoots(roots: readonly string[]): void {
+    if (
+      roots.length === this.extraRoots.length &&
+      roots.every((r, i) => r === this.extraRoots[i])
+    ) {
+      return;
+    }
+    this.extraRoots = [...roots];
+    this.invalidate();
+  }
+
+  addRoot(root: string): void {
+    if (root === this.root || this.extraRoots.includes(root)) return;
+    this.extraRoots.push(root);
+    this.invalidate();
+  }
+
+  private invalidate(): void {
+    this.generation++; // abandon any in-flight walk for the old root set
     this.files = [];
     this.builtAt = 0;
   }
@@ -118,8 +142,33 @@ class WorkspaceIndex {
 
   private async walk(gen: number): Promise<string[]> {
     const out: string[] = [];
+    const seen = new Set<string>();
+    const pushEntry = (entry: string): void => {
+      if (seen.has(entry)) return;
+      seen.add(entry);
+      out.push(entry);
+    };
+    const rootAbs = resolve(this.root);
     // Breadth-first so the shallow entries (the ones an empty `@` shows first) land earliest.
-    const queue: Array<{ abs: string; rel: string; depth: number }> = [{ abs: this.root, rel: '', depth: 0 }];
+    const queue: Array<{ abs: string; rel: string; depth: number }> = [{ abs: rootAbs, rel: '', depth: 0 }];
+    const walkedRoots: string[] = [rootAbs];
+    for (const extra of this.extraRoots) {
+      const extraAbs = resolve(extra);
+      // Skip if identical to or already inside a queued root.
+      if (walkedRoots.some((r) => extraAbs === r || extraAbs.startsWith(r.endsWith(sep) ? r : r + sep))) {
+        continue;
+      }
+      walkedRoots.push(extraAbs);
+      const relToRoot = relative(rootAbs, extraAbs).split(sep).join('/');
+      // Use a concise relative prefix when only one parent hop up (`../foo`), otherwise the
+      // POSIX path (stripped of trailing slash) so completions are unambiguous.
+      const rawPrefix = !relToRoot.startsWith('../../') && !relToRoot.startsWith('/')
+        ? relToRoot
+        : extraAbs.split(sep).join('/');
+      const prefix = rawPrefix.replace(/\/+$/, '');
+      pushEntry(`${prefix}/`);
+      queue.push({ abs: extraAbs, rel: prefix, depth: 0 });
+    }
     while (queue.length > 0) {
       if (gen !== this.generation) return out;
       if (out.length >= MAX_FILES) break;
@@ -141,10 +190,10 @@ class WorkspaceIndex {
         const childRel = rel ? `${rel}/${name}` : name;
         if (e.isDirectory()) {
           if (SKIP_DIRS.has(name)) continue;
-          out.push(`${childRel}/`);
+          pushEntry(`${childRel}/`);
           queue.push({ abs: join(abs, name), rel: childRel, depth: depth + 1 });
         } else if (e.isFile()) {
-          out.push(childRel);
+          pushEntry(childRel);
         }
       }
       // Yield between directories so input handling and streaming never wait on the walk.
@@ -180,12 +229,21 @@ export class ShadowAutocompleteProvider implements AutocompleteProvider {
   constructor(
     private commands: SlashCommandSpec[],
     workspaceRoot: string,
+    additionalRoots: readonly string[] = [],
   ) {
-    this.index = new WorkspaceIndex(workspaceRoot);
+    this.index = new WorkspaceIndex(workspaceRoot, additionalRoots);
   }
 
   setWorkspaceRoot(root: string): void {
     this.index.setRoot(root);
+  }
+
+  setAdditionalRoots(roots: readonly string[]): void {
+    this.index.setAdditionalRoots(roots);
+  }
+
+  addAdditionalRoot(root: string): void {
+    this.index.addRoot(root);
   }
 
   /** Warm the file index in the background so the first `@` is instant. */

@@ -7,6 +7,27 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [11.1.0] — 2026-10-31
+
+TUI & CLI harness polish: `@` file autocomplete now indexes `--add-dir` / `/add-dir` grants,
+ACP exposes `'auto-read'` autonomy parity with the CLI, the machine-output pre-scanner shares
+its value-taking flag set with `parseArgs`, and the renderer capability catalog is version-neutral.
+
+### Changed
+- **Snowfall `@` file autocomplete (`src/app/autocomplete.ts`, `src/app/app.ts`)**: `WorkspaceIndex`
+  and `ShadowAutocompleteProvider` now index additional directories granted at startup (`--add-dir`)
+  or mid-session (`/add-dir`), deduplicating overlapping roots while continuing to exclude `.env`
+  and dotfile secrets.
+- **ACP autonomy mode parity (`src/acp/server.ts`)**: `session/new`, `session/load`, and
+  `session/set_mode` now advertise and accept `'auto-read'` alongside `'manual'`, `'auto-edit'`,
+  and `'full'`, matching the CLI, TUI, and web companion autonomy vocabulary.
+- **CLI machine-output flag parser (`src/cli/flags.ts`, `src/cli/automation.ts`)**: `requestedMachineFormat`
+  now consumes a single shared `VALUE_TAKING_FLAGS` set exported from `src/cli/flags.ts` and
+  advances past `--output-schema <path>` arguments so flag-like values are never misinterpreted.
+- **Renderer capability catalog (`src/tui/commandCatalog.ts`, `src/tui/renderer.ts`)**: removed
+  stale `"in v10"` wording from Ink-only unavailable messages and regenerated
+  `docs/TERMINAL_RENDERERS.md`.
+
 ## [11.0.0] — 2026-10-28
 
 Endpoint management: Shadow can now inventory, probe, and switch between the model endpoints you

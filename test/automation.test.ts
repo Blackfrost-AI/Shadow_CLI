@@ -10,7 +10,7 @@ import { PassThrough } from 'node:stream';
 import test from 'node:test';
 import { EventBus } from '../src/agent/events.js';
 import { Context } from '../src/agent/context.js';
-import { parseArgs } from '../src/cli/flags.js';
+import { parseArgs, VALUE_TAKING_FLAGS } from '../src/cli/flags.js';
 import { AutomationOutput, exitCodeForStop, loadOutputSchema, readTaskInput, requestedMachineFormat } from '../src/cli/automation.js';
 import { SessionLog } from '../src/state/session.js';
 import { recordWorkCenterSnapshot } from '../src/state/workCenterPersistence.js';
@@ -58,9 +58,14 @@ test('automation flags, early detection, and existing default output remain expl
     assert.throws(() => parseArgs(args));
   }
   assert.equal(requestedMachineFormat(['--task', 'literal --json']), undefined);
+  assert.equal(requestedMachineFormat(['--task', '--json']), undefined);
+  assert.equal(requestedMachineFormat(['--output-schema', '--json', '--output-format', 'text']), undefined);
   assert.equal(requestedMachineFormat(['--', '--json']), undefined);
   assert.equal(requestedMachineFormat(['--output-format=broken']), 'json');
   assert.equal(requestedMachineFormat(['--json', '--output-format', 'text']), undefined);
+  for (const flag of VALUE_TAKING_FLAGS) {
+    assert.throws(() => parseArgs([flag]), new RegExp(`${flag} requires a value`));
+  }
 });
 
 test('JSONL envelopes retain tool/job identities, omit private reasoning, and report checks honestly', () => {

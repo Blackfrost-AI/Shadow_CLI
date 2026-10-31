@@ -44,6 +44,30 @@ export interface Flags {
   version?: boolean;
 }
 
+export const VALUE_TAKING_FLAGS: ReadonlySet<string> = new Set([
+  '--web-port',
+  '--system',
+  '--autonomy',
+  '--provider',
+  '--model',
+  '--base-url',
+  '--effort',
+  '--profile',
+  '--harness',
+  '--addon',
+  '--max-output-tokens',
+  '--max-iterations',
+  '--context-budget',
+  '--max-wall-sec',
+  '--workspace',
+  '--add-dir',
+  '--log-level',
+  '--task',
+  '--output-format',
+  '--output-schema',
+  '--style',
+]);
+
 export function parseArgs(argv: string[]): Flags {
   const f: Flags = {};
   for (let i = 0; i < argv.length; i++) {

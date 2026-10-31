@@ -51,7 +51,7 @@ tools are available to its agent through \`tool_search\`.
 
 ## Local collaboration
 
-Shadow 10.0.3 adds keyboard-driven workflow overlays for local project work.
+Shadow adds keyboard-driven workflow overlays for local project work.
 
 - \`/work\`: live workers, shell commands and plan items; Enter opens detail, A opens actions.
   \`/tasks\` filters the plan. \`/work artifacts\` inspects retained output and offers apply,

@@ -566,7 +566,11 @@ export class ShadowApp {
     this.editor.onChange = () => {
       this.hudRef = this.hudState();
     };
-    this.autocomplete = new ShadowAutocompleteProvider(this.commandSpecs(), this.opts.workspaceRoot);
+    this.autocomplete = new ShadowAutocompleteProvider(
+      this.commandSpecs(),
+      this.opts.workspaceRoot,
+      this.additionalRoots,
+    );
     this.editor.setAutocompleteProvider(this.autocomplete);
     // Warm the file index in the background so the first `@` usually hits a warm cache instead
     // of paying the walk mid-keystroke.
@@ -2728,6 +2732,8 @@ export class ShadowApp {
           return;
         }
         this.additionalRoots.push(abs);
+        this.autocomplete?.addAdditionalRoot(abs);
+        this.autocomplete?.warm();
         this.pushLine({ text: `  Granted (this session): ${abs}`, color: C.green });
         return;
       }

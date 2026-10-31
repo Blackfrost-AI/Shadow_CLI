@@ -163,7 +163,7 @@ test('session/new against an allowlisted cwd creates an "acp" session with adver
   const result = h.responseFor(id)!.result;
   assert.equal(typeof result.sessionId, 'string');
   assert.equal(result.modes.currentModeId, 'auto-edit');
-  assert.deepEqual(result.modes.availableModes.map((mode: { id: string }) => mode.id), ['manual', 'auto-edit', 'full']);
+  assert.deepEqual(result.modes.availableModes.map((mode: { id: string }) => mode.id), ['manual', 'auto-read', 'auto-edit', 'full']);
   assert.ok(Array.isArray(result.configOptions));
   const session = h.registry.get(result.sessionId);
   assert.ok(session);
@@ -209,6 +209,10 @@ test('ACP mode switching and the versioned Work Center extension operate on the 
   const modeId = await h.rpc('session/set_mode', { sessionId, modeId: 'manual' });
   await until(() => Boolean(h.responseFor(modeId)));
   assert.equal(session.autonomy(), 'manual');
+
+  const autoReadId = await h.rpc('session/set_mode', { sessionId, modeId: 'auto-read' });
+  await until(() => Boolean(h.responseFor(autoReadId)));
+  assert.equal(session.autonomy(), 'auto-read');
   await h.close();
 });
 

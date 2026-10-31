@@ -190,6 +190,31 @@ test('applyCompletion replaces exactly the reported prefix', async () => {
   assert.equal(out.cursorCol, out.lines[0]!.length);
 });
 
+test('@ completes files across additional granted roots (--add-dir / /add-dir)', async () => {
+  const root = fixtureWorkspace();
+  const extra = mkdtempSync(join(tmpdir(), 'shadow-extra-dir-'));
+  mkdirSync(join(extra, 'shared'), { recursive: true });
+  writeFileSync(join(extra, 'shared', 'externalWidget.ts'), '');
+  const p = new ShadowAutocompleteProvider([], root, [extra]);
+  const s = await suggestions(p, 'inspect @externalWidget');
+  assert.ok(s, 'expected completions from additional granted root');
+  assert.ok(
+    s.items.some((i) => i.value.includes('externalWidget.ts')),
+    `expected externalWidget.ts among ${s.items.map((i) => i.value).join(', ')}`,
+  );
+
+  // Dynamically adding another root via /add-dir invalidates cache and surfaces new files
+  const extra2 = mkdtempSync(join(tmpdir(), 'shadow-extra-dir2-'));
+  writeFileSync(join(extra2, 'dynamicGrant.ts'), '');
+  p.addAdditionalRoot(extra2);
+  const s2 = await suggestions(p, 'check @dynamicGrant');
+  assert.ok(s2, 'expected completions after addAdditionalRoot');
+  assert.ok(
+    s2.items.some((i) => i.value.includes('dynamicGrant.ts')),
+    `expected dynamicGrant.ts among ${s2.items.map((i) => i.value).join(', ')}`,
+  );
+});
+
 // ── 4. span → ANSI ───────────────────────────────────────────────────────────
 
 test('spanToAnsi emits truecolor SGR and always resets', () => {
