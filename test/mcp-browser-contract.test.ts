@@ -50,8 +50,9 @@ test('browser MCP public CLI persists the playwright preset and disables it by i
       command: 'npx',
       args: [
         '-y',
-        '@playwright/mcp@0.0.79',
+        '@playwright/mcp@0.0.84',
         '--isolated',
+        '--sandbox',
         '--browser',
         'chrome',
         '--output-dir',
@@ -60,8 +61,8 @@ test('browser MCP public CLI persists the playwright preset and disables it by i
         '52428800',
       ],
       // P3-08 Phase 3: a browsing browser legitimately needs sockets AND broad filesystem access,
-      // so the preset opts this one server out of the OS jail explicitly. Its own isolation is the
-      // `--isolated` profile + capped output dir inside ~/.shadow.
+      // so the preset opts this one server out of the OS jail explicitly. Chromium's own sandbox
+      // stays on via `--sandbox`; the `--isolated` profile + capped output dir keep state separate.
       network: true,
       sandbox: false,
     });

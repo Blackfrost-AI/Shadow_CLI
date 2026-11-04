@@ -7,6 +7,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+- **Playwright browser preset updated to `@playwright/mcp@0.0.84` with Chromium's `--sandbox`
+  enabled.** The previous `0.0.79` pin used Chromium builds affected by four browser
+  vulnerabilities fixed in Chrome `156.0.8078.73`. Profile isolation remains separate from the OS
+  jail; the preset still opts out of Shadow's MCP jail because the browser needs sockets and broad
+  filesystem access.
+
 ## [11.1.0] — 2026-10-31
 
 TUI & CLI harness polish: `@` file autocomplete now indexes `--add-dir` / `/add-dir` grants,

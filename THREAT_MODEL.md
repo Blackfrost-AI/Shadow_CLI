@@ -204,12 +204,13 @@ deduped, budget-capped note on the tool result and never widen permissions. `SHA
 which servers would spawn.
 
 **Pinned browser preset (5.5.1):** the opt-in Playwright MCP preset (`shadow mcp enable browser`)
-runs the official `@playwright/mcp` server with an isolated Chrome profile; its output goes to
-`~/.shadow/playwright-output` (capped), never the workspace. First connect resolves the pinned
-package from the npm registry via `npx -y` (that resolution IS egress; skipped under `--offline` —
-see Appendix A #8). A browsing browser needs sockets AND broad filesystem access, so the preset
-opts this one server out of the jail explicitly (`"network": true, "sandbox": false`) — its
-isolation is the `--isolated` profile + capped output dir. It stays `exec`-gated like every MCP server.
+runs the official `@playwright/mcp` server with Chromium's sandbox enabled and an isolated Chrome
+profile; its output goes to `~/.shadow/playwright-output` (capped), never the workspace. First
+connect resolves the pinned package from the npm registry via `npx -y` (that resolution IS egress;
+skipped under `--offline` — see Appendix A #8). A browsing browser needs sockets AND broad
+filesystem access, so the preset opts this one server out of the jail explicitly (`"network": true,
+"sandbox": false`) — the browser's own `--sandbox` remains on, and its session isolation is the
+`--isolated` profile + capped output dir. It stays `exec`-gated like every MCP server.
 
 ### 3.9 Offline mode — subtractive by construction
 `--offline` requires a local model (or aborts), does **not register** web tools (the model can't
@@ -517,7 +518,7 @@ abort. (8) MCP stdio spawn with scrubbedEnv allowlist (no provider creds inherit
 the child is OS-jailed on macOS/Linux with network OFF (plus AF_UNIX socket denies / private /tmp,
 §3.8), so its own calls go nowhere by default; a server granted `"network": true` opens sockets the
 egress broker cannot see (the honest residual — the jail, not the journal, is the layer). The pinned
-Playwright preset (`network: true, sandbox: false`) runs `npx -y @playwright/mcp@0.0.79` → npm
+Playwright preset (`network: true, sandbox: false`) runs `npx -y @playwright/mcp@0.0.84 --sandbox` → npm
 registry at first connect (skipped under --offline).
 **OPT-IN/USER-INITIATED:** (9) update check (`checkUpdate.ts:84`) — default FALSE, once/day, plain GET
 of public package.json, no params/headers/body, 3s cap, TUI-only. (10) `shadow update` binary

@@ -180,7 +180,7 @@ test('an npx-launched MCP server (browser preset) also reports the npm-registry 
     provider: 'openai',
     baseUrl: 'https://api.openai.com/v1',
     mcpServers: {
-      playwright: { command: 'npx', args: ['-y', '@playwright/mcp@0.0.79', '--isolated'] },
+      playwright: { command: 'npx', args: ['-y', '@playwright/mcp@0.0.84', '--isolated', '--sandbox'] },
       local: { command: 'node', args: ['server.js'] },
     },
   };

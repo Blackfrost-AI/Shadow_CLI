@@ -774,15 +774,17 @@ shadow mcp enable browser       # from your shell
 /mcp enable browser             # inside Shadow
 ```
 
-Shadow pins the official `@playwright/mcp@0.0.79` server and launches a visible Chrome window with
-an isolated profile, separate from your everyday Chrome cookies and logins. Restart Shadow after
-enabling it; MCP servers connect when a session starts. Every browser tool is treated as executable:
+Shadow pins the official `@playwright/mcp@0.0.84` server and launches a visible Chrome window with
+Chromium's sandbox enabled and an isolated profile, separate from your everyday Chrome cookies and
+logins. Restart Shadow after enabling it; MCP servers connect when a session starts. Every browser
+tool is treated as executable:
 at the default `auto-edit` level Shadow asks before it runs, unless you approve that tool for the
 session or choose `full` autonomy.
 
 Profile isolation prevents browser state from carrying between sessions; it is **not a security
-boundary**. The MCP server and Chrome still run as your OS user and retain network access, so treat
-visited pages as untrusted and do not use this profile for sensitive accounts. Disable the opt-in with
+boundary**. The Chromium sandbox remains enabled, but the MCP server and Chrome still run as your OS
+user and retain network access, so treat visited pages as untrusted and do not use this profile for
+sensitive accounts. Disable the opt-in with
 `shadow mcp disable playwright` (or `/mcp disable playwright`) and restart again.
 
 ---

@@ -30,7 +30,7 @@ export interface McpChange {
   servers: McpServers;
 }
 
-export const PLAYWRIGHT_MCP_PACKAGE = '@playwright/mcp@0.0.79';
+export const PLAYWRIGHT_MCP_PACKAGE = '@playwright/mcp@0.0.84';
 
 export function loadGlobalMcpServers(): McpServers {
   const cfg = loadGlobalConfig();
@@ -91,6 +91,7 @@ export function enablePlaywrightBrowser(servers: McpServers): McpChange {
           '-y',
           PLAYWRIGHT_MCP_PACKAGE,
           '--isolated',
+          '--sandbox',
           '--browser',
           'chrome',
           '--output-dir',
@@ -101,8 +102,9 @@ export function enablePlaywrightBrowser(servers: McpServers): McpChange {
         // P3-08 Phase 3: a browsing browser legitimately needs sockets AND broad filesystem
         // access (the Chrome profile, the capped output dir INSIDE ~/.shadow), so the preset
         // opts this one server out of the OS jail explicitly instead of shipping a jail that
-        // breaks it. Its own isolation story is separate: `--isolated` profile + output capped
-        // outside the workspace. stdio-only servers (the default) stay fully confined.
+        // breaks it. Chromium's own sandbox stays enabled via `--sandbox`; `--isolated` keeps
+        // the browser profile separate, and output is capped outside the workspace. stdio-only
+        // servers (the default) stay fully confined.
         network: true,
         sandbox: false,
       },
