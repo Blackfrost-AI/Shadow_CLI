@@ -7,6 +7,8 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [11.1.1] — 2026-11-03
+
 ### Fixed
 - **Playwright browser preset updated to `@playwright/mcp@0.0.84` with Chromium's `--sandbox`
   enabled.** The previous `0.0.79` pin used Chromium builds affected by four browser
