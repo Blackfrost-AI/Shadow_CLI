@@ -27,6 +27,7 @@ export interface MissionTask {
 
 export interface MissionSnapshot {
   active: boolean;
+  mode?: 'goal' | 'swarm';
   mission: string;
   phase: MissionPhase;
   tasks: MissionTask[];
@@ -103,11 +104,12 @@ export class MissionState {
   }
 
   /** `/goal <text>` — begin a mission in the planning phase (the caller enters plan mode). */
-  begin(text: string): MissionSnapshot {
+  begin(text: string, mode: 'goal' | 'swarm' = 'goal'): MissionSnapshot {
     if (!this.available) return this.snapshot();
     const mission = text.trim();
     this.snap = {
       active: mission.length > 0,
+      mode,
       mission,
       phase: 'planning',
       tasks: [],
@@ -265,7 +267,9 @@ export class MissionState {
     } else if (this.snap.phase === 'verifying' && !canUpdate) {
       lines.push('You are in the VERIFYING phase. Implementation has stopped. Verify each task against real evidence before reporting the result; mission state is read-only in this session.');
     } else {
-      lines.push(PHASE_INSTRUCTIONS[this.snap.phase]);
+      lines.push(PHASE_INSTRUCTIONS[this.snap.phase] + (this.snap.mode === 'swarm' && this.snap.phase === 'executing'
+        ? ' SWARM: use tool_search to discover swarm, then execute independent approved tasks as dependency-aware waves. Integrate verified worktree artifacts before launching dependent writers. Never spawn nested swarms.'
+        : ''));
     }
     if (canUpdate && canDelegate) {
       lines.push(
@@ -320,6 +324,7 @@ function coerceSnapshot(raw: unknown): MissionSnapshot | null {
     : [];
   const snap: MissionSnapshot = {
     active: true,
+    mode: r.mode === 'swarm' ? 'swarm' : 'goal',
     mission: r.mission,
     phase: r.phase as MissionPhase,
     tasks: tasks.map((t) => ({ ...t })),

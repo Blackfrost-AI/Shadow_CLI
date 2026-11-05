@@ -43,7 +43,7 @@ import { FORWARD_DELETE, HOME_KEYS, END_KEYS, SHIFT_ENTER, insertChunk } from '.
 const SHIFT_TAB = /^\x1b(?:\[(?:9;(\d+)u|27;(\d+);9~)|\[Z)$/;
 
 /** Slash commands safe to run LIVE while a turn is executing; everything else queues. */
-const SLASH_WHILE_RUNNING = new Set(['/help', '/cost', '/usage', '/context', '/connections', '/fast', '/effort', '/version', '/copy', '/plan', '/goal']);
+const SLASH_WHILE_RUNNING = new Set(['/help', '/cost', '/usage', '/context', '/connections', '/fast', '/effort', '/version', '/copy', '/plan', '/goal', '/swarm']);
 import type { FocusOwnerHandler, InkKey, KeyEnv } from './types.js';
 
 function handleComposer(env: KeyEnv, ch: string, key: InkKey): boolean {

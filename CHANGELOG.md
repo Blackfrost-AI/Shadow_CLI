@@ -7,6 +7,17 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [11.1.2] — 2026-11-05
+
+### Added
+- **`/swarm` missions: `/goal` planning with bounded parallel native-agent execution.** Approved
+  task graphs launch independent workers within existing concurrency, permission, and budget
+  controls; validate dependencies; run dependent read-only tasks after successful prerequisites;
+  and gate dependent writers on lead integration. Failed workers block descendants while unrelated
+  work continues. Job and retained-worktree references flow into the result, nested fan-out is
+  refused, and the lead must verify the final state before mission completion. Both terminal
+  renderers support `/swarm`, `/swarm status`, and `/swarm clear`.
+
 ## [11.1.1] — 2026-11-03
 
 ### Fixed

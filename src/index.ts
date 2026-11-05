@@ -55,6 +55,7 @@ import { ensureVaultReady } from './auth/unlock.js';
 import { makeAgentTool, makeScheduleWakeupTool } from './tools/index.js';
 import { makeProjectJobsTool, makeProjectRoomTool, makeAcceptanceCheckTool } from './tools/projectJobs.js';
 import { makeCollaborationTool } from './agent/collaboration.js';
+import { makeSwarmTool } from './tools/swarmTool.js';
 import type { Tool, ToolContext, ToolResult } from './tools/types.js';
 import type { RunShellData } from './tools/runShell.js';
 import { createMcpManager } from './mcp/manager.js';
@@ -2069,6 +2070,7 @@ async function main(): Promise<void> {
   const checkedShell: Tool<unknown, RunShellData> = { ...configuredShell,
     run: (input, ctx) => executeNativeTool('run_shell', input, ctx) as Promise<ToolResult<RunShellData>> };
   const acceptanceTool = makeAcceptanceCheckTool(checkedShell);
+  registry.register({ ...makeSwarmTool((input, ctx) => executeNativeTool('agent', input, ctx), cfg.subagentConcurrency), deferred: true, searchAliases: ['parallel', 'mission', 'dag', 'multi-agent'] });
   registry.register(makeProjectJobsTool());
   registry.register(makeProjectRoomTool());
   registry.register(acceptanceTool);

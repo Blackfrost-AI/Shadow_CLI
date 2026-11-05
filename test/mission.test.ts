@@ -35,6 +35,16 @@ test('begin starts a planning-phase mission', () => {
   assert.ok(!snap.planPath);
 });
 
+test('swarm mode persists and changes execution instructions', () => {
+  const m = new MissionState();
+  m.begin('parallel research', 'swarm');
+  m.onPlanApproved({ tasks: ['investigate', 'verify'] });
+  assert.equal(m.snapshot().mode, 'swarm');
+  assert.ok(m.block().includes('swarm'));
+  const restored = new MissionState().restore(m.snapshot());
+  assert.equal(restored.mode, 'swarm');
+});
+
 test('clear deactivates and block() goes empty', () => {
   const m = new MissionState();
   m.begin('ship it');

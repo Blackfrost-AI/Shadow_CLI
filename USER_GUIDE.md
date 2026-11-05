@@ -1030,6 +1030,27 @@ Two deliberate limits: **sub-agents never see the mission** (only the lead agent
 their `mission_update` calls are inert), and **a mission inherits your session autonomy** —
 nothing about a mission softens a permission gate, budget, or the sandbox.
 
+### Swarm missions (`/swarm`)
+
+`/swarm <text>` uses the same exploration, written-plan, and approval flow as `/goal`, then
+instructs the lead to execute independent tasks through the native `swarm` tool. `/swarm` and
+`/swarm clear` provide the same status and clear controls. A swarm supports at most 16 tasks in
+a wave and uses the session's `subagentConcurrency` ceiling; the tool's optional `concurrency`
+can request a lower width. Workers inherit the active model (or an explicit profile), permissions,
+budgets, and tool gates. Nested swarm fan-out is refused.
+
+Each graph node has a unique ID, prompt, dependencies, and optional `worktree` isolation. All
+ready independent nodes start together. Dependent read-only nodes run automatically after all
+prerequisites complete. A failed or cancelled node blocks its descendants while unrelated branches
+continue. Results retain worker answers and job/artifact references when the agent provides them.
+The lead must inspect and run real checks before integrating results or marking the mission done:
+agent success is not final verification.
+
+**Integration rule:** dependent implementation work is returned as `blocked` until the lead
+verifies and integrates predecessor artifacts, then submits a new wave. This avoids launching a
+dependent from a stale worktree. Independent implementation work may run in parallel.
+Parallel work is not useful for every goal; tightly coupled tasks should use `/goal` instead.
+
 ---
 
 ## Code intelligence (LSP + diagnostics)

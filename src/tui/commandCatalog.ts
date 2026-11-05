@@ -41,6 +41,7 @@ export const TERMINAL_COMMANDS: readonly TerminalCommand[] = [
   { name: '/clear', desc: 'Clear the screen and reset the conversation', renderers: both('clear') },
   { name: '/new', desc: 'Start a fresh conversation (alias for /clear)', dispatch: '/clear', renderers: both('clear') },
   { name: '/goal', desc: 'Start a mission: plan, tasks, then verify', renderers: both('goal') },
+  { name: '/swarm', desc: 'Mission with bounded parallel agents', renderers: both('swarm') },
   { name: '/model', desc: 'Manage or test models; dated capability history in Snowfall', renderers: both('model') },
   { name: '/table', desc: 'Open collaboration (Snowfall presets; legacy Ink roundtable)', renderers: both('table') },
   { name: '/provider', desc: 'Show active provider, endpoint, auth status, and model presets', renderers: both('provider') },

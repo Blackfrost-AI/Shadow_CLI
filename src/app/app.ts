@@ -2416,7 +2416,8 @@ export class ShadowApp {
         } else if (this.opts.workCenter) this.openWorkBrowser(true);
         else this.printTasks();
         return;
-      case '/goal': {
+      case '/goal':
+      case '/swarm': {
         // Mission mode (8.4), ported from slash.ts: /goal <text> starts a REAL mission — plan
         // mode engages, a kickoff turn runs, and the harness pins the mission in front of the
         // model every turn until done/failed or /goal clear. No arg = status, 'clear' = end.
@@ -2448,11 +2449,12 @@ export class ShadowApp {
           });
           return;
         }
-        this.mission = this.opts.mission.begin(arg);
+        const swarm = name === '/swarm';
+        this.mission = this.opts.mission.begin(arg, swarm ? 'swarm' : 'goal');
         // Missions start with an approved plan; drive the state object (the bus event updates
         // the HUD, so UI and truth cannot disagree — the /plan lesson).
         this.opts.planMode?.enter();
-        this.pushLine({ text: `Mission started: ${arg}`, color: C.purple });
+        this.pushLine({ text: `${swarm ? 'Swarm' : 'Mission'} started: ${arg}`, color: C.purple });
         this.pushLine({
           text: '  Plan mode on — write the plan (plan_write, include tasks), then exit_plan_mode for approval.',
           dimColor: true,

@@ -504,7 +504,8 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
       showBanner();
       pushLine({ text: 'Cleared — conversation reset. (mission kept — use /goal clear to drop it)', dimColor: true });
       break;
-    case '/goal': {
+    case '/goal':
+    case '/swarm': {
       // Mission mode (8.4): /goal <text> starts a REAL mission — plan mode engages, a
       // kickoff turn runs, and the harness pins the mission + tasks in front of the model
       // every turn until done/failed or /goal clear. No arg = status, 'clear' = end.
@@ -533,12 +534,13 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
           });
           break;
         }
-        opts.mission.begin(arg);
+        const swarm = dispatch === '/swarm';
+        opts.mission.begin(arg, swarm ? 'swarm' : 'goal');
         // Enter plan mode with it: missions start with an approved plan (the plan's tasks
         // become the mission list on approval). Drive the state object — the bus event
         // updates the HUD, so UI and truth cannot disagree (the /plan lesson).
         opts.planMode?.enter();
-        pushLine({ text: `Mission started: ${arg}`, color: C.purple });
+        pushLine({ text: `${swarm ? 'Swarm' : 'Mission'} started: ${arg}`, color: C.purple });
         pushLine({ text: 'Plan mode on — write the plan (plan_write, include tasks), then exit_plan_mode for approval.', dimColor: true });
         const kickoff = `[mission] ${arg}\nBegin the planning phase: explore as needed, write the plan with plan_write (include a tasks array), then call exit_plan_mode for approval.`;
         if (runningRef.current) {
