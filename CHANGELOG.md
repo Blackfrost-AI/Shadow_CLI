@@ -7,6 +7,13 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [11.1.3] — 2026-11-05
+
+### Changed
+- **Long-range sub-agent iteration defaults.** Reviewers and workers now default to 100 loop
+  iterations instead of 15. Explicit and profile limits remain clamped to the parent's ceiling;
+  unlimited parents retain a 1000-iteration hard cap and 30-minute wall-clock backstop.
+
 ## [11.1.2] — 2026-11-05
 
 ### Added

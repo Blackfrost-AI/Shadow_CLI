@@ -1030,6 +1030,15 @@ Two deliberate limits: **sub-agents never see the mission** (only the lead agent
 their `mission_update` calls are inert), and **a mission inherits your session autonomy** —
 nothing about a mission softens a permission gate, budget, or the sandbox.
 
+### Long-range sub-agents
+
+Sub-agents inherit the parent's tool permissions and cannot widen them. Their default ceiling is
+**100 loop iterations** (or the parent's ceiling if lower), sized for long-range agentic models.
+Adjust it with the `agent` tool's `max_iterations` argument, a profile in
+`.shadow/agents/<name>.md`, or the `maxIterations` setting; a child never exceeds its parent's
+ceiling. With an unlimited parent (`maxIterations: 0`), sub-agents retain a **1000-iteration**
+hard cap and a 30-minute wall-clock backstop rather than running without bounds.
+
 ### Swarm missions (`/swarm`)
 
 `/swarm <text>` uses the same exploration, written-plan, and approval flow as `/goal`, then

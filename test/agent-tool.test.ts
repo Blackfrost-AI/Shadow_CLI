@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync, execSync } from 'node:child_process';
-import { makeAgentTool, resolveSubagentIterations, SUBAGENT_ITERATION_HARD_CAP } from '../src/tools/agentTool.js';
+import { makeAgentTool, resolveSubagentIterations } from '../src/tools/agentTool.js';
 import { formatTaskNotification } from '../src/agent/busListeners.js';
 import { Budget } from '../src/agent/budget.js';
 import { Context } from '../src/agent/context.js';
@@ -873,21 +873,24 @@ test('subagent listeners are released after sync success, failure, throw, and qu
   } finally { release(); await first; h.close(); }
 });
 
-test('sub-agent iteration ceiling: default 15, raisable on request, never past the parent ceiling', () => {
-  assert.equal(resolveSubagentIterations(50), 15, 'default stays 15');
+test('sub-agent iteration ceiling: long-range default, parent clamping, and bounded unlimited parents', () => {
+  assert.equal(resolveSubagentIterations(50), 50, 'default uses the available parent allowance');
+  assert.equal(resolveSubagentIterations(200), 100, 'default is 100 for long-range parents');
   assert.equal(resolveSubagentIterations(8), 8, 'default never exceeds the parent');
-  assert.equal(resolveSubagentIterations(0), 15, 'unlimited parent still gets a backstop');
+  assert.equal(resolveSubagentIterations(0), 100, 'unlimited parent still gets a backstop');
   assert.equal(resolveSubagentIterations(50, 30), 30, 'agent definition value applies');
+  assert.equal(resolveSubagentIterations(200, 100), 100, 'agent definition applies');
+  assert.equal(resolveSubagentIterations(0, 1000), 1000, 'unlimited parent permits long-range custom work up to the hard cap');
   assert.equal(resolveSubagentIterations(20, 500), 20, 'agent definition is bounded by the parent');
-  assert.equal(resolveSubagentIterations(0, 500), SUBAGENT_ITERATION_HARD_CAP, 'agent definition is bounded by the hard cap for an unlimited parent');
+  assert.equal(resolveSubagentIterations(0, 500), 500, 'custom definition stays within the hard cap for an unlimited parent');
   assert.equal(resolveSubagentIterations(50, undefined, 40), 40, 'explicit request raises the ceiling');
   assert.equal(resolveSubagentIterations(50, 10, 40), 40, 'explicit request overrides the definition');
   assert.equal(resolveSubagentIterations(20, undefined, 500), 20, 'request is bounded by the parent');
-  assert.equal(resolveSubagentIterations(0, undefined, 500), SUBAGENT_ITERATION_HARD_CAP, 'unlimited parent: hard cap');
+  assert.equal(resolveSubagentIterations(0, undefined, 500), 500, 'explicit request remains within the unlimited-parent hard cap');
   assert.equal(resolveSubagentIterations(50, undefined, 2.7), 2, 'fractional request floors');
 });
 
-test('agent tool honours max_iterations: sub-agent runs past the default 15 when asked', async () => {
+test('agent tool honours max_iterations: sub-agent runs past the default 100 when asked', async () => {
   const script: ProviderEvent[][] = [];
   for (let n = 1; n <= 17; n++) {
     script.push([{ type: 'tool_call', call: { id: `c${n}`, name: 'glob', input: { pattern: `nothing-${n}-*.zz` } } } as ProviderEvent, { type: 'done', stopReason: 'tool_use' } as ProviderEvent]);

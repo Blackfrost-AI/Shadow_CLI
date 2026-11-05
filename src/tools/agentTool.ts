@@ -23,13 +23,13 @@ import type { ResolvedModelProfile } from '../agent/modelProfiles.js';
 import { checksForRegistry } from '../checks/registry.js';
 
 /** Upper bound for a requested sub-agent ceiling when the parent itself runs unlimited (maxIterations 0). */
-export const SUBAGENT_ITERATION_HARD_CAP = 100;
-const SUBAGENT_DEFAULT_ITERATIONS = 15;
+export const SUBAGENT_ITERATION_HARD_CAP = 1000;
+const SUBAGENT_DEFAULT_ITERATIONS = 100;
 
 /**
  * Resolve a sub-agent's iteration ceiling. A sub-agent always keeps at least one working backstop
  * (never 0 = unlimited). Precedence: an explicit `max_iterations` request, then the agent
- * definition's own value, then min(parent, 15). A request may raise the default but never exceeds
+ * definition's own value, then min(parent, 100). A request may raise the default but never exceeds
  * the parent's ceiling — or SUBAGENT_ITERATION_HARD_CAP when the parent is unlimited — so a model
  * cannot use delegation to escape the operator's iteration limit.
  */
@@ -53,7 +53,7 @@ const inputSchema = z.object({
   run_in_background: z.boolean().optional(),
   priority: z.enum(['low', 'normal', 'high']).optional().describe('Queue priority for background work.'),
   max_iterations: z.number().int().positive().optional().describe(
-    `Iteration ceiling for this sub-agent (default 15). Raise it for deep reviews or large sweeps; bounded by the parent's own ceiling (or ${SUBAGENT_ITERATION_HARD_CAP} when the parent is unlimited).`,
+    `Iteration ceiling for this sub-agent (default ${SUBAGENT_DEFAULT_ITERATIONS}). Adjust it for the task; bounded by the parent's own ceiling (or ${SUBAGENT_ITERATION_HARD_CAP} when the parent is unlimited).`,
   ),
 });
 

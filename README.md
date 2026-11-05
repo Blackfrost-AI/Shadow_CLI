@@ -1,6 +1,6 @@
 # Shadow CLI
 
-Current build: **`v11.1.2`** — `/swarm` adds dependency-aware parallel native-agent execution to approved `/goal` missions, within existing permissions, budgets, and concurrency controls.
+Current build: **`v11.1.3`** — reviewers and workers now support long-range agentic work with a 100-iteration default, parent-bounded overrides, and a 1000-iteration cap for unlimited parents.
 
 Shadow is a local-first, provider-neutral security engineering agent. Its built-in Security
 foundation covers investigation, hardening, incident response, defensive automation, secure coding,
