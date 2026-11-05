@@ -7,6 +7,14 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [11.1.4] — 2026-11-05
+
+### Changed
+- **Transcript detail launches expanded.** Both renderers now start with tool output and reasoning
+  bodies unfolded instead of compacted, so a fresh session shows its work without a keypress.
+  **Ctrl-O** remains the toggle and now folds the transcript in on first press; `/activity` still
+  retains tool output.
+
 ## [11.1.3] — 2026-11-05
 
 ### Changed

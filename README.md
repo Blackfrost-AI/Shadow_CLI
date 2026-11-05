@@ -1,6 +1,6 @@
 # Shadow CLI
 
-Current build: **`v11.1.3`** — reviewers and workers now support long-range agentic work with a 100-iteration default, parent-bounded overrides, and a 1000-iteration cap for unlimited parents.
+Current build: **`v11.1.4`** — the transcript launches expanded, showing tool output and reasoning bodies on start; Ctrl-O folds it back in.
 
 Shadow is a local-first, provider-neutral security engineering agent. Its built-in Security
 foundation covers investigation, hardening, incident response, defensive automation, secure coding,

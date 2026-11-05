@@ -73,8 +73,8 @@ Pickers support arrow keys, numbered choices followed by Enter, and / to search.
 a search first, then closes the overlay. Active work is interrupted once the overlay is closed.
 Elapsed time changes from seconds to minutes and hours. `/effort` shows a selectable list.
 Thinking shows a bounded preview while streaming, then collapses to one summary line when the
-answer or tool starts. Ctrl+O expands transcript detail, including completed thinking and grep
-matches; /activity also retains tool output. Empty reasoning creates no block.
+answer or tool starts. Transcript detail launches expanded; Ctrl+O collapses or re-expands it,
+including completed thinking and grep matches; /activity also retains tool output. Empty reasoning creates no block.
 
 While the agent works, Enter submits a follow-up at the next safe boundary. Model streaming
 stops immediately; already-running tools finish before the follow-up starts, and tool calls

@@ -442,7 +442,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const reducedMotion = opts.cfg.reducedMotion || process.env.SHADOW_REDUCED_MOTION === '1';
   const [committed, setCommitted] = useState<TranscriptItem[]>([]);
   // (No live-banner state: the welcome card commits to <Static> once at startup — see showBanner.)
-  const [showAllExpanded, setShowAllExpanded] = useState(false); // legacy restored body folds
+  const [showAllExpanded, setShowAllExpanded] = useState(true); // transcript detail starts unfolded; Ctrl+O folds
   /** Answer-table folds are independent of activity inspection. */
   const [expandedIds, setExpandedIds] = useState<Set<number>>(() => new Set());
   const [stream, setStream] = useState('');

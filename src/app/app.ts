@@ -296,7 +296,7 @@ export class ShadowApp {
   private brandCommitted = false;
 
   private queued: string[] = [];
-  private showAllExpanded = false;
+  private showAllExpanded = true;
   private dialog: PendingDialog | null = null;
   private dialogHandle: OverlayHandle | null = null;
   private selectionState: Record<number, string[]> = {};

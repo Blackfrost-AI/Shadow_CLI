@@ -704,7 +704,8 @@ or endpoint you selected just like other prompts and tool results.
   session. Only a one-line **index** of stored facts rides in the system prompt; the agent recalls
   a key's full value on demand. The store lives at `.shadow/memory.json` — inspect or hand-edit it
   there, and never put secrets in it.
-- **Transcript navigation**: **Ctrl-O** opens or toggles activity detail in both terminals. In Ink,
+- **Transcript navigation**: transcript detail launches expanded; **Ctrl-O** toggles it, folding tool
+  output and reasoning bodies in on first press, in both terminals. In Ink,
   **PageUp/PageDown** navigate the transcript and optional mouse handling is enabled with
   `"mouse": true` or `SHADOW_MOUSE=1`. In Snowfall, PageUp/PageDown and the wheel scroll the transcript. Home/End jump
   to its start/latest output; Ctrl+Up/Down jump between prompts; Ctrl+Shift+F searches.
