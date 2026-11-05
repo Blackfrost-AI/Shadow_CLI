@@ -10,13 +10,13 @@ const task = (id: string, dependsOn: string[] = [], isolation: 'none' | 'worktre
 });
 
 test('DAG validation rejects unknown dependencies and cycles', () => {
-  assert.match(validateSwarmTasks([task('a', ['missing'])]), /unknown dependency/i);
-  assert.match(validateSwarmTasks([task('a', ['b']), task('b', ['a'])]), /cycle/i);
+  assert.match(validateSwarmTasks([task('a', ['missing'])]) ?? '', /unknown dependency/i);
+  assert.match(validateSwarmTasks([task('a', ['b']), task('b', ['a'])]) ?? '', /cycle/i);
 });
 
 test('DAG validation rejects nested fan-out and excessive width', () => {
-  assert.match(validateSwarmTasks([{ ...task('a'), maxAgents: 4 } as SwarmTask]), /nested|maxAgents/i);
-  assert.match(validateSwarmTasks(Array.from({ length: 17 }, (_, i) => task(`s-${i}`))), /16/);
+  assert.match(validateSwarmTasks([{ ...task('a'), maxAgents: 4 } as SwarmTask]) ?? '', /nested|maxAgents/i);
+  assert.match(validateSwarmTasks(Array.from({ length: 17 }, (_, i) => task(`s-${i}`))) ?? '', /16/);
 });
 
 test('all independent ready tasks start together within the caller limit', async () => {

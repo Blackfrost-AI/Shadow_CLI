@@ -1,6 +1,6 @@
 # Shadow CLI
 
-Current build: **`v11.1.1`** — Playwright browser automation now pins `@playwright/mcp@0.0.84` with Chromium's sandbox enabled; the v11.1.0 terminal improvements remain.
+Current build: **`v11.1.2`** — `/swarm` adds dependency-aware parallel native-agent execution to approved `/goal` missions, within existing permissions, budgets, and concurrency controls.
 
 Shadow is a local-first, provider-neutral security engineering agent. Its built-in Security
 foundation covers investigation, hardening, incident response, defensive automation, secure coding,
@@ -13,7 +13,7 @@ prompt navigation, a compact session footer, and a pinned composer. Start this c
 `npm start` after building. Use `/theme snowfall` for the ice palette; saved themes remain active.
 `SHADOW_TUI=ink npm start` retains the compatibility renderer. The
 [terminal contract](docs/TERMINAL_RENDERERS.md) lists commands, keys and migration decisions.
-See the [11.1.1 release notes](https://github.com/Blackfrost-AI/Shadow_CLI/releases/tag/v11.1.1)
+See the [11.1.2 release notes](https://github.com/Blackfrost-AI/Shadow_CLI/releases/tag/v11.1.2)
 for the published release.
 
 Shadow names conversations from their opening prompt and shows the active name in the
