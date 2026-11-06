@@ -29,7 +29,7 @@ merges). This file records the m-14 evidence; it is updated as each gate runs.
 | Build (`npm run build`) | **PASS** — exit 0, dist/ fresh |
 | Release gate (`check:release-gate`) | **PASS** — all 6 checks OK |
 | Compatibility check (AC wire shapes, config schema) | **PASS** — additive-only (see findings F4) |
-| Security review of integrated diff | **COMPLETE — all 3 reviews reported.** R1 (DAP/relay/SSH): 5 vulns fixed (a25fbc4). R2 (RPC/journal): 2 vulns fixed. R3 (edits/advisors/commits): 3 vulns fixed. Total **10 confirmed vulnerabilities, all fixed with regression tests**; 24 weaknesses recorded in `plans/m14-security-followups.md` (R1:12, R2:6, R3:6) |
+| Security review of integrated diff | **COMPLETE — all 3 reviews reported.** R1 (DAP/relay/SSH): 5 vulns fixed (a25fbc4). R2 (RPC/journal): 2 vulns fixed (baea645). R3 (edits/advisors/commits): 3 vulns fixed (baea645). Total **10 confirmed vulnerabilities, all fixed with regression tests**; 24 weaknesses recorded in `plans/m14-security-followups.md` (R1:12, R2:6, R3:6) |
 
 ## Lint recovery record (13 findings → 0)
 
@@ -184,9 +184,55 @@ stdout/stderr wire discipline), `test/tui-composer-keys.test.ts` +
 `scripts/smoke-release.mjs` is a CI-only signed-artifact installer smoke test
 (requires disposable CI runners) — out of local scope by design.
 
+### F8 — Adversarial security review R2 (ACP RPC / approval binding / mutation journal) — COMPLETE
+
+Verdict: **2 confirmed vulnerabilities, 6 weaknesses, 10 notes.** Both fixed in
+commit baea645 with regression tests:
+
+1. Approval seal never rode the wire — the anti-spoofing control was inert;
+   every real-editor approval failed closed to total-deny (the only test that
+   passed fabricated an echo no real editor produces). Fixed: cli.ts sends
+   `{ ...params, _meta: { approvalDigest } }` after sealing; the editor can
+   now echo what it actually received. New test:
+   `test/m14-security-acp-wire.test.ts` (non-echoing editor fails closed;
+   echoing editor authorizes; digest mismatch refused; replay refused).
+2. `session/close` during a lazy build wedged the in-flight `session/prompt`
+   forever — repeatable to a permanent connection-wide backpressure DoS.
+   Fixed: `drive()` emits a terminal frame on the closed return, mirroring the
+   queued path. New tests in `test/web-registry.test.ts`.
+
+Also fixed under R3's third finding (see F9): the journal's `bindPreview`
+byte-exact re-encode check lives in `src/tools/mutation.ts`.
+
+### F9 — Adversarial security review R3 (edits / advisors / commit proposals) — COMPLETE
+
+Verdict: **3 confirmed vulnerabilities, 6 weaknesses, 8 notes.** All three fixed
+in commit baea645 with regression tests:
+
+1. Untrusted price-table injection disarmed every cost cap — project files
+   could zero `priceTable`/`budget` and zod accepted 0/negative prices.
+   Fixed: `priceTable` + `budget` added to `PROJECT_UNTRUSTED_KEYS`; every
+   `ModelPriceSchema` field requires `.positive()`. Consequence test note:
+   the old prototype-pollution test used `budget.maxCostUSD` as its
+   legit-sibling carrier and now asserts the STRIP (re-scoped to `stream`,
+   which remains project-mergeable). New tests:
+   `test/m14-security-config.test.ts`.
+2. Provider-reported usage trusted without non-negativity — a hostile endpoint
+   returned negative usage and erased accrued spend, unbounding retries.
+   Fixed: `Budget.recordUsage` rejects non-finite/negative components before
+   accruing. New tests: `test/m14-security-budget.test.ts`.
+3. astEdits byte-preservation failed on non-UTF-8-representable files — the
+   journal compared lossy text views, so preserved regions could be silently
+   destroyed. Fixed: `bindPreview` requires byte-exact re-encode
+   (`Buffer.from(file.before,'utf8').equals(actualBytes)`) instead of
+   comparing decoded views. New tests in `test/mutation.test.ts`.
+
 ### Post-fix gate status (final)
 
-typecheck:all **0 errors**; lint **0 findings**; full suite **4012/4012**;
+typecheck:all **0 errors**; lint **0 findings**; full suite **4025/4025**;
 modified-surface tests **111/111**; build **exit 0**; release gate **all 6
-checks OK**; compatibility **additive-only verified**. Security review in
-progress.
+checks OK**; compatibility **additive-only verified**. Security reviews
+**complete (3/3)**: 10 confirmed vulnerabilities fixed across R1–R3, each with
+a regression test; 24 weaknesses recorded for follow-up in
+`plans/m14-security-followups.md`. No unfixed confirmed vulnerability remains
+in the integrated diff.
