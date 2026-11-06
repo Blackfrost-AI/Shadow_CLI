@@ -27,6 +27,20 @@ export interface RunResult {
   /** Auto-compaction events fired during the run — proves the compaction task actually
    *  summarized context, not merely produced the right number. */
   compactions: number;
+  /** Total THIS-request cache reads across every turn (sum of per-request fields, NOT the
+   *  cumulative lead-loop snapshot). Providers report per-turn; summing them counts each
+   * request exactly once. */
+  cacheReadTokens: number;
+  /** Total THIS-request cache writes across every turn (same per-request sum). */
+  cacheWriteTokens: number;
+  /** Total raw per-request input tokens, summed across turns (per-request field). */
+  iterInputTokens: number;
+  /** Total raw per-request output tokens, summed across turns (per-request field). */
+  iterOutputTokens: number;
+  /** One-shot TOTAL spend of every finished sub-agent, summed from subagent_usage events. */
+  subagentInputTokens: number;
+  subagentOutputTokens: number;
+  subagentCostUSD: number;
 }
 
 export interface CheckResult {

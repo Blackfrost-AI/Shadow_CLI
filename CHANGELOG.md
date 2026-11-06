@@ -7,6 +7,41 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [11.3.1] — 2026-11-06
+
+The eval-integrity release: the harness-capability eval scoreboard now fails closed,
+counts real usage, and exercises real harness machinery in mock runs — turning it from
+a misleading 2/20-false-green signal into a measured instrument. Validated live against
+a local reasoning model (20-task fixture set): the scoreboard surfaced launch-poisoning,
+abnormal stops, and refusal, and measured whole-run prefix-cache savings (62.5%).
+
+### Fixed
+- **Eval exit-code semantics** (`eval/telemetry.ts`): only `end_turn`/`refusal`/`pause_turn`
+  are clean stops. `provider_error`, `max_iterations`, `budget`, `interrupted`,
+  `fatal_tool_error`, `spawn_error`, and wall-clock timeouts now fail the run with
+  `process.exitCode=1`. Previously a run whose tasks never reached a legitimate terminal
+  state could exit 0 (false green).
+- **Eval usage accounting** (`eval/telemetry.ts`): per-request `cacheRead`/`cacheWrite`
+  and one-shot `subagent_usage` totals are summed exactly once; the latest cumulative
+  lead-loop snapshot is retained without double-counting. Scorecards now print cache and
+  subagent token/cost splits per task and per run.
+- **Task-aware scripted mock provider** (`src/provider/mockScripts.ts`, opt-in via
+  `SHADOW_MOCK_SCRIPT=1`): per-task turn scripts covering all 20 fixtures — including
+  `tool_search` → deferred security-tool promotion — so mock runs exercise real plumbing
+  end-to-end instead of bypassing it. Existing dialect/recovery/demo mocks unchanged.
+- **Mock eval routing** (`src/provider/index.ts`, `eval/harness-eval.ts`): mock models
+  now route to the scripted provider so per-task coverage is real; the dialect override
+  no longer clobbers the script mock for mock models.
+
+### Added
+- **Scorecard stop-health and accounting columns**: per-task `stopOK`, abnormal-stop
+  counts, cache token breakdown, and subagent token/cost breakdown. `eval/README.md`
+  rewritten with the full 20-task table and explicit mock-expectation semantics (mock
+  success validates plumbing only, never model capability).
+- **Unit tests** (`test/eval.test.ts`): stop-health classification for every abnormal
+  stop reason; usage accounting latest-wins vs summed-field behavior from synthetic
+  session logs.
+
 ## [11.3.0] — 2026-11-06
 
 The daily-workflow-upgrade release: ten major capability surfaces, hardened by

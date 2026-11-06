@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { SessionLog } from '../src/state/session.js';
 import { TASKS, DIALECT_TASKS } from './tasks.js';
 import { SECURITY_TASKS } from './security-tasks.js';
+import { isCleanStop, parseSessionEvents } from './telemetry.js';
 import type { EvalTask, ModelCfg, RunResult } from './types.js';
 
 const SRC_INDEX = fileURLToPath(new URL('../src/index.ts', import.meta.url));
@@ -69,9 +70,8 @@ function loadModels(args: Args): ModelCfg[] {
   }));
 }
 
-/** Aggregate the redacted session log the run wrote. The log is relocated OUT of the graded
- *  workspace (SHADOW_SESSION_DIR) so a model's own `grep -r` / `find` can't match it. */
-function parseTelemetry(sessionParent: string): Omit<RunResult, 'exitCode' | 'timedOut' | 'wallMs' | 'stdout' | 'stderr'> {
+/** Load the relocated session log and fold it through the testable aggregator. */
+function parseTelemetry(sessionParent: string) {
   const dir = join(sessionParent, 'sessions');
   let paths: string[] = [];
   try {
@@ -83,38 +83,7 @@ function parseTelemetry(sessionParent: string): Omit<RunResult, 'exitCode' | 'ti
     /* no session log written */
   }
   const events = (paths.length ? SessionLog.load(paths[0]!) : []) as Record<string, unknown>[];
-  const t = { toolCalls: [] as { name: string; ok: boolean; input?: unknown }[], badJson: 0, errors: 0, iterations: 0, stopReason: '', inputTokens: 0, outputTokens: 0, compactions: 0 };
-  for (const e of events) {
-    switch (e.type) {
-      case 'tool_end': {
-        const call = e.call as { name?: string; input?: unknown } | undefined;
-        const result = e.result as { ok?: boolean } | undefined;
-        // Carry the ARGUMENTS through, not just the name. A task that needs to assert on what a
-        // tool was asked to do (e.g. "did the model enable network egress?") cannot recover that
-        // from {name, ok} alone, and reconstructing it from prose would be guessing.
-        t.toolCalls.push({ name: call?.name ?? '?', ok: !!result?.ok, input: call?.input });
-        break;
-      }
-      case 'error':
-        t.errors++;
-        if (String(e.message ?? '').includes('bad_tool_json')) t.badJson++;
-        break;
-      case 'assistant_done':
-        t.iterations++;
-        break;
-      case 'compaction':
-        t.compactions++;
-        break;
-      case 'usage':
-        t.inputTokens = (e.inputTokens as number) ?? t.inputTokens;
-        t.outputTokens = (e.outputTokens as number) ?? t.outputTokens;
-        break;
-      case 'stop':
-        t.stopReason = (e.reason as string) ?? t.stopReason;
-        break;
-    }
-  }
-  return t;
+  return parseSessionEvents(events);
 }
 
 function runShadow(task: EvalTask, ws: string, model: ModelCfg, maxWallSec: number): Promise<RunResult> {
@@ -138,7 +107,14 @@ function runShadow(task: EvalTask, ws: string, model: ModelCfg, maxWallSec: numb
   // Credentials go via ENV so shadow's needsOnboarding() check is satisfied (it
   // reads env/credentials, not the --base-url flag). Ollama ignores the key.
   const env: NodeJS.ProcessEnv = { ...process.env };
-  if (task.capability === 'dialect') env.SHADOW_MOCK_DIALECT = '1';
+  // Task-aware scripted mock: for mock models, EVERY fixture (dialect included) runs
+  // against the per-task script provider, so a mock eval is a real plumbing
+  // regression signal — tool calls actually happen and every task must stop cleanly.
+  if (model.mock) {
+    env.SHADOW_MOCK_SCRIPT = '1';
+  } else if (task.capability === 'dialect') {
+    env.SHADOW_MOCK_DIALECT = '1';
+  }
   if (!model.mock) {
     const key = model.apiKey ?? 'shadow-eval-local';
     if ((model.provider ?? 'openai') === 'anthropic') {
@@ -189,12 +165,27 @@ function runShadow(task: EvalTask, ws: string, model: ModelCfg, maxWallSec: numb
       } else {
         process.stderr.write(`[eval] session kept: ${sessionParent}\n`);
       }
-      resolve({ exitCode: code ?? -1, timedOut, wallMs: Date.now() - startedAt, stdout, stderr, ...telemetry });
+      resolve({
+        exitCode: code ?? -1,
+        timedOut,
+        wallMs: Date.now() - startedAt,
+        stdout,
+        stderr,
+        ...telemetry,
+      });
     });
     child.on('error', (err) => {
       clearTimeout(killer);
       try { rmSync(sessionParent, { recursive: true, force: true }); } catch { /* best-effort */ }
-      resolve({ exitCode: -1, timedOut, wallMs: Date.now() - startedAt, stdout, stderr: stderr + String(err), toolCalls: [], badJson: 0, errors: 1, iterations: 0, stopReason: 'spawn_error', inputTokens: 0, outputTokens: 0, compactions: 0 });
+      resolve({
+        exitCode: -1,
+        timedOut,
+        wallMs: Date.now() - startedAt,
+        stdout,
+        stderr: stderr + String(err),
+        ...parseSessionEvents([]),
+        stopReason: 'spawn_error',
+      });
     });
   });
 }
@@ -202,26 +193,40 @@ function runShadow(task: EvalTask, ws: string, model: ModelCfg, maxWallSec: numb
 interface Row {
   task: EvalTask;
   run: RunResult;
+  /** Fixture end-state verdict only. */
+  fixturePass: boolean;
+  /** True only when the loop also reached a legitimate terminal state. */
+  cleanStop: boolean;
+  /** The row passes only if BOTH the fixture passed and the stop was clean. */
   pass: boolean;
   detail: string;
 }
 
 function scorecard(model: ModelCfg, rows: Row[]): string {
   const passed = rows.filter((r) => r.pass).length;
+  const abnormalStops = rows.filter((r) => !r.cleanStop).length;
   const totalCalls = rows.reduce((n, r) => n + r.run.toolCalls.length, 0);
   const totalBad = rows.reduce((n, r) => n + r.run.badJson, 0);
   const validity = totalCalls + totalBad > 0 ? Math.round((totalCalls / (totalCalls + totalBad)) * 100) : null;
   const tokens = rows.reduce((n, r) => n + r.run.inputTokens + r.run.outputTokens, 0);
+  const cacheRead = rows.reduce((n, r) => n + r.run.cacheReadTokens, 0);
+  const cacheWrite = rows.reduce((n, r) => n + r.run.cacheWriteTokens, 0);
+  const subIn = rows.reduce((n, r) => n + r.run.subagentInputTokens, 0);
+  const subOut = rows.reduce((n, r) => n + r.run.subagentOutputTokens, 0);
+  const subCost = rows.reduce((n, r) => n + r.run.subagentCostUSD, 0);
+  const cost = rows.reduce((n, r) => n + r.run.iterInputTokens + r.run.iterOutputTokens, 0);
   const secs = Math.round(rows.reduce((n, r) => n + r.run.wallMs, 0) / 1000);
   const head = `### ${model.label}${model.mock ? '' : ` — ${model.provider}/${model.model}`}\n\n` +
-    `**${passed}/${rows.length} passed** · tool-call JSON validity ${validity === null ? 'n/a' : validity + '%'} · ` +
-    `bad-JSON ${totalBad} · ${tokens.toLocaleString()} tok · ${secs}s\n\n`;
-  const header = '| Task | Capability | Result | tools | badJSON | iters | stop | s | Detail |\n|---|---|---|--:|--:|--:|---|--:|---|\n';
+    `**${passed}/${rows.length} passed** · abnormal stops ${abnormalStops} · tool-call JSON validity ${validity === null ? 'n/a' : validity + '%'} · ` +
+    `bad-JSON ${totalBad} · ${tokens.toLocaleString()} tok (lead-loop) · ${cost.toLocaleString()} tok (per-request incl. cache: ${cacheRead.toLocaleString()} cacheR/${cacheWrite.toLocaleString()} cacheW) · ` +
+    `subagents ${subIn.toLocaleString()}in/${subOut.toLocaleString()}out/$${subCost.toFixed(4)} · ${secs}s\n\n`;
+  const header = '| Task | Capability | Result | stopOK | tools | badJSON | iters | stop | s | Detail |\n|---|---|---|--:|:--:|--:|--:|---|--:|---|\n';
   const body = rows
     .map((r) => {
       const okTools = r.run.toolCalls.filter((t) => t.ok).length;
       const res = r.pass ? '✅ pass' : (r.run.timedOut ? '⏱ timeout' : '❌ fail');
-      return `| ${r.task.id} | ${r.task.capability} | ${res} | ${okTools}/${r.run.toolCalls.length} | ${r.run.badJson} | ${r.run.iterations} | ${r.run.stopReason || '—'} | ${Math.round(r.run.wallMs / 1000)} | ${r.detail.replace(/\|/g, '/').slice(0, 70)} |`;
+      const stopOK = r.cleanStop ? '✅' : '⚠️';
+      return `| ${r.task.id} | ${r.task.capability} | ${res} | ${stopOK} | ${okTools}/${r.run.toolCalls.length} | ${r.run.badJson} | ${r.run.iterations} | ${r.run.stopReason || '—'} | ${Math.round(r.run.wallMs / 1000)} | ${r.detail.replace(/\|/g, '/').slice(0, 70)} |`;
     })
     .join('\n');
   return head + header + body + '\n';
@@ -237,6 +242,7 @@ async function main(): Promise<void> {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const sections: string[] = [`# Shadow harness-capability eval — ${stamp}\n`];
   process.stdout.write(sections[0]! + '\n');
+  const allRows: Row[] = [];
 
   for (const model of models) {
     process.stdout.write(`\n▶ ${model.label} (${model.mock ? 'mock' : `${model.provider}/${model.model}`})\n`);
@@ -246,9 +252,13 @@ async function main(): Promise<void> {
       try {
         task.setup(ws);
         const run = await runShadow(task, ws, model, args.maxWallSec);
-        const { pass, detail } = task.check(ws, run);
-        rows.push({ task, run, pass, detail });
-        process.stdout.write(`  ${pass ? '✅' : run.timedOut ? '⏱' : '❌'} ${task.id.padEnd(18)} ${detail}\n`);
+        const { pass: fixturePass, detail } = task.check(ws, run);
+        const cleanStop = isCleanStop(run);
+        const pass = fixturePass && cleanStop;
+        rows.push({ task, run, fixturePass, cleanStop, pass, detail });
+        allRows.push(rows[rows.length - 1]!);
+        const flag = pass ? '✅' : fixturePass && !cleanStop ? '⚠️' : run.timedOut ? '⏱' : '❌';
+        process.stdout.write(`  ${flag} ${task.id.padEnd(18)} ${detail}\n`);
       } finally {
         if (!args.keep) rmSync(ws, { recursive: true, force: true });
       }
@@ -262,6 +272,16 @@ async function main(): Promise<void> {
   writeFileSync(outPath, report, 'utf8');
   process.stdout.write(`\n${'─'.repeat(60)}\n${report}\n`);
   process.stdout.write(`\nScorecard written to ${outPath}\n`);
+
+  // FAIL CLOSED: any task whose fixture failed OR whose loop stopped abnormally
+  // (provider_error, max_iterations, budget, interrupted, fatal_tool_error,
+  // spawn_error, wall-clock kill) makes the whole eval run exit nonzero — a green
+  // exit must mean every task passed cleanly, nothing less.
+  const failedTasks = allRows.filter((r) => !r.pass);
+  if (failedTasks.length > 0) {
+    process.stderr.write(`\neval FAILED: ${failedTasks.length} task(s) did not pass cleanly (see scorecard)\n`);
+    process.exitCode = 1;
+  }
 }
 
 main().catch((err) => {

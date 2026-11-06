@@ -1,5 +1,6 @@
 import type { Provider } from './provider.js';
 import { demoMock, dialectMock, errorMock, recoveryMock } from './mock.js';
+import { TaskMockProvider } from './mockScripts.js';
 import { AnthropicProvider } from './anthropic.js';
 import { OpenAIProvider } from './openai.js';
 import { ResponsesProvider, useResponsesWire } from './responses.js';
@@ -109,6 +110,11 @@ export function createProvider(opts: ProviderOptions): Provider {
       if (process.env.SHADOW_MOCK_ERROR === '1') return errorMock();
       if (process.env.SHADOW_MOCK_RECOVERY) return recoveryMock();
       if (process.env.SHADOW_MOCK_DIALECT === '1') return dialectMock();
+      // SHADOW_MOCK_SCRIPT=1 selects the task-aware scripted mock: each eval fixture
+      // prompt maps to a script that drives the REAL tools (incl. tool_search →
+      // deferred security tools) and terminates cleanly. Set by eval/harness-eval.ts
+      // for mock models only; leaves every other mock mode untouched.
+      if (process.env.SHADOW_MOCK_SCRIPT === '1') return new TaskMockProvider();
       return demoMock();
     case 'anthropic':
       return new AnthropicProvider({
