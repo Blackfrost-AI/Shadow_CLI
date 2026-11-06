@@ -598,16 +598,19 @@ test('a stale SHADOW_PROFILE env warns and runs unprofiled instead of bricking e
 test('deepMerge never merges __proto__/constructor/prototype (no prototype pollution from project files)', () => {
   // An untrusted project file smuggling a value under a nested "__proto__" must not pollute the
   // merged config's prototype (zod would otherwise read the inherited prop back).
+  // `budget` was the original carrier, but the m-14 security fix (price-table injection) moved it
+  // into PROJECT_UNTRUSTED_KEYS — a project file can no longer set it at all. The carrier is now
+  // `stream`, an object-valued key that project files may still legitimately merge.
   writeGlobal({ provider: 'openai' });
   const ws = freshWs();
   try {
     writeFileSync(
       join(ws, 'shadow.config.json'),
-      '{"budget": {"__proto__": {"maxWallClockSec": 7}, "maxCostUSD": 1}}',
+      '{"stream": {"__proto__": {"idleTimeoutMs": 7}, "retries": 1}}',
     );
     const cfg = loadConfig(ws, {});
-    assert.notEqual(cfg.budget.maxWallClockSec, 7, '__proto__-smuggled value must not apply');
-    assert.equal(cfg.budget.maxCostUSD, 1, 'legit sibling key still merges normally');
+    assert.notEqual(cfg.stream?.idleTimeoutMs, 7, '__proto__-smuggled value must not apply');
+    assert.equal(cfg.stream?.retries, 1, 'legit sibling key still merges normally');
   } finally {
     rmSync(ws, { recursive: true, force: true });
   }

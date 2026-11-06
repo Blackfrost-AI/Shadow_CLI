@@ -40,6 +40,25 @@ test('approval is bound to exact content and state', () => {
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('apply refuses files whose bytes do not round-trip as UTF-8 (m-14 V3 byte-exact binding)', () => {
+  const root = workspace();
+  try {
+    const journal = createMutationJournal(root);
+    // A legacy file contains a byte that is NOT valid UTF-8 (Latin-1 0xFF).
+    // Whatever decoded it as UTF-8 produced U+FFFD in `before`; both sides of
+    // the text-view comparison hold the same replacement character, so the old
+    // text check alone passed while the write would emit EF BF BD over the
+    // untouched region. The byte-exact re-encode must refuse instead.
+    writeFileSync(join(root, 'src/legacy.ts'), Buffer.from([0x6d, 0x61, 0x69, 0x6e, 0x28, 0x29, 0x20, 0x7b, 0x7d, 0x0a, 0xff]));
+    const corruptedView = readFileSync(join(root, 'src/legacy.ts'), 'utf8');
+    assert.ok(corruptedView.includes('\uFFFD'), 'fixture must contain a non-UTF-8 byte that decodes to U+FFFD');
+    assert.throws(
+      () => journal.prepare([{ path: 'src/legacy.ts', before: corruptedView, after: 'main() { /* fixed */ }\n\uFFFD' }]),
+      /round-trip as UTF-8|precondition/i,
+    );
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('apply refuses wrong digest, then writes and refuses re-apply (no replay)', () => {
   const root = workspace();
   try {

@@ -294,6 +294,20 @@ export function createMutationJournal(workspaceRoot: string, options: MutationJo
     if (actualText !== file.before) {
       throw new MutationError(`Recorded precondition does not match the file: ${file.path}`);
     }
+    // m-14 security fix (review V3): bytes, not text views. Decoding then
+    // re-encoding can be LOSSY — a file containing bytes that are not valid
+    // UTF-8 (e.g. a Latin-1 0xFF in a legacy comment) decodes to U+FFFD on both
+    // sides of the text comparison, so the text view matches while the write
+    // would emit replacement characters over the untouched region. Require a
+    // byte-exact re-encode so non-UTF-8-representable files fail closed instead
+    // of being silently corrupted. This also closes the lone-surrogate variant.
+    if (
+      actualBytes !== null &&
+      file.before !== null &&
+      !Buffer.from(file.before, 'utf8').equals(actualBytes)
+    ) {
+      throw new MutationError(`File bytes do not round-trip as UTF-8 — refusing to mutate: ${file.path}`);
+    }
     const afterBytes = Buffer.from(file.after, 'utf8');
     if (afterBytes.length > MAX_BYTES) throw new MutationError(`Mutation exceeds 1 MiB: ${file.path}`);
     if (actualBytes !== null && actualBytes.length > MAX_BYTES) {

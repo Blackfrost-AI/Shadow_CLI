@@ -151,11 +151,17 @@ export async function runAcp(argv: string[]): Promise<void> {
       try {
         // Seal THIS ask's exact params under the wire id it rides on (onSend fires before the
         // frame is written); the response must echo the seal and authorize() burns it.
-        const result = await peer.request(M_SESSION_REQUEST_PERMISSION, params, {
+        // m-14 security fix (RPC review V1): the digest MUST ride the wire in
+        // _meta.approvalDigest — a spec-compliant editor can only echo what it
+        // actually received. Without this the anti-spoofing control was inert:
+        // the editor never saw the digest, authorize() always failed, and the
+        // approvals capability was a total-deny in production.
+        const sealed: Record<string, unknown> = { ...params };
+        const result = await peer.request(M_SESSION_REQUEST_PERMISSION, sealed, {
           ...(signal ? { signal } : {}),
           onSend: (id) => {
             wireId = String(id);
-            approvalBinding.seal(wireId, params);
+            sealed._meta = { approvalDigest: approvalBinding.seal(wireId, params) };
           },
         });
         const verdict = approvalBinding.authorize(wireId, approvalBinding.echoOf(result), params);

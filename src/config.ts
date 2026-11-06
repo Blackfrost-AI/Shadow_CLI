@@ -59,10 +59,14 @@ export interface ModelCapabilities {
 }
 
 const ModelPriceSchema = z.object({
-  input: z.number(),
-  output: z.number(),
-  cacheReadMult: z.number().optional(),
-  cacheWriteMult: z.number().optional(),
+  // m-14 security fix (review V1): prices must be non-negative — a hostile or
+  // planted price of 0/-1 disarms every cost cap (costUSD accrues 0 or goes
+  // monotonically negative). Zero stays legal for genuinely-free local models;
+  // negative never is.
+  input: z.number().nonnegative(),
+  output: z.number().nonnegative(),
+  cacheReadMult: z.number().nonnegative().optional(),
+  cacheWriteMult: z.number().nonnegative().optional(),
 });
 
 const PermissionRuleSchema = z.object({
@@ -719,7 +723,7 @@ const CONFIG_FILE = 'shadow.config.json';
 // `lastModel` drives an automatic startup selection. Project model entries stay available for an
 // explicit picker action, but a cloned repo cannot plant or replace the remembered global choice.
 // Update discovery is an outbound request: only the user can enable it, not a project file.
-const PROJECT_UNTRUSTED_KEYS = ['connection', 'baseUrl', 'selfHosted', 'shellEnvAllowlist', 'autonomy', 'denylistExtra', 'systemPromptPath', 'sandbox', 'sandboxNetwork', 'sandboxFailurePolicy', 'egress', 'additionalDirectories', 'projects', 'web', 'offline', 'hooks', 'statusLine', 'vision', 'permissionRules', 'diagnostics', 'lsp', 'updateCheck', 'pluginIndexUrl', 'pluginIndexKey', 'profiles', 'harnesses', 'lastModel', 'sessionRetentionDays', 'sessionRetentionKeep', 'advisors'];
+const PROJECT_UNTRUSTED_KEYS = ['connection', 'baseUrl', 'selfHosted', 'shellEnvAllowlist', 'autonomy', 'denylistExtra', 'systemPromptPath', 'sandbox', 'sandboxNetwork', 'sandboxFailurePolicy', 'egress', 'additionalDirectories', 'projects', 'web', 'offline', 'hooks', 'statusLine', 'vision', 'permissionRules', 'diagnostics', 'lsp', 'updateCheck', 'pluginIndexUrl', 'pluginIndexKey', 'profiles', 'harnesses', 'lastModel', 'sessionRetentionDays', 'sessionRetentionKeep', 'advisors', 'priceTable', 'budget'];
 
 /**
  * Layered precedence: CLI flags > env > active profile > project config file (de-fanged) >

@@ -202,6 +202,37 @@ test('close() during a lazy build disposes the result when it eventually resolve
   assert.equal(registry.get(s.id), undefined);
 });
 
+test('close() during a lazy build still unblocks the in-flight prompt — no wedge (m-14 RPC V2)', async () => {
+  let releaseBuild!: () => void;
+  const gate = new Promise<void>((resolve) => (releaseBuild = resolve));
+  const { agent, counts } = makeAgent();
+  const mcp = makeMcp();
+  const { registry } = makeRegistry({
+    builder: async () => {
+      await gate;
+      return { agent, mcp: [mcp.handle], jail: JAIL };
+    },
+  });
+  const s = registry.create({ projectRoot: '/tmp/ws' });
+  // Submit blocks on the build; the session is closed mid-build. The m-14 fix
+  // must settle the in-flight op (terminal frame) instead of wedging it forever
+  // — 64 wedged repeats would permanently exhaust the pending bound (DoS).
+  const submitP = registry.submit(s.id, 'go').catch(() => 'settled');
+  await until(() => registry.get(s.id)?.status === 'initializing');
+
+  assert.equal(await registry.remove(s.id), true);
+  releaseBuild();
+  await until(() => mcp.stopped() === 1);
+  // The wedge fix: the pending submit settles instead of hanging forever:
+  const outcome = (await Promise.race([
+    submitP,
+    new Promise((r) => setTimeout(() => r('WEDGE-HANG'), 3000)),
+  ])) as string;
+  assert.notEqual(outcome, 'WEDGE-HANG', 'the in-flight prompt must settle — no permanent wedge');
+  assert.equal(counts.bgKill, 1, 'late agent background children disposed');
+  assert.equal(registry.get(s.id), undefined);
+});
+
 test('the reserved mirror cannot be prompted, and the reserved id is not client-claimable', async () => {
   const { registry } = makeRegistry();
   registry.attachReserved({ bus: new EventBus(), displayPath: '/tmp/ws', origin: 'mirror' });

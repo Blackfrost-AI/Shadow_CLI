@@ -390,7 +390,15 @@ export function createSessionRegistry(deps: { builder: AgentBuilder; runTurn: Tu
         }
         await s.building;
       }
-      if (s.status === 'closed') return;
+      if (s.status === 'closed') {
+        // m-14 security fix (review V2): returning silently here wedged the in-flight
+        // session/prompt forever — its pending op never settled, liveOps never drained,
+        // and 64 repeats permanently exhausted RPC_PENDING_BOUND (backpressure DoS).
+        // The queued path already emits a terminal frame on the same condition; this
+        // path must too, so the editor unblocks exactly as it does on interrupt.
+        emitInterrupted(s);
+        return;
+      }
       // Interrupted DURING the build: stop here rather than running the turn the user cancelled.
       if (s.abort.signal.aborted) {
         s.status = 'idle';

@@ -23,13 +23,13 @@ merges). This file records the m-14 evidence; it is updated as each gate runs.
 |---|---|
 | Integrated typecheck (`tsc --noEmit`) | **PASS** — 0 errors |
 | Integrated typecheck:all (src+eval+test) | **PASS** — 0 errors after fixing 19 latent errors (see findings) |
-| Full test suite (`npm test`) | **PASS** — 4012/4012 tests, 0 fail, 0 skipped (59.1s; includes build-hygiene lint gate; re-run after all typecheck:all fixes — 2 net-new genuine redaction tests included) |
+| Full test suite (`npm test`) | **PASS — 4025/4025**, 0 fail, 0 skipped (includes 5 new R2/R3 security regression tests + re-scoped proto-pollution test; prior runs: 4016/4016 pre-fix, 3982 with 1 stale-test failure fixed by re-scoping its carrier key per the new `budget` strip) |
 | Lint (eslint whole repo) | **PASS** — 0 findings after correct per-file fixes (see recovery record) |
 | Touched-surface tests | **PASS** — 111/111 (all 6 modified test files incl. new genuine redaction tests) |
 | Build (`npm run build`) | **PASS** — exit 0, dist/ fresh |
 | Release gate (`check:release-gate`) | **PASS** — all 6 checks OK |
 | Compatibility check (AC wire shapes, config schema) | **PASS** — additive-only (see findings F4) |
-| Security review of integrated diff | IN PROGRESS — 2 focused reviewer sub-agents over the 19-file diff |
+| Security review of integrated diff | **COMPLETE — all 3 reviews reported.** R1 (DAP/relay/SSH): 5 vulns fixed (a25fbc4). R2 (RPC/journal): 2 vulns fixed. R3 (edits/advisors/commits): 3 vulns fixed. Total **10 confirmed vulnerabilities, all fixed with regression tests**; 24 weaknesses recorded in `plans/m14-security-followups.md` (R1:12, R2:6, R3:6) |
 
 ## Lint recovery record (13 findings → 0)
 
@@ -147,6 +147,30 @@ operator-facing tool catalog in this upgrade. Per §11's closing rule this is
 recorded explicitly rather than claimed as delivered: **the capabilities are
 verified libraries; wiring them into the interactive tool surface is
 unfinished operator-facing work beyond this upgrade's verified scope.**
+
+### F7 — Adversarial security review (DAP / browser relay / SSH remote) — COMPLETE
+
+Verdict: **5 confirmed vulnerabilities, 12 weaknesses, 8 notes.** All 5
+confirmed vulnerabilities fixed in commit a25fbc4, each with a regression test:
+
+1. redactSourcePath separator bypass — returned the raw absolute path for
+   separator-terminated paths. Fixed: strip trailing separators first;
+   placeholder for separator-only input.
+2. launch() wedge — failed initial breakpoints / refused configurationDone left
+   a live adapter child in state `configuring`. Fixed: close-then-rethrow.
+3. stderrTail leak — raw adapter stderr (absolute home paths as a matter of
+   course) surfaced in summary(). Fixed: redactStderr() masks all
+   path-shaped content then credential redaction.
+4. Relay credential-array masking gap — `set-cookie: [SESSIONID=...]`-shaped
+   values under credential-named keys reached the audit log. Fixed: mask the
+   whole subtree when the key names a credential, whatever its shape.
+5. SSH journal byte-swap — contentB64 never reconciled with the approved
+   contentDigest; same-user payload swap under a valid approval. Fixed:
+   decode() re-derives the digest and rejects mismatch.
+
+The 12 weaknesses are recorded verbatim in `plans/m14-security-followups.md`.
+Gates re-verified after the fixes: full suite **4016/4016**, typecheck:all
+**0 errors**, lint **0 findings**.
 
 ### F6 — CLI/renderer/protocol smoke coverage
 

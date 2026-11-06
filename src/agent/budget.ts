@@ -105,18 +105,31 @@ export class Budget {
     },
     now: number,
   ): void {
-    this.inputTokens += u.inputTokens;
-    this.outputTokens += u.outputTokens;
-    this.cacheReadTokens += u.cacheReadTokens ?? 0;
-    this.cacheWriteTokens += u.cacheWriteTokens ?? 0;
+    // m-14 security fix (review V2): provider-reported usage is UNTRUSTED. A
+    // hostile endpoint returning negative token counts would drive the
+    // accumulators negative so `total >= max` never trips — erasing every cap.
+    // Reject non-finite values; clamp negatives to zero (fail toward more
+    // accrued spend, never less).
+    const clean = (n: unknown): number => {
+      const v = typeof n === 'number' ? n : 0;
+      if (!Number.isFinite(v)) return 0;
+      return v < 0 ? 0 : v;
+    };
+    this.inputTokens += clean(u.inputTokens);
+    this.outputTokens += clean(u.outputTokens);
+    this.cacheReadTokens += clean(u.cacheReadTokens);
+    this.cacheWriteTokens += clean(u.cacheWriteTokens);
 
+    const inTok = clean(u.inputTokens);
+    const outTok = clean(u.outputTokens);
+    const crTok = clean(u.cacheReadTokens);
+    const cwTok = clean(u.cacheWriteTokens);
     const p = this.prices[this.model];
     if (p && u.billing !== 'subscription') {
       const M = 1_000_000;
-      const cacheRead = (u.cacheReadTokens ?? 0) * p.input * (p.cacheReadMult ?? 0.1);
-      const cacheWrite = (u.cacheWriteTokens ?? 0) * p.input * (p.cacheWriteMult ?? 1.25);
-      this.costUSD +=
-        (u.inputTokens * p.input + u.outputTokens * p.output + cacheRead + cacheWrite) / M;
+      const cacheRead = crTok * p.input * (p.cacheReadMult ?? 0.1);
+      const cacheWrite = cwTok * p.input * (p.cacheWriteMult ?? 1.25);
+      this.costUSD += (inTok * p.input + outTok * p.output + cacheRead + cacheWrite) / M;
     }
     void now;
   }
