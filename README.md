@@ -1,6 +1,6 @@
 # Shadow CLI
 
-Current build: **`v11.2.0`** — the transcript launches expanded, showing tool output and reasoning bodies on start; Ctrl-O folds it back in.
+Current build: **`v11.3.0`** — the daily-workflow upgrade: mutation journal, shell escape, LSP edit actions, commit proposals, persistent RPC, crash restore, AST edit previews, DAP debugging, browser relay, SSH remote paths, and bounded advisors.
 
 Shadow is a local-first, provider-neutral security engineering agent. Its built-in Security
 foundation covers investigation, hardening, incident response, defensive automation, secure coding,

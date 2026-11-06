@@ -7,6 +7,70 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [11.3.0] — 2026-11-06
+
+The daily-workflow-upgrade release: ten major capability surfaces, hardened by
+three adversarial security reviews (10 confirmed vulnerabilities fixed, each
+with a regression test). All new surfaces are module-scoped, preview/approval
+bound, and off by default.
+
+### Added
+- **Mutation journal** (`src/tools/mutation.ts`): every approved multi-step
+  edit lands through a journal record — per-file before/after bytes bound from
+  disk, approval digests, single-use locks, drift refusal, and per-file
+  reconcile truth. Interrupted operations are reported, never silently
+  retried.
+- **Shell escape** (`/!`): an explicit operator-only prefix that routes a
+  typed command through the real AgentLoop execution policy — no bypass of the
+  approval gate; injected/model-generated `/!` text is refused.
+- **LSP edit actions:** preview-bound rename, formatting, and edit-only code
+  actions with operation recovery and per-turn diagnostics budgets. The
+  operator approves a rendered preview; the apply path re-renders from stored
+  bytes and refuses on drift.
+- **Commit proposals:** scoped commits that preserve unrelated staged changes,
+  always run Git hooks, bind approvals to the exact (tree, message, paths),
+  refuse drift, and never replay a spent approval.
+- **Persistent versioned ACP RPC** (`src/acp/`): bounded NDJSON framing
+  (1 MiB frames, 64 pending), strict version negotiation, event streaming,
+  approval binding with digest echo on the wire, cancellation that fails closed,
+  and per-method policy gating.
+- **Crash restore:** operator-only rollback/keep/retry decisions over journaled
+  interrupted operations; no side effect is ever repeated, and corrupted
+  records surface as typed errors instead of being silently skipped.
+- **AST edit previews:** deterministic single-match selectors (zero or multiple
+  matches refuse), byte-preserving splices, dual syntax gates (parse +
+  re-parse), journal-only writes.
+- **DAP debugging** (`src/agent/dap/`): protocol, per-launch digest gating,
+  session lifecycle with guaranteed adapter reaping, and bounded inspection.
+  Frame/stderr redaction keeps adapter-supplied paths out of the transcript.
+- **Browser relay** (`src/web/browserRelay.ts`, opt-in): loopback-only
+  transport with DNS-rebinding defense, per-action digest-bound approvals,
+  credential-shape masking in the audit log, and fail-closed token handling.
+- **SSH remote paths** (`src/tools/sshRemote.ts`): pinned host identity
+  (known_hosts materialized only on exact key match), bounded read/write
+  paths, and explicit remote-write approval bound to the transferred bytes.
+- **Advisors** (`src/agent/advisor.ts`, opt-in): bounded advisory providers
+  with visible egress, hard token/cost/wall-clock budgets enforced by a shared
+  budget ledger, and no mutation authority — advice is returned to the model,
+  never applied.
+
+### Security
+- **Project-file price-table injection disarmed:** `priceTable` and `budget`
+  are global-only; every model price must be positive. A cloned repo can no
+  longer zero prices or raise caps to defeat cost ceilings.
+- **Provider-reported usage validated:** non-finite or negative token counts
+  from an endpoint can no longer erase accrued spend or unbound retries.
+- **Approval digests now ride the wire:** the sealed digest is sent in
+  `_meta` so editors can echo it; previously the anti-spoofing control was
+  inert and every real-editor approval failed closed to total deny.
+- **Session-close backpressure DoS closed:** `session/close` during a lazy
+  build now settles the pending prompt instead of wedging it permanently.
+- **Journal byte-binding:** previews are bound against byte-exact re-encode,
+  closing a lossy UTF-8 round-trip that could destroy preserved regions.
+- **DAP frame/stderr redaction enforced; launch cleanup on refused configs;
+  relay credential-array masking; SSH content-digest binding.** (Six further
+  hardening fixes shipped in the R1 review pass.)
+
 ## [11.2.0] — 2026-11-06
 
 ### Added

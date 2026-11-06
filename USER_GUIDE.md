@@ -1107,6 +1107,51 @@ inherited), reading only workspace files; Shadow makes no network request for th
 your user, like any dev tool — `shadow doctor --privacy` lists exactly which servers would spawn
 in the current directory.
 
+## The daily-workflow upgrade (v11.3.0)
+
+Ten new capability surfaces shipped in one release, all module-scoped and off by
+default until you enable them. Each is documented in its own doc:
+
+- **Mutation journal** — every approved multi-step edit lands through a
+  journaled record with per-file byte binding, single-use approval digests, and
+  drift refusal; interrupted operations are reported for operator decision,
+  never silently retried. See [docs/AST_EDITS.md](docs/AST_EDITS.md).
+- **Shell escape (`/!`)** — type `/! <command>` to run a shell command through
+  the same execution policy as the agent (no bypass; injected/model text is
+  refused). Only operator-typed input reaches this path.
+- **LSP edit actions** — preview-bound rename, formatting, and edit-only code
+  actions: you approve a rendered diff, and the apply path re-renders from
+  stored bytes and refuses any drift. See
+  [docs/LSP_EDIT_ACTIONS.md](docs/LSP_EDIT_ACTIONS.md).
+- **Commit proposals** — scoped commits that preserve unrelated staged work,
+  always run hooks, and bind your approval to the exact tree/message/paths. See
+  [docs/COMMIT_PROPOSAL.md](docs/COMMIT_PROPOSAL.md).
+- **Persistent ACP RPC** — versioned, bounded stdio framing for editor
+  integration with approval binding and cancellation that fails closed. See
+  [docs/M7_M8_RPC_RECOVERY.md](docs/M7_M8_RPC_RECOVERY.md).
+- **Crash restore** — after a crash, journaled interrupted operations are
+  presented for explicit rollback/keep/retry; no side effect repeats.
+- **AST edit previews** — deterministic single-match code edits with dual syntax
+  gates and journal-only writes. See [docs/AST_EDITS.md](docs/AST_EDITS.md).
+- **DAP debugging** — gated launch/evaluation with guaranteed adapter cleanup
+  and redacted frames/stderr. See [docs/DAP_DEBUG.md](docs/DAP_DEBUG.md).
+- **Browser relay (opt-in)** — loopback-only authenticated relay with
+  per-action digest-bound approvals and DNS-rebinding defense. See
+  [docs/BROWSER_RELAY.md](docs/BROWSER_RELAY.md).
+- **SSH remote paths** — pinned host identity plus bounded read/write with
+  explicit remote-write approval bound to the transferred bytes. See
+  [docs/SSH_REMOTE.md](docs/SSH_REMOTE.md).
+- **Advisors (opt-in)** — bounded advisory providers with visible egress and
+  hard token/cost/wall-clock budgets; advice is returned to the model, never
+  applied.
+
+**Security posture of this release:** the integrated diff was reviewed by three
+adversarial security passes; 10 confirmed vulnerabilities were fixed before
+release (each with a regression test), and the release additionally disarms
+project-file price-table injection and validates provider-reported usage. The
+24 residual hardening weaknesses are recorded in
+`plans/m14-security-followups.md` for follow-up.
+
 ## Troubleshooting
 
 **Reply is empty or cut off, stop reason `max_tokens`.** The output cap was hit — raise it (see
