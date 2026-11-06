@@ -615,6 +615,33 @@ const ConfigSchema = z.object({
     'gemini-flash-latest': { input: 0.3, output: 2.5 },
   }),
 
+  // m13 — opt-in bounded advisors. DEFAULT DISABLED: the block is absent in a
+  // stock install, and AdvisorService refuses every consultation without it.
+  // All three caps are REQUIRED when enabled — there are no invented per-axis
+  // defaults. `endpoints` is the allowlist of named provider+model pairs a
+  // consultation may select; nothing outside it is ever consulted. Advised to
+  // be global-only (PROJECT_UNTRUSTED_KEYS): a cloned repo must not be able to
+  // open an egress channel by planting config. `maxAttempts` is bounded to
+  // 1..3 so a blocked endpoint cannot cause a retry storm.
+  advisors: z
+    .object({
+      enabled: z.boolean().default(false),
+      endpoints: z
+        .array(
+          z.object({
+            name: z.string().min(1),
+            provider: z.enum(['anthropic', 'openai', 'openai-compat', 'mock']),
+            model: z.string().min(1),
+          }),
+        )
+        .default([]),
+      maxWallClockSec: z.number().int().positive().optional(),
+      maxTotalTokens: z.number().int().positive().optional(),
+      maxCostUSD: z.number().positive().optional(),
+      maxAttempts: z.number().int().min(1).max(3).default(1),
+    })
+    .default({}),
+
   // P2-13 — session log retention. Opt-in; the sweep runs at session start and only ever
   // ARCHIVES (moves logs into sessions/.archive) — never deletes. `sessionRetentionDays`
   // archives logs whose mtime is older than N days; `sessionRetentionKeep` always protects the
@@ -692,7 +719,7 @@ const CONFIG_FILE = 'shadow.config.json';
 // `lastModel` drives an automatic startup selection. Project model entries stay available for an
 // explicit picker action, but a cloned repo cannot plant or replace the remembered global choice.
 // Update discovery is an outbound request: only the user can enable it, not a project file.
-const PROJECT_UNTRUSTED_KEYS = ['connection', 'baseUrl', 'selfHosted', 'shellEnvAllowlist', 'autonomy', 'denylistExtra', 'systemPromptPath', 'sandbox', 'sandboxNetwork', 'sandboxFailurePolicy', 'egress', 'additionalDirectories', 'projects', 'web', 'offline', 'hooks', 'statusLine', 'vision', 'permissionRules', 'diagnostics', 'lsp', 'updateCheck', 'pluginIndexUrl', 'pluginIndexKey', 'profiles', 'harnesses', 'lastModel', 'sessionRetentionDays', 'sessionRetentionKeep'];
+const PROJECT_UNTRUSTED_KEYS = ['connection', 'baseUrl', 'selfHosted', 'shellEnvAllowlist', 'autonomy', 'denylistExtra', 'systemPromptPath', 'sandbox', 'sandboxNetwork', 'sandboxFailurePolicy', 'egress', 'additionalDirectories', 'projects', 'web', 'offline', 'hooks', 'statusLine', 'vision', 'permissionRules', 'diagnostics', 'lsp', 'updateCheck', 'pluginIndexUrl', 'pluginIndexKey', 'profiles', 'harnesses', 'lastModel', 'sessionRetentionDays', 'sessionRetentionKeep', 'advisors'];
 
 /**
  * Layered precedence: CLI flags > env > active profile > project config file (de-fanged) >
