@@ -19,6 +19,8 @@ import { createSessionRegistry } from '../web/registry.js';
 import { makeTurnRunner } from '../web/runTurn.js';
 import { addProject } from '../web/projects.js';
 import { RpcPeer } from './jsonrpc.js';
+import { acpPolicy } from './policy.js';
+import { ApprovalBinding } from './approvalBinding.js';
 import { createAcpServer, type AcpServer } from './server.js';
 import {
   ACP_PROTOCOL_VERSION,
@@ -107,12 +109,31 @@ export async function runAcp(argv: string[]): Promise<void> {
   // Peer ↔ server reference each other; both are fully constructed before stdin is wired, so
   // nothing can arrive before the closures below resolve. `server` starts null only to break
   // the construction cycle — it is bound before any input can arrive.
+  // Peer ↔ server reference each other; both are fully constructed before stdin is wired, so
+  // nothing can arrive before the closures below resolve. `server` starts null only to break
+  // the construction cycle — it is bound before any input can arrive.
   let server: AcpServer | null = null;
+  // Shutdown is bound synchronously by the promise executor below BEFORE any stdin data can
+  // fire (Node delivers 'data' only on a later tick) — this ref is what the peer's onDead
+  // hook can reach.
+  let shutdownRef: (why: string) => void = () => {};
+  // m-7: every outbound permission ask is sealed to its own (wire id, exact params); the
+  // editor's response must echo the seal and the seal burns on first use. A spoofed,
+  // non-echoing, or replayed response fails closed to deny.
+  const approvalBinding = new ApprovalBinding();
   const peer = new RpcPeer(
     (line) => process.stdout.write(line),
     {
       request: (method, params) => server!.handleRequest(method, params),
       notification: (method, params) => server!.handleNotification(method, params),
+    },
+    {
+      // m-7 production gates: versioned handshake, capability negotiation, op cancellation.
+      policy: acpPolicy(),
+      // The peer enforces the bounds; the transport pauses BEFORE the pending bound is crossed
+      // and resumes when the queue drains back under it.
+      onDrain: () => process.stdin.resume(),
+      onDead: (reason) => shutdownRef(`connection dead: ${reason}`),
     },
   );
   const registry = createSessionRegistry({
@@ -126,10 +147,25 @@ export async function runAcp(argv: string[]): Promise<void> {
     version,
     notify: (method, params) => peer.notify(method, params),
     askPermission: async (params, signal) => {
+      let wireId = '';
       try {
-        const result = await peer.request(M_SESSION_REQUEST_PERMISSION, params, signal ? { signal } : undefined);
+        // Seal THIS ask's exact params under the wire id it rides on (onSend fires before the
+        // frame is written); the response must echo the seal and authorize() burns it.
+        const result = await peer.request(M_SESSION_REQUEST_PERMISSION, params, {
+          ...(signal ? { signal } : {}),
+          onSend: (id) => {
+            wireId = String(id);
+            approvalBinding.seal(wireId, params);
+          },
+        });
+        const verdict = approvalBinding.authorize(wireId, approvalBinding.echoOf(result), params);
+        if (!verdict.ok) {
+          process.stderr.write(`approval refused: ${verdict.reason}\n`);
+          return undefined; // fail closed — the permission gate denies
+        }
         return result as RequestPermissionResult;
       } catch {
+        approvalBinding.unseal(wireId);
         return undefined; // abort, editor error, or shutdown — the gate fail-closes on undefined
       }
     },
@@ -138,7 +174,16 @@ export async function runAcp(argv: string[]): Promise<void> {
   process.stderr.write(`${AGENT_NAME} ${version} — ACP agent ready (protocol v${ACP_PROTOCOL_VERSION}); diagnostics on stderr\n`);
 
   process.stdin.setEncoding('utf8');
-  process.stdin.on('data', (chunk) => peer.feed(String(chunk)));
+  // m-7: feed() reports backpressure as the pending bound is reached — stop reading then,
+  // and resume from the peer's onDrain. A frame already fed is never silently dropped.
+  process.stdin.on('data', (chunk) => {
+    const { backpressure, dead } = peer.feed(String(chunk));
+    if (dead) {
+      shutdownRef('connection dead');
+      return;
+    }
+    if (backpressure) process.stdin.pause();
+  });
 
   let shuttingDown = false;
   await new Promise<void>((resolveShutdown) => {
@@ -152,7 +197,9 @@ export async function runAcp(argv: string[]): Promise<void> {
         } catch {
           /* teardown is best-effort */
         }
-        peer.cancelPending('acp server shutting down');
+        // m-7: the peer's own teardown aborts every in-flight operation, drains the outbound
+        // pending map, and poisons the stream — one call covers shutdown and dead connection.
+        peer.end('acp server shutting down');
         // On the signal paths the editor will never close stdin for us, and its open pipe with
         // a 'data' listener keeps the event loop referenced — the process would outlive its own
         // teardown. Destroy the handle so the loop drains when runAcp returns. (On the EOF path
@@ -165,6 +212,7 @@ export async function runAcp(argv: string[]): Promise<void> {
         resolveShutdown();
       })();
     };
+    shutdownRef = shutdown;
     // Editor exits → stdin EOF → clean teardown. Signals cover Ctrl-C / editor kill.
     process.stdin.on('end', () => shutdown('stdin closed'));
     process.stdin.on('error', () => shutdown('stdin error'));

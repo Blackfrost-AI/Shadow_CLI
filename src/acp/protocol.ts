@@ -25,6 +25,16 @@ export const M_SESSION_SET_CONFIG_OPTION = 'session/set_config_option';
 /** Versioned Shadow extensions; ACP reserves underscore-prefixed methods for extensions. */
 export const M_SHADOW_WORK_LIST = '_shadow/work/list';
 export const M_SHADOW_WORK_CONTROL = '_shadow/work/control';
+/**
+ * m-7 op-cancellation surface (pinned names for the versioned gate). The peer-level
+ * mechanism — one AbortController per inbound operation, a cancel method that aborts
+ * it and answers with a typed error — is real and tested; NO production handler is
+ * registered for `tool_call` today, so `tool_cancel` stays dormant on the live wire
+ * until such a surface exists. The real editor cancellation path remains
+ * `session/cancel` → registry.interrupt → stopReason `cancelled`.
+ */
+export const M_TOOL_CALL = 'tool_call';
+export const M_TOOL_CANCEL = 'tool_cancel';
 
 // --- agent → client ----------------------------------------------------------
 /** Notification carrying one streamed session update (see U_* below). */
@@ -54,6 +64,24 @@ export const E_INVALID_REQUEST = -32600;
 export const E_METHOD_NOT_FOUND = -32601;
 export const E_INVALID_PARAMS = -32602;
 export const E_INTERNAL = -32603;
+
+// --- m-7 gate: JSON-RPC 2.0 reserves -32000..-32099 for implementation-defined
+// server errors. Every refusal below is SPECIFIC (code + message) — never a silent
+// drop, and never a generic -32603 that hides which gate fired.
+/** A single frame exceeded the transport frame bound — the connection is dead. */
+export const E_ACP_FRAME_TOO_LARGE = -32000;
+/** The first request was not `initialize` — nothing executes until the handshake does. */
+export const E_ACP_INITIALIZE_REQUIRED = -32001;
+/** `initialize` named an unsupported protocol version — the connection is dead. */
+export const E_ACP_UNSUPPORTED_VERSION = -32002;
+/** The method belongs to a capability class the client never negotiated at initialize. */
+export const E_ACP_CAPABILITY_NOT_NEGOTIATED = -32003;
+/** The peer is at its in-flight bound — the caller must stop reading until it drains. */
+export const E_ACP_OVERLOAD = -32004;
+/** An in-flight operation was cancelled by the client. */
+export const E_ACP_OP_CANCELLED = -32005;
+/** A request id was reused for different content. */
+export const E_ACP_ID_REUSE = -32006;
 
 // --- payload types --------------------------------------------------------------
 export type RpcId = number | string;
