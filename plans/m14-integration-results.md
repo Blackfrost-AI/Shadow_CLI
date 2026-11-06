@@ -29,7 +29,7 @@ merges). This file records the m-14 evidence; it is updated as each gate runs.
 | Build (`npm run build`) | **PASS** — exit 0, dist/ fresh |
 | Release gate (`check:release-gate`) | **PASS** — all 6 checks OK |
 | Compatibility check (AC wire shapes, config schema) | **PASS** — additive-only (see findings F4) |
-| Security review of integrated diff | IN PROGRESS (dedicated reviewer sub-agent over `git diff 7677ac4..HEAD -- src/`, 19 files / ~6.3k lines) |
+| Security review of integrated diff | IN PROGRESS — 2 focused reviewer sub-agents over the 19-file diff |
 
 ## Lint recovery record (13 findings → 0)
 
@@ -133,6 +133,32 @@ peer-level cancellation surface (`tool_call`/`tool_cancel`) is pinned but dorman
 Config (`src/config.ts`): every new key is `.optional()` with safe defaults;
 no key was removed; the provider enum was widened (`openai-compat`) with a
 backward `.transform()` to the old value. Old config files parse unchanged.
+
+### F5 — Production wiring audit (lead-agent check)
+
+The new capability modules are **libraries with tests, not yet operator-facing
+tools**: grep shows no production importer of `astEdits`, `sshRemote`,
+`gitCommitProposal`, the LSP `editTool`/`editActions`, `browserRelay`,
+`AdvisorService` or the DAP session outside their own modules/tests. The plan's
+§10 wording ("independent opt-in integrations") and §11 ("integration and
+delivery") requires slices to pass gates and be reviewed — which they now do
+on the integrated branch — but does not require each slice to be wired into the
+operator-facing tool catalog in this upgrade. Per §11's closing rule this is
+recorded explicitly rather than claimed as delivered: **the capabilities are
+verified libraries; wiring them into the interactive tool surface is
+unfinished operator-facing work beyond this upgrade's verified scope.**
+
+### F6 — CLI/renderer/protocol smoke coverage
+
+The plan's §11 requires CLI/renderer/protocol smoke tests. Coverage in the
+passing suite: `test/acp-cli.test.ts` (arg parsing, stdin teardown, RPC-mode
+stdout/stderr wire discipline), `test/tui-composer-keys.test.ts` +
+`test/tui-steer-focus.test.ts` (renderer key routing/focus),
+`test/tmux-client.test.ts` (renderer client), `test/web-cli-ux.test.ts`,
+`test/cli-base-url-bootstrap.test.ts`, `test/harness-readiness-cli.test.ts`,
+`test/legacy-resume-cli.test.ts`. All passed in the 4012/4012 run.
+`scripts/smoke-release.mjs` is a CI-only signed-artifact installer smoke test
+(requires disposable CI runners) — out of local scope by design.
 
 ### Post-fix gate status (final)
 

@@ -28,6 +28,21 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { statSync } from 'node:fs';
 import { resolve as resolvePath } from 'node:path';
+import { redactString } from '../../util/redact.js';
+
+/**
+ * Adapter stderr is UNTRUSTED display data. Real adapter failures (module-load
+ * errors, stack traces) print absolute paths as a matter of course, and a
+ * hostile adapter can print anything. The invariant is the same one frames
+ * enforce: NO absolute path — workspace, home or otherwise — ever surfaces.
+ * Anything path-shaped is masked whole, then the shared credential redaction
+ * runs. Over-redaction (e.g. a URL losing its path part) is the fail-safe
+ * direction; the diagnostic text itself survives.
+ */
+function redactStderr(text: string): string {
+  const out = text.replace(/(?:[A-Za-z]:[\\/]|[\\]{2}|\/~?|\/)\S*/g, '[path]');
+  return redactString(out);
+}
 import { inspect } from 'node:util';
 import { insideProject } from '../formatter.js';
 import { scrubbedEnv } from '../../util/safeEnv.js';
@@ -448,7 +463,7 @@ export class DapSession {
       pid: this.transport?.pid() ?? null,
       terminated: this.terminatedEvent,
       stoppedEvents: this.stoppedEvents.length,
-      stderrTail: this.stderrTail.trim(),
+      stderrTail: redactStderr(this.stderrTail.trim()),
     };
   }
 
@@ -541,9 +556,25 @@ export class DapSession {
       throw new DapSessionError('Adapter never reported readiness (no initialized event).');
     }
 
-    for (const bp of initial.breakpoints ?? []) await this.applyBreakpoints(bp.path, bp.lines);
+    for (const bp of initial.breakpoints ?? []) {
+      try {
+        await this.applyBreakpoints(bp.path, bp.lines);
+      } catch (cause) {
+        // NEVER wedge the session open in `configuring` with a live adapter
+        // child when initial breakpoints fail — close first, then rethrow.
+        await this.close(null);
+        throw cause;
+      }
+    }
 
-    await this.send('configurationDone', undefined, { privileged: true });
+    try {
+      await this.send('configurationDone', undefined, { privileged: true });
+    } catch (cause) {
+      // An adapter that refuses configurationDone must not leave a live child
+      // either — same cleanup-then-rethrow discipline as the paths above.
+      await this.close(null);
+      throw cause;
+    }
     this.state = 'launching';
     try {
       await launchPromise;

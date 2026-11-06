@@ -72,6 +72,13 @@ test('redactSourcePath strips every directory — only the basename survives', (
   assert.equal(redactSourcePath('main.ts'), 'main.ts');
   // Path traversal never survives as a directory:
   assert.equal(redactSourcePath('../../etc/passwd'), 'passwd');
+  // Trailing separators are stripped BEFORE basename extraction, so a path
+  // ending in a separator still yields its real basename — no directory
+  // structure leaks — and the function never falls back to the raw input:
+  assert.equal(redactSourcePath('/Users/craigmac/secret-client/'), 'secret-client');
+  assert.equal(redactSourcePath('C:\\\\Users\\\\u\\\\'), 'u');
+  // A separator-only path has no basename at all: placeholder, never raw input:
+  assert.equal(redactSourcePath('///'), '(redacted)');
 });
 
 test('frames surface only basename + line/column — never absolute paths', async () => {

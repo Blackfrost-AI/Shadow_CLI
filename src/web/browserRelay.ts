@@ -200,7 +200,10 @@ function redactValue(value: unknown, seen: WeakSet<object>): unknown {
   if (Array.isArray(value)) return value.map((entry) => redactValue(entry, seen));
   const out: Record<string, unknown> = {};
   for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-    out[key] = entry != null && typeof entry !== 'object' && CREDENTIAL_KEY_RE.test(key)
+    // Mask the whole subtree when the KEY names a credential, whatever the
+    // value's shape — arrays (multi-valued headers like set-cookie) and objects
+    // included. Never recurse into a credential-named subtree.
+    out[key] = entry != null && CREDENTIAL_KEY_RE.test(key)
       ? REDACTED
       : redactValue(entry, seen);
   }

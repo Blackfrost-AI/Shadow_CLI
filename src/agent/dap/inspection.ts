@@ -171,10 +171,13 @@ function lineOrNull(v: unknown): number | null {
  * The frame redaction boundary: an adapter-reported source path is UNTRUSTED
  * display data. Only the basename may ever surface — directories, home paths and
  * any other structure are stripped here, before the frame is stored or shown.
+ * A path that is ONLY separators has no basename; a placeholder is returned
+ * instead — the raw adapter input never surfaces.
  */
 export function redactSourcePath(path: string): string {
-  const last = path.split(/[\\/]/).pop() ?? '';
-  return last.length > 0 ? last : path;
+  const stripped = path.replace(/[\\/]+$/, '');
+  const last = stripped.split(/[\\/]/).pop() ?? '';
+  return last.length > 0 ? last : '(redacted)';
 }
 
 /** Scopes for one frame, bounded. */

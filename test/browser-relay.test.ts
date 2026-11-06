@@ -400,6 +400,31 @@ test('cookie values and Authorization headers are redacted in logged output', as
   await relay.operator.close();
 });
 
+test('array and object values under credential-named keys are masked whole — multi-valued headers cannot leak', async () => {
+  const dispatch = async (): Promise<unknown> => ({
+    // Multi-valued header shape (Node's set-cookie array): the KEY names a
+    // credential, so the ENTIRE subtree must be masked whatever its shape.
+    'set-cookie': ['SESSIONID=<40-char-random-token-here>'],
+    headers: { 'x-api-key': { token: 'sk-live-SECRETKEY12345' } },
+  });
+  const { relay } = await attachedRelay(dispatch);
+  const port = relay.operator.status().port!;
+  await relay.operator.grant('read-dom');
+  const response = await relay.handle({
+    path: '/action/read-dom', method: 'POST',
+    headers: fixture(port, relay.operator.token()),
+    body: { targetId: TAB.id, detail: { selector: '.balance' } },
+  });
+  assert.equal(response.status, 200);
+  const text = JSON.stringify(response.body);
+  assert.ok(!text.includes('SESSIONID'), 'array under a credential key must be masked whole');
+  assert.ok(!text.includes('SECRETKEY12345'), 'nested object under a credential key must be masked whole');
+  const logText = JSON.stringify(relay.operator.auditLog());
+  assert.ok(!logText.includes('SESSIONID'), 'the audit log must mask credential-named arrays');
+  assert.ok(!logText.includes('SECRETKEY12345'), 'the audit log must mask credential-named objects');
+  await relay.operator.close();
+});
+
 test('raw credential material never appears in the audit log even when the broker fails', async () => {
   const dispatch = async (): Promise<unknown> => { throw new Error('broker exploded'); };
   const { relay } = await attachedRelay(dispatch);

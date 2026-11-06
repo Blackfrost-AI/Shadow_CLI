@@ -422,6 +422,30 @@ test('partial write outcome is recorded as partial, never success', async () => 
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
+test('a journal whose transferred bytes do not re-derive the approved digest is refused — no silent byte swap', async () => {
+  const root = workspace();
+  const fs = new FakeRemoteFs();
+  const remote = makeRemote(root, makeFakeRunner(fs));
+  try {
+    const record = await remote.prepareWrite({ host: 'lab', items: [
+      { remotePath: `${PREFIX}/one`, content: 'operator-approved bytes' },
+    ] });
+    await remote.approveWrite(record.id, record.approvalDigest);
+    // SAME-USER ATTACK (the module's own threat model): between approval and
+    // apply, another process swaps contentB64 while leaving contentDigest and
+    // the approval digest untouched — decode() must refuse the mismatched bytes.
+    const journalPath = join(root, '.shadow', 'ssh-remote', `${record.id}.json`);
+    const raw = JSON.parse(readFileSync(journalPath, 'utf8'));
+    raw.items[0].contentB64 = Buffer.from('attacker-swapped bytes', 'utf8').toString('base64');
+    writeFileSync(journalPath, `${JSON.stringify(raw, null, 2)}\n`);
+    await assert.rejects(() => remote.applyWrite(record.id, record.approvalDigest),
+      /does not match its approved digest/);
+    // The attacker's bytes were never transferred:
+    assert.equal(fs.calls.filter((c) => c.kind === 'write').length, 0);
+    assert.equal(fs.files.has(`${PREFIX}/one`), false);
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test('unknown write outcome is recorded as unknown when the probe cannot classify', async () => {
   const root = workspace();
   const fs = new FakeRemoteFs();

@@ -41,6 +41,12 @@ export class FakeAdapter {
   private handlers: TransportHandlers | null = null;
   private alive = true;
 
+  /** Whether close()'s terminate path has killed this fake (asserted by wedge tests). */
+  isAlive(): boolean { return this.alive; }
+
+  /** Inject text as if the adapter child printed it on stderr (redaction tests). */
+  emitStderr(text: string): void { this.handlers?.onStderr(text); }
+
   constructor(script: FakeAdapterScript = {}) {
     this.script = script;
   }

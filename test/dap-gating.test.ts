@@ -382,6 +382,33 @@ test('D1: a replayed sequence kills the session and nothing works after', async 
 
 // ── E. Terminated sessions ─────────────────────────────────────────────────
 
+test('E0: a refused configurationDone (or failed initial breakpoint) never wedges the session open with a live adapter', async () => {
+  setupRoot();
+  try {
+    const fake = new FakeAdapter();
+    const p = makePrompt();
+    const session = makeSession(fake, p.prompt);
+    await session.requestLaunchApproval(launchCfg());
+    // Handshake proceeds, but the adapter REFUSES configurationDone:
+    fake.setScript({
+      initialize: { kind: 'resolve', body: { supportTerminateDebuggee: true } },
+      launch: { kind: 'drop' },
+      configurationDone: { kind: 'refuse', message: 'no debugging for you' },
+      disconnect: { kind: 'resolve' },
+    });
+    setTimeout(() => fake.emit('initialized'), 5);
+    const msg = await rejectMsg(() => session.launch(launchCfg()));
+    // The session is closed — never wedged in `configuring` with a live child:
+    assert.equal(session.getState(), 'closed');
+    assert.match(msg, /no debugging for you/);
+    // And the fake adapter (stand-in for the adapter child) is dead — close()
+    // ran its terminate path against the transport:
+    assert.equal(fake.isAlive(), false);
+  } finally {
+    teardownRoot();
+  }
+});
+
 test('E1: adapter `terminated` event closes the session and no command works after', async () => {
   setupRoot();
   try {
@@ -473,6 +500,24 @@ test('F4: an unscripted (dropped) initialize cannot hang the session forever', a
 });
 
 // ── direct pure-function checks ─────────────────────────────────────────────
+
+test('E2: summary() redacts absolute paths and credentials from adapter stderr', async () => {
+  setupRoot();
+  try {
+    const fake = new FakeAdapter();
+    const session = await launchOk(fake);
+    // Realistic adapter stderr: stack traces leak absolute home paths.
+    fake.emitStderr('Error: Cannot find module \'/Users/craigmac/project/src/main.ts\'\n'
+      + 'at Object.<anonymous> (/Users/craigmac/project/node_modules/x.js:3:1)\n');
+    const tail = session.summary().stderrTail;
+    assert.ok(!tail.includes('/Users/craigmac'), 'absolute home paths must never surface via stderrTail');
+    assert.ok(!tail.includes('project/src'), 'directory structure must never surface via stderrTail');
+    // The redaction is explicit, not silent truncation:
+    assert.ok(tail.includes('Cannot find module'), 'the diagnostic message itself survives redaction');
+  } finally {
+    teardownRoot();
+  }
+});
 
 test('B8: validateLaunchConfig jail and normalization (pure function)', () => {
   setupRoot();

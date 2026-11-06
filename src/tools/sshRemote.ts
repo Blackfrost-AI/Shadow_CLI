@@ -517,6 +517,12 @@ export function createSshRemote(workspaceRoot: string, hosts: SshHostConfig[], o
       if (typeof item.contentDigest !== 'string' || !DIGEST_RE.test(item.contentDigest)) {
         throw new SshRemoteError('Invalid SSH remote journal record');
       }
+      // The approval binds the EXACT bytes: the decoded payload must re-derive
+      // the approved digest. Without this, a same-user process could swap the
+      // transferred bytes while leaving the digest (and thus the approval) valid.
+      if (sha256hex(Buffer.from(item.contentB64, 'base64')) !== item.contentDigest) {
+        throw new SshRemoteError('SSH remote journal record does not match its approved digest');
+      }
       if (item.preconditionDigest !== null
         && (typeof item.preconditionDigest !== 'string' || !DIGEST_RE.test(item.preconditionDigest))) {
         throw new SshRemoteError('Invalid SSH remote journal record');
