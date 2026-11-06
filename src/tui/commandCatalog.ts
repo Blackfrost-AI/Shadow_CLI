@@ -36,6 +36,7 @@ const piOnly = (handler: string, unavailable: string): TerminalCommand['renderer
 });
 
 export const TERMINAL_COMMANDS: readonly TerminalCommand[] = [
+  { name: '/!', desc: 'Run an explicit shell command through the full permission, denylist and sandbox policy', renderers: both('shell') },
   { name: '/help', desc: 'Show keybindings and commands', renderers: both('help') },
   { name: '/steer', desc: 'Steer the active turn at a safe boundary without overtaking queued work', renderers: both('steer') },
   { name: '/queue', desc: 'Queue a follow-up without interrupting the active turn', renderers: both('queue') },

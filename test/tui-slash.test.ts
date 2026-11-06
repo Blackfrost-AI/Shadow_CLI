@@ -48,7 +48,7 @@ test('typing "/" opens the command menu with descriptions', async () => {
   let f = strip(lastFrame());
   assert.match(f, /\/help/);
   assert.match(f, /\/clear/);
-  assert.match(f, /\/provider/);
+  assert.match(f, /\/!/, 'the m-4 shell escape is listed first (it sorts before letters)');
   assert.match(f, /Show keybindings/, 'shows a description for each command');
   // The command list is capped to keep the menu short; filter to reach a late one.
   stdin.write('q'); // input → "/q"

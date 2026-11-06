@@ -190,6 +190,8 @@ export interface KeyEnv {
   confirmQuestion: () => void;
   selectModel: (entry: ModelEntry) => void;
   runSlash: (cmd: SlashCommand, rawLine?: string) => void;
+  /** m-4: explicit /! shell escape — raw submitted line, judged by the shared core. */
+  shellEscape: (raw: string) => void;
   startTurn: (task: string) => void;
   ensureFileList: () => string[];
   slashMatches: (

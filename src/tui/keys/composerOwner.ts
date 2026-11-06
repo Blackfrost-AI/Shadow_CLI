@@ -447,6 +447,15 @@ function handleComposer(env: KeyEnv, ch: string, key: InkKey): boolean {
         return true;
       }
     }
+    // m-4: explicit operator shell escape. Judged on the RAW line before any busy barrier —
+    // an explicit /! must be refused as a command (with its reason), never queued or steered.
+    // The shared core rejects empty payloads, paste chips and multiline text before any state
+    // changes, and routes acceptance through the full execution-policy pipeline.
+    if (!env.tableRef.current && task.startsWith('/!')) {
+      pushHistory(env, task);
+      env.shellEscape(task);
+      return true;
+    }
     if (env.modelSwitchingRef.current) {
       env.pushLine({ text: 'Model switch is still initializing — your draft is preserved.', dimColor: true });
       return true;

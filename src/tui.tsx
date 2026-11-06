@@ -103,6 +103,7 @@ import { displayWidth, takeByWidth } from './util/width.js';
 import { stripCtl, formatDuration, formatUsage, shellCommandOf, agentAttr, oneLine } from './tui/format.js';
 import { THEMES, THEME_NAMES, C, normalizeThemeName, applyTheme, paletteSnapshot, backgroundSequence, themeBackground, type ThemeName, type Palette } from './tui/theme.js';
 import { dispatchPromptControl } from './tui/promptControl.js';
+import { useShellEscape } from './tui/useShellEscape.js';
 import { SLASH_COMMANDS, SLASH_NAME_WIDTH, findSlashCommand, runSlashCommand, slashDispatchName, type SlashCommand, type SlashCtx } from './tui/slash.js';
 import { slashMatches, classifySlash, type SlashMenuItem, type ArgContext } from './tui/slashMenu.js';
 import { sanitizeAssistantText } from './tui/sanitize.js';
@@ -1917,6 +1918,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       queuedTasksRef, setQueued, pastesRef, pushLine,
       startTurn: (task) => startTurnRef.current?.(task),
     }, mode, text),
+    // m-4: late-bound like startTurnRef — the hook is defined below this object; the ctx entry
+    // is a stable arrow function that dereferences the live hook at dispatch time.
+    shellEscape: (raw: string) => { void shellEscape(raw); },
     queueDeferred: (text: string) => {
       setQueued([...queuedTasksRef.current, { text, kind: 'deferred' }]);
     },
@@ -1939,6 +1943,15 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   }, [setLine, showToast]);
   useEffect(() => kbRegister('chat:steer', () => submitPromptControl('steer')), [kbRegister, submitPromptControl]);
   useEffect(() => kbRegister('chat:queue', () => submitPromptControl('queue')), [kbRegister, submitPromptControl]);
+
+  // m-4: explicit operator shell escape (/!) — extracted under src/tui/ per the structural
+  // line budget (plan 2.4). See src/tui/useShellEscape.ts for the full contract.
+  const shellEscape = useShellEscape({
+    opts, pushLine, setRunning, setLine,
+    runningRef, compactingRef, modelSwitchingRef, asyncCommandRef, inputRef,
+    runStartRef, interruptionReportedRef, controllerRef, flushQueueRef,
+    makeBudget: () => new Budget({ maxIterations: 0, ...opts.cfg.budget }, currentRef.current.model, opts.cfg.priceTable, Date.now()),
+  });
 
   // Apply a picked model: rebuild the provider, hot-swap it into the running loop
   // (there is none mid-pick — the picker can't open while a turn runs), point the
@@ -3261,6 +3274,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         confirmQuestion,
         selectModel,
         runSlash,
+        shellEscape,
         startTurn,
         ensureFileList,
         slashMatches,

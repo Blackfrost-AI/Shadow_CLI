@@ -290,6 +290,8 @@ export interface SlashCtx {
   /** Queue a deferred turn while one runs (the /goal begin-while-running path). */
   queueDeferred: (text: string) => void;
   promptControl: (mode: 'steer' | 'queue', text: string) => void;
+  /** m-4: explicit /! shell escape — the raw submitted line, judged by the shared core. */
+  shellEscape: (raw: string) => void;
   startTableRef: { current: ((arg: string) => void) | null };
   currentRef: { current: { provider: string; model: string } };
   selectModelRef: { current: ((entry: ModelEntry) => Promise<void>) | null };
@@ -362,6 +364,12 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
     return;
   }
   switch (dispatch) {
+    case '/shell':
+      // The composer intercepts a typed /! with its raw line BEFORE this dispatch; this case
+      // exists so a menu-completed bare /! (no payload) is judged by the same core and gets
+      // the usage message instead of an unknown-command error.
+      ctx.shellEscape(rawLine ?? '/!');
+      break;
     case '/steer':
     case '/queue':
       ctx.promptControl(dispatch === '/steer' ? 'steer' : 'queue', arg);

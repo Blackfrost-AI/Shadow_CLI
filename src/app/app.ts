@@ -16,6 +16,7 @@ import { truncateToWidth, visibleWidth } from '@earendil-works/pi-tui';
 import { AgentLoop } from '../agent/loop.js';
 import { dropOneQueuedByText, queuedAhead } from '../agent/steerQueue.js';
 import { promptControlPayload, promptSteeringAction } from '../agent/promptControl.js';
+import { runShellEscape } from '../tui/shellEscape.js';
 import { buildLoopDeps } from '../agent/loopDeps.js';
 import { Budget } from '../agent/budget.js';
 import { SessionApprovals, type ApprovalDecision, type ApprovalGate, type ApprovalRequest } from '../agent/approval.js';
@@ -1426,6 +1427,12 @@ export class ShadowApp {
       this.runSlash(text);
       return;
     }
+    // m-4: explicit shell escape is refused while busy — NEVER queued: a queued shell command
+    // would run at an arbitrary later boundary without the operator watching it.
+    if (/^\/!(?:\s|$)/.test(text)) {
+      this.runSlash(text);
+      return;
+    }
     if (this.compacting) {
       if (text === '/compact' || text === '/summary') this.runSlash(text);
       else this.queue(text);
@@ -2283,6 +2290,13 @@ export class ShadowApp {
   private runSlash(raw: string): void {
     const [typedName, ...rest] = raw.trim().split(/\s+/);
     const arg = rest.join(' ').trim();
+    // Explicit operator shell escape — recognized BEFORE any command lookup: the raw line
+    // (not the tokenized name) is what must be judged, and /! must never fall through to
+    // the unknown-command path or the custom-command prompt path.
+    if (raw.trim().startsWith('/!')) {
+      void this.shellEscape(raw);
+      return;
+    }
     const command = findTerminalCommand(typedName ?? '');
     if (!command) {
       const custom = this.discoverCommands().find((c) => `/${c.name.toLowerCase()}` === typedName?.toLowerCase());
@@ -2307,6 +2321,12 @@ export class ShadowApp {
     // new catalog row cannot become an unreachable switch case through a second name lookup.
     const name = `/${handler}`;
     switch (name) {
+      case '/shell': {
+        // The composer's /! interception runs BEFORE command lookup; this arm only fires for
+        // a menu-completed bare /! (no payload) and routes through the same shared core.
+        void this.shellEscape(raw);
+        return;
+      }
       case '/steer':
       case '/queue': {
         try {
@@ -4408,6 +4428,43 @@ export class ShadowApp {
       this.pushLine({ text: `${title}: ${approvalText(result.summary)}`, color: result.ok ? C.green : C.yellow });
     } catch (error) { if (!controller.signal.aborted) this.featureError(error); }
     finally { release?.(); this.endTurn(); if (!this.running && !this.exiting) complete?.(); }
+  }
+
+  /** m-4: explicit operator shell escape. The composer's /! prefix routes here BEFORE any
+   * command-token lookup; the shared core rejects unsafe input and busy state, and dispatch
+   * goes through the full execution-policy pipeline (permissions, plan mode, classifier,
+   * denylist, hooks, sandbox, env scrubbing, timeout) via the native tool executor. One
+   * dispatch, no retries; ESC aborts through the standard controller wiring. */
+  private async shellEscape(raw: string): Promise<void> {
+    if (!this.opts.runNativeTool) {
+      // A session without runNativeTool has no shell escape at all. Busy state is judged by
+      // the shared core so the operator gets the real busy refusal, never this message.
+      this.pushLine({ text: '  Shell escape is unavailable in this session.', dimColor: true });
+      return;
+    }
+    try {
+      await runShellEscape({
+        busy: () => this.running || this.compacting || this.modelChecking || this.switcher.isSwitching || this.exiting,
+        errorLine: (text) => this.pushLine({ text: `  ${text}`, color: C.yellow }),
+        outcomeLine: (text, ok) => this.pushLine({ kind: 'system', text: `  ${text}`, color: ok ? C.green : C.yellow }),
+        clearComposer: () => { if (this.editor.getText().trim()) this.editor.setText(''); },
+        armAbort: (controller) => {
+          // Mirror runFeatureTool exactly: ALL live-turn state goes live before the lock.
+          this.closePicker(); this.commitBrandLine(); this.running = true; this.runStart = Date.now();
+          this.controller = controller; this.startTicker(); this.hudRef = this.hudState();
+        },
+        acquireLock: (signal) => runLock.acquire(CLI_HOLDER, { priority: true, signal }),
+        runNativeTool: async (name, input, signal, budget) => {
+          if (!this.opts.runNativeTool) throw new Error('Shell escape is unavailable in this session.');
+          return this.opts.runNativeTool(name, input, signal, budget as Budget);
+        },
+        newBudget: () => new Budget({ maxIterations: 0, ...this.opts.cfg.budget }, this.current.model, this.opts.cfg.priceTable, Date.now()),
+      }, raw);
+    } catch (error) {
+      this.featureError(error);
+    } finally {
+      this.endTurn();
+    }
   }
 
   private doChecks(arg = ''): void {
