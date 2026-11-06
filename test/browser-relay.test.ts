@@ -443,7 +443,6 @@ test('the listener binds 127.0.0.1 only — never 0.0.0.0 — and only while att
   const bound = relay.operator.boundAddress();
   assert.ok(bound, 'attached relay must have a bound address');
   assert.equal(bound.address, RELAY_BIND_HOST, 'must bind the literal loopback address');
-  assert.equal(bound.address !== '0.0.0.0', true);
   const port = bound.port;
   // A real loopback connect must reach the dispatcher (and be refused: no grant).
   const response = await new Promise<string>((resolve, reject) => {

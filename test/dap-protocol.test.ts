@@ -18,7 +18,7 @@ import {
   encodeDapFrame,
   DapFrameDecoder,
   DapPeer,
-} from '../src/agent/dap/protocol.ts';
+} from '../src/agent/dap/protocol.js';
 
 // ── encoder ──────────────────────────────────────────────────────────────────
 
@@ -94,7 +94,7 @@ function makeClient() {
     {
       onEvent: (name, body) => events.push(`${name}:${JSON.stringify(body)}`),
       onProtocolError: (e) => protocolErrors.push(e.message),
-      onReverseRequest: async () => undefined,
+      onRequest: async () => undefined,
     },
   );
   const wireJson = () => written.map((b) => JSON.parse(b.subarray(b.indexOf('\r\n\r\n', 0, 'latin1') + 4).toString('utf8')));

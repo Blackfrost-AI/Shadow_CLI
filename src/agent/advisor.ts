@@ -28,10 +28,9 @@
  *     signal; time already spent is recorded honestly and nothing is refunded.
  */
 
-import { performance } from 'node:perf_hooks';
 import { Budget } from './budget.js';
 import type { ModelPrice } from './budget.js';
-import type { Provider, ProviderEvent } from '../provider/provider.js';
+import type { Provider } from '../provider/provider.js';
 import { estimateTokensFromMessages } from '../provider/provider.js';
 import type { ShadowConfig } from '../config.js';
 
@@ -262,11 +261,10 @@ export class AdvisorService {
   ): Promise<AdvisorResult> {
     const maxAttempts = caps.maxAttempts;
     const controller = new AbortController();
-    let watchdog: NodeJS.Timeout | undefined;
 
     // Wall-clock watchdog: absolute deadline armed ONCE for the whole
     // consultation. It aborts the in-flight request the moment the cap passes.
-    watchdog = setTimeout(
+    const watchdog: NodeJS.Timeout = setTimeout(
       () => controller.abort(new Error('advisor wall-clock cap')),
       caps.maxWallClockSec * 1_000,
     );
@@ -366,7 +364,7 @@ export class AdvisorService {
         // Bounded retry: the loop ceiling (maxAttempts <= 3) is the storm bound.
       }
     } finally {
-      if (watchdog !== undefined) clearTimeout(watchdog);
+      clearTimeout(watchdog);
     }
 
     const spentMs = Date.now() - startedAtMs;

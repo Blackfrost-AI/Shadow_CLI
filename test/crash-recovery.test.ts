@@ -5,7 +5,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createMutationJournal } from '../src/tools/mutation.js';
 import {
-  CrashRecoveryError,
   listInterrupted,
   reconnectReport,
   resolutionMarkerPath,

@@ -1,6 +1,6 @@
 import { createHash, randomUUID, timingSafeEqual } from 'node:crypto';
 import {
-  chmodSync, closeSync, existsSync, fsyncSync, lstatSync, mkdirSync, openSync,
+  chmodSync, closeSync, fsyncSync, lstatSync, mkdirSync, openSync,
   readFileSync, readdirSync, realpathSync, renameSync, unlinkSync, writeSync,
 } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -442,7 +442,7 @@ export function createMutationJournal(workspaceRoot: string, options: MutationJo
         id, state: record.state,
         files: record.files.map((file) => {
           try { return classifyFile(file); }
-          catch (error) { return { path: file.path, status: 'drifted' as const }; }
+          catch { return { path: file.path, status: 'drifted' as const }; }
         }),
       });
     }

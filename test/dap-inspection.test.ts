@@ -13,11 +13,14 @@ import {
   isSecretLikeValue,
   redactSecretValue,
   redactIfSecretNamed,
+  redactSourcePath,
+  stackTrace,
   DapInspectionError,
   inspectionRefusal,
   DAP_STEP_TIMEOUT_MS,
   type DapStackFrame,
-} from '../src/agent/dap/inspection.ts';
+} from '../src/agent/dap/inspection.js';
+import { MAX_STACK_FRAMES, type DapSession } from '../src/agent/dap/session.js';
 
 // ── secret redaction primitives ─────────────────────────────────────────────
 
@@ -58,17 +61,79 @@ test('redactIfSecretNamed redacts by NAME regardless of shape', () => {
   assert.equal(benign.value, '42');
 });
 
-test('frames surface only basename + line/column — never absolute paths', () => {
-  // The frame type itself is the contract: no path field other than basename.
-  const frame: DapStackFrame = {
-    name: 'main',
-    path: '/home/u/project/src/main.ts',
-    line: 10,
-    column: 2,
-  };
-  // path is the ONLY path field, and the session layer redacts it to basename:
-  assert.ok(frame.path.includes('/home/u') === false || true); // tautology guard: the field exists to be redacted downstream
-  assert.ok(frame.line === 10 && frame.column === 2);
+test('redactSourcePath strips every directory — only the basename survives', () => {
+  // Absolute POSIX path:
+  assert.equal(redactSourcePath('/home/u/project/src/main.ts'), 'main.ts');
+  // Windows separators must be stripped too:
+  assert.equal(redactSourcePath('C:\\Users\\u\\project\\main.ts'), 'main.ts');
+  // Mixed separators:
+  assert.equal(redactSourcePath('a/b\\c/d.ts'), 'd.ts');
+  // A bare filename stays itself:
+  assert.equal(redactSourcePath('main.ts'), 'main.ts');
+  // Path traversal never survives as a directory:
+  assert.equal(redactSourcePath('../../etc/passwd'), 'passwd');
+});
+
+test('frames surface only basename + line/column — never absolute paths', async () => {
+  // GENUINE end-to-end check of the redaction boundary: the REAL stackTrace()
+  // production path runs against a stub transport that answers like an adapter.
+  // The stub is transport only — parsing, bounds and redaction are the real code.
+  const hostileFrames = [
+    {
+      id: 1,
+      name: 'main',
+      source: { path: '/home/u/project/src/main.ts' },
+      line: 10,
+      column: 2,
+    },
+    {
+      id: 2,
+      name: 'load',
+      source: { path: 'C:\\Users\\u\\secrets\\loader.js' },
+      line: 3,
+      column: 0,
+    },
+  ];
+  const stub = {
+    request: async (command: string) => {
+      assert.equal(command, 'stackTrace');
+      return { stackFrames: hostileFrames };
+    },
+  } as unknown as DapSession;
+  const { frames, truncated } = await stackTrace(stub, 1);
+  assert.equal(truncated, false);
+  assert.equal(frames.length, 2);
+  // Basename ONLY — no absolute path, no home directory may ever surface:
+  assert.equal(frames[0].sourceBasename, 'main.ts');
+  assert.equal(frames[1].sourceBasename, 'loader.js');
+  const wire = JSON.stringify(frames);
+  assert.ok(!wire.includes('/home/u'), 'frames must never carry POSIX directories');
+  assert.ok(!wire.includes('C:\\'), 'frames must never carry Windows directories');
+  assert.ok(!wire.includes('secrets'), 'frames must never carry directory names');
+  // Line/column/frameId still flow through for diagnosis:
+  assert.equal(frames[0].line, 10);
+  assert.equal(frames[0].column, 2);
+  assert.equal(frames[0].frameId, 1);
+  assert.equal(frames[1].frameId, 2);
+  // The interface itself carries no path-shaped field anymore:
+  const frame: DapStackFrame = frames[0];
+  assert.ok(!('sourcePath' in frame), 'sourcePath must not exist on frames');
+});
+
+test('stackTrace truncates at MAX_STACK_FRAMES and reports it', async () => {
+  const many = Array.from({ length: MAX_STACK_FRAMES + 9 }, (_, i) => ({
+    id: i,
+    name: 'f' + i,
+    source: { path: '/x/y/f' + i + '.ts' },
+    line: i,
+    column: 0,
+  }));
+  const stub = {
+    request: async () => ({ stackFrames: many }),
+  } as unknown as DapSession;
+  const { frames, truncated } = await stackTrace(stub, 1);
+  assert.equal(frames.length, MAX_STACK_FRAMES);
+  assert.equal(truncated, true);
 });
 
 // ── refusal and bounds ───────────────────────────────────────────────────────

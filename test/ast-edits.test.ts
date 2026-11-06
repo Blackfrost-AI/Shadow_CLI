@@ -21,8 +21,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { previewAstEdit, prepareAstEdit, AstEditError } from '../src/tools/astEdits.ts';
-import { createMutationJournal } from '../src/tools/mutation.ts';
+import { previewAstEdit, prepareAstEdit, AstEditError } from '../src/tools/astEdits.js';
+import { createMutationJournal } from '../src/tools/mutation.js';
 
 const sha = (s: string) => createHash('sha256').update(s, 'utf8').digest('hex');
 
@@ -193,7 +193,7 @@ test('identifier replacements must scan as exactly one identifier token', () => 
     file: 'a.ts',
     selector: { kind: 'identifier', name: 'alpha' },
     text: 'const alpha = 1;',
-  };
+  } as const;
   // Gate 1 (post-parse) fires first for splices that break the file:
   for (const breaksParse of ['beta.gamma', 'beta gamma', '']) {
     const e = errOf(() => previewAstEdit({ ...base, replacement: breaksParse }));
@@ -212,7 +212,7 @@ test('method replacements must parse as exactly one class method', () => {
     file: 'a.ts',
     selector: { kind: 'method', name: 'alpha' },
     text: 'class A { alpha() {} }',
-  };
+  } as const;
   for (const bad of ['', 'alpha() {} keep() {}', 'alphaField = 1;', 'const x = 1;']) {
     const e = errOf(() => previewAstEdit({ ...base, replacement: bad }));
     assert.equal(e.code, 'invalid-replacement-shape', `replacement ${JSON.stringify(bad)}`);
@@ -297,7 +297,7 @@ test('a .js file with a unique selector edits cleanly (javascript)', () => {
 
 test('invalid selectors and calls are refused before any parse', () => {
   const base = { file: 'a.ts', text: 'const alpha = 1;' };
-  const noKind = errOf(() => previewAstEdit({ ...base, selector: { kind: 'wildcard', name: 'alpha' }, replacement: 'beta' }));
+  const noKind = errOf(() => previewAstEdit({ ...base, selector: { kind: 'wildcard', name: 'alpha' }, replacement: 'beta' } as never));
   assert.equal(noKind.code, 'invalid-selector');
   const noName = errOf(() => previewAstEdit({ ...base, selector: { kind: 'identifier', name: '' }, replacement: 'beta' }));
   assert.equal(noName.code, 'invalid-selector');

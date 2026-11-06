@@ -14,7 +14,6 @@ import {
   remoteWriteApprovalDigest,
   parseProbeOutput,
   withinPrefix,
-  SshRemoteError,
   type SshRunner,
   type PinnedHost,
   type RunnerSpec,

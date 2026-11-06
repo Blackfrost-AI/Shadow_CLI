@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { rejectUnsafeShellInput, runShellEscape, SHELL_ESCAPE_COMMAND } from '../src/tui/shellEscape.js';
 import { ToolRegistry } from '../src/tools/registry.js';

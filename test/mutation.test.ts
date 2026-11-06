@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, readFileSync, chmodSync, existsSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, readFileSync, existsSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -217,7 +217,3 @@ test('symlinked targets and journal records are rejected', () => {
     assert.throws(() => journal.prepare([{ path: `.shadow/mutations/${existing.id}.json`, before: null, after: 'x' }]), /Journal files/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
-
-class MutationCrash extends Error {
-  constructor(public readonly record: unknown) { super('simulated crash during journal write'); }
-}

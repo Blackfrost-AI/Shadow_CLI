@@ -27,7 +27,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { FakeAdapter } from './fixtures/dap.ts';
+import { FakeAdapter } from './fixtures/dap.js';
 import {
   DapSession,
   DapSessionError,
@@ -35,12 +35,12 @@ import {
   MAX_ARG_CHARS,
   validateLaunchConfig,
   debuggeeEnv,
-} from '../src/agent/dap/session.ts';
-import { createDapGate, DapGateError, dapLaunchDigest } from '../src/agent/dap/gating.ts';
+} from '../src/agent/dap/session.js';
+import { createDapGate, DapGateError, dapLaunchDigest } from '../src/agent/dap/gating.js';
 
-const SPEC = {
+const SPEC: import('../src/agent/dap/adapters.js').DapAdapterSpec = {
   id: 'js-debug',
-  language: 'js' as const,
+  language: 'js',
   command: 'node',
   args: ['adapter.js'],
   installRequirement: 'none',

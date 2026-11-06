@@ -14,7 +14,7 @@
 
 import { nextApprovalId, settleWithAbort, type ApprovalGate } from '../approval.js';
 import { diffLines } from '../../util/diff.js';
-import { createMutationJournal, MutationError, type MutationJournalOptions, type MutationRecord } from '../../tools/mutation.js';
+import { createMutationJournal, type MutationJournalOptions, type MutationRecord } from '../../tools/mutation.js';
 import { readFileSync as fsReadFileSync, realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { resolve, sep } from 'node:path';

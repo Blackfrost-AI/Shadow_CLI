@@ -55,7 +55,9 @@ export function redactIfSecretNamed(name: string, value: string): RedactionResul
 export interface DapStackFrame {
   frameId: number;
   name: string;
-  sourcePath: string | null;
+  /** Basename ONLY — the redaction boundary strips directories before this
+   *  value is ever stored. Never an absolute path, never a home directory. */
+  sourceBasename: string | null;
   line: number | null;
   column: number | null;
 }
@@ -148,7 +150,7 @@ export async function stackTrace(
     out.push({
       frameId: asNonNegativeInt((f as { id?: unknown })?.id, 'stackFrames[].id'),
       name: asString((f as { name?: unknown })?.name ?? '(unnamed)', 'stackFrames[].name'),
-      sourcePath: typeof source?.path === 'string' ? source.path : null,
+      sourceBasename: typeof source?.path === 'string' ? redactSourcePath(source.path) : null,
       line: lineOrNull((f as { line?: unknown })?.line),
       column: lineOrNull((f as { column?: unknown })?.column),
     });
@@ -163,6 +165,16 @@ function lineOrNull(v: unknown): number | null {
     throw new DapInspectionError('Adapter stack frame coordinate is malformed.');
   }
   return v;
+}
+
+/**
+ * The frame redaction boundary: an adapter-reported source path is UNTRUSTED
+ * display data. Only the basename may ever surface — directories, home paths and
+ * any other structure are stripped here, before the frame is stored or shown.
+ */
+export function redactSourcePath(path: string): string {
+  const last = path.split(/[\\/]/).pop() ?? '';
+  return last.length > 0 ? last : path;
 }
 
 /** Scopes for one frame, bounded. */
@@ -265,7 +277,6 @@ function bpIdOrNull(v: unknown): number | null {
   if (typeof v !== 'number' || !Number.isInteger(v) || v < 0) {
     throw new DapInspectionError('Adapter breakpoint id is malformed.');
   }
-  0;
   return v;
 }
 

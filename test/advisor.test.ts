@@ -26,7 +26,7 @@ import {
   ADVISOR_MAX_ATTEMPTS_CEILING,
   type AdvisorHooks,
   type AdvisorResult,
-} from '../src/agent/advisor.ts';
+} from '../src/agent/advisor.js';
 import type { ShadowConfig } from '../src/config.js';
 
 interface RecordedSend {
@@ -55,12 +55,12 @@ class FakeProvider implements Provider {
         .join(''),
       signal: req.signal,
     });
-    const self = this;
+    const { opts, script } = this;
     return {
       async *[Symbol.asyncIterator]() {
-        if (self.opts.hangMs !== undefined) {
+        if (opts.hangMs !== undefined) {
           await new Promise<void>((resolve) => {
-            const t = setTimeout(resolve, self.opts.hangMs);
+            const t = setTimeout(resolve, opts.hangMs);
             req.signal?.addEventListener(
               'abort',
               () => {
@@ -73,7 +73,7 @@ class FakeProvider implements Provider {
           return;
         }
         yield { type: 'text', delta: 'send#' + index + ':' };
-        for (const ev of self.script) yield ev;
+        for (const ev of script) yield ev;
       },
     };
   }
@@ -106,8 +106,8 @@ function recordingHooks(): RecordingHooks {
 }
 
 function makeConfig(
-  advisors: ShadowConfig['advisors'],
-  priceTable: ShadowConfig['priceTable'],
+  advisors: ShadowConfig['advisors'] | undefined,
+  priceTable: ShadowConfig['priceTable'] | undefined,
 ): ShadowConfig {
   return { advisors, priceTable } as ShadowConfig;
 }
@@ -127,7 +127,7 @@ const PRICE_TABLE = {
   'claude-3-5-haiku-latest': { input: 0.8, output: 4 },
 } as ShadowConfig['priceTable'];
 
-function service(advisors: ShadowConfig['advisors'], script: ProviderEvent[]) {
+function service(advisors: ShadowConfig['advisors'] | undefined, script: ProviderEvent[]) {
   const hooks = recordingHooks();
   const provider = new FakeProvider(script);
   const svc = new AdvisorService(makeConfig(advisors, PRICE_TABLE), () => provider, hooks);
