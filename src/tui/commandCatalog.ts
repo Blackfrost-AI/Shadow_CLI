@@ -37,6 +37,8 @@ const piOnly = (handler: string, unavailable: string): TerminalCommand['renderer
 
 export const TERMINAL_COMMANDS: readonly TerminalCommand[] = [
   { name: '/help', desc: 'Show keybindings and commands', renderers: both('help') },
+  { name: '/steer', desc: 'Steer the active turn at a safe boundary without overtaking queued work', renderers: both('steer') },
+  { name: '/queue', desc: 'Queue a follow-up without interrupting the active turn', renderers: both('queue') },
   { name: '/keybindings', desc: 'Show renderer keybindings; Ink can also write a starter config', renderers: both('keybindings') },
   { name: '/clear', desc: 'Clear the screen and reset the conversation', renderers: both('clear') },
   { name: '/new', desc: 'Start a fresh conversation (alias for /clear)', dispatch: '/clear', renderers: both('clear') },

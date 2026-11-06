@@ -1,6 +1,6 @@
 # Shadow CLI
 
-Current build: **`v11.1.4`** — the transcript launches expanded, showing tool output and reasoning bodies on start; Ctrl-O folds it back in.
+Current build: **`v11.2.0`** — the transcript launches expanded, showing tool output and reasoning bodies on start; Ctrl-O folds it back in.
 
 Shadow is a local-first, provider-neutral security engineering agent. Its built-in Security
 foundation covers investigation, hardening, incident response, defensive automation, secure coding,
