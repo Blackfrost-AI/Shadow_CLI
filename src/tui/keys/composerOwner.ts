@@ -43,7 +43,7 @@ import { FORWARD_DELETE, HOME_KEYS, END_KEYS, SHIFT_ENTER, insertChunk } from '.
 const SHIFT_TAB = /^\x1b(?:\[(?:9;(\d+)u|27;(\d+);9~)|\[Z)$/;
 
 /** Slash commands safe to run LIVE while a turn is executing; everything else queues. */
-const SLASH_WHILE_RUNNING = new Set(['/help', '/cost', '/usage', '/context', '/connections', '/fast', '/effort', '/version', '/copy', '/plan', '/goal', '/swarm']);
+const SLASH_WHILE_RUNNING = new Set(['/steer', '/queue', '/help', '/cost', '/usage', '/context', '/connections', '/fast', '/effort', '/version', '/copy', '/plan', '/goal', '/swarm']);
 import type { FocusOwnerHandler, InkKey, KeyEnv } from './types.js';
 
 function handleComposer(env: KeyEnv, ch: string, key: InkKey): boolean {
@@ -437,6 +437,16 @@ function handleComposer(env: KeyEnv, ch: string, key: InkKey): boolean {
     }
     const task = env.inputRef.current.trim();
     if (!task && !env.attachmentsRef.current.length) return true; // allow an image-only message
+    // Decode controls before busy barriers: never enqueue the literal slash command or
+    // let /queue fall into the ordinary message-steering path. Table input stays separate.
+    if (!env.tableRef.current && /^\/(?:steer|queue)(?:\s|$)/.test(task)) {
+      const cmd = env.findSlashCommand(task.split(/\s+/)[0]!);
+      if (cmd) {
+        pushHistory(env, task);
+        env.runSlash(cmd, task);
+        return true;
+      }
+    }
     if (env.modelSwitchingRef.current) {
       env.pushLine({ text: 'Model switch is still initializing — your draft is preserved.', dimColor: true });
       return true;

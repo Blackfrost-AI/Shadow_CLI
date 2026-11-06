@@ -15,6 +15,7 @@ import { truncateToWidth, visibleWidth } from '@earendil-works/pi-tui';
 
 import { AgentLoop } from '../agent/loop.js';
 import { dropOneQueuedByText, queuedAhead } from '../agent/steerQueue.js';
+import { promptControlPayload, promptSteeringAction } from '../agent/promptControl.js';
 import { buildLoopDeps } from '../agent/loopDeps.js';
 import { Budget } from '../agent/budget.js';
 import { SessionApprovals, type ApprovalDecision, type ApprovalGate, type ApprovalRequest } from '../agent/approval.js';
@@ -1390,9 +1391,7 @@ export class ShadowApp {
       // commands and input behind a model-switch/compaction barrier stay in submission order.
       if (matchesKey(data, 'enter') && !matchesKey(data, 'ctrl+j') && (this.running || this.compacting || this.modelChecking || this.switcher.isSwitching) && this.editor.getText().trim()) {
         const q = this.editor.getExpandedText().trim();
-        this.editor.addToHistory(q);
-        this.editor.setText('');
-        this.queue(q);
+        this.submit(q);
         return { consume: true };
       }
 
@@ -1420,9 +1419,23 @@ export class ShadowApp {
     if (!text) return;
     this.editor.addToHistory(text);
     if (this.editor.getText().trim()) this.editor.setText('');
+    // Explicit prompt controls must be decoded before any busy barrier stores input.
+    // Everything else keeps the baseline contract: a busy Enter queues the text so the
+    // loop replays it at the safe boundary — commands like /compact included.
+    if (/^\/(?:steer|queue)(?:\s|$)/i.test(text)) {
+      this.runSlash(text);
+      return;
+    }
     if (this.compacting) {
       if (text === '/compact' || text === '/summary') this.runSlash(text);
       else this.queue(text);
+      return;
+    }
+    if (this.running && text.startsWith('/')) {
+      // Baseline contract for commands while a turn runs: queue for replay at the safe
+      // boundary (flushQueue) instead of dispatching now — /compact would refuse mid-turn
+      // and drop the input. Only the explicit controls above bypass this queueing.
+      this.queue(text);
       return;
     }
     if (this.modelChecking) {
@@ -1444,7 +1457,7 @@ export class ShadowApp {
     this.startTurn(text);
   }
 
-  private queue(task: string): void {
+  private queue(task: string, allowSteering = true): void {
     // Enqueue before signalling: the loop's finally drains this queue once model work has
     // stopped and every already-started tool has settled. Never hard-abort an active tool or
     // cancel a prompt still waiting for the run lock (there is no loop to steer yet).
@@ -1467,14 +1480,14 @@ export class ShadowApp {
     // END, or the queue could never drain (a stalled provider plus a non-steering message is a
     // deadlock), so that case falls back to the bare steer, which stops the turn and lets
     // flushQueue run the backlog in submission order.
-    const steered = ahead === 0
-      ? !task.startsWith('/') && this.running && (this.loopRef?.requestSteer(task) ?? false)
-      : false;
+    const steering = promptSteeringAction(task, ahead, this.running, this.loopRef?.hasPendingSteer() ?? false,
+      allowSteering && !this.compacting && !this.modelChecking && !this.switcher.isSwitching);
+    const steered = steering === 'inject' && (this.loopRef?.requestSteer(task) ?? false);
     // Only break the turn when this is the FIRST thing to steer. If a steer is already pending for
     // the running turn, force-aborting again would discard the text that steer is about to inject
     // (B would lose its turn to C). The pending injection ends the turn naturally when it lands,
     // and flushQueue then runs the backlog in submission order.
-    if (ahead > 0 && this.running && !task.startsWith('/') && !this.loopRef?.hasPendingSteer()) {
+    if (steering === 'end-turn') {
       this.loopRef?.requestSteer();
     }
     if (steered) {
@@ -2294,6 +2307,21 @@ export class ShadowApp {
     // new catalog row cannot become an unreachable switch case through a second name lookup.
     const name = `/${handler}`;
     switch (name) {
+      case '/steer':
+      case '/queue': {
+        try {
+          const payload = promptControlPayload(raw.trim().slice((typedName ?? '').length));
+          if (name === '/steer' && !this.running) throw new Error('No active turn to steer. Submit a message or use /queue <text>.');
+          if (this.running || this.compacting || this.modelChecking || this.switcher.isSwitching || this.queued.length) {
+            this.queue(payload, name === '/steer');
+          } else {
+            this.startTurn(payload);
+          }
+        } catch (error) {
+          this.pushLine({ text: `  ${(error as Error).message}`, color: C.yellow });
+        }
+        return;
+      }
       case '/tmux':
         this.openTmux(arg);
         return;

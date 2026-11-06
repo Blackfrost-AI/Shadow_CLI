@@ -104,7 +104,7 @@ export const KEYBINDING_ACTIONS: readonly string[] = Object.values(RAW_DEFAULTS)
  * of accepting them silently; the keybinding-liveness test pins this list to the actual
  * kbRegister sites so it cannot drift from the truth.
  */
-export const REGISTERED_NON_DEFAULT_ACTIONS: readonly string[] = ['app:redraw'];
+export const REGISTERED_NON_DEFAULT_ACTIONS: readonly string[] = ['app:redraw', 'chat:steer', 'chat:queue'];
 
 /** Every action id the loader accepts without an unknown-action warning. */
 export const KNOWN_ACTION_IDS: ReadonlySet<string> = new Set([...KEYBINDING_ACTIONS, ...REGISTERED_NON_DEFAULT_ACTIONS]);

@@ -7,6 +7,19 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [11.2.0] — 2026-11-06
+
+### Added
+- **Explicit steering control:** `/steer <text>` steers the active turn at the next safe boundary, without overtaking earlier queued work. Refused when no turn is active. Available in both Snowfall and Ink.
+- **Explicit non-interrupting queue control:** `/queue <text>` queues follow-up input that never requests steering under any state; when idle it starts a normal turn. Available in both Snowfall and Ink.
+- **Ink configurable actions:** opt-in `chat:steer` and `chat:queue` keybinding actions with no default bindings. The existing keybinding loader, normalizer, and reserved-key protection apply unchanged.
+
+### Changed
+- **Snowfall busy-Enter routing:** while a turn runs, a submitted slash command is now queued for replay at the safe boundary instead of being dispatched immediately (previously `/compact` would refuse mid-turn and the input was dropped). Only the explicit controls above are decoded before busy barriers; every other command keeps the existing queue-and-replay FIFO contract.
+
+### Security
+- Steering and queue payloads are never interpreted as slash commands (nested `/` payloads are rejected); `off`/`status`/`clear` are ordinary message text. Multiline payloads are preserved verbatim. Model output or pasted text cannot reach these control paths — only explicit operator submission.
+
 ## [11.1.4] — 2026-11-05
 
 ### Changed

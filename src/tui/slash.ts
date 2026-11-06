@@ -289,6 +289,7 @@ export interface SlashCtx {
   missionRef: { current: MissionSnapshot | null };
   /** Queue a deferred turn while one runs (the /goal begin-while-running path). */
   queueDeferred: (text: string) => void;
+  promptControl: (mode: 'steer' | 'queue', text: string) => void;
   startTableRef: { current: ((arg: string) => void) | null };
   currentRef: { current: { provider: string; model: string } };
   selectModelRef: { current: ((entry: ModelEntry) => Promise<void>) | null };
@@ -361,6 +362,10 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
     return;
   }
   switch (dispatch) {
+    case '/steer':
+    case '/queue':
+      ctx.promptControl(dispatch === '/steer' ? 'steer' : 'queue', arg);
+      break;
     case '/activity':
     case '/expand': {
       if (arg && !/^\d+$/.test(arg)) { showToast(`Use ${dispatch} [number].`, 'warn'); break; }
