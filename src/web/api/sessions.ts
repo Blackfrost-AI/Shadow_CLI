@@ -129,11 +129,23 @@ export function registerSessionsRoutes(route: RouteFn, ctx: ApiContext): void {
   // Send a prompt. 202 immediately; the turn builds + runs in the background, streaming on SSE.
   route('POST', /^\/api\/sessions\/([^/]+)\/chat$/, async (req, _res, m) => {
     const id = m[1]!;
-    const body = (await readJsonBody(req)) as { prompt?: unknown } | null;
+    const body = (await readJsonBody(req)) as { prompt?: unknown; mission?: unknown } | null;
     if (!body || typeof body.prompt !== 'string' || !body.prompt.trim()) {
       return { status: 400, body: { error: 'prompt (non-empty string) is required' } };
     }
-    const r = await ctx.registry.submit(id, body.prompt);
+    const mission = typeof body.mission === 'string' ? body.mission.trim() : '';
+    if (mission.length > 2000) {
+      return { status: 400, body: { error: 'mission must be at most 2000 characters' } };
+    }
+    const r = await ctx.registry.submit(id, body.prompt, mission ? { mission } : undefined);
+    if (r.ok) return { status: 202, body: { accepted: true } };
+    return { status: r.code, body: { error: r.reason } };
+  });
+
+  // Compact the session's context without a task turn. 202 accepted; 409 while busy; 503 when
+  // the host was built without a compaction runner (older composition roots).
+  route('POST', /^\/api\/sessions\/([^/]+)\/compact$/, async (_req, _res, m) => {
+    const r = await ctx.registry.compact(m[1]!);
     if (r.ok) return { status: 202, body: { accepted: true } };
     return { status: r.code, body: { error: r.reason } };
   });

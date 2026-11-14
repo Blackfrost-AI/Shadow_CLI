@@ -103,6 +103,77 @@ test('create → chat → the mock turn runs and lands a terminal stop on the tr
   }
 });
 
+test('chat with a mission starts a mission and broadcasts mission state', async () => {
+  const proj = mkdtempSync(join(HOME, 'chatproj-mission-'));
+  const h = await server.startWebServer({ bus: new EventBus(), workspaceRoot: proj });
+  try {
+    projects.addProject(proj);
+    const created = await req(h.port, 'POST', '/api/sessions', h.token, { projectRoot: proj });
+    const id = created.json.id as string;
+    const chat = await req(h.port, 'POST', `/api/sessions/${id}/chat`, h.token, {
+      prompt: 'ship the release',
+      mission: 'ship the release',
+    });
+    assert.equal(chat.status, 202);
+    const deadline = Date.now() + 8000;
+    let status = '';
+    while (Date.now() < deadline) {
+      const list = await req(h.port, 'GET', '/api/sessions', h.token);
+      const row = (list.json.sessions as Array<{ id: string; status: string }>).find((s) => s.id === id);
+      status = row?.status ?? '';
+      if (status === 'idle' || status === 'error') break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    assert.equal(status, 'idle', 'the mission turn built a real agent and completed');
+    const tr = await req(h.port, 'GET', `/api/transcript?session=${id}`, h.token);
+    const missions = (tr.json.events as Array<{ event: { type: string; mission?: { active: boolean; mission: string } } }>)
+      .filter((entry) => entry.event.type === 'mission')
+      .map((entry) => entry.event.mission);
+    assert.ok(
+      missions.some((mission) => mission?.active && mission.mission === 'ship the release'),
+      'the active mission was broadcast on the session stream',
+    );
+  } finally {
+    await h.close();
+    rmSync(proj, { recursive: true, force: true });
+  }
+});
+
+test('compact is accepted without appending a task turn', async () => {
+  const proj = mkdtempSync(join(HOME, 'chatproj-compact-'));
+  const h = await server.startWebServer({ bus: new EventBus(), workspaceRoot: proj });
+  const waitIdle = async (id: string): Promise<string> => {
+    const deadline = Date.now() + 8000;
+    let status = '';
+    while (Date.now() < deadline) {
+      const list = await req(h.port, 'GET', '/api/sessions', h.token);
+      status =
+        (list.json.sessions as Array<{ id: string; status: string }>).find((s) => s.id === id)
+          ?.status ?? '';
+      if (status === 'idle' || status === 'error') break;
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    return status;
+  };
+  try {
+    projects.addProject(proj);
+    const created = await req(h.port, 'POST', '/api/sessions', h.token, { projectRoot: proj });
+    const id = created.json.id as string;
+
+    const compact = await req(h.port, 'POST', `/api/sessions/${id}/compact`, h.token);
+    assert.equal(compact.status, 202);
+    assert.equal(await waitIdle(id), 'idle', 'compaction completed without a task turn');
+    const tr = await req(h.port, 'GET', `/api/transcript?session=${id}`, h.token);
+    const types = (tr.json.events as Array<{ event: { type: string } }>).map(
+      (entry) => entry.event.type,
+    );
+    assert.equal(types.includes('user'), false, 'compaction does not append a user turn');
+  } finally {
+    await h.close();
+    rmSync(proj, { recursive: true, force: true });
+  }
+});
+
 test('interrupt on an idle web session is a clean 200 (nothing to interrupt)', async () => {
   const proj = mkdtempSync(join(HOME, 'chatproj2-'));
   const h = await server.startWebServer({ bus: new EventBus(), workspaceRoot: proj });

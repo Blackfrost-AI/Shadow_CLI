@@ -118,6 +118,11 @@ export function makeAgentBuilder(deps: { bootConfig: ShadowConfig; installDir: s
     // ever reaches /events. No explicit detach needed — the todoList dies with the agent and the
     // bus dies with the session, so the listener's references drop with them on close().
     agent.todoList.onUpdate((items) => session.bus.emit({ type: 'todo', items }));
+    // Live mission state (index.ts:mission.onUpdate parity for the TUI). The desktop renders the
+    // pinned mission block from these events; without the listener `/goal` state exists only in
+    // the loop's system prompt and never reaches the browser.
+    agent.mission.onUpdate((mission) => session.bus.emit({ type: 'mission', mission }));
+    session.bus.emit({ type: 'mission', mission: agent.mission.snapshot() });
     if (session.resumeSessionPath) session.workCenter?.restore(readLatestWorkCenterSnapshot(session.resumeSessionPath));
     session.workCenter?.syncTodos(agent.todoList.snapshot());
     if (session.workCenter) agent.bg.attachWorkCenter(session.workCenter);

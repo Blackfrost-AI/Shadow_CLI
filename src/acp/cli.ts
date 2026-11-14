@@ -16,7 +16,7 @@ import { readVersion } from '../version.js';
 import { ensureVaultReady } from '../auth/unlock.js';
 import { makeAgentBuilder } from '../web/sessionAgent.js';
 import { createSessionRegistry } from '../web/registry.js';
-import { makeTurnRunner } from '../web/runTurn.js';
+import { makeCompactionRunner, makeTurnRunner } from '../web/runTurn.js';
 import { addProject } from '../web/projects.js';
 import { RpcPeer } from './jsonrpc.js';
 import { createAcpServer, type AcpServer } from './server.js';
@@ -120,6 +120,7 @@ export async function runAcp(argv: string[]): Promise<void> {
     // The turn's approval gate bridges to the EDITOR (session/request_permission) instead of
     // denying everything — see AcpPermissionGate. Same fail-closed floor.
     runTurn: makeTurnRunner(undefined, (s) => server!.gateFor(s)),
+    runCompaction: makeCompactionRunner(undefined, (s) => server!.gateFor(s)),
   });
   server = createAcpServer({
     registry,

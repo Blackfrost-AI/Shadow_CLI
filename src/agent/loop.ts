@@ -754,6 +754,15 @@ export class AgentLoop {
     return result === 'summarized' || result === 'truncated';
   }
 
+  /**
+   * Compact the current context without running a model turn. Used by the explicit
+   * compaction action (web/TUI) when the user wants to reclaim space before the automatic
+   * trigger fires; `maybeCompact` still owns the summarizer, hooks and degradation findings.
+   */
+  async compactNow(): Promise<boolean> {
+    return this.maybeCompact(this.deps.provider, this.deps.model, this.deps.system, true);
+  }
+
   async run(): Promise<LoopResult> {
     this.completionGuard = new CompletionGuard(this.deps.completion);
     this.stopHooksEvaluated = false;

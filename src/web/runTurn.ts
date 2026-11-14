@@ -7,7 +7,7 @@ import type { ApprovalGate } from '../agent/approval.js';
 import type { LoopDeps } from '../agent/loop.js';
 import type { ShadowConfig } from '../config.js';
 import type { ToolCall } from '../provider/provider.js';
-import type { JailCapability, TurnRunner, WebSession } from './registry.js';
+import type { CompactionRunner, JailCapability, TurnRunner, WebSession } from './registry.js';
 import { resolveJail } from './projects.js';
 
 /**
@@ -65,6 +65,7 @@ export function buildTurnDeps(session: WebSession, gate?: ApprovalGate): LoopDep
     forceConfirm: makeWebForceConfirm(agent.cfg),
     todoList: agent.todoList,
     planMode: agent.planMode,
+    mission: agent.mission,
     streamShell: true,
     sessionLog: agent.sessionLog,
     resolveFallback: async (entry, fallbackSignal) => {
@@ -105,6 +106,20 @@ export function makeTurnRunner(
 
     const deps = buildTurnDeps(session, gateFor?.(session));
     await new AgentLoop(deps, session.autonomy()).run();
+  };
+}
+
+/** Compaction-only run: re-resolve the jail, assemble the same deps, and let the loop force a
+ *  summarization without appending a user turn or calling the model for a task answer. */
+export function makeCompactionRunner(
+  resolve: (root: string) => JailCapability = resolveJail,
+  gateFor?: (s: WebSession) => ApprovalGate,
+): CompactionRunner {
+  return async (session: WebSession) => {
+    if (!session.agent) throw new Error('compact called before the session was built');
+    session.jail = resolve(session.displayPath);
+    const deps = buildTurnDeps(session, gateFor?.(session));
+    await new AgentLoop(deps, session.autonomy()).compactNow();
   };
 }
 

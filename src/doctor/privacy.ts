@@ -248,6 +248,16 @@ export function buildPrivacyReport(cfg: PrivacyConfigView, env: PrivacyEnv): Pri
   });
   if (!offline) warnings.push('web_fetch / web_search can reach arbitrary hosts when the agent invokes them.');
 
+  // (b2) osv_query — fixed public advisory endpoint, only when the agent invokes it, dropped offline.
+  // Sends package identity (ecosystem/name/version or purl) ONLY — never workspace contents.
+  egress.push({
+    name: 'OSV advisory lookup (osv_query)',
+    target: 'api.osv.dev',
+    active: !offline,
+    scope: 'on-tool-use',
+    note: offline ? 'dropped in offline mode' : 'only when the agent invokes it; sends package identity only, never workspace contents; brokered with receipts',
+  });
+
   // (c) MCP servers — http `url` servers are direct egress; `command` servers are local processes.
   const mcp = cfg.mcpServers ?? {};
   for (const [name, s] of Object.entries(mcp)) {

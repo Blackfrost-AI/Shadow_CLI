@@ -9,7 +9,7 @@ import { createApiRouter } from './router.js';
 import { readAsset, shellPage, contentTypeFor } from './assets.js';
 import { createSessionRegistry, CLI_SESSION_ID, type SessionRegistry } from './registry.js';
 import { makeAgentBuilder } from './sessionAgent.js';
-import { makeTurnRunner } from './runTurn.js';
+import { makeCompactionRunner, makeTurnRunner } from './runTurn.js';
 import { WebApprovalGate } from './approvalGate.js';
 import { INSTALL_DIR } from '../installDir.js';
 import { loadConfig, type ShadowConfig } from '../config.js';
@@ -131,6 +131,7 @@ export async function startWebServer(opts: WebServerOptions): Promise<WebServerH
     // answers over POST /api/sessions/:id/approvals/:id (fail-closed on abort/close). The ACP
     // adapter injects its own editor-mediated gate the same way (src/acp/cli.ts).
     runTurn: makeTurnRunner(undefined, (s) => new WebApprovalGate(s)),
+    runCompaction: makeCompactionRunner(undefined, (s) => new WebApprovalGate(s)),
   });
   registry.attachReserved({
     bus: opts.bus,

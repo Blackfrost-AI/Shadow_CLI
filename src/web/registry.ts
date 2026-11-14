@@ -182,6 +182,9 @@ export type AgentBuilder = (s: WebSession) => Promise<{
 /** Injected likewise: assembles LoopDeps from a built session and runs one turn. */
 export type TurnRunner = (s: WebSession, prompt: string) => Promise<void>;
 
+/** Compaction-only run: same deps, no user turn and no task answer. */
+export type CompactionRunner = (s: WebSession) => Promise<void>;
+
 export interface SessionRegistry {
   get(id: string): WebSession | undefined;
   list(): SessionSummary[];
@@ -196,8 +199,15 @@ export interface SessionRegistry {
   }): WebSession;
   /** Browser-owned. Builds a stream + bus ONLY. Rejects the reserved id. */
   create(spec: CreateSessionSpec): WebSession;
-  /** Admits and detaches. Resolves once ACCEPTED (202), not once the turn is done. */
-  submit(id: string, prompt: string): Promise<{ ok: true } | { ok: false; code: number; reason: string }>;
+  /** Admits and detaches. Resolves once ACCEPTED (202), not once the turn is done.
+   *  `mission` starts a /goal mission (planning phase + plan mode) before the turn. */
+  submit(
+    id: string,
+    prompt: string,
+    options?: { mission?: string },
+  ): Promise<{ ok: true } | { ok: false; code: number; reason: string }>;
+  /** Queue a compaction-only run. No user turn is appended; 409 while the session is busy. */
+  compact(id: string): Promise<{ ok: true } | { ok: false; code: number; reason: string }>;
   /** Answer a parked approval ask. False = unknown session, or no pending ask with that id. */
   decide(id: string, approvalId: string, decision: ApprovalDecision): boolean;
   /** Change a browser-created session's autonomy (the composer's access pill). */
@@ -212,7 +222,11 @@ export interface SessionRegistry {
   closeAll(): Promise<void>;
 }
 
-export function createSessionRegistry(deps: { builder: AgentBuilder; runTurn: TurnRunner }): SessionRegistry {
+export function createSessionRegistry(deps: {
+  builder: AgentBuilder;
+  runTurn: TurnRunner;
+  runCompaction?: CompactionRunner;
+}): SessionRegistry {
   const sessions = new Map<string, WebSessionInternal>();
   let nextClientId = 1;
   const allocClientId = (): number => nextClientId++;
@@ -356,7 +370,12 @@ export function createSessionRegistry(deps: { builder: AgentBuilder; runTurn: Tu
     try { built.agent.wakeup.clear(); } catch { /* best-effort */ }
   };
 
-  async function drive(s: WebSessionInternal, prompt: string): Promise<void> {
+  async function drive(
+    s: WebSessionInternal,
+    prompt: string,
+    missionGoal?: string,
+    compactOnly = false,
+  ): Promise<void> {
     // E3a — interruptible from the FIRST tick, including the build.
     //
     // The controller used to be created AFTER `await s.building`, so during 'initializing' —
@@ -397,6 +416,19 @@ export function createSessionRegistry(deps: { builder: AgentBuilder; runTurn: Tu
         emitInterrupted(s);
         return;
       }
+      // /goal mission: begin BEFORE runTurn builds LoopDeps so the mission block and plan-mode
+      // instructions are pinned into this very turn. Failure is a terminal error frame, not a
+      // silent normal turn.
+      if (missionGoal) {
+        if (!s.agent) return;
+        if (!s.agent.mission.available) {
+          throw new Error(
+            s.agent.mission.unavailableReason ?? 'mission mode is unavailable in this session',
+          );
+        }
+        s.agent.mission.begin(missionGoal);
+        s.agent.planMode?.enter();
+      }
       // Serialize the actual turn through the process-wide run lock — one at a time across the TUI
       // and every session. Web sessions wait WITHOUT priority (the operator's TUI jumps ahead).
       s.status = 'queued';
@@ -413,7 +445,12 @@ export function createSessionRegistry(deps: { builder: AgentBuilder; runTurn: Tu
       }
       try {
         s.status = 'running';
-        await deps.runTurn(s, prompt);
+        if (compactOnly) {
+          if (!deps.runCompaction) throw new Error('compaction is unavailable');
+          await deps.runCompaction(s);
+        } else {
+          await deps.runTurn(s, prompt);
+        }
         s.status = 'idle';
       } finally {
         // Release ONLY here, in the finally around the turn — never off a `stop` event (a
@@ -510,7 +547,7 @@ export function createSessionRegistry(deps: { builder: AgentBuilder; runTurn: Tu
       return s;
     },
 
-    async submit(id, prompt) {
+    async submit(id, prompt, options) {
       const s = sessions.get(id);
       if (!s) return { ok: false, code: 404, reason: 'unknown session' };
       if (!s.canPrompt) return { ok: false, code: 409, reason: 'session_is_mirror' };
@@ -520,7 +557,20 @@ export function createSessionRegistry(deps: { builder: AgentBuilder; runTurn: Tu
       if (s.status === 'initializing' || s.status === 'queued' || s.status === 'running') {
         return { ok: false, code: 409, reason: 'busy' };
       }
-      void drive(s, prompt);
+      void drive(s, prompt, options?.mission);
+      return { ok: true };
+    },
+
+    async compact(id) {
+      const s = sessions.get(id);
+      if (!s) return { ok: false, code: 404, reason: 'unknown session' };
+      if (!s.canPrompt) return { ok: false, code: 409, reason: 'session_is_mirror' };
+      if (s.status === 'closed') return { ok: false, code: 409, reason: 'closed' };
+      if (!deps.runCompaction) return { ok: false, code: 503, reason: 'compaction_unavailable' };
+      if (s.status === 'initializing' || s.status === 'queued' || s.status === 'running') {
+        return { ok: false, code: 409, reason: 'busy' };
+      }
+      void drive(s, '', undefined, true);
       return { ok: true };
     },
 

@@ -461,6 +461,12 @@ macOS or Linux.
 
 ## Appendix A — Egress inventory (every byte that leaves the machine, verified 2026-08-16)
 
+Security-toolbelt update reviewed 2026-11-13: `osv_query` adds one fixed public advisory endpoint
+(`api.osv.dev`), ON-TOOL-USE — see entry (17). It sends package identity only, never workspace
+contents, and is brokered like every other tool call. `secrets_scan` and `sast_scan` add NO egress
+(local read / local scanner with telemetry forced off); `bin_recon` ELF/PE parsing is local and
+read-only. No other new destination.
+
 Onboarding catalog update reviewed 2026-10-05:
 
 | Destination | Trigger and payload |
@@ -543,6 +549,14 @@ the user runs `shadow plugin add <git-url>`; scheme allowlist (https/ssh/file/sc
 plain `http://` refused), scrubbed env, `GIT_TERMINAL_PROMPT=0`, shallow clone into a 0700 temp dir,
 refused under `--offline` (local `file://` still works); broker-bypass child process, journaled as
 `plugin-clone` in the receipt.
+(17) `osv_query` OSV.dev advisory lookup — ON-TOOL-USE, only when the agent invokes the tool, to the
+FIXED endpoint `https://api.osv.dev/v1/query` (`src/tools/osvQuery.ts:19`). The POST body is package
+identity ONLY — `{package:{ecosystem,name},version}` or `{package:{purl}}`
+(`src/tools/osvQuery.ts:123-125`) — never workspace paths or file contents. The response is advisory
+ids/aliases/severity/fixed versions, size-capped. Through the broker (`shadowFetch`, `purpose: 'osv'`,
+`origin: 'user'`, `src/tools/osvQuery.ts:130-138`): offline wall, SSRF re-validation, and append-only
+receipt all apply; dropped in `--offline`. User-initiated, never automatic, no manifest auto-upload.
+Listed by `doctor --privacy`.
 **LOCAL/LAN (not internet egress):** local-model readiness probes — 127.0.0.1 for Shadow's own
 auto-serves, the operator-configured host (LAN/mDNS) when the user serves their own endpoint;
 journaled to the receipt as `local-probe`. Web console (127.0.0.1 bind, CSP

@@ -8,6 +8,7 @@ import {
   CLI_SESSION_ID,
   TRANSPORT_GONE_MS,
   type AgentBuilder,
+  type CompactionRunner,
   type TurnRunner,
   type WebSession,
   type McpHandle,
@@ -62,8 +63,12 @@ async function until(cond: () => boolean, ms = 2000): Promise<void> {
 
 /** Build a registry whose builder/runTurn are spies. Overrides supply the behavior; the wrappers
  *  always count the call first. */
-function makeRegistry(overrides?: { builder?: AgentBuilder; runTurn?: TurnRunner }) {
-  const calls = { builder: 0, runTurn: 0 };
+function makeRegistry(overrides?: {
+  builder?: AgentBuilder;
+  runTurn?: TurnRunner;
+  runCompaction?: CompactionRunner;
+}) {
+  const calls = { builder: 0, runTurn: 0, compaction: 0 };
   const defaultBuilder: AgentBuilder = async () => ({ agent: makeAgent().agent, mcp: [], jail: JAIL });
   const builder: AgentBuilder = async (s) => {
     calls.builder++;
@@ -73,9 +78,47 @@ function makeRegistry(overrides?: { builder?: AgentBuilder; runTurn?: TurnRunner
     calls.runTurn++;
     if (overrides?.runTurn) await overrides.runTurn(s, p);
   };
-  const registry = createSessionRegistry({ builder, runTurn });
+  const runCompaction: CompactionRunner = async (s) => {
+    calls.compaction++;
+    if (overrides?.runCompaction) await overrides.runCompaction(s);
+  };
+  const registry = createSessionRegistry({ builder, runTurn, runCompaction });
   return { registry, calls };
 }
+
+test('manual compaction queues a compaction-only run and refuses while busy', async () => {
+  let releaseTurn!: () => void;
+  const gate = new Promise<void>((r) => (releaseTurn = r));
+  const { registry, calls } = makeRegistry({
+    runTurn: async () => {
+      await gate;
+    },
+  });
+  const s = registry.create({ projectRoot: '/tmp/ws' });
+
+  assert.deepEqual(await registry.submit(s.id, 'hi'), { ok: true });
+  await until(() => registry.get(s.id)!.status === 'running');
+  assert.deepEqual(await registry.compact(s.id), { ok: false, code: 409, reason: 'busy' });
+
+  releaseTurn();
+  await until(() => registry.get(s.id)!.status === 'idle');
+  assert.deepEqual(await registry.compact(s.id), { ok: true });
+  await until(() => calls.compaction === 1 && registry.get(s.id)!.status === 'idle');
+  assert.equal(calls.runTurn, 1, 'compaction does not append a user turn');
+});
+
+test('compaction is 503 when the composition root has no compaction runner', async () => {
+  const registry = createSessionRegistry({
+    builder: async () => ({ agent: makeAgent().agent, mcp: [], jail: JAIL }),
+    runTurn: async () => {},
+  });
+  const s = registry.create({ projectRoot: '/tmp/ws' });
+  assert.deepEqual(await registry.compact(s.id), {
+    ok: false,
+    code: 503,
+    reason: 'compaction_unavailable',
+  });
+});
 
 test('create() and the read path never build an agent', async () => {
   const { registry, calls } = makeRegistry();
@@ -112,6 +155,66 @@ test('first submit builds exactly once; a second submit while a turn is in fligh
   await until(() => registry.get(s.id)!.status === 'idle');
   assert.equal(calls.builder, 1, 'the build ran once despite two submits');
   assert.equal(calls.runTurn, 1, 'exactly one turn ran');
+});
+
+test('submit with a mission begins it and enters plan mode before the turn', async () => {
+  const events: string[] = [];
+  const agent = {
+    bg: { killAll: () => {} },
+    wakeup: { clear: () => {} },
+    mission: {
+      available: true,
+      unavailableReason: undefined,
+      begin: (text: string) => events.push(`begin:${text}`),
+      snapshot: () => ({ active: true }),
+    },
+    planMode: {
+      enter: () => {
+        events.push('plan');
+        return {};
+      },
+    },
+  } as unknown as AgentSession;
+  const { registry, calls } = makeRegistry({
+    builder: async () => ({ agent, mcp: [], jail: JAIL }),
+    runTurn: async () => {
+      events.push('turn');
+    },
+  });
+  const s = registry.create({ projectRoot: '/tmp/ws' });
+  const accepted = await registry.submit(s.id, 'ship it', { mission: 'ship it' });
+  assert.deepEqual(accepted, { ok: true });
+  await until(() => registry.get(s.id)!.status === 'idle');
+  assert.deepEqual(events, ['begin:ship it', 'plan', 'turn']);
+  assert.equal(calls.runTurn, 1);
+});
+
+test('a mission on a session without mission controls fails before the turn', async () => {
+  const events: string[] = [];
+  const agent = {
+    bg: { killAll: () => {} },
+    wakeup: { clear: () => {} },
+    mission: {
+      available: false,
+      unavailableReason: 'required controls are hidden: mission_update',
+      begin: () => events.push('begin'),
+      snapshot: () => ({ active: false }),
+    },
+    planMode: { enter: () => events.push('plan') },
+  } as unknown as AgentSession;
+  const { registry, calls } = makeRegistry({
+    builder: async () => ({ agent, mcp: [], jail: JAIL }),
+    runTurn: async () => {
+      events.push('turn');
+    },
+  });
+  const s = registry.create({ projectRoot: '/tmp/ws' });
+  const accepted = await registry.submit(s.id, 'ship it', { mission: 'ship it' });
+  assert.deepEqual(accepted, { ok: true });
+  await until(() => registry.get(s.id)!.status === 'error');
+  assert.deepEqual(events, []);
+  assert.equal(calls.runTurn, 0, 'no turn runs when mission controls are hidden');
+  assert.match(s.lastError ?? '', /mission_update/);
 });
 
 test('a build failure is contained: status error, a terminal frame, secret scrubbed, others alive', async () => {

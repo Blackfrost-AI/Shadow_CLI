@@ -19,6 +19,9 @@ import { targetSnapshot } from './targetSnapshot.js';
 import { engagementOps } from './engagementOps.js';
 import { inferRecon } from './inferRecon.js';
 import { inferCapacity } from './inferCapacity.js';
+import { secretsScan } from './secretsScan.js';
+import { osvQuery } from './osvQuery.js';
+import { sastScan } from './sastScan.js';
 import { makeWatcherTool } from './watcherTool.js';
 import type { WatcherRegistry } from '../agent/watcher.js';
 
@@ -115,6 +118,11 @@ export function registerBuiltinTools(
   // nothing in the default schema and are found via tool_search. Neither loads or runs a model.
   registry.register(inferRecon);
   registry.register(inferCapacity);
+  // Security research toolbelt: masked secret sweep (read) + OSV advisory lookup
+  // (network, brokered). Deferred — found via tool_search, zero default-schema cost.
+  registry.register(secretsScan);
+  registry.register(osvQuery);
+  registry.register(sastScan);
   // Detached watchers: registered only when the caller supplies a registry, because the registry is
   // workspace-scoped and this function has no workspace root of its own.
   if (opts.watchers) registry.register(makeWatcherTool(opts.watchers));

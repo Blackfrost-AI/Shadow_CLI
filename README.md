@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Blackfrost-AI/Shadow_CLI/releases"><img src="https://img.shields.io/badge/release-v11.7.0-7fb4d8?style=flat-square" alt="Release v11.7.0"></a>
+  <a href="https://github.com/Blackfrost-AI/Shadow_CLI/releases"><img src="https://img.shields.io/badge/release-v11.8.0-7fb4d8?style=flat-square" alt="Release v11.8.0"></a>
   <img src="https://img.shields.io/badge/node-%E2%89%A522.19.0-3c873a?style=flat-square" alt="Node ≥ 22.19.0">
   <img src="https://img.shields.io/badge/telemetry-zero-2ea043?style=flat-square" alt="Zero telemetry">
   <img src="https://img.shields.io/badge/providers-any-8b949e?style=flat-square" alt="Provider-neutral">
@@ -12,7 +12,7 @@
 
 # Shadow CLI
 
-Current build: **`v11.7.0`** — TUI immersion: clickable OSC 8 links, a configurable prose width (`proseMaxCols`), a grouped drill-in command menu (`/menu`) with a repository file browser (`/repo`), named model roles (`/role`), and Ctrl+P model cycling (`--models`). Restores the Snowfall image viewer fallback.
+Current build: **`v11.8.0`** — the security toolbelt: `secrets_scan` (masked credential sweep), `osv_query` (brokered CVE/GHSA lookup), `sast_scan` (privacy-first semgrep bridge), and `bin_recon` now reading ELF and PE alongside Mach-O. Three bundled security skills ship in the prompt bundle. Local-first and zero-telemetry throughout; the one network tool is brokered, fixed-endpoint, and identity-only.
 
 Shadow is a local-first, provider-neutral security engineering agent. Its built-in Security
 foundation covers investigation, hardening, incident response, defensive automation, secure coding,
@@ -24,19 +24,28 @@ receipts stay under your control. Shadow requires no Shadow account and includes
 to the endpoint *you* configure; every network request is brokered, receipted, and can be switched
 off entirely with `--offline`. Nothing phones home.
 
-## What's new in v11.7.0
+## What's new in v11.8.0
 
-- **Repository browser & grouped menu** — `/menu` drills into grouped command categories; `/repo`
-  browses the workspace with a live busy-guard before opening the editor.
-- **Model roles & cycling** — assign `smol`/`slow`/`plan` roles via `/role` (`config.roles`), and
-  cycle an allowlist with `Ctrl+P` (`--models`).
-- **Clickable links** — OSC 8 hyperlinks open in your browser behind the `linkClickOpen` gate.
-- **Readable prose** — `proseMaxCols` (default 100, `0` = fill) keeps long answers readable and the
-  layout reflows cleanly when you resize the terminal.
-- **Image save/open fallback** — Snowfall saves an image and opens it with your system viewer when
-  inline rendering isn't available.
+- **`secrets_scan` — masked credential sweep.** Finds hardcoded API keys, tokens, private keys,
+  and passwords across the workspace. Output is masked only (`file:line` + rule id + masked
+  preview); raw secret material never enters context. `.gitignore`-aware, no writes, no network.
+- **`osv_query` — known-vulnerability lookup.** Checks a package version against published
+  CVE/GHSA advisories via the fixed OSV.dev endpoint. Sends **package identity only** (never
+  workspace contents), brokered with the offline wall + receipts. User-initiated, never automatic.
+- **`sast_scan` — privacy-first static analysis.** A semgrep bridge with telemetry forced off,
+  local rules by default (registry rules need explicit `allowRegistry`), SARIF output under
+  `.shadow/sast/`, and optional import into the `security_findings` evidence store.
+- **`bin_recon` reads ELF and PE.** Magic-byte dispatch adds ELF (32/64, both endians) and PE
+  (PE32/PE32+) pure parsers with the same read-only action set; Mach-O behavior is unchanged.
+- **Three bundled security skills** — `security-review`, `security-scan`, and
+  `agent-security-hardening` — ship in the prompt bundle, no plugin install or network fetch.
 
-Recent releases also landed **information survival** (completed background tasks wake idle sessions;
+All four tools are deferred and discoverable by intent (`tool_search`: `secrets`, `cve`,
+`semgrep`, `elf`, `pe`). The new `api.osv.dev` destination was reviewed against the zero-telemetry
+host guard and documented in `docs/security/THREAT_MODEL.md` Appendix A and `doctor --privacy`.
+
+Recent releases also landed **TUI immersion** (clickable OSC 8 links, `proseMaxCols`, the `/menu`
+command browser, `/repo`, model roles + Ctrl+P cycling), **information survival** (completed background tasks wake idle sessions;
 compaction spills cleared tool output to recoverable locators), **live memory** (facts refresh
 mid-session without busting the prompt cache), and **injection-safe compaction** (untrusted tool
 output stays enveloped through summarization). See the [changelog](CHANGELOG.md) for the full history.
@@ -154,8 +163,9 @@ credential storage, egress policy, and their limits. OS sandbox support differs 
 - [Threat model](docs/security/THREAT_MODEL.md): trust boundaries and defenses.
 - [Vision](docs/VISION.md): connect a vision endpoint.
 - [Testing](docs/TESTING.md): test runner and verification details.
-- [Documentation index](docs/README.md): current guides and security material.
-- [Changelog](CHANGELOG.md): release history.
+- [Release assessment](docs/RELEASE_ASSESSMENT_2026-09-27.md): cleanup record, blockers, and makeover plan.
+- [Documentation index](docs/README.md): current guides, security material, and historical records.
+- [Changelog](CHANGELOG.md): prior release history and unreleased cleanup.
 
 ## Development
 
@@ -171,6 +181,10 @@ npm run check:release-gate
 Run tests with `npm test`. The suite relies on Node honoring its isolated test homes; running
 `bun test` can operate on real credential files. Bun is used separately to compile standalone
 binaries with `npm run build:binary`.
+
+The private working repository and public source mirror have separate histories. Follow the
+internal release procedure before publishing; the assessment records the current remote problem
+and the checks needed to establish a reliable release process.
 
 ## License
 

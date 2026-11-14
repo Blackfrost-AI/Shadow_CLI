@@ -7,6 +7,81 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [11.8.0] — 2026-11-13
+
+**Security toolbelt for vulnerability hunters and ethical hackers.** Four deferred,
+discoverable tools (`tool_search` resolves them by intent — `secrets`, `cve`, `semgrep`,
+`elf`, `pe`) plus three bundled security skills, so the harness enhances a model's
+defensive-security capability out of the box. Everything stays local-first and
+zero-telemetry; the one network tool is brokered, fixed-endpoint, and identity-only.
+
+### Added
+
+- **`secrets_scan` — masked credential sweep (read-only).** Scans the workspace or named
+  paths for hardcoded secrets (API keys, tokens, private keys, passwords) using the session
+  redaction engine's patterns plus an optional high-entropy assignment heuristic. Output is
+  **masked only** — `file:line`, rule id, and a masked preview; raw secret material never
+  enters context. `.gitignore`-aware via git, skips binaries and vendor dirs. No writes, no
+  network.
+- **`osv_query` — known-vulnerability lookup (brokered network).** Checks whether a package
+  version has published CVE/GHSA advisories via the fixed public OSV.dev endpoint
+  (`api.osv.dev/v1/query`). Provide `ecosystem`+`name`+`version` or a `purl`; returns advisory
+  ids, aliases, severity, and fixed versions. The POST body is **package identity only** —
+  never workspace paths or file contents — and routes through the egress broker (offline
+  wall, SSRF re-validation, append-only receipts). User-initiated, never automatic. Added to
+  `doctor --privacy` and `docs/security/THREAT_MODEL.md` Appendix A (entry 17); the
+  zero-telemetry host snapshot was deliberately re-pinned after that review.
+- **`sast_scan` — privacy-first static analysis (semgrep bridge).** Telemetry forced **off**
+  (`--metrics=off` plus scrubbed env); rules default to a **local path**, and registry rules
+  require explicit `allowRegistry: true` (they fetch from semgrep.dev). Fixed argv, bounded
+  timeout, honest missing-binary failure. Results are written as a SARIF artifact under
+  `.shadow/sast/` and can be imported into the `security_findings` evidence store.
+  `action: 'check'` probes availability; `'scan'` runs the sweep. Never edits source.
+- **Three bundled security skills** — `security-review`, `security-scan`, and
+  `agent-security-hardening` — ship in the prompt bundle (loader-verified on a clean
+  machine), giving the model structured defensive-security workflows without any plugin
+  install or network fetch.
+
+### Changed
+
+- **`bin_recon` now reads ELF and PE, not just Mach-O.** Magic-byte dispatch routes ELF
+  (32/64-bit, both endians) and PE (PE32/PE32+) images to new pure-parser handlers
+  (`src/security/elf.ts`, `src/security/pe.ts`) with the same action set and output contract:
+  headers, sections/segments, imports/exports, symbols, hardening flags, and raw byte
+  windows. Still read-only — it never executes or loads the target — and an unrecognized
+  magic is reported honestly rather than guessed. Mach-O behavior is unchanged (37
+  regression tests pass).
+- **Security-engagement policy updated** (`prompts/policies/security-engagement.md`,
+  regenerated bundle): documents the three new tools, the ELF/PE `bin_recon` surface, and
+  the scope boundary — `osv_query` is the single brokered exception; every other toolbelt
+  tool operates on local files and needs no network path.
+- **Web companion + ACP manual compaction.** New `AgentLoop.compactNow()` runs the same
+  summarizer/hooks/degradation path as the automatic trigger, forced on demand. The web
+  host exposes `WebSessionRegistry.runCompaction()` (one compact per session, guarded
+  against a running turn); the router wires it, `runTurn`/session routes return **409**
+  while a compact is in flight, and the ACP client gains a `session/compact` method with
+  the same semantics. The TUI already had `/compact`; the web and editor surfaces now
+  match it instead of waiting for the automatic threshold.
+
+### Verification
+
+- Full suite: **4180 pass / 2 fail / 1 skip** (Node test runner, two consecutive full runs).
+  Both failures are the **known, pre-existing `claude-code-provider` deadline flake**
+  (`test/claude-code-provider.test.ts`, ENOENT on the fixture capture under full-suite
+  load — also documented for 11.6.0/11.7.0); the suite passes **31/31 isolated**. No new
+  failures. New coverage: ELF/PE parsing (12 tests, incl. the crafted-import CPU-budget
+  regression), secrets/osv (10), sast (7), web-registry compaction guards, plus the
+  bundled-skill loader check (17).
+- `npm run typecheck` clean; `npm run lint` clean; `npm run build` clean;
+  `npm run check:release-gate` OK.
+- The zero-telemetry remote-host snapshot guard flagged the new `api.osv.dev` destination;
+  it was reviewed (THREAT_MODEL.md A(17) + `doctor --privacy`), confirmed brokered and
+  identity-only, and deliberately re-pinned — the guard worked as designed.
+- PE import parsing now enforces a **global** imported-function budget (65 536) in addition
+  to the per-DLL cap: a crafted image declaring thousands of import descriptors can no
+  longer multiply the per-DLL allowance into a CPU-exhaustion parse. Regression-tested with
+  a 200-DLL crafted image (bounded walk, truncation flagged, early outer-loop stop).
+
 ## [11.7.0] — 2026-11-13
 
 **TUI immersion: clickable links, command menu, model roles.** Five operator-requested

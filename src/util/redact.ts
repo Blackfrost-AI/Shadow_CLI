@@ -62,6 +62,44 @@ const PATTERNS: Array<[RegExp, string]> = [
  * Mask known secret shapes — and the live values of sensitive environment
  * variables — in a single string. Best-effort (see file header).
  */
+/**
+ * Read-only view of the shape-based secret patterns, for the `secrets_scan` tool.
+ * Returns copies so a scanner cannot mutate the redaction engine's own list. This is
+ * an additive export — it changes no redaction behavior.
+ */
+export function getRedactionPatterns(): Array<{ label: string; pattern: RegExp }> {
+  return PATTERNS.map(([pattern, label]) => ({ label, pattern: new RegExp(pattern.source, pattern.flags) }));
+}
+
+/** A named detection rule for `secrets_scan`. `secretGroup` selects the capture group
+ *  holding the actual secret (0 = whole match) so previews mask only the secret, not
+ *  surrounding context like `KEY=`. Patterns are derived from the redaction engine so
+ *  the scanner and redactor detect the same shapes. */
+export interface SecretScanRule {
+  id: string;
+  pattern: RegExp;
+  secretGroup: number;
+}
+
+export function getSecretScanRules(): SecretScanRule[] {
+  return [
+    { id: 'provider-api-key', pattern: /sk-[A-Za-z0-9_-]{12,}/g, secretGroup: 0 },
+    { id: 'stripe-key', pattern: /[rs]k_(?:live|test)_[A-Za-z0-9]{16,}/g, secretGroup: 0 },
+    { id: 'bearer-token', pattern: /Bearer\s+[A-Za-z0-9._-]{8,}/gi, secretGroup: 0 },
+    { id: 'github-token', pattern: /gh[posur]_[A-Za-z0-9]{20,}/g, secretGroup: 0 },
+    { id: 'github-fine-grained-token', pattern: /github_pat_[A-Za-z0-9_]{20,}/g, secretGroup: 0 },
+    { id: 'slack-token', pattern: /xox[baprs]-[A-Za-z0-9-]{10,}/g, secretGroup: 0 },
+    { id: 'gitlab-token', pattern: /glpat-[A-Za-z0-9_-]{16,}/g, secretGroup: 0 },
+    { id: 'google-api-key', pattern: /AIza[A-Za-z0-9_-]{30,}/g, secretGroup: 0 },
+    { id: 'aws-access-key-id', pattern: /A(?:KIA|SIA)[0-9A-Z]{16}/g, secretGroup: 0 },
+    { id: 'aws-secret-access-key', pattern: /(?:aws[_-]?)?secret[_-]?access[_-]?key\s*[:=]\s*["']?([A-Za-z0-9/+=]{16,})/gi, secretGroup: 1 },
+    { id: 'private-key-block', pattern: /-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----/g, secretGroup: 0 },
+    { id: 'jwt', pattern: /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{6,}/g, secretGroup: 0 },
+    { id: 'url-credentials', pattern: /[a-z][a-z0-9+.-]*:\/\/[^:@\s/]+:([^@\s/]+)@/gi, secretGroup: 1 },
+    { id: 'credential-assignment', pattern: /\b[A-Za-z0-9_]*(?:API_KEY|SECRET|TOKEN|PASSWORD|PASS|PWD|CRED|CREDENTIAL|PRIVATE_KEY)=(\S+)/gi, secretGroup: 1 },
+  ];
+}
+
 export function redactString(s: string): string {
   if (!s) return s;
   let out = s;

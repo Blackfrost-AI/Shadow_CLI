@@ -1,12 +1,15 @@
-// bin_recon — read-only structured binary reconnaissance for Mach-O images.
+// bin_recon — read-only structured binary reconnaissance for Mach-O, ELF, and PE images.
 //
 // The Phase 1 redteam context-cost fix: every query returns capped, structured JSON
 // instead of a raw `otool` dump, and the fat-slice VA<->offset math that was previously
 // hand-computed per crack is built in. Structure, symbols and entitlements come from the
-// pure parser in ../security/macho.ts (never executing anything inside the target).
-// Disassembly windows shell out to the host llvm-objdump when present and fall back to
-// a raw byte window otherwise — the byte window is the fail-soft core, the mnemonics
-// are an optional enhancement. All file access runs through the workspace jail.
+// pure parsers in ../security/{macho,elf,pe}.ts (never executing anything inside the
+// target). Format is detected from magic bytes: Mach-O keeps its original path
+// unchanged; ELF (32/64, both endians) and PE (PE32/PE32+) route to a parallel handler
+// with the same action contract. Disassembly windows shell out to the host objdump
+// when present and fall back to a raw byte window otherwise — the byte window is the
+// fail-soft core, the mnemonics are an optional enhancement. All file access runs
+// through the workspace jail.
 
 import { spawnSync } from 'node:child_process';
 import { readFileSync, statSync, mkdirSync, writeFileSync, unlinkSync } from 'node:fs';
@@ -27,8 +30,26 @@ import {
   type FatSlice,
   type MachoSliceInfo,
 } from '../security/macho.js';
+import {
+  isElf,
+  parseElf,
+  scanSymbols as scanElfSymbols,
+  vaToOffset as elfVaToOffset,
+  offsetToVa as elfOffsetToVa,
+  ElfError,
+  type ElfInfo,
+} from '../security/elf.js';
+import {
+  isPe,
+  parsePe,
+  scanSymbols as scanPeSymbols,
+  vaToOffset as peVaToOffset,
+  offsetToVa as peOffsetToVa,
+  PeError,
+  type PeInfo,
+} from '../security/pe.js';
 import { clamp } from './util.js';
-import { fail, ok, type Tool, type ToolResult } from './types.js';
+import { fail, ok, type Tool, type ToolResult, type ToolContext } from './types.js';
 
 const MAX_FILE_BYTES = 512 * 1024 * 1024; // refuse images above 512 MiB
 const MAX_SYMBOL_RESULTS = 500;
@@ -96,23 +117,341 @@ function parseVa(value: string): bigint {
   return BigInt(value);
 }
 
+/**
+ * ELF/PE reconnaissance handler. Same action set and output contract as the
+ * Mach-O path; format-specific detail lives under the same field names where
+ * the concepts match (segments/sections/symbols/imports). `entitlements` is a
+ * Mach-only concept and returns null with an honest note. Single-image formats:
+ * no fat container, so `layout` reports one slice describing the whole file.
+ */
+function reconElfPe(
+  input: BinReconInput,
+  ctx: ToolContext,
+  buf: Buffer,
+  resolved: string,
+  start: number,
+): ToolResult<unknown> {
+  const failNow = (code: string, message: string) =>
+    fail('bin_recon', 'read', Date.now() - start, code, message);
+  const okNow = (data: unknown) =>
+    ok(
+      'bin_recon',
+      'read',
+      Date.now() - start,
+      clamp(JSON.stringify({ action: input.action, ...((data ?? {}) as object) }), MAX_OUTPUT_CHARS),
+      data,
+    );
+
+  let elf: ElfInfo | null = null;
+  let pe: PeInfo | null = null;
+  try {
+    if (isElf(buf)) elf = parseElf(buf);
+    else pe = parsePe(buf);
+  } catch (e) {
+    const code =
+      e instanceof ElfError || e instanceof PeError
+        ? e.code === 'unsupported'
+          ? 'unsupported'
+          : 'parse_error'
+        : 'parse_error';
+    return failNow(code, (e as Error).message);
+  }
+  const archName = elf ? elf.archName : pe!.archName;
+  const format = elf ? 'elf' : 'pe';
+
+  try {
+    ctx.signal?.throwIfAborted();
+    if (input.arch && input.arch !== archName) {
+      return failNow('unknown_arch', `Image is ${format} ${archName}; no slice for ${input.arch}.`);
+    }
+    let data: unknown;
+    switch (input.action) {
+      case 'layout': {
+        const slice = elf
+          ? {
+              archName,
+              offset: 0,
+              size: buf.length,
+              format,
+              class: elf.class,
+              endian: elf.endian,
+              filetype: elf.typeName,
+            }
+          : {
+              archName,
+              offset: 0,
+              size: buf.length,
+              format,
+              peClass: pe!.peClass,
+              isDll: pe!.isDll,
+            };
+        data = { kind: format, path: input.path, size: buf.length, slices: [slice] };
+        break;
+      }
+      case 'info': {
+        if (elf) {
+          data = {
+            path: input.path,
+            format,
+            arch: archName,
+            filetype: elf.typeName,
+            class: elf.class,
+            endian: elf.endian,
+            entry: '0x' + elf.entry.toString(16),
+            size: buf.length,
+            segments: elf.segments.map((s) => ({
+              name: s.typeName,
+              flags: s.flagsText,
+              vmaddr: '0x' + s.vaddr.toString(16),
+              vmsize: s.memsz.toString(),
+              fileoff: s.offset,
+              filesize: s.filesz,
+            })),
+            sections: elf.sections.map((s) => ({
+              name: s.name,
+              type: s.typeName,
+              addr: '0x' + s.addr.toString(16),
+              offset: s.offset,
+              size: s.size.toString(),
+            })),
+            libs: elf.libs,
+            rpaths: elf.rpaths,
+            interpreter: elf.interpreter,
+            dynamic: elf.dynamic.map((d) => ({
+              tag: d.tagName,
+              value: '0x' + d.value.toString(16),
+              ...(d.str !== null ? { str: d.str } : {}),
+            })),
+            symtabCount: elf.symtabCount,
+            dynsymCount: elf.dynsymCount,
+            stripped: elf.stripped,
+            hardening: elf.hardening,
+          };
+        } else {
+          data = {
+            path: input.path,
+            format,
+            arch: archName,
+            peClass: pe!.peClass,
+            isDll: pe!.isDll,
+            isExecutable: pe!.isExecutable,
+            timestamp: pe!.timestamp,
+            imageBase: '0x' + pe!.imageBase.toString(16),
+            entry: '0x' + pe!.entryVa.toString(16),
+            subsystem: pe!.subsystemName,
+            size: buf.length,
+            sections: pe!.sections.map((s) => ({
+              name: s.name,
+              flags: s.flagsText,
+              vmaddr: '0x' + (pe!.imageBase + BigInt(s.virtualAddress)).toString(16),
+              vmsize: s.virtualSize.toString(),
+              fileoff: s.rawDataPointer,
+              filesize: s.rawDataSize,
+            })),
+            imports: pe!.imports,
+            exports: pe!.exports,
+            authenticode: pe!.authenticode,
+            clr: pe!.clr,
+            symbolCount: pe!.symbolCount,
+            stripped: pe!.stripped,
+            hardening: pe!.hardening,
+          };
+        }
+        break;
+      }
+      case 'entitlements': {
+        data = {
+          path: input.path,
+          arch: archName,
+          entitlements: null,
+          note: `Entitlements are a Mach-O concept; this is an ${format.toUpperCase()} image. ` +
+            (elf
+              ? 'See info.hardening for NX/RELRO/PIE/canary posture.'
+              : 'See info.authenticode for signature presence and info.hardening for ASLR/NX/CFG.'),
+        };
+        break;
+      }
+      case 'symbols': {
+        const limit = Math.min(input.count ?? 100, MAX_SYMBOL_RESULTS);
+        let re: RE2JS | undefined;
+        if (input.filter) {
+          try {
+            re = RE2JS.compile(input.filter);
+          } catch (e) {
+            return failNow('bad_filter', `Invalid or unsupported RE2 filter: ${(e as Error).message}`);
+          }
+        }
+        const pred = re ? (s: { name: string }) => re!.test(s.name) : undefined;
+        const scan = elf
+          ? scanElfSymbols(buf, elf, limit, pred)
+          : scanPeSymbols(buf, pe!, limit, pred);
+        data = {
+          path: input.path,
+          arch: archName,
+          totalNamed: scan.totalNamed,
+          totalMatched: scan.totalMatched,
+          returned: scan.symbols.length,
+          truncated: scan.totalMatched > scan.symbols.length,
+          symbols: scan.symbols,
+          ...(scan.totalNamed === 0
+            ? {
+                note: elf
+                  ? 'No named symbols in .symtab/.dynsym (stripped or no symbol tables).'
+                  : pe!.symbolCount === 0
+                    ? 'No COFF symbol table (stripped). Use info.imports/exports for named API surface.'
+                    : 'COFF symbol table present but no named entries matched.',
+              }
+            : {}),
+        };
+        break;
+      }
+      case 'disasm':
+      case 'bytes': {
+        if (!input.va) return failNow('va_required', `${input.action} requires va.`);
+        let va: bigint;
+        try {
+          va = parseVa(input.va);
+        } catch (e) {
+          return failNow('bad_va', (e as Error).message);
+        }
+        const mapping = elf ? elfVaToOffset(elf, va) : peVaToOffset(pe!, va);
+        if (!mapping) {
+          return failNow('va_unmapped', `VA ${input.va} does not map to file bytes in this ${format.toUpperCase()} image.`);
+        }
+        const count =
+          input.action === 'bytes'
+            ? Math.min(input.count ?? 64, MAX_BYTE_WINDOW)
+            : Math.min(input.count ?? 16, MAX_DISASM_INSTRUCTIONS);
+        const span = input.action === 'bytes' ? count : count * 16;
+        if (mapping.offset + span > buf.length) {
+          return failNow('window_out_of_range', 'Requested window extends past the end of the file.');
+        }
+        const endMapping = elf
+          ? elfVaToOffset(elf, va + BigInt(span - 1))
+          : peVaToOffset(pe!, va + BigInt(span - 1));
+        if (
+          !endMapping ||
+          endMapping.segment !== mapping.segment ||
+          endMapping.offset !== mapping.offset + span - 1
+        ) {
+          return failNow('window_out_of_segment', 'Requested window extends past the mapped file-backed region.');
+        }
+        const window: WindowData = {
+          arch: archName,
+          va: input.va,
+          fileOffset: mapping.offset,
+          segment: mapping.segment,
+          section: mapping.section,
+          bytesHex: hexOf(buf, mapping.offset, input.action === 'bytes' ? count : span).slice(
+            0,
+            MAX_BYTE_WINDOW * 2,
+          ),
+        };
+        if (input.action === 'disasm') {
+          const tool = objdumpPath();
+          if (tool) {
+            // Whole file is the image — no slice extraction needed (unlike fat Mach-O).
+            const stop = '0x' + (va + BigInt(span)).toString(16);
+            const res = spawnSync(
+              tool,
+              ['--disassemble', `--start-address=${input.va}`, `--stop-address=${stop}`, resolved],
+              { timeout: 30000, windowsHide: true, maxBuffer: 8 * 1024 * 1024, env: scrubbedEnv() },
+            );
+            if (!res.error && res.status === 0) {
+              const lines: string[] = [];
+              let instructions = 0;
+              for (const line of res.stdout.toString('utf8').split('\n')) {
+                if (instructions >= count) break;
+                if (/^\s*[0-9a-fA-F]+:\s+\S/.test(line)) {
+                  lines.push(line);
+                  instructions++;
+                } else if (/^\s*[0-9a-fA-F]+\s+<[^>]+>:\s*$/.test(line)) {
+                  lines.push(line);
+                }
+              }
+              if (instructions > 0) {
+                window.disasm = clamp(lines.join('\n'), 12000);
+                window.disassembler = tool;
+              }
+            }
+          }
+          if (!window.disasm) {
+            window.disassembler =
+              'unavailable — raw byte window returned (install objdump/LLVM for mnemonics)';
+          }
+        }
+        data = window;
+        break;
+      }
+      case 'va_to_offset': {
+        if (!input.va) return failNow('va_required', 'va_to_offset requires va.');
+        let va: bigint;
+        try {
+          va = parseVa(input.va);
+        } catch (e) {
+          return failNow('bad_va', (e as Error).message);
+        }
+        const mapping = elf ? elfVaToOffset(elf, va) : peVaToOffset(pe!, va);
+        if (!mapping) {
+          return failNow('va_unmapped', `VA ${input.va} does not map to file bytes in this ${format.toUpperCase()} image.`);
+        }
+        data = { path: input.path, arch: archName, va: input.va, ...mapping };
+        break;
+      }
+      case 'offset_to_va': {
+        if (typeof input.offset !== 'number') {
+          return failNow('offset_required', 'offset_to_va requires offset.');
+        }
+        if (input.offset < 0 || input.offset >= buf.length) {
+          return failNow('offset_out_of_range', `Offset is outside the file (0-${buf.length}).`);
+        }
+        const back = elf ? elfOffsetToVa(elf, input.offset) : peOffsetToVa(pe!, input.offset);
+        if (!back) {
+          return failNow('offset_unmapped', 'Offset is not covered by a mapped section/segment.');
+        }
+        data = {
+          path: input.path,
+          arch: archName,
+          offset: input.offset,
+          va: '0x' + back.va.toString(16),
+          segment: back.segment,
+        };
+        break;
+      }
+    }
+    ctx.signal?.throwIfAborted();
+    return okNow(data);
+  } catch (e) {
+    const code =
+      e instanceof ElfError || e instanceof PeError
+        ? e.code === 'unsupported'
+          ? 'unsupported'
+          : 'parse_error'
+        : 'recon_error';
+    return failNow(code, (e as Error).message);
+  }
+}
+
 export const binRecon: Tool<BinReconInput> = {
   name: 'bin_recon',
   risk: 'read',
   deferred: true,
   searchAliases: [
     'binary', 'malware', 'sample', 'reverse', 'reversing', 'disassemble', 'disassembly',
-    'objdump', 'macho', 'elf', 'executable', 'strings', 'symbols', 'imports',
+    'objdump', 'macho', 'elf', 'pe', 'exe', 'dll', 'coff', 'windows', 'linux',
+    'executable', 'strings', 'symbols', 'imports', 'exports', 'hardening', 'aslr',
     'entropy', 'packed', 'unpack', 'triage', 'analysis', 'analyse', 'analyze', 'dropper',
     'implant', 'payload', 'beacon', 'stager', 'loader', 'ransomware', 'rat', 'backdoor',
     'rootkit', 'shellcode', 'c2', 'cobalt', 'threat', 'ioc', 'indicator',
   ],
   inputSchema: schema,
   description:
-    'Read-only structured reconnaissance of a Mach-O binary (thin or fat/universal): slice table, segments, ' +
-    'linked dylibs, entitlements, symbol search, VA<->offset mapping, capped disassembly windows and raw byte ' +
-    'windows. Never executes or loads the target. Every query returns capped structured JSON. Disassembly uses ' +
-    'the host objdump when available and otherwise falls back to a raw byte window.',
+    'Read-only structured reconnaissance of a Mach-O (thin or fat/universal), ELF (32/64, little/big endian), ' +
+    'or PE (PE32/PE32+) binary: layout, segments/sections, linked libraries/imports, exports (PE), entitlements ' +
+    '(Mach-O), hardening posture (ELF NX/RELRO/PIE/canary; PE ASLR/NX/CFG), symbol search, VA<->offset mapping, ' +
+    'capped disassembly windows and raw byte windows. Format is auto-detected from magic bytes. Never executes ' +
+    'or loads the target. Every query returns capped structured JSON. Disassembly uses the host objdump when ' +
+    'available and otherwise falls back to a raw byte window.',
   async run(input, ctx): Promise<ToolResult<unknown>> {
     const start = Date.now();
     let resolved: string;
@@ -161,6 +500,11 @@ export const binRecon: Tool<BinReconInput> = {
         );
       }
       buf = readFileSync(resolved);
+      // Non-Mach-O formats take a parallel handler with the same action contract.
+      // The Mach-O path below is unchanged.
+      if (isElf(buf) || isPe(buf)) {
+        return reconElfPe(input, ctx, buf, resolved, start);
+      }
       parsed = layout(buf);
       // `layout` is the discovery operation for a universal binary: it must work before the
       // caller knows which architecture to select, and it does not need to parse a slice.

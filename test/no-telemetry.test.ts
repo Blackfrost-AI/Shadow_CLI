@@ -80,6 +80,7 @@ const HOST_SNAPSHOT = [
   'api.mistral.ai', // catalog preset
   'api.moonshot.ai', // catalog preset
   'api.openai.com', // provider default
+  'api.osv.dev', // osv_query advisory lookup — REVIEWED 2026-11-13: fixed endpoint, package identity only, brokered (THREAT_MODEL.md A(17) + doctor --privacy)
   'api.together.xyz', // catalog preset
   'api.x.ai', // catalog preset
   'api.z.ai', // catalog preset (GLM)
