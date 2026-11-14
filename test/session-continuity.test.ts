@@ -136,6 +136,8 @@ test('chronological tool replay is bounded, redacted and explicit about unavaila
     { role: 'assistant', content: [{ type: 'tool_use', id: 'r2', name: 'read_file', input: {} }] },
     { role: 'user', content: [{ type: 'tool_result', toolCallId: 'r2', ok: true, content: '[Old tool result content cleared]' }] },
     { role: 'assistant', content: [{ type: 'tool_use', id: 'r3', name: 'read_file', input: {} }] },
+    // 11.6.0 locator variant (resumed session): the sentinel text is NOT historical output.
+    { role: 'user', content: [{ type: 'tool_result', toolCallId: 'r3', ok: true, content: '[Old tool result content cleared — full output: .shadow/sessions/s1/spill/read_file-r3.txt]' }] },
   ];
   const replay = sessionReplay(messages);
   assert.deepEqual(replay.map((item) => item.kind), ['user', 'assistant', 'tool', 'tool', 'tool']);
@@ -145,7 +147,8 @@ test('chronological tool replay is bounded, redacted and explicit about unavaila
   assert.ok(tools[0]!.result.data.stdout.length < 12_100);
   assert.match(tools[0]!.result.data.stdout, /Historical display truncated/);
   assert.equal(tools[1]?.result.summary, HISTORICAL_OUTPUT_UNAVAILABLE);
-  assert.equal(tools[2]?.unavailable, true);
+  assert.equal(tools[2]?.unavailable, true, 'locator sentinel is reclaimed content, not replayable output');
+  assert.equal(tools[2]?.result.summary, HISTORICAL_OUTPUT_UNAVAILABLE);
 });
 
 test('rewind preview names restore/delete targets without mutating files and returns matching control state', () => {

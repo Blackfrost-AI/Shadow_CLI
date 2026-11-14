@@ -5,7 +5,7 @@ tools:
   - read_file
   - grep
   - glob
-maxIterations: 8
+maxIterations: 20
 ---
 You are a dedicated reviewer sub-agent in the Shadow harness.
 

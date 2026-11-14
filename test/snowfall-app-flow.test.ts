@@ -156,13 +156,19 @@ test('thinking previews while streaming, folds after completion or Escape, and e
     await terminal.flush();
     assert.match(screen(), /Thinking · 1m/);
     assert.match(terminal.lines().at(-1)!, /working 1m/);
+    // Expanded is the default, but a LIVE trace still shows only the bounded tail — the
+    // full body becomes available once the trace settles (asserted after the answer below).
     assert.match(screen(), /Reasoning step 7/);
-    // The transcript now launches expanded, so fold once to reach the collapsed baseline this
-    // reasoning state machine is written against — every toggle below is still exercised.
+    assert.doesNotMatch(screen(), /Reasoning step 1/);
+    assert.match(screen(), /Ctrl\+O compact/);
     terminal.input('\x0f'); await terminal.flush();
+    assert.match(screen(), /Reasoning step 7/);
     assert.doesNotMatch(screen(), /Reasoning step 1/);
     terminal.input('\x0f'); await terminal.flush();
-    assert.match(screen(), /Reasoning step 1/);
+    // Toggling fold while LIVE changes nothing visible: the streaming tail is bounded in
+    // both states. Expansion of the full body is asserted on the settled trace below.
+    assert.match(screen(), /Reasoning step 7/);
+    assert.doesNotMatch(screen(), /Reasoning step 1/);
     assert.match(screen(), /Ctrl\+O compact/);
     terminal.input('\x0f'); await terminal.flush();
     assert.doesNotMatch(screen(), /Reasoning step 1/);
@@ -281,16 +287,17 @@ for (const whitespaceThinking of [false, true]) test(`a provider with ${whitespa
     assert.equal(tools.length, 2);
     assert.equal(inspect.items.indexOf(tools[1]!), inspect.items.indexOf(tools[0]!) + 1, 'findings do not break a consecutive search group');
     assert.match(screen(), /Grep 2 patterns/);
-    // Transcript launches expanded: both match bodies are already on screen and the collapsed
-    // `^O · /activity` affordance is absent until the user folds the group with Ctrl+O.
+    // Expanded is the default: matches are visible without any toggle.
     assert.match(screen(), /alpha\.ts:1:7.*KEEP_ALPHA_MATCH/);
     assert.match(screen(), /beta\.ts:1:7.*KEEP_BETA_MATCH/);
-    assert.doesNotMatch(screen(), /\/activity/);
+    terminal.input('\x0f'); await terminal.flush();
+    assert.match(screen(), /\/activity/);
+    assert.doesNotMatch(screen(), /KEEP_ALPHA_MATCH|KEEP_BETA_MATCH/);
+    terminal.input('\x0f'); await terminal.flush();
+    assert.match(screen(), /alpha\.ts:1:7.*KEEP_ALPHA_MATCH/);
+    assert.match(screen(), /beta\.ts:1:7.*KEEP_BETA_MATCH/);
     terminal.input('\x0f'); await terminal.flush();
     assert.doesNotMatch(screen(), /KEEP_ALPHA_MATCH|KEEP_BETA_MATCH/);
-    assert.match(screen(), /\/activity/);
-    terminal.input('\x0f'); await terminal.flush();
-    assert.match(screen(), /KEEP_ALPHA_MATCH|KEEP_BETA_MATCH/);
     assert.ok(inspect.details[0]!.body?.some((line) => line.includes('KEEP_ALPHA_MATCH')));
     assert.ok(inspect.details[1]!.body?.some((line) => line.includes('KEEP_BETA_MATCH')));
     inspect.runSlash('/activity'); await terminal.flush();

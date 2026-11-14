@@ -434,7 +434,7 @@ test('process crashes at rollback boundaries recover to a complete discoverable 
       );
       assert.equal(child.status, 87, `child must stop at ${point}: ${child.stderr}`);
 
-      const discovered = discoverSkills(workspace, { homedir: home });
+      const discovered = discoverSkills(workspace, { homedir: home }).filter((s) => s.source !== 'bundled');
       assert.deepEqual(discovered.map((skill) => skill.name), ['rollback-crash']);
       const recoveredStore = new SkillCandidateStore({ skillsRoot: root });
       const active = recoveredStore.readActiveSkill('rollback-crash');
@@ -513,7 +513,7 @@ test('a crash while aborting a failed rollback recovers the complete prior gener
       );
       assert.equal(child.status, 88, `child must stop at ${scenario.crashAt}: ${child.stderr}`);
 
-      const discovered = discoverSkills(workspace, { homedir: home });
+      const discovered = discoverSkills(workspace, { homedir: home }).filter((s) => s.source !== 'bundled');
       assert.deepEqual(discovered.map((skill) => skill.name), ['rollback-abort-crash']);
       const recoveredStore = new SkillCandidateStore({ skillsRoot: root });
       const active = recoveredStore.readActiveSkill('rollback-abort-crash');
@@ -662,7 +662,7 @@ test('a process crash after the activation receipt is recovered forward from the
   assert.equal(child.status, 86, `child must stop at the simulated crash boundary: ${child.stderr}`);
   assert.equal(existsSync(join(root, 'crash-recovery')), false, 'the prior generation was staged before the crash boundary');
 
-  const discovered = discoverSkills(workspace, { homedir: home });
+  const discovered = discoverSkills(workspace, { homedir: home }).filter((s) => s.source !== 'bundled');
   assert.deepEqual(discovered.map((skill) => skill.name), ['crash-recovery'], 'session startup recovers before discovery');
   const recoveredStore = new SkillCandidateStore({ skillsRoot: root });
   const candidate = recoveredStore.inspectCandidate('crash-recovery');
@@ -737,14 +737,19 @@ test('candidate and revision internals stay invisible to normal skill discovery'
   mkdirSync(workspace, { recursive: true });
   const store = new SkillCandidateStore({ skillsRoot: root, now: () => new Date('2026-10-09T12:00:00.000Z') });
   const draft = store.draftCandidate(verifiedInput('discovered-after-approval'));
-  assert.deepEqual(discoverSkills(workspace, { homedir: home }), [], 'a draft is never loaded as a skill');
+  // Bundled skills ship with the agent and are always present — disk discovery must be empty.
+  assert.deepEqual(
+    discoverSkills(workspace, { homedir: home }).filter((s) => s.source !== 'bundled'),
+    [],
+    'a draft is never loaded as a skill',
+  );
 
   store.activateCandidate('discovered-after-approval', {
     expectedVersion: draft.version,
     approvedBy: 'operator',
     confirmation: 'activate',
   });
-  const discovered = discoverSkills(workspace, { homedir: home });
+  const discovered = discoverSkills(workspace, { homedir: home }).filter((s) => s.source !== 'bundled');
   assert.deepEqual(discovered.map((skill) => skill.name), ['discovered-after-approval']);
   assert.equal(discovered[0]?.body, draft.skillMarkdown.trim());
   assert.ok(!discovered.some((skill) => skill.name === '.candidates' || skill.name === '.revisions'));

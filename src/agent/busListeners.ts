@@ -37,11 +37,49 @@ export interface PendingNotifications {
   size(): number;
 }
 
-export function attachBgAgentDelivery(bus: EventBus, mainContext: Context): PendingNotifications {
+/**
+ * @param onTerminal Optional wake seam (11.6.0). Called once per coalesced batch of terminal
+ * notifications so an IDLE session actually picks the results up — buffering alone left them
+ * unread until the next human turn. The callback returns whether the wake was accepted
+ * (`wakeup.tryFire`'s contract: fired or queued = true, rate-dropped = false).
+ *
+ * EVERY task_notification wakes, with NO status filter: 'completed' | 'partial' | 'failed' |
+ * 'cancelled' are all terminal by construction, and 'partial' (a ceiling-truncated sub-agent)
+ * is precisely the case that must not be silently stranded. 'launched' is a separate event
+ * type (bg_agent_launched) and never wakes.
+ *
+ * Coalescing lives HERE, not in the host's wakeup fire handler — that handler is shared with
+ * schedule_wakeup, whose jobs must never be deduped. N notifications arriving while a turn
+ * runs produce at most ONE queued wake per turn-end batch:
+ * - `wakePending` latches on the first notification and suppresses the rest of the batch.
+ * - `drain()` clears the latch: the drain IS the wake being consumed (hosts drain at turn
+ *   start), so notifications arriving during the wake turn arm exactly one fresh wake.
+ * - A refused wake (rate ceiling) leaves the latch clear, so the NEXT notification retries.
+ *   The buffer is untouched either way — a dropped wake delays pickup, never loses it.
+ * - The latch is set BEFORE the call: a host that drains synchronously inside the callback
+ *   must not leave a stuck latch behind. If the callback throws, the latch conservatively
+ *   holds (EventBus.emit swallows listener throws) and recovers at the next drain — clearing
+ *   it on throw could double-queue a wake that was already enqueued before the throw.
+ *
+ * Known residual: a host that accepts the wake but abandons the turn before draining (prompt
+ * hook denial, exiting) keeps the latch set until the next successful drain; notifications
+ * keep buffering and are delayed, not lost. A wake queued behind a human turn that drains the
+ * buffer first runs one empty synthetic turn — bounded and harmless.
+ */
+export function attachBgAgentDelivery(
+  bus: EventBus,
+  mainContext: Context,
+  onTerminal?: () => boolean,
+): PendingNotifications {
   const pending: string[] = [];
+  let wakePending = false;
   bus.on((e: any) => {
     if (e.type === 'task_notification') {
       pending.push(formatTaskNotification(e));
+      if (!wakePending && onTerminal) {
+        wakePending = true;
+        if (!onTerminal()) wakePending = false;
+      }
     }
     if (e.type === 'bg_agent_launched') {
       // Bookkeeping only — appends no message, so it stays inline.
@@ -50,7 +88,10 @@ export function attachBgAgentDelivery(bus: EventBus, mainContext: Context): Pend
     }
   });
   return {
-    drain: () => pending.splice(0, pending.length),
+    drain: () => {
+      wakePending = false;
+      return pending.splice(0, pending.length);
+    },
     size: () => pending.length,
   };
 }

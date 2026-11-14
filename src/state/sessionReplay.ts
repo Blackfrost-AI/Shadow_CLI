@@ -1,4 +1,5 @@
 import type { Message, ToolUseBlock } from '../provider/provider.js';
+import { isReclaimedContent } from '../agent/context.js';
 import { redact } from '../util/redact.js';
 import { approvalText } from '../util/approvalText.js';
 
@@ -24,7 +25,9 @@ export function sessionReplay(messages: Message[]): ReplayItem[] {
   };
   const tool = (id: string, ok: boolean, content: string) => {
     const call = calls.get(id);
-    const unavailable = !content.trim() || content.includes('[Old tool result content cleared]');
+    // 11.6.0: prefix-aware — legacy exact sentinels AND locator variants
+    // (`[Old tool result content cleared — full output: …]`) are reclaimed bodies, not output.
+    const unavailable = !content.trim() || isReclaimedContent(content);
     const clean = unavailable ? HISTORICAL_OUTPUT_UNAVAILABLE : safe(content);
     const body = clean.length > OUTPUT_LIMIT ? `${clean.slice(0, OUTPUT_LIMIT)}\n[Historical display truncated at ${OUTPUT_LIMIT} characters]` : clean;
     out.push({ kind: 'tool', call: { name: safe(call?.name ?? 'unknown tool'), input: safeInput(redact(call?.input ?? {})) },

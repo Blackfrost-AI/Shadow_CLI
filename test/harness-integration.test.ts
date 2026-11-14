@@ -100,12 +100,15 @@ test('a selected harness composes instructions, skills, and canonical tool polic
       })),
       pluginDirs: [],
     });
-    assert.equal(skills.length, 1);
-    assert.equal(skills[0]?.name, 'incident-triage');
-    assert.equal(skills[0]?.source, 'harness');
-    assert.match(skills[0]?.body ?? '', /INCIDENT_TRIAGE_SKILL_MARKER/);
-    assert.doesNotMatch(skills[0]?.body ?? '', /MUTATED_SKILL_BODY_MUST_NOT_LEAK/);
-    assert.equal(skills[0]?.description, 'Triage an incident while preserving evidence.');
+    // Bundled skills ship with the agent and are always present; the harness-bound set
+    // under test is exactly the captured skill.
+    const harnessBound = skills.filter((s) => s.source === 'harness');
+    assert.equal(harnessBound.length, 1);
+    assert.equal(harnessBound[0]?.name, 'incident-triage');
+    assert.equal(harnessBound[0]?.source, 'harness');
+    assert.match(harnessBound[0]?.body ?? '', /INCIDENT_TRIAGE_SKILL_MARKER/);
+    assert.doesNotMatch(harnessBound[0]?.body ?? '', /MUTATED_SKILL_BODY_MUST_NOT_LEAK/);
+    assert.equal(harnessBound[0]?.description, 'Triage an incident while preserving evidence.');
     assert.equal(
       stack.skills[0]?.sha256,
       stack.addons[0]?.files.find((file) => file.path === 'skills/incident-triage/SKILL.md')?.sha256,

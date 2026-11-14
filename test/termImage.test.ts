@@ -119,3 +119,15 @@ test('an unknown media type still gets a usable extension', () => {
   assert.match(basename(p), /\.png$/);
   rmSync(p, { force: true });
 });
+
+test('a hostile name extension never becomes the saved file extension (open-exec RCE guard)', () => {
+  // macOS `open` EXECUTES a .command/.sh file in Terminal. The name is tool-influenced, so an
+  // unknown media type must NOT inherit `.command` from it — the cache file always gets a known
+  // image extension and is handed to Preview, never a shell. (S1, 11.7.0 review.)
+  for (const hostile of ['payload.command', 'run.sh', 'evil.app', 'x.html']) {
+    const p = saveImage(Buffer.from([1, 2, 3]), 'application/octet-stream', hostile);
+    assert.match(basename(p), /\.png$/, `${hostile} must not keep its executable extension`);
+    assert.ok(!/\.(command|sh|app|html)$/.test(basename(p)), 'no executable extension survives');
+    rmSync(p, { force: true });
+  }
+});

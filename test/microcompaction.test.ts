@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Context } from '../src/agent/context.js';
+import { Context, isReclaimedContent } from '../src/agent/context.js';
 import { MockProvider } from '../src/provider/mock.js';
 import {
   estimateTokensFromMessages,
@@ -62,7 +62,10 @@ test('microcompaction clears OLD compactable tool_result bodies, keeping id/ok/p
   const first = msgs[2]!.content[0]!;
   assert.equal(first.type, 'tool_result');
   if (first.type === 'tool_result') {
-    assert.equal(first.content, SENTINEL, 'old body replaced by the sentinel');
+    // B2 (11.6.0): without a spillBody callback the legacy exact sentinel is retained; with one,
+    // a locator variant. Accept both via the shared reclaim guard.
+    assert.ok(isReclaimedContent(first.content), 'old body replaced by a reclaim sentinel (legacy or locator)');
+    assert.equal(first.content, SENTINEL, 'no spillBody injected → legacy exact sentinel');
     assert.equal(first.toolCallId, 'old0', 'toolCallId preserved');
     assert.equal(first.ok, true, 'ok flag preserved');
   }

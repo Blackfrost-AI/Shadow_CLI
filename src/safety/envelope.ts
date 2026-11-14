@@ -67,15 +67,24 @@ export const ENVELOPE_TRUNCATION_NOTE = '\n…(payload truncated to fit the cont
  * top of a 16MB MCP dump and dropped the stack trace at the bottom) — with the omitted count
  * recorded between them, INSIDE the envelope. F06-07. Retained bytes are never mutated: the head
  * is a true prefix and the tail a true suffix.
+ *
+ * Hard contract: result.length <= max(0, floor(cap)) for EVERY cap. The payload floor only lifts
+ * the budget UP TO the cap — it never lets the result exceed it (11.6.1 review adjustment: the
+ * old floor-first budget returned up to 512 chars even when the caller asked for less). At
+ * production budgets (cap >= ENVELOPE_MARGIN + ENVELOPE_PAYLOAD_FLOOR) behavior is unchanged.
  */
 export function fitPayload(content: string, cap: number): string {
-  const budget = Math.max(ENVELOPE_PAYLOAD_FLOOR, cap - ENVELOPE_MARGIN);
+  const hardCap = Number.isFinite(cap) ? Math.max(0, Math.floor(cap)) : 0;
+  const budget = Math.min(Math.max(ENVELOPE_PAYLOAD_FLOOR, hardCap - ENVELOPE_MARGIN), hardCap);
   if (content.length <= budget) return content;
+  // Below the head/tail + note minimum there is no honest way to keep both ends — a true prefix
+  // is the only output that can honor the cap. (Unreachable at production budgets.)
+  if (budget < ENVELOPE_TRUNCATION_NOTE.length + 4) return content.slice(0, budget);
   // Note length depends on the omitted count's digits; estimate with the MAXIMUM omitted value
   // first (most digits), then rebuild with the exact number — the exact note is never longer.
   const worstNote = truncNote(content.length);
   const usable = budget - worstNote.length;
-  if (usable <= 2) return content.slice(0, budget - ENVELOPE_TRUNCATION_NOTE.length) + ENVELOPE_TRUNCATION_NOTE;
+  if (usable <= 2) return content.slice(0, Math.max(0, budget - ENVELOPE_TRUNCATION_NOTE.length)) + ENVELOPE_TRUNCATION_NOTE;
   const headLen = Math.max(1, Math.floor((usable * 2) / 3));
   const tailLen = Math.max(1, usable - headLen);
   const omitted = content.length - headLen - tailLen;
@@ -151,4 +160,27 @@ export function envelopUntrusted(opts: EnvelopeOpts): string {
     opts.content,
     end,
   ].join('\n');
+}
+
+/**
+ * F1 (api-injection-study): remove every COMPLETE untrusted-content envelope span from `text`,
+ * returning the remainder. Compaction's instruction harvest uses this so quoted evidence can
+ * never be promoted into the pinned objective — data stays data even when the operator quotes it.
+ *
+ * Padding-matched exactly like envelopeSafeSlice: only a same-width END closes a same-width
+ * BEGIN (envelopeMarkers' widening invariant), so a forged bare END inside a widened fence
+ * cannot terminate the span early, and a deeper-padded forged pair inside a plain fence is
+ * removed with the whole outer span. An UNCLOSED BEGIN (e.g. a truncated quote) tail-strips from
+ * that marker to end-of-text: text before it survives, nothing after an open fence is trusted.
+ * Pure text transform — callers decide what to do with the result; stored history is untouched.
+ */
+export function stripUntrustedSpans(text: string): string {
+  const SPAN = /<<<(=*)UNTRUSTED_CONTENT_BEGIN\1>>>[\s\S]*?<<<\1UNTRUSTED_CONTENT_END\1>>>/g;
+  const out = text.replace(SPAN, '');
+  // After the global replace every surviving BEGIN is unclosed: a BEGIN with a later same-pad
+  // END was already consumed by the lazy match starting at that BEGIN. So tail-strip from the
+  // EARLIEST remaining BEGIN — not the last per pad (which would leave an earlier open BEGIN and
+  // its payload to harvest when a message quotes two truncated fences).
+  const open = out.search(/<<<(=*)UNTRUSTED_CONTENT_BEGIN\1>>>/);
+  return open === -1 ? out : out.slice(0, open);
 }

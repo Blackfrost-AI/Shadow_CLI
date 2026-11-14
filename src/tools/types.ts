@@ -62,12 +62,33 @@ export interface ToolContext {
   toolCallId?: string;
   /** When set, write tools save a pre-mutation checkpoint for `/rewind`. */
   checkpoint?: { sessionId: string; turn: number };
+  /** Session id for session-scoped spill (11.6.0). Derived from the loop's session log; absent in
+   *  tests/legacy callers — spill falls back to the historical workspace-global directory. */
+  sessionId?: string;
   /** Auto-format-after-write settings (config `formatters` block). Absent = defaults (enabled). */
   formatters?: FormatterConfig;
   /** Injectable runner for the post-write formatter (tests/fakes); defaults to a real spawn. */
   formatterExec?: FormatterExec;
   /** Injectable binary lookup for the post-write formatter; defaults to PATH search. */
   formatterWhich?: (bin: string) => string | null;
+  /**
+   * Injectable accelerator-probe runner for the inference tools (tests/fakes); defaults to a real
+   * bounded `spawnSync` of the vendor SMI binaries. Kept on ToolContext rather than in a tool input
+   * schema on purpose: these are host facts, and letting model-supplied arguments override them
+   * would let a model invent a GPU it does not have and then "pass" a capacity check against it.
+   */
+  inferProbeRunner?: unknown;
+  /** Injectable CPU architecture for the inference tools; defaults to `process.arch`. Same rule. */
+  inferArch?: string;
+  /**
+   * Injectable platform for the inference tools; defaults to `process.platform`. Same rule.
+   *
+   * This matters for more than tests. `inventoryAccelerators` documents that every environment-
+   * derived input must be an explicit option, because reading one implicitly from the ambient
+   * environment makes the OTHER injections untrustworthy — a Linux accelerator fixture probed on an
+   * Apple host would silently take the unified-memory branch and report a plausible wrong answer.
+   */
+  inferPlatform?: NodeJS.Platform;
   /** F06-10: true when this tool runs inside a sub-agent loop. A nested `agent` call uses it
    *  to bypass the session admission gate — queuing behind its own parent's permit deadlocks. */
   nestedAgent?: boolean;

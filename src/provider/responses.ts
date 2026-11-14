@@ -85,11 +85,14 @@ export function buildResponsesBody(
   opts: ResponsesOptions = {},
 ): Record<string, unknown> {
   const model = req.model || fallbackModel;
+  const systemText = req.systemVolatileSuffix?.trim()
+    ? `${req.system}\n\n${req.systemVolatileSuffix}`
+    : req.system;
   const body: Record<string, unknown> = {
     model,
     input: responseInput(req, model, opts),
     stream: opts.chatgptPlan ? true : stream,
-    ...(req.system ? { instructions: escapeMultimodalControlTokens(req.system) } : {}),
+    ...(systemText ? { instructions: escapeMultimodalControlTokens(systemText) } : {}),
   };
   let tools = req.tools;
   const choice = req.toolChoice;

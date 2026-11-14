@@ -42,6 +42,7 @@ import { cycleAutonomy, type AutonomyLevel } from '../safety/permissions.js';
 import { applyPermissionCommand } from '../safety/permissionCmd.js';
 import { sandboxConfinement, sandboxToolAvailable } from '../safety/sandbox.js';
 import { discoverSkills } from '../skills/loader.js';
+import { buildSkillInvocationPrompt, listDisabledSkills, resolveSkillByName, setSkillEnabled } from '../skills/control.js';
 import { exportSession } from '../state/chatExport.js';
 import { forkSession } from '../state/fork.js';
 import { GLOBAL_DIR, saveGlobalConfig, vaultUnlocked } from '../state/globalStore.js';
@@ -289,9 +290,6 @@ export interface SlashCtx {
   missionRef: { current: MissionSnapshot | null };
   /** Queue a deferred turn while one runs (the /goal begin-while-running path). */
   queueDeferred: (text: string) => void;
-  promptControl: (mode: 'steer' | 'queue', text: string) => void;
-  /** m-4: explicit /! shell escape — the raw submitted line, judged by the shared core. */
-  shellEscape: (raw: string) => void;
   startTableRef: { current: ((arg: string) => void) | null };
   currentRef: { current: { provider: string; model: string } };
   selectModelRef: { current: ((entry: ModelEntry) => Promise<void>) | null };
@@ -364,16 +362,6 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
     return;
   }
   switch (dispatch) {
-    case '/shell':
-      // The composer intercepts a typed /! with its raw line BEFORE this dispatch; this case
-      // exists so a menu-completed bare /! (no payload) is judged by the same core and gets
-      // the usage message instead of an unknown-command error.
-      ctx.shellEscape(rawLine ?? '/!');
-      break;
-    case '/steer':
-    case '/queue':
-      ctx.promptControl(dispatch === '/steer' ? 'steer' : 'queue', arg);
-      break;
     case '/activity':
     case '/expand': {
       if (arg && !/^\d+$/.test(arg)) { showToast(`Use ${dispatch} [number].`, 'warn'); break; }
@@ -517,8 +505,7 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
       showBanner();
       pushLine({ text: 'Cleared — conversation reset. (mission kept — use /goal clear to drop it)', dimColor: true });
       break;
-    case '/goal':
-    case '/swarm': {
+    case '/goal': {
       // Mission mode (8.4): /goal <text> starts a REAL mission — plan mode engages, a
       // kickoff turn runs, and the harness pins the mission + tasks in front of the model
       // every turn until done/failed or /goal clear. No arg = status, 'clear' = end.
@@ -547,13 +534,12 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
           });
           break;
         }
-        const swarm = dispatch === '/swarm';
-        opts.mission.begin(arg, swarm ? 'swarm' : 'goal');
+        opts.mission.begin(arg);
         // Enter plan mode with it: missions start with an approved plan (the plan's tasks
         // become the mission list on approval). Drive the state object — the bus event
         // updates the HUD, so UI and truth cannot disagree (the /plan lesson).
         opts.planMode?.enter();
-        pushLine({ text: `${swarm ? 'Swarm' : 'Mission'} started: ${arg}`, color: C.purple });
+        pushLine({ text: `Mission started: ${arg}`, color: C.purple });
         pushLine({ text: 'Plan mode on — write the plan (plan_write, include tasks), then exit_plan_mode for approval.', dimColor: true });
         const kickoff = `[mission] ${arg}\nBegin the planning phase: explore as needed, write the plan with plan_write (include a tasks array), then call exit_plan_mode for approval.`;
         if (runningRef.current) {
@@ -1578,20 +1564,56 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
           pushLine({ text: rollbackActiveSkill(name, generation), color: C.yellow });
           break;
         }
+        // W2: per-skill enable/disable (global-only config, next-session effect).
+        if (sub === 'enable' || sub === 'disable') {
+          if (!name) throw new Error(`usage: /skills ${sub} <name>`);
+          try {
+            pushLine({ text: setSkillEnabled(name, sub === 'enable'), color: sub === 'enable' ? C.green : C.yellow });
+          } catch (error) {
+            pushLine({ text: (error as Error).message, color: C.red });
+          }
+          break;
+        }
+        // W3: explicit operator invocation of a skill from the session snapshot.
+        if (sub === 'run') {
+          if (!name) throw new Error('usage: /skills run <name>');
+          const catalog = opts.skills ?? discoverSkills(opts.workspaceRoot);
+          const resolved = resolveSkillByName(catalog, name);
+          if ('error' in resolved) {
+            pushLine({ text: resolved.error, color: C.red });
+            break;
+          }
+          if (resolved.disabled) {
+            pushLine({ text: `skill "${resolved.entry.name}" is operator-disabled — re-enable with /skills enable ${resolved.entry.name} first.`, color: C.red });
+            break;
+          }
+          if (resolved.entry.userInvocation === false) {
+            pushLine({ text: `skill "${resolved.entry.name}" declares user-invocable: false — model-only skill; ask it to load the skill instead.`, color: C.red });
+            break;
+          }
+          const prompt = buildSkillInvocationPrompt(resolved.entry);
+          if (runningRef.current) queueDeferred(prompt);
+          else startTurnRef.current?.(prompt);
+          break;
+        }
       } catch (error) {
         pushLine({ text: (error as Error).message, color: C.red });
         break;
       }
       const skills = opts.skills ?? discoverSkills(opts.workspaceRoot);
+      const disabledList = listDisabledSkills();
       pushLine({
         kind: 'system',
         text: 'skills',
-        lines: skills.length
-          ? skills.slice(0, 30).map((s) => ({
-              text: `  ${s.name.padEnd(18)} ${shortPath(s.path)} — ${s.description}`,
-              dimColor: true,
-            }))
-          : [{ text: 'No repo skills found under skills/ or .shadow/skills/.', dimColor: true }],
+        lines: [
+          ...(skills.length
+            ? skills.slice(0, 30).map((s) => ({
+                text: `  ${s.name.padEnd(18)} ${shortPath(s.path)} — ${s.description}`,
+                dimColor: true,
+              }))
+            : [{ text: 'No repo skills found under skills/ or .shadow/skills/.', dimColor: true }]),
+          ...(disabledList.length ? [{ text: `  Operator-disabled (hidden from model + user until re-enabled): ${disabledList.join(', ')}`, dimColor: true }] : []),
+        ],
       });
       break;
     }

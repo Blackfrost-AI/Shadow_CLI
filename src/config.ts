@@ -59,14 +59,10 @@ export interface ModelCapabilities {
 }
 
 const ModelPriceSchema = z.object({
-  // m-14 security fix (review V1): prices must be non-negative — a hostile or
-  // planted price of 0/-1 disarms every cost cap (costUSD accrues 0 or goes
-  // monotonically negative). Zero stays legal for genuinely-free local models;
-  // negative never is.
-  input: z.number().nonnegative(),
-  output: z.number().nonnegative(),
-  cacheReadMult: z.number().nonnegative().optional(),
-  cacheWriteMult: z.number().nonnegative().optional(),
+  input: z.number(),
+  output: z.number(),
+  cacheReadMult: z.number().optional(),
+  cacheWriteMult: z.number().optional(),
 });
 
 const PermissionRuleSchema = z.object({
@@ -398,6 +394,21 @@ const ConfigSchema = z.object({
   // scrolling for click-to-caret. Shipping it on by default was a mistake; it stranded terminals
   // in reporting mode when a session was killed before cleanup ran.
   mouse: z.boolean().default(false),
+  // Open a clicked OSC 8 hyperlink in the default browser (Snowfall). The engine hit-tests
+  // links on mouse release; this gates the host openUrl callback. http/https only. Default
+  // on; set false to keep clicks inert (terminal-native handling).
+  linkClickOpen: z.boolean().default(true),
+  // Readability cap on transcript prose width (columns). Chrome always spans the full
+  // terminal; body text wraps at min(terminal, proseMaxCols) so lines don't stretch
+  // edge-to-edge on wide windows. 0 = fill the terminal width (no cap). Default 100.
+  proseMaxCols: z.number().int().min(0).max(1000).default(100),
+  // Named model roles (OMP --smol/--slow/--plan parity). Each value is a model label from
+  // `models`; /role <name> switches to it. Optional — unset roles simply aren't offered.
+  roles: z.object({
+    smol: z.string().optional(),
+    slow: z.string().optional(),
+    plan: z.string().optional(),
+  }).default({}),
   // Terminal notification on turn-complete / approval-waiting (P1B-04). `auto` picks the terminal's
   // native desktop notification (iTerm2/kitty/ghostty) or the bell elsewhere; `off` disables. Local
   // terminal escape only — nothing leaves the machine.
@@ -473,7 +484,20 @@ const ConfigSchema = z.object({
   // activate one: activation may change the tools and trusted instructions exposed to the model.
   harnesses: HarnessSelectionSchema.default([]),
 
+  // Skills Option C (W2): per-skill enable/disable. GLOBAL-ONLY (in
+  // PROJECT_UNTRUSTED_KEYS): a cloned repo must not be able to hide skills from the
+  // operator — disabling is a user decision recorded in ~/.shadow/config.json. Names
+  // are skill directory names; disabling removes the skill from the model-visible index,
+  // from /skills run, and from the skill tool for NEW sessions (snapshot binding).
+  skillsDisabled: z.array(z.string()).default([]),
+
   maxIterations: z.number().int().nonnegative().default(200), // 0 = unlimited (dead-drop / long engagements); real backstop = tokens/cost/wall-clock
+  // Loop guard v2 (frosty-spark incident, 2026-11-07): cumulative per-(tool,args) failure limits.
+  // NUDGE: the Nth identical FAILING call is refused with an explicit redirect (the model has
+  // N-1 full error transcripts in context). FATAL: when attempts reach this limit the run stops
+  // (fatal_tool_error). 0 disables that stage. A success of the same call clears its record.
+  loopGuardNudge: z.number().int().nonnegative().default(4),
+  loopGuardFatal: z.number().int().nonnegative().default(8),
   // Generous default so reasoning models (incl. custom LOCAL reasoners that isReasoningModel
   // can't detect by name) don't burn the whole budget on hidden thinking and hit the cap before
   // answering. Local servers just cap generation; a cloud model with a smaller hard limit gets a
@@ -594,6 +618,11 @@ const ConfigSchema = z.object({
       maxTotalTokens: z.number().int().positive().optional(),
       maxCostUSD: z.number().positive().optional(),
       maxWallClockSec: z.number().positive().optional(),
+      // Backstop wall-clock ceiling (seconds) INJECTED when `maxIterations: 0` (unlimited) is
+      // used with no other budget axis — keeps "unlimited iterations" from meaning "no cap at
+      // all" while letting long-range engagements opt into a much longer (or truly unlimited,
+      // via 0) duration. Default 6h. See the loadConfig injection below.
+      backstopWallClockSec: z.number().int().nonnegative().optional(),
       // Spend guardrails (soft): warn once at warnRatio, then pause and ask via the
       // approval seam; approve grants exactly one more allowance window (same limits
       // again), deny ends the run gracefully. Distinct from the hard ceilings above:
@@ -618,33 +647,6 @@ const ConfigSchema = z.object({
     'grok-4': { input: 3, output: 15 },
     'gemini-flash-latest': { input: 0.3, output: 2.5 },
   }),
-
-  // m13 — opt-in bounded advisors. DEFAULT DISABLED: the block is absent in a
-  // stock install, and AdvisorService refuses every consultation without it.
-  // All three caps are REQUIRED when enabled — there are no invented per-axis
-  // defaults. `endpoints` is the allowlist of named provider+model pairs a
-  // consultation may select; nothing outside it is ever consulted. Advised to
-  // be global-only (PROJECT_UNTRUSTED_KEYS): a cloned repo must not be able to
-  // open an egress channel by planting config. `maxAttempts` is bounded to
-  // 1..3 so a blocked endpoint cannot cause a retry storm.
-  advisors: z
-    .object({
-      enabled: z.boolean().default(false),
-      endpoints: z
-        .array(
-          z.object({
-            name: z.string().min(1),
-            provider: z.enum(['anthropic', 'openai', 'openai-compat', 'mock']),
-            model: z.string().min(1),
-          }),
-        )
-        .default([]),
-      maxWallClockSec: z.number().int().positive().optional(),
-      maxTotalTokens: z.number().int().positive().optional(),
-      maxCostUSD: z.number().positive().optional(),
-      maxAttempts: z.number().int().min(1).max(3).default(1),
-    })
-    .default({}),
 
   // P2-13 — session log retention. Opt-in; the sweep runs at session start and only ever
   // ARCHIVES (moves logs into sessions/.archive) — never deletes. `sessionRetentionDays`
@@ -723,7 +725,7 @@ const CONFIG_FILE = 'shadow.config.json';
 // `lastModel` drives an automatic startup selection. Project model entries stay available for an
 // explicit picker action, but a cloned repo cannot plant or replace the remembered global choice.
 // Update discovery is an outbound request: only the user can enable it, not a project file.
-const PROJECT_UNTRUSTED_KEYS = ['connection', 'baseUrl', 'selfHosted', 'shellEnvAllowlist', 'autonomy', 'denylistExtra', 'systemPromptPath', 'sandbox', 'sandboxNetwork', 'sandboxFailurePolicy', 'egress', 'additionalDirectories', 'projects', 'web', 'offline', 'hooks', 'statusLine', 'vision', 'permissionRules', 'diagnostics', 'lsp', 'updateCheck', 'pluginIndexUrl', 'pluginIndexKey', 'profiles', 'harnesses', 'lastModel', 'sessionRetentionDays', 'sessionRetentionKeep', 'advisors', 'priceTable', 'budget'];
+const PROJECT_UNTRUSTED_KEYS = ['connection', 'baseUrl', 'selfHosted', 'shellEnvAllowlist', 'autonomy', 'denylistExtra', 'systemPromptPath', 'sandbox', 'sandboxNetwork', 'sandboxFailurePolicy', 'egress', 'additionalDirectories', 'projects', 'web', 'offline', 'hooks', 'statusLine', 'vision', 'permissionRules', 'diagnostics', 'lsp', 'updateCheck', 'pluginIndexUrl', 'pluginIndexKey', 'profiles', 'harnesses', 'lastModel', 'sessionRetentionDays', 'sessionRetentionKeep', 'skillsDisabled'];
 
 /**
  * Layered precedence: CLI flags > env > active profile > project config file (de-fanged) >
@@ -968,18 +970,30 @@ export function loadConfig(
   // Safety backstop: `maxIterations: 0` ("unlimited") is only safe while SOME budget cap exists. If the
   // user opted into 0 with no token/cost/wall-clock limit, a model looping on slightly-varying tool args
   // (dodging the consecutive-identical loop guard) would run forever on paid requests. Inject a wall-clock
-  // ceiling so "unlimited iterations" can never silently mean "no backstop at all".
+  // ceiling so "unlimited iterations" can never silently mean "no backstop at all". The ceiling is
+  // configurable via `budget.backstopWallClockSec` (default 6h; 0 = truly unlimited, operator's
+  // explicit choice — loop guard v2 remains the runaway defense at that point).
   if (
     cfg.maxIterations === 0 &&
     cfg.budget.maxTotalTokens == null &&
     cfg.budget.maxCostUSD == null &&
     cfg.budget.maxWallClockSec == null
   ) {
-    cfg.budget.maxWallClockSec = 6 * 60 * 60; // 6h default ceiling
-    process.stderr.write(
-      'shadow: maxIterations:0 with no budget backstop — applied a 6h wall-clock ceiling ' +
-        '(set budget.maxWallClockSec / maxCostUSD / maxTotalTokens to override).\n',
-    );
+    const backstop = cfg.budget.backstopWallClockSec ?? 6 * 60 * 60; // 6h default ceiling
+    if (backstop > 0) {
+      cfg.budget.maxWallClockSec = backstop;
+      const backstopLabel =
+        backstop >= 3600 ? `${Math.round((backstop / 3600) * 10) / 10}h` : `${backstop}s`;
+      process.stderr.write(
+        `shadow: maxIterations:0 with no budget backstop — applied a ${backstopLabel} wall-clock ceiling ` +
+          '(set budget.maxWallClockSec / maxCostUSD / maxTotalTokens to override, or budget.backstopWallClockSec: 0 to disable).\n',
+      );
+    } else {
+      process.stderr.write(
+        'shadow: maxIterations:0 with budget.backstopWallClockSec:0 — running with NO wall-clock backstop ' +
+          '(loop guard v2 and the token/cost ceilings you set are the remaining defenses).\n',
+      );
+    }
   }
   return cfg;
 }

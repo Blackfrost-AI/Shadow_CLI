@@ -1,8 +1,13 @@
+import { basename } from 'node:path';
 import { readJsonBody, type ApiContext, type RouteFn } from '../router.js';
 import { resolveJail } from '../projects.js';
 import { AUTONOMY_LEVELS } from '../../safety/permissions.js';
 import type { AutonomyLevel } from '../../safety/permissions.js';
 import type { ApprovalDecision, UserAnswer } from '../../agent/approval.js';
+import { SessionLog } from '../../state/session.js';
+import { resumeSession, listResumableSessions } from '../../state/resume.js';
+import { loadConfig } from '../../config.js';
+import { readLatestWorkCenterSnapshot } from '../../state/workCenterPersistence.js';
 
 /**
  * Session management surface.
@@ -18,28 +23,105 @@ import type { ApprovalDecision, UserAnswer } from '../../agent/approval.js';
  * loop emits `stop` on success — either way the browser spinner stops).
  */
 export function registerSessionsRoutes(route: RouteFn, ctx: ApiContext): void {
+  // Persisted CLI sessions a companion may attach to (newest first). Returns id/ts/title only —
+  // never absolute paths — so the surface stays safe to expose to a remote companion later.
+  route('GET', /^\/api\/resumable$/, (req) => {
+    const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+    const projectRoot = url.searchParams.get('projectRoot');
+    if (!projectRoot) return { status: 400, body: { error: 'projectRoot query parameter is required' } };
+    let jail;
+    try {
+      jail = resolveJail(projectRoot);
+    } catch (e) {
+      return { status: 403, body: { error: e instanceof Error ? e.message : String(e) } };
+    }
+    const sessions = listResumableSessions(jail.workspaceRoot).map(({ id, ts, title }) => ({ id, ts, title }));
+    return { status: 200, body: { sessions } };
+  });
+
   route('GET', /^\/api\/sessions$/, () => ({
     status: 200,
     body: { sessions: ctx.registry.list() },
   }));
 
-  // Create a browser session. 403 before it exists if the project is not currently allowlisted —
-  // UX + storage hygiene; resolveJail at BUILD time (fresh re-read) is the real boundary.
+  // Create a browser session, or attach to a persisted CLI session when `resumeSessionId` is set.
+  // 403 before it exists if the project is not currently allowlisted — UX + storage hygiene;
+  // resolveJail at BUILD time (fresh re-read) is the real boundary.
   route('POST', /^\/api\/sessions$/, async (req) => {
-    const body = (await readJsonBody(req)) as { projectRoot?: unknown; title?: unknown; model?: unknown } | null;
+    const body = (await readJsonBody(req)) as {
+      projectRoot?: unknown;
+      title?: unknown;
+      model?: unknown;
+      resumeSessionId?: unknown;
+    } | null;
     if (!body || typeof body.projectRoot !== 'string') {
       return { status: 400, body: { error: 'projectRoot (string) is required' } };
     }
+    let jail;
     try {
-      resolveJail(body.projectRoot); // throws if the path is not a currently-allowlisted project
+      jail = resolveJail(body.projectRoot); // throws if the path is not a currently-allowlisted project
     } catch (e) {
       return { status: 403, body: { error: e instanceof Error ? e.message : String(e) } };
     }
-    const session = ctx.registry.create({
-      projectRoot: body.projectRoot,
-      title: typeof body.title === 'string' ? body.title : undefined,
-      model: typeof body.model === 'string' ? body.model : undefined,
-    });
+    const title = typeof body.title === 'string' ? body.title : undefined;
+    const model = typeof body.model === 'string' ? body.model : undefined;
+
+    // Companion resume: the SAME persisted-session attach the ACP editor uses (acp/server.ts
+    // session/load). The owning CLI process remains the sole writer of the workspace JSONL; this
+    // only hydrates a live registry session from it. resumeSession() authenticates the owner-only
+    // harness binding and FAILS CLOSED if it is missing or mismatched — never a silent bypass.
+    if (typeof body.resumeSessionId === 'string' && body.resumeSessionId.trim()) {
+      const wanted = body.resumeSessionId.trim();
+      const path = SessionLog.list(jail.workspaceRoot).find((candidate) => {
+        const id = SessionLog.sessionIdFromPath(candidate);
+        return id === wanted || id.endsWith(wanted) || candidate === wanted;
+      });
+      if (!path) return { status: 404, body: { error: `unknown persisted session: ${wanted}` } };
+      const storedId = SessionLog.sessionIdFromPath(path);
+      // Sole-writer guard: the workspace JSONL must have exactly one live writer. If a live session
+      // already owns this log, attaching a second would corrupt snapshot baseOffsets — refuse.
+      let owned = false;
+      ctx.registry.each((s) => {
+        if (s.status === 'closed') return;
+        if (s.resumeSessionPath === path || s.agent?.sessionLog.path === path) owned = true;
+      });
+      if (owned) return { status: 409, body: { error: 'session log is already owned by a live session' } };
+      const cfg = loadConfig(jail.workspaceRoot);
+      let hydrated;
+      try {
+        hydrated = resumeSession(path, {
+          contextBudget: cfg.contextBudget,
+          triggerRatio: cfg.summarizeTriggerRatio,
+          keepLastTurns: cfg.keepLastTurns,
+        });
+      } catch (e) {
+        return { status: 403, body: { error: e instanceof Error ? e.message : String(e) } };
+      }
+      let session;
+      try {
+        session = ctx.registry.create({
+          id: storedId,
+          projectRoot: jail.workspaceRoot,
+          title: title ?? hydrated.meta.title ?? basename(jail.workspaceRoot),
+          model,
+          resumeSessionPath: path,
+        });
+      } catch (e) {
+        // A live session already owns this id (e.g. resumed twice) — the companion should open it.
+        return { status: 409, body: { error: e instanceof Error ? e.message : String(e) } };
+      }
+      session.workCenter.restore(readLatestWorkCenterSnapshot(path));
+      // Replay history for display BEFORE the lazy build wires bus→recordEvent, so the transcript
+      // shows the prior conversation without re-recording it into the sole-writer log.
+      for (const message of hydrated.context.messages()) {
+        const text = message.content.filter((block) => block.type === 'text').map((block) => block.text).join('\n');
+        if (!text) continue;
+        session.bus.emit(message.role === 'user' ? { type: 'user', text } : { type: 'assistant_done', text });
+      }
+      return { status: 200, body: { id: session.id, resumed: true } };
+    }
+
+    const session = ctx.registry.create({ projectRoot: body.projectRoot, title, model });
     // The sidebar refetches GET /api/sessions after each action, so returning the id is enough.
     return { status: 200, body: { id: session.id } };
   });

@@ -188,7 +188,10 @@ export function toOpenAIMessages(
   opts: { preserveProviderReasoning?: boolean; reasoningRoundtrip?: 'last' | 'none' } = {},
 ): OAIMessage[] {
   const clean = escapeMultimodalControlTokens;
-  const out: OAIMessage[] = [{ role: 'system', content: clean(req.system) }];
+  const systemText = req.systemVolatileSuffix?.trim()
+    ? `${req.system}\n\n${req.systemVolatileSuffix}`
+    : req.system;
+  const out: OAIMessage[] = [{ role: 'system', content: clean(systemText) }];
 
   // F06-08: reasoning replay is a CONTINUATION contract — the model needs its own preserved
   // thinking to keep the current tool-calling thread, not a replay of every turn's thinking.

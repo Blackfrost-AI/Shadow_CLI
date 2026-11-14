@@ -7,152 +7,273 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
-## [11.3.1] — 2026-11-06
+## [11.7.0] — 2026-11-13
 
-The eval-integrity release: the harness-capability eval scoreboard now fails closed,
-counts real usage, and exercises real harness machinery in mock runs — turning it from
-a misleading 2/20-false-green signal into a measured instrument. Validated live against
-a local reasoning model (20-task fixture set): the scoreboard surfaced launch-poisoning,
-abnormal stops, and refusal, and measured whole-run prefix-cache savings (62.5%).
+**TUI immersion: clickable links, command menu, model roles.** Five operator-requested
+improvements from the TUI immersion review (`research/tui-immersion-review-2026-11-13.md`).
+
+### Added
+- **Clickable links (Snowfall).** Clicked OSC 8 hyperlinks open in the default browser. The
+  engine already hit-tested links on mouse release; Shadow now wires the `openUrl` callback
+  (`src/util/openLink.ts`). Only `http`/`https` URLs open, passed as a single argv element to
+  `open`/`xdg-open` with no shell. Gated by `linkClickOpen` (default on).
+- **Configurable prose width.** New `proseMaxCols` config (default 100; `0` = fill the
+  terminal width) replaces the hardcoded 100-column cap in both renderers, so wide windows
+  no longer leave a dead zone beside the transcript. Chrome still spans the full width.
+- **Grouped command menu (`/menu`).** A browsable, drill-in menu overlay (OMP parity) with
+  categories (Repository, Session, Models, Work, Planning, Config, Help), breadcrumb header,
+  ↑/↓ navigate, Enter open, Esc/← back. Command leaves dispatch through the existing
+  `runSlash` path — no parallel handlers. The `/` autocomplete remains the fast type-ahead.
+- **Repository browser (`/repo`).** Lists tracked files (`git ls-files`) in a picker and
+  opens the chosen file in `$EDITOR` (no shell — the path is a literal argv element, so a
+  hostile filename cannot inject). Git actions (`/diff`, `/review`) sit alongside it in the
+  menu's Repository submenu.
+- **Named model roles (`/role`).** New `roles` config (`smol`/`slow`/`plan` → model labels);
+  `/role <name>` switches to that model, bare `/role` lists configured roles. OMP
+  `--smol/--slow/--plan` parity.
+- **Ctrl+P model cycling.** Cycles through the `--models a,b,c` allowlist (or all enabled
+  models when unset), reusing the model switcher. Idle-only, like the picker. New `--models`
+  flag and `src/util/modelCycle.ts` (pure, unit-tested).
 
 ### Fixed
-- **Eval exit-code semantics** (`eval/telemetry.ts`): only `end_turn`/`refusal`/`pause_turn`
-  are clean stops. `provider_error`, `max_iterations`, `budget`, `interrupted`,
-  `fatal_tool_error`, `spawn_error`, and wall-clock timeouts now fail the run with
-  `process.exitCode=1`. Previously a run whose tasks never reached a legitimate terminal
-  state could exit 0 (false green).
-- **Eval usage accounting** (`eval/telemetry.ts`): per-request `cacheRead`/`cacheWrite`
-  and one-shot `subagent_usage` totals are summed exactly once; the latest cumulative
-  lead-loop snapshot is retained without double-counting. Scorecards now print cache and
-  subagent token/cost splits per task and per run.
-- **Task-aware scripted mock provider** (`src/provider/mockScripts.ts`, opt-in via
-  `SHADOW_MOCK_SCRIPT=1`): per-task turn scripts covering all 20 fixtures — including
-  `tool_search` → deferred security-tool promotion — so mock runs exercise real plumbing
-  end-to-end instead of bypassing it. Existing dialect/recovery/demo mocks unchanged.
-- **Mock eval routing** (`src/provider/index.ts`, `eval/harness-eval.ts`): mock models
-  now route to the scripted provider so per-task coverage is real; the dialect override
-  no longer clobbers the script mock for mock models.
-
-### Added
-- **Scorecard stop-health and accounting columns**: per-task `stopOK`, abnormal-stop
-  counts, cache token breakdown, and subagent token/cost breakdown. `eval/README.md`
-  rewritten with the full 20-task table and explicit mock-expectation semantics (mock
-  success validates plumbing only, never model capability).
-- **Unit tests** (`test/eval.test.ts`): stop-health classification for every abnormal
-  stop reason; usage accounting latest-wins vs summed-field behavior from synthetic
-  session logs.
-
-## [11.3.0] — 2026-11-06
-
-The daily-workflow-upgrade release: ten major capability surfaces, hardened by
-three adversarial security reviews (10 confirmed vulnerabilities fixed, each
-with a regression test). All new surfaces are module-scoped, preview/approval
-bound, and off by default.
-
-### Added
-- **Mutation journal** (`src/tools/mutation.ts`): every approved multi-step
-  edit lands through a journal record — per-file before/after bytes bound from
-  disk, approval digests, single-use locks, drift refusal, and per-file
-  reconcile truth. Interrupted operations are reported, never silently
-  retried.
-- **Shell escape** (`/!`): an explicit operator-only prefix that routes a
-  typed command through the real AgentLoop execution policy — no bypass of the
-  approval gate; injected/model-generated `/!` text is refused.
-- **LSP edit actions:** preview-bound rename, formatting, and edit-only code
-  actions with operation recovery and per-turn diagnostics budgets. The
-  operator approves a rendered preview; the apply path re-renders from stored
-  bytes and refuses on drift.
-- **Commit proposals:** scoped commits that preserve unrelated staged changes,
-  always run Git hooks, bind approvals to the exact (tree, message, paths),
-  refuse drift, and never replay a spent approval.
-- **Persistent versioned ACP RPC** (`src/acp/`): bounded NDJSON framing
-  (1 MiB frames, 64 pending), strict version negotiation, event streaming,
-  approval binding with digest echo on the wire, cancellation that fails closed,
-  and per-method policy gating.
-- **Crash restore:** operator-only rollback/keep/retry decisions over journaled
-  interrupted operations; no side effect is ever repeated, and corrupted
-  records surface as typed errors instead of being silently skipped.
-- **AST edit previews:** deterministic single-match selectors (zero or multiple
-  matches refuse), byte-preserving splices, dual syntax gates (parse +
-  re-parse), journal-only writes.
-- **DAP debugging** (`src/agent/dap/`): protocol, per-launch digest gating,
-  session lifecycle with guaranteed adapter reaping, and bounded inspection.
-  Frame/stderr redaction keeps adapter-supplied paths out of the transcript.
-- **Browser relay** (`src/web/browserRelay.ts`, opt-in): loopback-only
-  transport with DNS-rebinding defense, per-action digest-bound approvals,
-  credential-shape masking in the audit log, and fail-closed token handling.
-- **SSH remote paths** (`src/tools/sshRemote.ts`): pinned host identity
-  (known_hosts materialized only on exact key match), bounded read/write
-  paths, and explicit remote-write approval bound to the transferred bytes.
-- **Advisors** (`src/agent/advisor.ts`, opt-in): bounded advisory providers
-  with visible egress, hard token/cost/wall-clock budgets enforced by a shared
-  budget ledger, and no mutation authority — advice is returned to the model,
-  never applied.
+- **Snowfall image viewer fallback.** On terminals that can't paint inline pixels
+  (iTerm2 / Apple_Terminal / tmux), Snowfall showed only a text placeholder and never opened
+  the image. It now mirrors Ink's `saveAndOpen` fallback (save to the image cache + open the
+  OS viewer), so the image is actually seen.
+- **Repository editor busy guard is live.** `/repo` → open-in-editor now checks turn state at
+  file-choose time (not a snapshot from when the picker opened), so a turn that starts while
+  the picker is open still blocks the blocking editor spawn.
 
 ### Security
-- **Project-file price-table injection disarmed:** `priceTable` and `budget`
-  are global-only; every model price must be positive. A cloned repo can no
-  longer zero prices or raise caps to defeat cost ceilings.
-- **Provider-reported usage validated:** non-finite or negative token counts
-  from an endpoint can no longer erase accrued spend or unbound retries.
-- **Approval digests now ride the wire:** the sealed digest is sent in
-  `_meta` so editors can echo it; previously the anti-spoofing control was
-  inert and every real-editor approval failed closed to total deny.
-- **Session-close backpressure DoS closed:** `session/close` during a lazy
-  build now settles the pending prompt instead of wedging it permanently.
-- **Journal byte-binding:** previews are bound against byte-exact re-encode,
-  closing a lossy UTF-8 round-trip that could destroy preserved regions.
-- **DAP frame/stderr redaction enforced; launch cleanup on refused configs;
-  relay credential-array masking; SSH content-digest binding.** (Six further
-  hardening fixes shipped in the R1 review pass.)
+- **Image cache files always get a known image extension.** The save-and-open fallback no
+  longer derives the file extension from the (tool-influenced) image name. A name ending in
+  `.command`/`.sh` with an unknown media type could previously make macOS `open` *execute* the
+  saved file in Terminal; it now always saves as a real image type (`.png` fallback) and is
+  handed to the image viewer. Closes the vector for both renderers. Regression-tested.
 
-## [11.2.0] — 2026-11-06
+### Verification
+- New regression suites: `test/tui-immersion.test.ts`, `test/menu-tree.test.ts`,
+  `test/model-cycle.test.ts`, plus image-extension and live-busy-guard cases in
+  `test/termImage.test.ts`. Full suite + typecheck + lint + release gate green.
+- `docs/TERMINAL_RENDERERS.md` regenerated from the catalog (new `/menu`, `/repo`, `/role`).
+- `src/app/app.ts` stays at its 5010-line ratchet via `src/app/commands.ts` + `gitInfo.ts`
+  extraction (no budget raised).
 
-### Added
-- **Explicit steering control:** `/steer <text>` steers the active turn at the next safe boundary, without overtaking earlier queued work. Refused when no turn is active. Available in both Snowfall and Ink.
-- **Explicit non-interrupting queue control:** `/queue <text>` queues follow-up input that never requests steering under any state; when idle it starts a normal turn. Available in both Snowfall and Ink.
-- **Ink configurable actions:** opt-in `chat:steer` and `chat:queue` keybinding actions with no default bindings. The existing keybinding loader, normalizer, and reserved-key protection apply unchanged.
+## [11.6.2] — 2026-11-13
 
-### Changed
-- **Snowfall busy-Enter routing:** while a turn runs, a submitted slash command is now queued for replay at the safe boundary instead of being dispatched immediately (previously `/compact` would refuse mid-turn and the input was dropped). Only the explicit controls above are decoded before busy barriers; every other command keeps the existing queue-and-replay FIFO contract.
-
-### Security
-- Steering and queue payloads are never interpreted as slash commands (nested `/` payloads are rejected); `off`/`status`/`clear` are ordinary message text. Multiline payloads are preserved verbatim. Model output or pasted text cannot reach these control paths — only explicit operator submission.
-
-## [11.1.4] — 2026-11-05
-
-### Changed
-- **Transcript detail launches expanded.** Both renderers now start with tool output and reasoning
-  bodies unfolded instead of compacted, so a fresh session shows its work without a keypress.
-  **Ctrl-O** remains the toggle and now folds the transcript in on first press; `/activity` still
-  retains tool output.
-
-## [11.1.3] — 2026-11-05
-
-### Changed
-- **Long-range sub-agent iteration defaults.** Reviewers and workers now default to 100 loop
-  iterations instead of 15. Explicit and profile limits remain clamped to the parent's ceiling;
-  unlimited parents retain a 1000-iteration hard cap and 30-minute wall-clock backstop.
-
-## [11.1.2] — 2026-11-05
+**Hotkey parity + verification.** Follow-up to the CLI shortcut/hotkey review
+(`research/tui-hotkey-review-2026-11-13.md`): one Ink parity gap closed, one suspected
+collision empirically disproven and pinned, and the key documentation completed.
 
 ### Added
-- **`/swarm` missions: `/goal` planning with bounded parallel native-agent execution.** Approved
-  task graphs launch independent workers within existing concurrency, permission, and budget
-  controls; validate dependencies; run dependent read-only tasks after successful prerequisites;
-  and gate dependent writers on lead integration. Failed workers block descendants while unrelated
-  work continues. Job and retained-worktree references flow into the result, nested fan-out is
-  refused, and the lead must verify the final state before mission completion. Both terminal
-  renderers support `/swarm`, `/swarm status`, and `/swarm clear`.
 
-## [11.1.1] — 2026-11-03
+- **Ink Ctrl+N opens the work center** (`chat:workCenter`), matching Snowfall's Ctrl+N
+  work overlay. Routes to the same read-only `/work` surface and is allowed mid-turn
+  (checking background work is exactly what you do while a turn runs); a latch guards
+  synchronous re-entry. Advertised via `/keybindings`.
+- **Regression tests:** `snowfall-search-keys` (3) pins Ctrl+G ownership end-to-end through
+  the real pi engine + ShadowApp listener; `ink-work-key` (1) pins the Ink binding.
+
+### Verified (no code change needed)
+
+- **Ctrl+G search/editor collision — disproven.** The engine's viewport listener is
+  registered first and consumes Ctrl+G as search-next while the search overlay is focused;
+  the app additionally defers on any open overlay before its external-editor branch. Idle
+  Ctrl+G still opens `$VISUAL/$EDITOR`. Pinned by the new tests rather than a speculative fix.
+
+### Changed
+
+- **Renderer contract docs regenerated** (`docs/TERMINAL_RENDERERS.md`): Ctrl+N row now
+  names both renderers; Ink-only keys documented — Ctrl+R history search (repeat/Enter/Esc
+  semantics), Ctrl+X C draft copy, Alt+C last-answer copy, Ctrl+O activity inspector,
+  Alt+O latest activity detail. Shift-modified chords are deliberately NOT documented:
+  terminals send the same bytes as their unshifted forms (source: defaultBindings.ts).
+  Ctrl+O default-expanded behavior (11.5.1) confirmed intact.
+
+## [11.6.1] — 2026-11-12
+
+**Injection-safe compaction (security patch).** Closes the one confirmed Shadow defect
+(F1) surfaced by the API-delivered prompt-injection investigation: compaction harvested
+quoted / injected / harness-synthetic text verbatim into the pinned session objective and
+re-sent it every turn. Block-by-default; operator opt-in preserved.
 
 ### Fixed
-- **Playwright browser preset updated to `@playwright/mcp@0.0.84` with Chromium's `--sandbox`
-  enabled.** The previous `0.0.79` pin used Chromium builds affected by four browser
-  vulnerabilities fixed in Chrome `156.0.8078.73`. Profile isolation remains separate from the OS
-  jail; the preset still opts out of Shadow's MCP jail because the browser needs sockets and broad
-  filesystem access.
+
+- **F1 — objective laundering via compaction.** `harvestInstructions` now strips untrusted
+  envelope spans (padding-aware, including unclosed and redacted `<ta[REDACTED]` notification
+  forms) BEFORE carrier/header parsing, excludes synthetic harness turns, and honors a
+  `[System note:` carrier only from the pinned slice. Injected "instructions" can no longer
+  become the authoritative objective. Legacy unstamped turns remain harvestable; already-
+  contaminated objectives self-heal on the next compaction.
+- **`fitPayload` hard-cap contract.** The result is now `<= max(0, floor(cap))` for EVERY cap;
+  the payload floor lifts the budget only up to the cap, never past it (previously returned up
+  to 512 chars even for smaller caps). Production-budget behavior is unchanged.
+
+### Added
+
+- **`Message.synthetic` process-only flag**, stamped at every harness-injection site (loop
+  empty/badJson/tool-use/completion nudges, agentTool project-messages, bootstrap recovered-task
+  note, index hook-denial note). Never serialized to any provider wire payload.
+- **Regression coverage:** `harvest-injection` (20), `synthetic-propagation` + wire-omission (8,
+  Anthropic/OpenAI/Responses behavioral + Claude Code structural), and `fitPayload` hard-cap
+  contract tests. Full suite 4107/4110 (2 known `claude-code-provider` deadline-fixture load
+  flakes, 31/31 isolated; 1 skip).
+
+## [11.6.0] — 2026-11-12
+
+**Information survival + self-resuming agents.** Built by a 4-agent worktree swarm
+(spec: `plans/swarm-11.6.0-information-survival.md`, reviewer-gated, lead-integrated).
+
+### Added
+
+- **Self-resuming background work (WAKE).** A completed background task now wakes an
+  idle session instead of waiting for the next human message. Every `task_notification`
+  status — including `partial` ceiling stops — triggers the wake; mid-turn completions
+  coalesce into one queued wake; the 30/hr rate ceiling applies and a dropped wake never
+  loses the notification buffer. Ordering invariant preserved: no mid-history injection.
+- **Recoverable reclamation (RECLAIM).** Microcompaction and degraded truncation now
+  persist cleared tool bodies to session-scoped spill files BEFORE replacing them; the
+  sentinel carries a locator the model can re-read (`read_file`). Re-clear is idempotent
+  (prefix-based guards, legacy exact-match retained) and a spill is never overwritten by
+  a later sentinel. `web_fetch`/`web_search`/MCP oversize now spills the FULL readable
+  text pre-clamp with a locator in the trusted provenance line — the silent-truncation
+  bypass is closed. Retention ARCHIVES spill with the session (`.archive/spill-<id>`),
+  never deletes on sweep. Containment stays at the spill preview boundary
+  (`envelopeSafeSlice`); `read_file` returns raw bytes — comments and tests pin that.
+- **Cache-safe live state (CACHE).** The facts index is no longer frozen at bootstrap:
+  it refreshes per turn and, on prompt-caching adapters, rides the message-tail volatile
+  suffix together with plan/mission/todo control blocks. A `todo_write` no longer busts
+  the Anthropic system+history prefix; facts remembered mid-session are visible on the
+  next request. Non-caching adapters keep system placement; single render site (B4);
+  empty-tail guard keeps unlimited-loop requests byte-identical. New
+  `Provider.promptCaching` capability (no provider name-matching).
+
+### Fixed
+
+- **Memory durability + privacy (MEMORY).** Corrupt `memory.json` is quarantined
+  (`memory.json.corrupt-<ISO>`, `wx`-create, 0600, collision-safe) instead of silently
+  overwritten; missing files are not treated as corruption; unreadable files block
+  persist until healed. Every persist keeps a `.bak`; values + source are redacted at
+  write; all files explicit 0600. Concurrent writers merge under a best-effort lockfile
+  (fresh disk + pending replay) instead of losing updates. The memory tool echoes the
+  STORED (redacted) value — a refused write can no longer return raw secret-shaped input.
+
+### Fixed (integration review)
+
+- **One-shot headless no longer kills its own queued wake (G3).** A notification arriving
+  during the LAST `--task` turn queued a continuation that the finally-block abort-all sweep
+  then aborted — the release's headline promise failed in one-shot mode. The headless exit
+  path now waits (bounded 30 min) for pending wakeups and in-flight wake turns BEFORE
+  detach/abort/clear; Ctrl-C/SIGTERM still exit immediately; `wakeup.clear()` teardown intact.
+- **The volatile tail is counted by the compaction trigger (adj2).** Facts/plan/todo tail
+  content is real request payload; it now feeds the heuristic estimate and the real-count
+  path, so a large tail cannot hide from the trigger and sail into a server overflow.
+- **Store warnings are sticky until an explicit memory op (adj1).** Quarantine/refused-write
+  notices ride EVERY provider request as a one-line banner (peek) and are consumed exactly
+  once by a mutating/lookup tool op — a corrupt store can no longer go silently unnoticed
+  just because no memory tool call happened.
+
+### Notes
+
+- Swarm process evidence: 2 slices hit 60-iteration ceilings mid-implementation; retained
+  diffs + continuation agents recovered RECLAIM (lead-completed the test fixtures) and
+  CACHE (verify/test/commit). Reviewer pre-pass caught 4 spec blockers before launch
+  (partial-status wake, sentinel idempotence data-loss, archive-never-delete, facts
+  double-render). Per-slice + integration review; 91/91 cross-slice tests, full suite
+  green at release.
+- Known limits: wake is TUI/headless-host only (web host has no attach site); a REPL that
+  exits on EOF does not wait out pending wake timers (only the one-shot `--task` path drains
+  them); memory lock is best-effort (residual lost-update window under heavy contention);
+  spill retrieval is raw (containment at preview boundary, by design); the volatile-tail
+  estimate uses the chars/4 heuristic for the real-count floor (additive, never lowers);
+  DeepSeek reasoning round-trip is UNTESTED against the live API (fixture-tested only).
+
+## [11.5.2] — 2026-11-12
+
+### Fixed
+
+- **Subagents no longer die at their iteration ceiling with empty or intent-only
+  partials.** Read-only `explore`/`reviewer` runs used to burn their whole turn
+  budget exploring and return "I'll re-read the files now…" instead of findings.
+  Four changes close that failure mode:
+  - Every capped agent now sees a per-turn `## Iteration budget` block
+    (turns used / max / remaining) with a bounded near-ceiling directive to stop
+    gathering and synthesize. Unlimited loops are unaffected.
+  - The counter travels as a new request field (`systemVolatileSuffix`) placed
+    at the Anthropic **message tail, after the rolling cache breakpoint** — the
+    breakpoint stays on the last persisted history block, so the
+    tools+system+history prefix keeps its prompt-cache hit every turn. It is
+    request-only and excluded from compaction continuity, so no stale counter is
+    frozen into a summary. Non-caching adapters fold it into the system text.
+  - Ceiling salvage now falls back to the last substantive assistant findings
+    when the closing call comes back empty, drops pure forward-looking intent
+    (ceiling stops only — completed answers stay verbatim), and labels the
+    outcome with `N/M iterations`.
+  - Read-only ceilings right-sized for real review work: `explore` 12→30,
+    `reviewer` 10→20, still clamped by the parent's ceiling. Bundled agent prompt
+    ceilings synced.
+
+  Budget-stop contracts unchanged: a spend/wall-clock stop makes **zero** further
+  provider calls; a `max_iterations` stop makes at most one tool-less salvage
+  call. No new dependencies, no telemetry, approval/sandbox/egress untouched.
+
+## [11.5.1] — 2026-11-12
+
+### Changed
+- **Snowfall transcript starts expanded**: the Ctrl-O "everything unfolded" state is now the
+  default at launch (`src/app/app.ts` `showAllExpanded`). Reasoning bodies, long tool output,
+  and tables render in full from the first frame; Ctrl-O (or `/expand`) still toggles the whole
+  transcript to the compact folded view and back. The legacy Ink renderer (`SHADOW_TUI=ink`)
+  is unchanged.
+
+## [11.5.0] — 2026-11-11
+
+Inference management for the self-hosting era: GGUF recon and memory-capacity planning tools,
+a prompt module that teaches them, and the v11.5.0 codebase review that hardened them.
+
+### Added
+- **`infer_recon` (`src/tools/inferRecon.ts`)**: deferred, read-only GGUF inspection — architecture,
+  context length, layer/KV-head geometry, quantization mix, and per-field provenance tags
+  (MEASURED / DECLARED / DERIVED / MODELLED). Never loads or executes the model.
+- **`infer_capacity` (`src/tools/inferCapacity.ts`)**: deferred memory-capacity planning — weight,
+  activation, and KV-cache footprints across VRAM / host RAM / unified memory pools in binary
+  units, KV sized from KV heads (not query heads), per-scenario fit ceilings with provenance.
+  Host accelerator inventory comes from the harness, not model input. Memory-capacity only —
+  no throughput or latency claims. Unknown geometry fails closed rather than guessing.
+- **`prompts/policies/inference-toolkit.md`**: new prompt module with a reach-for table and tool
+  contracts, whole-module gated on both `infer_recon` and `infer_capacity` being available.
+- **Inference tests**: `test/inference-{ggufMeta,capacity,gpu,tools,prompt-gate}.test.ts` — 174 tests
+  covering GGUF metadata parsing, capacity math, GPU probe, tool wiring, and the prompt gate.
+
+### Changed
+- **`PROMPT_REFERENCED_TOOLS` (`src/system/resolveSystem.ts`)**: extended with 10 tools
+  (`tool_search`, `repository_context`, `project_checks`, `web_search`, `web_fetch`, `memory`,
+  `watcher`, `schedule_wakeup`, `infer_recon`, `infer_capacity`) so capability-aware line
+  filtering now covers prompt lines naming them; `tool_search` was the only one with no module
+  gate.
+- **`plan_write` (`src/tools/planModeTools.ts`)**: now writes atomically (temp file + rename),
+  matching `write_file`'s contract, so a crashed plan write cannot leave a half-written plan.
+- **Inference hardening (review-driven)**: fail-closed unchecked memory pools; bounded
+  max-context/max-sequences semantics; compare-quants KV-unsized ranking caveat; honest error
+  paths; tool_search discoverability aliases without throughput over-promise.
+
+### Removed
+- **`prompts/.DS_Store`**: macOS artifact, never loaded, removed from the tree.
+
+## [11.2.0] — 2026-11-10
+
+Long-range sessions: the main-session wall-clock backstop is now configurable, so `maxIterations: 0`
+can back week-scale engagements instead of silently ending at six hours.
+
+### Added
+- **`budget.backstopWallClockSec` (`src/config.ts`)**: configures the wall-clock ceiling Shadow
+  injects when `maxIterations: 0` is set with no token/cost/wall-clock budget. Default remains
+  6h; a larger value (e.g. `604800` for a week) raises it; `0` explicitly opts out — the loop
+  guard and any budgets you set remain the defenses. The startup notice now names the applied
+  ceiling and how to change it. Tests: `test/config-security.test.ts`
+  (default-inject / raise / opt-out).
+- **User guide section "Long sessions" (`docs/USER_GUIDE.md`)**: documents the knob, the
+  precedence of an explicit `budget.maxWallClockSec`, and the safe unattended-run guidance.
 
 ## [11.1.0] — 2026-10-31
 

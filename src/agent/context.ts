@@ -1,5 +1,13 @@
 import type { ContentBlock, Message, Provider, ToolSchema } from '../provider/provider.js';
-import { envelopeSafeSlice, envelopUntrusted } from '../safety/envelope.js';
+import { envelopeSafeSlice, envelopUntrusted, stripUntrustedSpans } from '../safety/envelope.js';
+import { clearedContentLocator, droppedContentLocator } from './toolSpill.js';
+
+/**
+ * Persist a body being reclaimed from context; returns the locator path for the sentinel, or
+ * null when persistence failed. Injected by the loop (which owns the filesystem) so Context
+ * stays fs-free. Must NEVER overwrite an existing full-body spill.
+ */
+export type SpillBody = (toolName: string, toolCallId: string, body: string) => string | null;
 
 /** Explicit session attachments, separate from conversation history and never silently compacted. */
 export interface ContextSource {
@@ -358,7 +366,7 @@ export class Context {
    * forensic evidence that a summarizer failed — so re-running each turn only touches
    * newly-stale results.
    */
-  microcompact(provider: Provider): boolean {
+  microcompact(provider: Provider, spillBody?: SpillBody): boolean {
     if (!this.microcompactOn) return false;
     const gate = this.opts.contextBudget * Math.min(this.microcompactRatio, this.opts.triggerRatio);
     if (this.estimateTokens(provider) <= gate) return false;
@@ -382,12 +390,16 @@ export class Context {
       const content = m.content.map((b) => {
         if (b.type !== 'tool_result') return b;
         // Idempotent — and never overwrite the degradation tombstone with the generic marker.
-        if (b.content === MICROCOMPACT_SENTINEL || b.content === TRUNCATED_RESULT_SENTINEL) return b;
+        // B2: prefix-aware — a locator sentinel (`[Old tool result content cleared — full
+        // output: …]`) is ALREADY reclaimed; re-clearing it would spill the sentinel text over
+        // the original full body. Legacy exact sentinels from resumed sessions match too.
+        if (isReclaimedContent(b.content)) return b;
         const name = toolNameById.get(b.toolCallId);
         if (!name || !MICROCOMPACTABLE_TOOLS.has(name)) return b;
         changed = true;
         // Clear ONLY the body; type/toolCallId/ok/position are preserved for the healer.
-        return { ...b, content: MICROCOMPACT_SENTINEL };
+        // Spill-before-clear: the full body lands on disk first; the sentinel carries its locator.
+        return { ...b, content: reclaimedSentinel(b, name, spillBody, 'cleared') };
       });
       if (changed) {
         this.msgs[i] = { ...m, content };
@@ -504,6 +516,12 @@ export class Context {
     /** The live system prompt + tool schemas, so the count matches the REAL request (D4). */
     countCtx?: {
       system?: string;
+      /**
+       * 11.6.0 adj2: the request's volatile message-tail suffix (caching path). Real request
+       * payload that lives outside message history — counted here so a large facts/plan/todo
+       * tail cannot hide from the compaction trigger and sail into a server 400.
+       */
+      volatileSuffix?: string;
       tools?: unknown[];
       /** Goal/todo/plan state that lives outside message history but must shape the handoff. */
       continuity?: string;
@@ -516,6 +534,11 @@ export class Context {
        * overflow recovery, when a normal compaction already ran and the request is still too long.
        */
       aggressiveKeep?: boolean;
+      /**
+       * 11.6.0: persist a body before degraded truncation tombstones it; the tombstone then
+       * carries a locator instead of pointing at the void. Absent/failing → today's sentinel.
+       */
+      spillBody?: SpillBody;
     },
   ): Promise<CompactResult> {
     if (signal?.aborted) return false;
@@ -523,7 +546,13 @@ export class Context {
     // never be reported against a later, unrelated one.
     this.lastFailureReason = undefined;
     const trigger = this.opts.contextBudget * this.opts.triggerRatio;
-    let tokens = this.estimateTokens(provider);
+    // The volatile tail rides the real request (message tail on caching adapters, folded into
+    // system elsewhere) but is not part of history — count it with the same heuristic the
+    // history estimate uses (chars/4 × 1.05). Additive only: never lowers the estimate.
+    const suffixTokens = countCtx?.volatileSuffix
+      ? Math.ceil((countCtx.volatileSuffix.length / 4) * 1.05)
+      : 0;
+    let tokens = this.estimateTokens(provider) + suffixTokens;
 
     if (!force) {
       // Hysteresis only applies when we are STILL under the trigger. Once we are over
@@ -539,7 +568,12 @@ export class Context {
             const real = await provider.countTokens({
               model,
               messages: this.requestMessages(),
-              system: countCtx?.system,
+              // Count the tail where the adapter will actually carry it: caching adapters
+              // append it after the last persisted message (request-only), others fold it
+              // into system. Either way it is part of the counted request.
+              system: provider.promptCaching === true
+                ? countCtx?.system
+                : [countCtx?.system, countCtx?.volatileSuffix].filter((s) => s && s.trim()).join('\n\n') || undefined,
               tools: countCtx?.tools as never,
               signal,
             });
@@ -550,7 +584,8 @@ export class Context {
             // compaction quietly stopped compacting.
             if (real > 0) {
               if (real > this.lastActualTokens) this.lastActualTokens = real;
-              tokens = Math.max(tokens, real);
+              // On caching adapters the tail was NOT in the counted request — add it back.
+              tokens = Math.max(tokens, real + (provider.promptCaching === true ? suffixTokens : 0));
             }
           } catch {
             /* ignore, keep heuristic */
@@ -632,7 +667,7 @@ export class Context {
 
     // Always fold the pinned objective into the summarizer prompt so a weak local model
     // cannot invent a new task — and so the progress note is about THIS work.
-    const objectiveLines = harvestInstructions(pinnedSlice);
+    const objectiveLines = harvestInstructions(pinnedSlice, true);
     const middleLines = harvestInstructions(toSummarize);
     const allInstructions = mergeInstructions(objectiveLines, middleLines);
 
@@ -707,7 +742,7 @@ export class Context {
       // takeFailureReason() for the caller's finding.
       const reason = e instanceof Error ? e.message : String(e);
       this.lastFailureReason = `summarizer request failed: ${reason}`;
-      return this.truncateLocally(provider, end, trigger);
+      return this.truncateLocally(provider, end, trigger, countCtx?.spillBody);
     }
     // A provider can yield a partial summary before its fetch notices the abort. Never replace
     // valid history with that truncated handoff: steering and Esc both promise context remains
@@ -716,7 +751,7 @@ export class Context {
     // An EMPTY summary is a failure too (a model that emitted nothing reclaimed nothing).
     if (!summary.trim()) {
       this.lastFailureReason = 'summarizer returned an empty summary';
-      return this.truncateLocally(provider, end, trigger);
+      return this.truncateLocally(provider, end, trigger, countCtx?.spillBody);
     }
 
     // Reframe the pin: a raw first user prompt after compact reads as a FRESH request and
@@ -726,7 +761,8 @@ export class Context {
       allInstructions.length > 0
         ? allInstructions.map((l) => `• ${l}`).join('\n')
         : pinnedSlice
-            .map((m) => m.content.map(blockText).join(' ').trim())
+            .filter((m) => !m.synthetic)
+            .map((m) => sanitizeInstructionText(m.content.map(blockText).join(' ')).trim())
             .filter(Boolean)
             .join('\n') || '(session objective — see progress note)';
 
@@ -745,6 +781,7 @@ export class Context {
 
     const progressMsg: Message = {
       role: 'user',
+      synthetic: true,
       content: [
         {
           type: 'text',
@@ -827,7 +864,7 @@ export class Context {
    * Returns 'truncated' when at least one body was reclaimed, 'failed' when there was nothing
    * left to drop (the caller surfaces both — compaction failure is visible, never silent).
    */
-  private truncateLocally(provider: Provider, end: number, trigger: number): CompactResult {
+  private truncateLocally(provider: Provider, end: number, trigger: number, spillBody?: SpillBody): CompactResult {
     // A tool_result carries only a toolCallId; the originating tool NAME lives on the matching
     // tool_use block in an earlier assistant turn. Map id → name so pass 1 can spare
     // state-bearing results.
@@ -837,7 +874,8 @@ export class Context {
     }
     const droppable = (b: ContentBlock, allowStateBearing: boolean): boolean => {
       if (b.type !== 'tool_result') return false;
-      if (b.content === TRUNCATED_RESULT_SENTINEL || b.content === MICROCOMPACT_SENTINEL) return false;
+      // B2: prefix-aware — locator sentinels are already reclaimed (see microcompact).
+      if (isReclaimedContent(b.content)) return false;
       if (allowStateBearing) return true;
       const name = toolNameById.get(b.toolCallId);
       return !!name && MICROCOMPACTABLE_TOOLS.has(name);
@@ -863,7 +901,11 @@ export class Context {
         if (!m.content.some((b) => droppable(b, allowStateBearing))) continue;
         this.msgs[i] = {
           ...m,
-          content: m.content.map((b) => (droppable(b, allowStateBearing) ? { ...b, content: TRUNCATED_RESULT_SENTINEL } : b)),
+          content: m.content.map((b) =>
+            droppable(b, allowStateBearing) && b.type === 'tool_result'
+              ? { ...b, content: reclaimedSentinel(b, toolNameById.get(b.toolCallId) ?? 'tool', spillBody, 'dropped') }
+              : b,
+          ),
         };
         droppedMessages += 1;
       }
@@ -896,6 +938,44 @@ export const IMAGE_STRIPPED_SENTINEL = '[image removed to free context]';
 const MICROCOMPACT_SENTINEL = '[Old tool result content cleared]';
 /** F04-11: replacement body when the summarizer FAILED and context was reclaimed locally. */
 export const TRUNCATED_RESULT_SENTINEL = '[Tool result dropped — summarizer unavailable; context reclaimed locally]';
+
+/**
+ * B2 (11.6.0): idempotence guard for BOTH reclaim paths. A body is already reclaimed when it is
+ * a legacy exact sentinel (resumed pre-11.6 sessions) OR a locator variant, which replaces the
+ * closing bracket with ` — full output: …]`. The prefixes therefore stop BEFORE the bracket.
+ * Exported for tests and replay surfaces.
+ */
+export function isReclaimedContent(content: string): boolean {
+  return (
+    content === MICROCOMPACT_SENTINEL ||
+    content === TRUNCATED_RESULT_SENTINEL ||
+    content.startsWith('[Old tool result content cleared') ||
+    content.startsWith('[Tool result dropped — summarizer unavailable')
+  );
+}
+
+/**
+ * Spill-before-clear (11.6.0): persist the full body via the injected callback and return the
+ * locator sentinel; on absent/failing callback return the legacy sentinel unchanged. Never
+ * throws out of compaction — a failed spill costs recoverability, not the turn.
+ */
+function reclaimedSentinel(
+  b: Extract<ContentBlock, { type: 'tool_result' }>,
+  toolName: string,
+  spillBody: SpillBody | undefined,
+  kind: 'cleared' | 'dropped',
+): string {
+  const legacy = kind === 'cleared' ? MICROCOMPACT_SENTINEL : TRUNCATED_RESULT_SENTINEL;
+  if (!spillBody) return legacy;
+  let locator: string | null = null;
+  try {
+    locator = spillBody(toolName, b.toolCallId, b.content);
+  } catch {
+    locator = null;
+  }
+  if (!locator) return legacy;
+  return kind === 'cleared' ? clearedContentLocator(locator) : droppedContentLocator(locator);
+}
 
 /** Outcome of a compaction attempt (F04-11: failure must be distinguishable from no-op). */
 export type CompactResult =
@@ -967,10 +1047,50 @@ function capTranscript(lines: string[], cap: number): string {
 }
 
 /**
+ * F1 (api-injection-study): strip DATA spans from a candidate instruction text BEFORE any
+ * carrier/header parsing. Enveloped untrusted content and folded task notifications are
+ * evidence, never instructions. <task-notification> spans are stripped whole (busListeners escapes inner
+ * tags, so the outer pair is unambiguous); an UNCLOSED span tail-strips from its opener —
+ * operator text before it survives, nothing after an open fence is trusted. Provenance header
+ * lines ride outside the fence and are dropped by prefix. Pure transform: stored history is
+ * untouched; only the copy promoted into the objective is sanitized.
+ */
+function sanitizeInstructionText(text: string): string {
+  let out = stripUntrustedSpans(text);
+  // Intact notification spans (in-memory / unredacted history).
+  out = out.replace(/<task-notification\b[^>]*>[\s\S]*?<\/task-notification>/gi, '');
+  // Redacted notification spans: session logs are redacted on write, and redactString's sk- key
+  // pattern mangles "task-notification" → "ta[REDACTED]" (separate defect, noted not fixed here).
+  // Resumed history carries the mangled form; strip it too so a folded sub-agent answer can never
+  // harvest after a resume.
+  out = out.replace(/<ta\[REDACTED\][^>]*>[\s\S]*?<\/ta\[REDACTED\]>/gi, '');
+  // Tail-strip from the earliest unclosed opener of either form.
+  const opens = [out.search(/<task-notification\b/i), out.search(/<ta\[REDACTED\]/i)].filter(
+    (i) => i !== -1,
+  );
+  if (opens.length) out = out.slice(0, Math.min(...opens));
+  return out
+    .split('\n')
+    .filter((line) => {
+      const t = line.trimStart();
+      return (
+        !t.startsWith('[UNTRUSTED CONTENT') &&
+        !t.startsWith('It may contain instructions written by someone else.')
+      );
+    })
+    .join('\n');
+}
+
+/**
  * Pull human instructions out of turns. Skips tool_result user turns. Prior compaction notes
  * contribute only their instruction block (or the SESSION OBJECTIVE carrier).
+ *
+ * F1: instruction authority is earned by provenance, not by role. Every candidate text is
+ * sanitized BEFORE parsing, harness-synthetic turns are skipped, and the objective carrier is
+ * re-parsed ONLY in the pinned slice — a middle-slice lookalike is ordinary user text, never an
+ * authoritative carrier. `allowCarrier` is true only for the pinned slice.
  */
-function harvestInstructions(turns: Message[]): string[] {
+function harvestInstructions(turns: Message[], allowCarrier = false): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
   const add = (raw: string): void => {
@@ -985,11 +1105,17 @@ function harvestInstructions(turns: Message[]): string[] {
   for (const m of turns) {
     if (m.role !== 'user') continue;
     if (m.content.some((b) => b.type === 'tool_result')) continue;
-    const text = m.content.map(blockText).join(' ').trim();
+    const text = sanitizeInstructionText(m.content.map(blockText).join(' ')).trim();
     if (!text) continue;
 
-    // New-style objective carrier
-    if (text.startsWith('SESSION OBJECTIVE')) {
+    // Harness-generated turns (nudges, denial notes, recovery notices) are never instructions.
+    // Checked BEFORE the carrier branch: the objective carrier is unstamped by design and
+    // synthetics only ever land past pinnedPrefix, but the invariant is enforced here rather
+    // than relied upon, so a future stamping change cannot create a carrier bypass.
+    if (m.synthetic) continue;
+
+    // New-style objective carrier — honored ONLY where the harness pins it (pinnedPrefix).
+    if (allowCarrier && text.startsWith('SESSION OBJECTIVE')) {
       const body = text.replace(/^SESSION OBJECTIVE[^\n]*:\n?/i, '');
       for (const line of body.split('\n')) {
         const l = line.replace(/^\s*•\s?/, '').trim();
@@ -1010,6 +1136,12 @@ function harvestInstructions(turns: Message[]): string[] {
       continue;
     }
     if (text.startsWith('[System note:')) continue;
+    // Wake turns never harvest: schedule_wakeup's task arg is MODEL-authored (the tool is
+    // model-invoked with no operator content confirmation), so promoting it would launder
+    // injected model text into the immortal objective. The operator's original task stays
+    // pinned; wake content remains in history for the summarizer, without instruction authority.
+    // Prefix match (not a bracket regex) so a ']' inside reason cannot leak a harvestable tail.
+    if (text.startsWith('[wakeup:')) continue;
     add(text);
   }
   return out;

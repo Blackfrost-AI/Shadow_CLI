@@ -7,6 +7,8 @@ export interface Flags {
   autonomy?: AutonomyLevel;
   provider?: string;
   model?: string;
+  /** --models a,b,c: allowlist of model labels for Ctrl+P quick cycling (OMP parity). */
+  models?: string[];
   baseUrl?: string;
   effort?: string;
   /** --profile <name>: activate a named profile from ~/.shadow/config.json (P2-11). */
@@ -50,6 +52,7 @@ export const VALUE_TAKING_FLAGS: ReadonlySet<string> = new Set([
   '--autonomy',
   '--provider',
   '--model',
+  '--models',
   '--base-url',
   '--effort',
   '--profile',
@@ -113,6 +116,9 @@ export function parseArgs(argv: string[]): Flags {
         break;
       case '--model':
         f.model = next();
+        break;
+      case '--models':
+        f.models = next().split(',').map((s) => s.trim()).filter(Boolean);
         break;
       case '--base-url':
         f.baseUrl = next();

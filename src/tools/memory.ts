@@ -3,6 +3,7 @@ import type { Tool, ToolResult } from './types.js';
 import { ok, fail } from './types.js';
 import type { MemoryEntry, ProjectMemory } from '../state/memory.js';
 import { MEMORY_KEY_MAX } from '../state/memory.js';
+import { redactString } from '../util/redact.js';
 
 // A tool the agent calls to manage its own project-memory KV
 // (<workspaceRoot>/.shadow/memory.json). remember/forget MUTATE that store, and
@@ -62,7 +63,21 @@ export function makeMemoryTool(mem: ProjectMemory): Tool<MemoryInput, MemoryData
     inputSchema,
     async run(input, _ctx): Promise<ToolResult<MemoryData>> {
       const start = Date.now();
-      switch (input.action) {
+      const result = await runAction(input, start);
+      // 11.6.0 adj1: read-only actions PEEK the store warning (the per-turn facts banner keeps
+      // showing it until an explicit op consumes it); mutating/lookup ops TAKE it exactly once.
+      const readOnly = input.action === 'list';
+      const notice = readOnly ? mem.peekNotice?.() : mem.takeNotice?.();
+      if (notice) {
+        result.summary = `${result.summary}\n⚠ ${notice}`;
+        result.meta.findings = [...(result.meta.findings ?? []), { title: 'project memory', body: notice, severity: 'warn' }];
+      }
+      return result;
+    },
+  };
+
+  async function runAction(input: MemoryInput, start: number): Promise<ToolResult<MemoryData>> {
+    switch (input.action) {
         case 'edit':
         case 'remember': {
           if (!input.key || input.value === undefined) {
@@ -72,11 +87,16 @@ export function makeMemoryTool(mem: ProjectMemory): Tool<MemoryInput, MemoryData
             return fail('memory', 'write', Date.now() - start, 'not_found', `No memory named "${input.key}".`);
           }
           mem.set(input.key, input.value, { author: 'generated', source: input.source });
+          const stored = mem.inspect(input.key);
           return ok('memory', 'read', Date.now() - start, `Remembered "${input.key}".`, {
             action: input.action,
-            entry: mem.inspect(input.key),
+            entry: stored,
             key: input.key,
-            value: input.value,
+            // Report what actually persisted — values are secret-scrubbed at write time,
+            // so echoing the raw input could show a secret the store no longer holds.
+            // When nothing persisted (blocked persist, refused ghost key) there IS no
+            // stored value — fall back to the REDACTED input, never the raw secret.
+            value: stored?.value ?? redactString(input.value),
           });
         }
         case 'inspect':
@@ -115,7 +135,6 @@ export function makeMemoryTool(mem: ProjectMemory): Tool<MemoryInput, MemoryData
             entries: mem.entries(),
           });
         }
-      }
-    },
-  };
+    }
+  }
 }

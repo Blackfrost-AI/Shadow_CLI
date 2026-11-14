@@ -220,7 +220,7 @@ test('finished reasoning collapses to one summary row while keeping its body ava
   }
 });
 
-test('streaming reasoning keeps a bounded four-row tail and expands to the full trace', () => {
+test('streaming reasoning keeps a bounded four-row tail in both fold states; settled traces expand fully', () => {
   const item: FlattenItem = {
     id: 'live-trace', kind: 'reasoning', reasoningState: 'streaming', durationMs: 65000,
     text: Array.from({ length: 7 }, (_, i) => `Live trace ${i + 1}: checking.`).join('\n'),
@@ -232,8 +232,26 @@ test('streaming reasoning keeps a bounded four-row tail and expands to the full 
   assert.ok(!compact.some((line) => line.includes('Live trace 1:')));
   assert.match(compact.join('\n'), /Thinking · 1m/);
   assert.match(compact.join('\n'), /Ctrl\+O expand/);
-  const expanded = flattenItem(item, 80, false, T).map((row) => row.spans.map((span) => span.text).join('')).join('\n');
+  // A live trace is a tail in BOTH fold states: the head is dropped before wrapping so every
+  // delta is O(1), not O(total length). Expansion applies to the SETTLED trace below.
+  const liveExpanded = flattenItem(item, 80, false, T).map((row) => row.spans.map((span) => span.text).join('')).join('\n');
+  assert.ok(!liveExpanded.includes('Live trace 1:'));
+  assert.ok(liveExpanded.includes('Live trace 7:'));
+  const settled: FlattenItem = { ...item, reasoningState: 'complete' };
+  const expanded = flattenItem(settled, 80, false, T).map((row) => row.spans.map((span) => span.text).join('')).join('\n');
   for (let i = 1; i <= 7; i++) assert.ok(expanded.includes(`Live trace ${i}:`));
+});
+
+test('streaming reasoning render cost is bounded by the preview tail, not the accumulated text', () => {
+  // Regression: the clip used to be gated on `collapsed`, so a streaming trace (never
+  // collapsed) wrapped the FULL text on every delta — quadratic per thinking turn. The
+  // visible tail must be identical whether or not the head exists, at any length.
+  const tail = Array.from({ length: 6 }, (_, i) => `tail line ${i + 1}`).join('\n');
+  const short = flattenItem({ id: 'r', kind: 'reasoning', reasoningState: 'streaming', text: tail }, 80, false, T);
+  const long = flattenItem({ id: 'r', kind: 'reasoning', reasoningState: 'streaming', text: `${'head filler '.repeat(20000)}\n${tail}` }, 80, false, T);
+  // Row KEYS carry absolute wrap indices, so compare the visible projection, not the keys.
+  const visible = (rows: typeof short) => rows.map((r) => r.spans.map((s) => s.text).join(''));
+  assert.deepEqual(visible(long), visible(short));
 });
 
 test('empty or whitespace-only reasoning never emits a panel or even a gap row', () => {

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Context, TRUNCATED_RESULT_SENTINEL } from '../src/agent/context.js';
+import { Context, isReclaimedContent } from '../src/agent/context.js';
 import {
   estimateTokensFromMessages,
   type CompletionRequest,
@@ -318,7 +318,7 @@ test('truncateLocally stays exact and its stop line reads the provider live', as
   const tombstones = ctx
     .messages()
     .flatMap((m) => m.content)
-    .filter((b) => b.type === 'tool_result' && b.content === TRUNCATED_RESULT_SENTINEL).length;
+    .filter((b) => b.type === 'tool_result' && isReclaimedContent(b.content)).length;
   // The summarization window holds seven droppable results; at this budget the stop line is
   // crossed after ~3 tombstones, so tombstoning must halt BEFORE exhausting the window (a
   // stale cached stop line would drop all seven).

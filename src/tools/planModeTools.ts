@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { z } from 'zod';
 import type { PlanModeState, PlanSnapshot } from '../agent/planMode.js';
@@ -75,7 +75,11 @@ export function makePlanWriteTool(
       const path = ctx.dryRun ? `plans/${slug}.md` : resolve(ctx.workspaceRoot, `plans/${slug}.md`);
       if (!ctx.dryRun) {
         mkdirSync(resolve(ctx.workspaceRoot, 'plans'), { recursive: true });
-        writeFileSync(path, renderPlanFile(input));
+        // Atomic write (temp file + rename), matching write_file's contract, so a crashed
+        // plan_write cannot leave a half-written plan behind.
+        const temp = `${path}.${process.pid}.${Date.now()}.tmp`;
+        writeFileSync(temp, renderPlanFile(input));
+        renameSync(temp, path);
       }
       const snapshot = planMode.recordPlan(input.title, path, input.tasks);
       return ok('plan_write', 'write', 1, `Plan written: ${input.title}.`, { title: input.title, path, planMode: snapshot });

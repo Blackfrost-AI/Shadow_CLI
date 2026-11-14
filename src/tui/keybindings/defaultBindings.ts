@@ -33,6 +33,10 @@ const RAW_DEFAULTS: Record<ContextName, Record<string, string>> = {
     // Paste from the SYSTEM clipboard (pbpaste / wl-paste / xclip). Terminal-native paste
     // still works; this is the explicit in-app path (and the only one on odd terminals).
     'ctrl+v': 'chat:pasteClipboard',
+    // Work-center parity with Snowfall's Ctrl+N work overlay: same /work surface, read-only,
+    // so the handler also allows it mid-turn (it mutates no state). Ctrl+N is otherwise
+    // unclaimed in Ink (not readline newline-next — the composer owns history on arrows).
+    'ctrl+n': 'chat:workCenter',
   },
   Autocomplete: {
     tab: 'menu:accept',
@@ -104,7 +108,7 @@ export const KEYBINDING_ACTIONS: readonly string[] = Object.values(RAW_DEFAULTS)
  * of accepting them silently; the keybinding-liveness test pins this list to the actual
  * kbRegister sites so it cannot drift from the truth.
  */
-export const REGISTERED_NON_DEFAULT_ACTIONS: readonly string[] = ['app:redraw', 'chat:steer', 'chat:queue'];
+export const REGISTERED_NON_DEFAULT_ACTIONS: readonly string[] = ['app:redraw'];
 
 /** Every action id the loader accepts without an unknown-action warning. */
 export const KNOWN_ACTION_IDS: ReadonlySet<string> = new Set([...KEYBINDING_ACTIONS, ...REGISTERED_NON_DEFAULT_ACTIONS]);

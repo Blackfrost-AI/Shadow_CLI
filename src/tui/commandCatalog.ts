@@ -36,16 +36,13 @@ const piOnly = (handler: string, unavailable: string): TerminalCommand['renderer
 });
 
 export const TERMINAL_COMMANDS: readonly TerminalCommand[] = [
-  { name: '/!', desc: 'Run an explicit shell command through the full permission, denylist and sandbox policy', renderers: both('shell') },
   { name: '/help', desc: 'Show keybindings and commands', renderers: both('help') },
-  { name: '/steer', desc: 'Steer the active turn at a safe boundary without overtaking queued work', renderers: both('steer') },
-  { name: '/queue', desc: 'Queue a follow-up without interrupting the active turn', renderers: both('queue') },
   { name: '/keybindings', desc: 'Show renderer keybindings; Ink can also write a starter config', renderers: both('keybindings') },
   { name: '/clear', desc: 'Clear the screen and reset the conversation', renderers: both('clear') },
   { name: '/new', desc: 'Start a fresh conversation (alias for /clear)', dispatch: '/clear', renderers: both('clear') },
   { name: '/goal', desc: 'Start a mission: plan, tasks, then verify', renderers: both('goal') },
-  { name: '/swarm', desc: 'Mission with bounded parallel agents', renderers: both('swarm') },
   { name: '/model', desc: 'Manage or test models; dated capability history in Snowfall', renderers: both('model') },
+  { name: '/role', desc: 'Switch to a named model role: /role smol|slow|plan (config.roles)', renderers: piOnly('role', 'Named model roles use Snowfall. Start SHADOW_TUI=pi shadow.') },
   { name: '/table', desc: 'Open collaboration (Snowfall presets; legacy Ink roundtable)', renderers: both('table') },
   { name: '/provider', desc: 'Show active provider, endpoint, auth status, and model presets', renderers: both('provider') },
   { name: '/local', desc: 'Add, test, switch, list, or remove a local model', renderers: both('local') },
@@ -115,6 +112,8 @@ export const TERMINAL_COMMANDS: readonly TerminalCommand[] = [
   { name: '/add-dir', desc: 'Grant an extra directory to file tools for this session', renderers: both('add-dir') },
   { name: '/image', desc: 'Attach an image file to the next message', renderers: both('image') },
   { name: '/review', desc: 'Review the current uncommitted changes', renderers: both('review') },
+  { name: '/menu', desc: 'Browse the grouped command menu with drill-in submenus', renderers: piOnly('menu', 'The grouped menu overlay uses Snowfall. Start SHADOW_TUI=pi shadow; Ink uses the / autocomplete list.') },
+  { name: '/repo', desc: 'Browse repository files and open one in $EDITOR', renderers: piOnly('repo', 'The repository file browser uses Snowfall. Start SHADOW_TUI=pi shadow.') },
   { name: '/quit', desc: 'Exit Shadow', renderers: both('quit') },
   { name: '/exit', desc: 'Exit Shadow (alias for /quit)', dispatch: '/quit', renderers: both('quit') },
 ] as const;

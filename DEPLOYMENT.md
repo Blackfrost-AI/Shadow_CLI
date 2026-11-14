@@ -5,7 +5,7 @@ process — everything here runs against this repository alone, with no private 
 
 **Audience:** contributors and anyone building their own artifacts.
 
-**Release version:** `v10.6.0`. The commands below are required checks, not a record that they passed.
+**Release version:** `v11.7.0`. The commands below are required checks, not a record that they passed.
 
 > **Maintainer note:** the *official* release pipeline (binary hosting, signing keys) is private
 > and intentionally not part of this repo. This guide covers the parts that are.
@@ -112,9 +112,9 @@ audit result does not validate the current lockfile or advisory database.
 ## See also
 
 - [README.md](README.md) — installation + model setup
-- [USER_GUIDE.md](USER_GUIDE.md) — day-to-day usage
-- [THREAT_MODEL.md](THREAT_MODEL.md) — the security model this release process protects
-- [TESTING.md](TESTING.md) — testing conventions
-- [TERMINAL_RENDERERS.md](TERMINAL_RENDERERS.md) — Snowfall and compatibility renderer controls
+- [USER_GUIDE.md](docs/USER_GUIDE.md) — day-to-day usage
+- [THREAT_MODEL.md](docs/security/THREAT_MODEL.md) — the security model this release process protects
+- [TESTING.md](docs/TESTING.md) — testing conventions
+- [TERMINAL_RENDERERS.md](docs/TERMINAL_RENDERERS.md) — Snowfall and compatibility renderer controls
 - [Collaboration](docs/COLLABORATION.md) — jobs, consultations, retained work and runtime limits
 - [CHANGELOG.md](CHANGELOG.md) — release notes

@@ -33,6 +33,15 @@ const ANTHROPIC_VERSION = '2023-06-01';
 
 export class AnthropicProvider implements Provider {
   readonly name = 'anthropic';
+  /**
+   * Prompt-cache capability, straight from the endpoint's declared capabilities (F10-01):
+   * caching is the adapter's default behaviour, so only an explicit `promptCache: false`
+   * declaration turns it off. The loop reads this to route volatile per-turn state into the
+   * uncached message tail instead of busting the cached system prefix.
+   */
+  get promptCaching(): boolean {
+    return this.capabilities?.promptCache !== false;
+  }
   private readonly apiKey: string | undefined;
   private readonly authToken: string | undefined;
   private readonly url: string;
@@ -390,9 +399,30 @@ export function buildAnthropicBody(
   // + this one. Previously only system+tools were cached, so the (growing) history
   // was re-billed in full every turn; this is the big multi-turn latency/cost win.
   const messages = toAnthropicMessages(req.messages, model);
-  const lastMsg = messages[messages.length - 1];
-  if (cachingEnabled && lastMsg && lastMsg.content.length > 0) {
-    (lastMsg.content[lastMsg.content.length - 1] as Record<string, unknown>).cache_control = cacheControl;
+  // Rolling cache breakpoint goes on the last PERSISTED history block FIRST. The cached prefix must
+  // terminate on bytes that RECUR in the next turn's request, or the entry is unhittable: Anthropic
+  // matches a cached prefix against the start of the new request, and a prefix ending in a
+  // request-only block that never recurs (e.g. a per-turn counter) can never be read back.
+  const lastPersisted = messages[messages.length - 1];
+  if (cachingEnabled && lastPersisted && lastPersisted.content.length > 0) {
+    (lastPersisted.content[lastPersisted.content.length - 1] as Record<string, unknown>).cache_control = cacheControl;
+  }
+  // Volatile per-turn text (e.g. the iteration-budget counter) rides at the MESSAGE TAIL, appended
+  // AFTER the breakpoint and left UNCACHED. The cache prefix is tools → system → messages; the counter
+  // must not enter it (in `system`, even as a 2nd block, it would precede the message breakpoint and
+  // bust the rolling cache every turn). After the breakpoint it is delivered to the model but never
+  // cached, so the ENTIRE persisted prefix (tools + system + full history) cache-hits each turn and
+  // only this small trailing block is re-processed. Request-only — never written to context.messages —
+  // so it cannot accumulate in history or reach a compaction summary.
+  const volatileTail = req.systemVolatileSuffix?.trim() ? req.systemVolatileSuffix : undefined;
+  if (volatileTail) {
+    if (lastPersisted && lastPersisted.role === 'user') {
+      lastPersisted.content.push({ type: 'text', text: volatileTail });
+    } else {
+      // No persisted user turn to host it (empty history, or an assistant prefill): add a fresh user
+      // turn at the tail. The breakpoint above stays on persisted history, so the cache is unaffected.
+      messages.push({ role: 'user', content: [{ type: 'text', text: volatileTail }] });
+    }
   }
   const body: Record<string, unknown> = {
     model: wireModel,
@@ -425,7 +455,9 @@ export function buildAnthropicBody(
   // Same fail-closed decision as `adaptive` above — one resolution, two consumers.
   if (fastEnabled) body.speed = 'fast';
 
-  // System as a cacheable text block (prompt caching is GA; no beta header).
+  // System as a cacheable text block (prompt caching is GA; no beta header). The volatile per-turn
+  // suffix is NOT placed here — it rides at the message tail (see above) so it never enters the
+  // cached prefix. Keeping system a single stable block preserves the tools+system cache hit.
   if (req.system && req.system.trim()) {
     body.system = [
       cachingEnabled

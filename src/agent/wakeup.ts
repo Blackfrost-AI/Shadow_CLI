@@ -86,6 +86,11 @@ export class WakeupScheduler {
     return true;
   }
 
+  /** True while any scheduled wakeup timer is outstanding (session-exit guard for queued wakes). */
+  hasPending(): boolean {
+    return this.jobs.size > 0;
+  }
+
   cancel(id: string): boolean {
     const t = this.jobs.get(id);
     if (!t) return false;

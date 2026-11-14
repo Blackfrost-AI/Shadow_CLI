@@ -102,8 +102,6 @@ import { scrubbedEnv } from './util/safeEnv.js';
 import { displayWidth, takeByWidth } from './util/width.js';
 import { stripCtl, formatDuration, formatUsage, shellCommandOf, agentAttr, oneLine } from './tui/format.js';
 import { THEMES, THEME_NAMES, C, normalizeThemeName, applyTheme, paletteSnapshot, backgroundSequence, themeBackground, type ThemeName, type Palette } from './tui/theme.js';
-import { dispatchPromptControl } from './tui/promptControl.js';
-import { useShellEscape } from './tui/useShellEscape.js';
 import { SLASH_COMMANDS, SLASH_NAME_WIDTH, findSlashCommand, runSlashCommand, slashDispatchName, type SlashCommand, type SlashCtx } from './tui/slash.js';
 import { slashMatches, classifySlash, type SlashMenuItem, type ArgContext } from './tui/slashMenu.js';
 import { sanitizeAssistantText } from './tui/sanitize.js';
@@ -312,8 +310,16 @@ export interface TuiOpts {
   sessionLogBox?: { current: SessionLog };
   forceConfirm?: (call: ToolCall, risk: string) => string | null;
   system: string;
+  /**
+   * LIVE workspace-facts index (11.6.0 B4) — bootstrap's capability-gated provider, threaded to
+   * the LEAD loop's deps so mid-session memory writes render next request. Optional: standalone
+   * mounts/tests omit it (no facts section). Sub-agents never receive it.
+   */
+  factsProvider?: () => string;
   workspaceRoot: string;
   cfg: ShadowConfig;
+  /** --models allowlist: model labels for Ctrl+P quick cycling (OMP parity). Optional. */
+  models?: string[];
   baseContextPolicy?: { contextBudget: number; triggerRatio: number; keepLastTurns: number };
   autonomy: AutonomyLevel;
   bypass: boolean; // --yolo
@@ -444,7 +450,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const reducedMotion = opts.cfg.reducedMotion || process.env.SHADOW_REDUCED_MOTION === '1';
   const [committed, setCommitted] = useState<TranscriptItem[]>([]);
   // (No live-banner state: the welcome card commits to <Static> once at startup — see showBanner.)
-  const [showAllExpanded, setShowAllExpanded] = useState(true); // transcript detail starts unfolded; Ctrl+O folds
+  const [showAllExpanded, setShowAllExpanded] = useState(false); // legacy restored body folds
   /** Answer-table folds are independent of activity inspection. */
   const [expandedIds, setExpandedIds] = useState<Set<number>>(() => new Set());
   const [stream, setStream] = useState('');
@@ -1913,14 +1919,6 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     flushQueueRef, runOneRef, repaintFromContextRef,
     // /goal begin while a turn runs: queue the kickoff like a wakeup (never a second
     // concurrent turn on the shared Context).
-    promptControl: (mode, text) => dispatchPromptControl({
-      runningRef, compactingRef, asyncCommandRef, modelSwitchingRef, loopRef,
-      queuedTasksRef, setQueued, pastesRef, pushLine,
-      startTurn: (task) => startTurnRef.current?.(task),
-    }, mode, text),
-    // m-4: late-bound like startTurnRef — the hook is defined below this object; the ctx entry
-    // is a stable arrow function that dereferences the live hook at dispatch time.
-    shellEscape: (raw: string) => { void shellEscape(raw); },
     queueDeferred: (text: string) => {
       setQueued([...queuedTasksRef.current, { text, kind: 'deferred' }]);
     },
@@ -1933,25 +1931,19 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
     [],
   );
 
-  // Opt-in only: no default chords change and bracketed paste never reaches the resolver.
-  const submitPromptControl = useCallback((mode: 'steer' | 'queue') => {
-    if (tableRef.current) { showToast('Prompt controls are unavailable in a round-table.', 'warn'); return; }
-    const text = inputRef.current;
-    if (!text.trim()) return;
-    slashCtxRef.current!.promptControl(mode, text);
-    setLine('');
-  }, [setLine, showToast]);
-  useEffect(() => kbRegister('chat:steer', () => submitPromptControl('steer')), [kbRegister, submitPromptControl]);
-  useEffect(() => kbRegister('chat:queue', () => submitPromptControl('queue')), [kbRegister, submitPromptControl]);
-
-  // m-4: explicit operator shell escape (/!) — extracted under src/tui/ per the structural
-  // line budget (plan 2.4). See src/tui/useShellEscape.ts for the full contract.
-  const shellEscape = useShellEscape({
-    opts, pushLine, setRunning, setLine,
-    runningRef, compactingRef, modelSwitchingRef, asyncCommandRef, inputRef,
-    runStartRef, interruptionReportedRef, controllerRef, flushQueueRef,
-    makeBudget: () => new Budget({ maxIterations: 0, ...opts.cfg.budget }, currentRef.current.model, opts.cfg.priceTable, Date.now()),
-  });
+  // Ctrl+N — work-center parity with Snowfall's work overlay. Same /work surface the slash
+  // command runs; read-only, so it is ALSO allowed mid-turn (unlike the submit path's
+  // SLASH_WHILE_RUNNING gate) — checking background work is exactly what you do while a
+  // turn runs. The latch guards synchronous re-entry only (runSlashCommand is synchronous);
+  // repeated presses across keypresses simply re-list, which is harmless.
+  const workCenterBusy = useRef(false);
+  useEffect(() => kbRegister('chat:workCenter', () => {
+    if (workCenterBusy.current) return;
+    const cmd = findSlashCommand('/work');
+    if (!cmd) return;
+    workCenterBusy.current = true;
+    try { runSlash(cmd, ''); } finally { workCenterBusy.current = false; }
+  }), [kbRegister, runSlash]);
 
   // Apply a picked model: rebuild the provider, hot-swap it into the running loop
   // (there is none mid-pick — the picker can't open while a turn runs), point the
@@ -2839,6 +2831,9 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         // into the system prompt each turn, plan/todo parity) — the TUI no longer injects a
         // standing-goal suffix here, so the two could never disagree mid-mission.
         system: opts.styleState?.systemForStyle?.(styleRef.current) ?? opts.system,
+        // Live facts index (11.6.0 B4) — the loop renders it per request (system on non-caching
+        // providers, uncached message tail on caching ones). Bootstrap no longer bakes facts.
+        factsProvider: opts.factsProvider,
         workspaceRoot: opts.workspaceRoot,
         additionalRoots: additionalRootsRef.current,
         forceConfirm: opts.forceConfirm,
@@ -3274,7 +3269,6 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
         confirmQuestion,
         selectModel,
         runSlash,
-        shellEscape,
         startTurn,
         ensureFileList,
         slashMatches,
@@ -3668,7 +3662,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
             continuation={item.kind === 'assistant' && index > 0 && committed[index - 1]?.kind === 'assistant'}
             // Answer tables expand independently of the activity inspector.
             foldLargeTables={!expandedIds.has(item.id)}
-
+            proseMaxCols={opts.cfg.proseMaxCols}
           />
         )}
       </Static>
@@ -3712,6 +3706,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
                 speaker: speakerRef.current ?? { handle: 'SHADOW', model: current.model, color: C.accent } }}
               cols={terminalSize.cols} collapsed={false} foldLargeTables={false}
               continuation={answerOpenRef.current} maxRows={hudFit.liveRows}
+              proseMaxCols={opts.cfg.proseMaxCols}
             /> : null}
             </Box>
           ) : null}

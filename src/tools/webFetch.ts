@@ -5,6 +5,7 @@ import { clamp } from './util.js';
 import { assertUrlAllowed } from '../safety/netguard.js';
 import { shadowFetch } from '../safety/egress.js';
 import { envelopUntrusted, fitPayload } from '../safety/envelope.js';
+import { spillReclaimedBody } from '../agent/toolSpill.js';
 
 /** Sanitize a server-controlled string interpolated OUTSIDE the envelope markers (header line,
  *  data fields): no CR/LF/control chars (line-splitting = framing forgery on text providers),
@@ -186,7 +187,24 @@ export const webFetch: Tool<WebFetchInput, WebFetchData> = {
     }
 
     const text = /html/i.test(contentType) ? htmlToText(body) : body;
-    const clamped = clamp(text || '(empty response)', maxBytes);
+    const readable = text || '(empty response)';
+    const clamped = clamp(readable, maxBytes);
+    // 11.6.0 information survival: when the readable page exceeds the result budget, persist the
+    // FULL readable text (pre-clamp) to the session spill dir and point at it from the TRUSTED
+    // provenance line — the in-tool clamp used to discard the tail with no way back. The spill
+    // file holds untrusted text raw; read_file returns it raw (containment is guaranteed at the
+    // spill PREVIEW boundary by envelopeSafeSlice, not on re-read). A failed spill costs
+    // recoverability, not the result (spillReclaimedBody never throws).
+    const spillLocator =
+      ctx.maxToolResultChars && readable.length > ctx.maxToolResultChars
+        ? spillReclaimedBody({
+            workspaceRoot: ctx.workspaceRoot,
+            sessionId: ctx.sessionId,
+            toolName: 'web_fetch',
+            toolCallId: ctx.toolCallId ?? 'call',
+            body: readable,
+          })
+        : null;
     // P3-05: the page bytes are untrusted content authored by whoever controls the host — even a
     // 4xx body. They enter the context EXACTLY once, inside the containment envelope (surviving
     // bytes untouched; the matching policy sits in the system prompt). The payload is clamped to
@@ -194,9 +212,12 @@ export const webFetch: Tool<WebFetchInput, WebFetchData> = {
     // cut that severed it would hand a forged END inside the page its escape wedge.
     const payload = ctx.maxToolResultChars ? fitPayload(clamped, ctx.maxToolResultChars) : clamped;
     const healthy = status >= 200 && status < 300;
-    const provenance = healthy
+    const baseProvenance = healthy
       ? `Fetched ${currentUrl} (HTTP ${status}, ${contentType || 'unknown type'}, ${payload.length} chars).`
       : `Fetched ${currentUrl} but server returned HTTP ${status}.`;
+    const provenance = spillLocator
+      ? `${baseProvenance} Full readable output (${readable.length} chars) saved to ${spillLocator} — read it with read_file or grep it there.`
+      : baseProvenance;
     const summary = `${provenance}\n${envelopUntrusted({ tool: 'web_fetch', source: currentUrl, content: payload })}`;
 
     return ok('web_fetch', 'network', Date.now() - start, summary, {

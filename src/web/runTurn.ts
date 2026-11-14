@@ -56,6 +56,9 @@ export function buildTurnDeps(session: WebSession, gate?: ApprovalGate): LoopDep
     signal: session.abort?.signal ?? new AbortController().signal,
     model: agent.cfg.model,
     system: agent.system,
+    // Live facts index (11.6.0 B4): rendered per request by the loop — system on non-caching
+    // providers, uncached message tail on caching ones. Never baked into agent.system.
+    factsProvider: agent.factsProvider,
     // THE enforcement point — the pinned jail root, not the display path.
     workspaceRoot: jail.workspaceRoot,
     additionalRoots: [...jail.additionalRoots],

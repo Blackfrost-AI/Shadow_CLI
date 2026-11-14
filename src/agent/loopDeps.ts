@@ -35,7 +35,8 @@ export interface LoopDepsInput {
    * and `parallelTools` is resolved against whatever is passed here.
    */
   model: string;
-  /** Fully composed system prompt (style, standing goal, sub-agent prefix already applied). */
+  /** Fully composed system prompt (style, standing goal, sub-agent prefix already applied).
+   *  Facts-free by contract (11.6.0 B4): live facts render per turn via `factsProvider`. */
   system: string;
   workspaceRoot: string;
   additionalRoots?: string[];
@@ -60,6 +61,11 @@ export interface LoopDepsInput {
    */
   readTracker?: ReadTracker;
   continuityState?: string;
+  /**
+   * LIVE facts index for the LEAD loop (11.6.0 B4). The sub-agent factory deliberately omits it
+   * (like `mission`) — delegates must not inherit the lead session's facts.
+   */
+  factsProvider?: LoopDeps['factsProvider'];
   resolveFallback?: LoopDeps['resolveFallback'];
   /** The previous run's stop reason when the caller tracks it (honest empty-response diagnosis — P1A-08). */
   priorStopReason?: LoopDeps['priorStopReason'];
@@ -94,6 +100,7 @@ export function buildLoopDeps(input: LoopDepsInput): LoopDeps {
     approvals: input.approvals,
     readTracker: input.readTracker,
     continuityState: input.continuityState,
+    factsProvider: input.factsProvider,
     resolveFallback: input.resolveFallback,
     priorStopReason: input.priorStopReason,
 
@@ -120,6 +127,9 @@ export function buildLoopDeps(input: LoopDepsInput): LoopDeps {
     // Spend guardrails (plan 2.3): the soft step/cost budget, when configured. Derived here so
     // headless, TUI, and sub-agent call sites all get it identically.
     spendGuard: cfg.budget,
+    // Loop guard v2 (frosty-spark incident): cumulative per-(tool,args) failure limits, derived
+    // here so headless, TUI, and sub-agent call sites all get it identically. 0/0 disables.
+    loopGuard2: { nudge: cfg.loopGuardNudge, fatal: cfg.loopGuardFatal },
     // P2-12 — confinement-aware approval escalation. `sandbox: 'off'` is set by index.ts for
     // --no-sandbox/--yolo/unrestricted/full-autonomy (an EXPLICIT waiver → undefined, no
     // escalation). Otherwise the truth is whether this host has the tool to confine with.

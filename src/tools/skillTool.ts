@@ -35,7 +35,9 @@ export function makeSkillTool(catalog: SkillEntry[] | (() => SkillEntry[])): Too
     ? null
     : catalog.map((skill: SkillEntry) => ({ ...skill }));
   const getSkills = (): SkillEntry[] => liveCatalog ? liveCatalog() : fixedCatalog!;
-  const names = getSkills().map((s) => safeName(s.name));
+  // REVIEW-R1: the advertised list matches the model-visible index — skills declaring
+  // disable-model-invocation: true are operator-invocable only and are not advertised.
+  const names = getSkills().filter((s) => s.modelInvocation !== false).map((s) => safeName(s.name));
   return {
     name: 'skill',
     description:
@@ -55,11 +57,20 @@ export function makeSkillTool(catalog: SkillEntry[] | (() => SkillEntry[])): Too
           `No skill named "${input.name}". Available: ${names.length ? names.join(', ') : '(none)'}.`,
         );
       }
+      // REVIEW-R1 (model-side enforcement): a skill declaring `disable-model-invocation: true` is
+      // excluded from the model-visible index; enforce the same rule at the load point so the
+      // declaration cannot be bypassed by direct tool invocation.
+      if (s.modelInvocation === false) {
+        return fail('skill', 'read', Date.now() - start, 'model_invocation_disabled',
+          `Skill "${safeName(s.name)}" declares disable-model-invocation: true — it is operator-invocable only.`);
+      }
       // The SKILL.md body may come from an untrusted workspace (a cloned repo). Fence it as reference
       // data — the harness must apply its guidance to the task but never treat its contents as
       // authority that overrides the user or the safety rules.
       let body = s.body;
-      if (liveCatalog && s.root) {
+      // Bundled skills are compiled constants with no disk presence — always serve the
+      // captured body, in every mount (array snapshot or legacy live-refresh function).
+      if (liveCatalog && s.root && s.source !== 'bundled') {
         try {
           if (lstatSync(s.path).isSymbolicLink()) throw new Error('symlink');
           const path = resolveWithin(s.root, s.path);

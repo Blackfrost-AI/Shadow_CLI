@@ -14,7 +14,7 @@ import { execFileSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
-import { join, basename, extname } from 'node:path';
+import { join, basename } from 'node:path';
 
 /** Cap inline emission: a base64 string this large in a single Ink <Text> node gets slow/memory-
  *  heavy, and huge in-place images are a poor UX. Beyond this, fall back to save+open only. */
@@ -143,13 +143,12 @@ const MEDIA_EXT: Record<string, string> = {
   'image/webp': '.webp',
 };
 
-/** File extension for a media type, with a name fallback. */
-function extFor(mediaType: string, name?: string): string {
-  // `||` not `??`: extname() returns an EMPTY STRING for a name with no extension, and `??` only
-  // falls through on null/undefined — so an unknown media type used to produce a file with NO
-  // extension at all, which is one of the ways the OS viewer ends up saying "format not
-  // recognized" even when the bytes are fine.
-  return MEDIA_EXT[mediaType] || (name ? extname(name) : '') || '.png';
+/** File extension for a media type. Always a KNOWN image extension — never derived from the
+ *  (tool-influenced) name: a `.command`/`.sh` suffix would make macOS `open` EXECUTE the saved
+ *  file instead of handing it to Preview. Unknown media types fall back to .png so the bytes
+ *  still reach an image viewer rather than a shell. */
+function extFor(mediaType: string): string {
+  return MEDIA_EXT[mediaType] || '.png';
 }
 
 /**
@@ -165,7 +164,7 @@ export function saveImage(bytes: Buffer, mediaType: string, name?: string): stri
   // basename first: a full path contributed nothing but noise to the filename.
   const hint = name ? basename(name) : '';
   const safeName = hint.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 40);
-  const fname = `${safeName ? safeName + '-' : ''}${randomUUID()}${extFor(mediaType, name)}`;
+  const fname = `${safeName ? safeName + '-' : ''}${randomUUID()}${extFor(mediaType)}`;
   const path = join(dir, fname);
   writeFileSync(path, bytes);
   return path;
@@ -203,6 +202,19 @@ export function saveAndOpen(bytes: Buffer, mediaType: string, name?: string): st
     // No viewer available — the file is still on disk; the returned path lets the user open it.
   }
   return path;
+}
+
+/** One-call viewer fallback for transcript image cells: if the terminal can't paint inline
+ *  pixels but a viewer can be opened, save the bytes and open them. Returns the saved path (so
+ *  the caller can surface it), or null when no fallback applies / the save failed. Best-effort —
+ *  never throws, so a failed save/open cannot break the transcript. */
+export function tryViewerFallback(bytes: string, mediaType: string, name?: string): string | null {
+  if (supportsInlineImages() || !canOpenViewer()) return null;
+  try {
+    return saveAndOpen(Buffer.from(bytes, 'base64'), mediaType, name);
+  } catch {
+    return null;
+  }
 }
 
 /** Human-readable byte size, e.g. "234 KB", "1.5 MB". */

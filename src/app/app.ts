@@ -15,8 +15,6 @@ import { truncateToWidth, visibleWidth } from '@earendil-works/pi-tui';
 
 import { AgentLoop } from '../agent/loop.js';
 import { dropOneQueuedByText, queuedAhead } from '../agent/steerQueue.js';
-import { promptControlPayload, promptSteeringAction } from '../agent/promptControl.js';
-import { runShellEscape } from '../tui/shellEscape.js';
 import { buildLoopDeps } from '../agent/loopDeps.js';
 import { Budget } from '../agent/budget.js';
 import { SessionApprovals, type ApprovalDecision, type ApprovalGate, type ApprovalRequest } from '../agent/approval.js';
@@ -49,6 +47,7 @@ import { homedir } from 'node:os';
 import { discoverCustomCommands, expandCommandBody } from '../tui/customCommands.js';
 import { PI_KEYS } from './keymap.js';
 import { ChoicePicker } from './picker.js';
+import { MenuOverlay } from './menuOverlay.js';
 import { InputPrompt } from './inputPrompt.js';
 import { ContextInspector } from './contextInspector.js';
 import { buildContextInspection, pinContextFile, excludeContextFile } from '../context/inspection.js';
@@ -82,10 +81,13 @@ function parseSubProvider(value: string | undefined): SubProvider | null {
 }
 import { egressSummary } from '../safety/egress.js';
 import { discoverSkillCatalog } from '../skills/loader.js';
+import { buildSkillInvocationPrompt, listDisabledSkills, resolveSkillByName, setSkillEnabled } from '../skills/control.js';
 import { SkillCandidateStore } from '../skills/candidateStore.js';
 import { formatDuration, shortPath } from '../tui/format.js';
 import { imageMediaType, MAX_IMAGE_BYTES } from '../util/image.js';
 import { copyToClipboard, hasClipboard } from '../util/clipboard.js';
+import { tryViewerFallback } from '../util/termImage.js';
+import { openExternalUrl } from '../util/openLink.js';
 import { redactString } from '../util/redact.js';
 import { GLOBAL_DIR, saveGlobalConfig, vaultUnlocked } from '../state/globalStore.js';
 import { exportSession } from '../state/chatExport.js';
@@ -126,6 +128,8 @@ import { StreamRate, formatTokPerSec } from './streamRate.js';
 import { emitNotification } from '../util/notify.js';
 import type { SubAgentView } from '../tui/subagentPanel.js';
 import { modelRows, type PickerRow } from '../util/modelGroups.js';
+import { cycleModel, doRole, openRepoBrowser } from './commands.js';
+import { showGitInfo } from './gitInfo.js';
 import { ShadowAutocompleteProvider, type SlashCommandSpec } from './autocomplete.js';
 import type { TuiOpts } from '../tui.js';
 import { commandHandler, findTerminalCommand, terminalCommandsFor } from '../tui/commandCatalog.js';
@@ -298,6 +302,7 @@ export class ShadowApp {
   private brandCommitted = false;
 
   private queued: string[] = [];
+  /** Start expanded (the Ctrl-O "everything unfolded" state); Ctrl-O still toggles to compact. */
   private showAllExpanded = true;
   private dialog: PendingDialog | null = null;
   private dialogHandle: OverlayHandle | null = null;
@@ -444,7 +449,10 @@ export class ShadowApp {
       searchCurrentMatchStyle: (text) => '\x1b[1;7m' + text + RESET,
       searchNavigationButtonStyle: (text) => style.fg(C.accent, text),
       scrollToEndIndicator: () => style.fg(C.accent, ' ↓ Latest · End '),
+      // Clicked OSC 8 hyperlinks open in the default browser (http/https only, argv-safe).
+      openUrl: this.opts.cfg.linkClickOpen ? (url: string) => void openExternalUrl(url) : undefined,
     });
+    this.streamCell.setProseMaxCols(this.opts.cfg.proseMaxCols);
     this.editor = new SnowfallEditor(this.tui, editorTheme(), () => this.snowfallState(), () => this.terminal.rows);
   }
 
@@ -724,6 +732,13 @@ export class ShadowApp {
     this.commit(item);
   }
 
+  /** Push an image cell; on terminals without inline pixels, save + open the OS viewer (Ink's fallback). */
+  private pushImageCell(bytes: string, mediaType: string, alt: string, source: string): void {
+    this.pushLine({ kind: 'image', text: '', image: { bytes, mediaType, alt, source } });
+    const saved = tryViewerFallback(bytes, mediaType, alt);
+    if (saved) this.pushLine({ kind: 'info', text: `Image opened in viewer · ${saved}`, color: C.dim });
+  }
+
   private commit(item: FlattenItem): void {
     if (this.exiting) return;
     this.items.push(item);
@@ -753,7 +768,7 @@ export class ShadowApp {
       const run = runs.get(it.id);
       let cell = this.cellById.get(it.id);
       if (!cell) {
-        cell = new FlatCell(it as never, collapsed, continuation, run, foldTables);
+        cell = new FlatCell(it as never, collapsed, continuation, run, foldTables, this.opts.cfg.proseMaxCols);
         this.cellById.set(it.id, cell);
       } else {
         cell.update({ collapsed, continuation, toolRun: run, foldTables });
@@ -988,7 +1003,7 @@ export class ShadowApp {
         this.pushTool(call, result);
         for (const image of result?.images ?? []) {
           const imageSource = sanitizeTerminalEscapes(previewOf(call.input), false);
-          this.pushLine({ kind: 'image', text: '', image: { bytes: image.data, mediaType: image.mediaType, alt: imageSource || sanitizeTerminalEscapes(call.name, false), source: imageSource } });
+          this.pushImageCell(image.data, image.mediaType, imageSource || sanitizeTerminalEscapes(call.name, false), imageSource);
         }
         break;
       }
@@ -1348,6 +1363,12 @@ export class ShadowApp {
         return { consume: true };
       }
 
+      // Ctrl-P cycles the --models allowlist (or all enabled models). Idle-only, like the picker.
+      if (matchesKey(data, 'ctrl+p') && !this.running && !this.compacting && !this.modelChecking) {
+        cycleModel({ opts: this.opts, switcher: this.switcher, pushLine: (p) => this.pushLine(p), selectModel: (e) => this.selectModel(e) });
+        return { consume: true };
+      }
+
       // Shift+Tab is the key form of /plan. pi-tui does not translate it for the editor, so the
       // shell owns CSI Z before focus dispatch.
       if (matchesKey(data, 'shift+tab')) {
@@ -1392,7 +1413,9 @@ export class ShadowApp {
       // commands and input behind a model-switch/compaction barrier stay in submission order.
       if (matchesKey(data, 'enter') && !matchesKey(data, 'ctrl+j') && (this.running || this.compacting || this.modelChecking || this.switcher.isSwitching) && this.editor.getText().trim()) {
         const q = this.editor.getExpandedText().trim();
-        this.submit(q);
+        this.editor.addToHistory(q);
+        this.editor.setText('');
+        this.queue(q);
         return { consume: true };
       }
 
@@ -1420,29 +1443,9 @@ export class ShadowApp {
     if (!text) return;
     this.editor.addToHistory(text);
     if (this.editor.getText().trim()) this.editor.setText('');
-    // Explicit prompt controls must be decoded before any busy barrier stores input.
-    // Everything else keeps the baseline contract: a busy Enter queues the text so the
-    // loop replays it at the safe boundary — commands like /compact included.
-    if (/^\/(?:steer|queue)(?:\s|$)/i.test(text)) {
-      this.runSlash(text);
-      return;
-    }
-    // m-4: explicit shell escape is refused while busy — NEVER queued: a queued shell command
-    // would run at an arbitrary later boundary without the operator watching it.
-    if (/^\/!(?:\s|$)/.test(text)) {
-      this.runSlash(text);
-      return;
-    }
     if (this.compacting) {
       if (text === '/compact' || text === '/summary') this.runSlash(text);
       else this.queue(text);
-      return;
-    }
-    if (this.running && text.startsWith('/')) {
-      // Baseline contract for commands while a turn runs: queue for replay at the safe
-      // boundary (flushQueue) instead of dispatching now — /compact would refuse mid-turn
-      // and drop the input. Only the explicit controls above bypass this queueing.
-      this.queue(text);
       return;
     }
     if (this.modelChecking) {
@@ -1464,7 +1467,7 @@ export class ShadowApp {
     this.startTurn(text);
   }
 
-  private queue(task: string, allowSteering = true): void {
+  private queue(task: string): void {
     // Enqueue before signalling: the loop's finally drains this queue once model work has
     // stopped and every already-started tool has settled. Never hard-abort an active tool or
     // cancel a prompt still waiting for the run lock (there is no loop to steer yet).
@@ -1487,14 +1490,14 @@ export class ShadowApp {
     // END, or the queue could never drain (a stalled provider plus a non-steering message is a
     // deadlock), so that case falls back to the bare steer, which stops the turn and lets
     // flushQueue run the backlog in submission order.
-    const steering = promptSteeringAction(task, ahead, this.running, this.loopRef?.hasPendingSteer() ?? false,
-      allowSteering && !this.compacting && !this.modelChecking && !this.switcher.isSwitching);
-    const steered = steering === 'inject' && (this.loopRef?.requestSteer(task) ?? false);
+    const steered = ahead === 0
+      ? !task.startsWith('/') && this.running && (this.loopRef?.requestSteer(task) ?? false)
+      : false;
     // Only break the turn when this is the FIRST thing to steer. If a steer is already pending for
     // the running turn, force-aborting again would discard the text that steer is about to inject
     // (B would lose its turn to C). The pending injection ends the turn naturally when it lands,
     // and flushQueue then runs the backlog in submission order.
-    if (steering === 'end-turn') {
+    if (ahead > 0 && this.running && !task.startsWith('/') && !this.loopRef?.hasPendingSteer()) {
       this.loopRef?.requestSteer();
     }
     if (steered) {
@@ -1627,6 +1630,9 @@ export class ShadowApp {
         signal: controller.signal,
         model: this.current.model,
         system: this.opts.styleState?.systemForStyle?.(this.style) ?? this.opts.system,
+        // Live facts index (11.6.0 B4) — the loop renders it per request (system on non-caching
+        // providers, uncached message tail on caching ones). Bootstrap no longer bakes facts.
+        factsProvider: this.opts.factsProvider,
         workspaceRoot: this.opts.workspaceRoot,
         additionalRoots: this.additionalRoots,
         forceConfirm: this.opts.forceConfirm,
@@ -2290,13 +2296,6 @@ export class ShadowApp {
   private runSlash(raw: string): void {
     const [typedName, ...rest] = raw.trim().split(/\s+/);
     const arg = rest.join(' ').trim();
-    // Explicit operator shell escape — recognized BEFORE any command lookup: the raw line
-    // (not the tokenized name) is what must be judged, and /! must never fall through to
-    // the unknown-command path or the custom-command prompt path.
-    if (raw.trim().startsWith('/!')) {
-      void this.shellEscape(raw);
-      return;
-    }
     const command = findTerminalCommand(typedName ?? '');
     if (!command) {
       const custom = this.discoverCommands().find((c) => `/${c.name.toLowerCase()}` === typedName?.toLowerCase());
@@ -2321,27 +2320,6 @@ export class ShadowApp {
     // new catalog row cannot become an unreachable switch case through a second name lookup.
     const name = `/${handler}`;
     switch (name) {
-      case '/shell': {
-        // The composer's /! interception runs BEFORE command lookup; this arm only fires for
-        // a menu-completed bare /! (no payload) and routes through the same shared core.
-        void this.shellEscape(raw);
-        return;
-      }
-      case '/steer':
-      case '/queue': {
-        try {
-          const payload = promptControlPayload(raw.trim().slice((typedName ?? '').length));
-          if (name === '/steer' && !this.running) throw new Error('No active turn to steer. Submit a message or use /queue <text>.');
-          if (this.running || this.compacting || this.modelChecking || this.switcher.isSwitching || this.queued.length) {
-            this.queue(payload, name === '/steer');
-          } else {
-            this.startTurn(payload);
-          }
-        } catch (error) {
-          this.pushLine({ text: `  ${(error as Error).message}`, color: C.yellow });
-        }
-        return;
-      }
       case '/tmux':
         this.openTmux(arg);
         return;
@@ -2452,6 +2430,9 @@ export class ShadowApp {
       case '/model':
         this.doModel(arg);
         return;
+      case '/role':
+        doRole({ opts: this.opts, pushLine: (p) => this.pushLine(p), selectModel: (e) => this.selectModel(e) }, arg);
+        return;
       case '/activity':
       case '/act':
         this.openActivity();
@@ -2464,8 +2445,7 @@ export class ShadowApp {
         } else if (this.opts.workCenter) this.openWorkBrowser(true);
         else this.printTasks();
         return;
-      case '/goal':
-      case '/swarm': {
+      case '/goal': {
         // Mission mode (8.4), ported from slash.ts: /goal <text> starts a REAL mission — plan
         // mode engages, a kickoff turn runs, and the harness pins the mission in front of the
         // model every turn until done/failed or /goal clear. No arg = status, 'clear' = end.
@@ -2497,12 +2477,11 @@ export class ShadowApp {
           });
           return;
         }
-        const swarm = name === '/swarm';
-        this.mission = this.opts.mission.begin(arg, swarm ? 'swarm' : 'goal');
+        this.mission = this.opts.mission.begin(arg);
         // Missions start with an approved plan; drive the state object (the bus event updates
         // the HUD, so UI and truth cannot disagree — the /plan lesson).
         this.opts.planMode?.enter();
-        this.pushLine({ text: `${swarm ? 'Swarm' : 'Mission'} started: ${arg}`, color: C.purple });
+        this.pushLine({ text: `Mission started: ${arg}`, color: C.purple });
         this.pushLine({
           text: '  Plan mode on — write the plan (plan_write, include tasks), then exit_plan_mode for approval.',
           dimColor: true,
@@ -2566,35 +2545,19 @@ export class ShadowApp {
       case '/version':
         this.pushLine({ text: `  shadow ${this.opts.version} · Snowfall`, dimColor: true });
         return;
-      case '/diff':
-      case '/files':
-      case '/branch': {
-        const git = (...args: string[]): string => execFileSync(
-          'git', ['-C', this.opts.workspaceRoot, '--no-pager', ...args],
-          { encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'] },
-        ).trimEnd();
-        try {
-          let lines: string[];
-          if (name === '/diff') {
-            this.openChanges({ kind: 'working' });
-            return;
-          } else if (name === '/files') {
-            const out = git('status', '--short');
-            lines = out ? out.split('\n').slice(0, 40) : ['No changed files.'];
-          } else {
-            const branch = git('branch', '--show-current');
-            const status = git('status', '--short', '--branch');
-            lines = [`branch: ${branch || 'detached HEAD'}`, ...status.split('\n').slice(0, 20)];
-          }
-          this.pushLine({
-            kind: 'system', text: name.slice(1),
-            lines: lines.map((text) => ({ text: approvalText(text), dimColor: true })),
-          });
-        } catch (error) {
-          this.pushLine({ kind: 'error', text: `${name} failed: ${approvalText((error as Error).message.split('\n')[0]!)}`, color: C.red });
-        }
+      case '/menu':
+        new MenuOverlay(this.tui, (command) => this.runSlash(command)).show();
         return;
-      }
+      case '/repo':
+        openRepoBrowser({ opts: this.opts, terminal: this.terminal, tui: this.tui, editor: this.editor, isBusy: () => this.running || this.compacting || this.modelChecking, getPickerHandle: () => this.pickerHandle, setPickerHandle: (h) => { this.pickerHandle = h; }, pushLine: (p) => this.pushLine(p), closePicker: () => this.closePicker() });
+        return;
+      case '/diff':
+        this.openChanges({ kind: 'working' });
+        return;
+      case '/files':
+      case '/branch':
+        showGitInfo({ workspaceRoot: this.opts.workspaceRoot, pushLine: (p) => this.pushLine(p) }, name);
+        return;
       case '/permissions': {
         const result = applyPermissionCommand(this.opts.cfg.permissionRules ?? [], arg);
         if (!result.ok) {
@@ -2821,7 +2784,7 @@ export class ShadowApp {
           }
           const data = readFileSync(absImg).toString('base64');
           this.imageAttachments.push({ mediaType, data });
-          this.pushLine({ kind: 'image', text: '', image: { bytes: data, mediaType, alt: basename(absImg), source: absImg } });
+          this.pushImageCell(data, mediaType, basename(absImg), absImg);
           this.pushLine({ text: `  Attached ${basename(absImg)} (${mediaType}) — sends with your next message.`, color: C.cyan });
         } catch (e) {
           this.pushLine({ kind: 'error', text: `  Could not read ${arg}: ${(e as Error).message}`, color: C.red });
@@ -3024,6 +2987,38 @@ export class ShadowApp {
             this.pushLine({ text: `  ${rollbackActiveSkill(name, generation)}`, color: C.yellow });
             return;
           }
+          // W2: per-skill enable/disable (global-only config, next-session effect).
+          if (sub === 'enable' || sub === 'disable') {
+            if (!name) throw new Error(`usage: /skills ${sub} <name>`);
+            try {
+              this.pushLine({ text: `  ${setSkillEnabled(name, sub === 'enable')}`, color: sub === 'enable' ? C.green : C.yellow });
+            } catch (error) {
+              this.pushLine({ kind: 'error', text: `  ${(error as Error).message}`, color: C.red });
+            }
+            return;
+          }
+          // W3: explicit operator invocation of a skill from the session snapshot.
+          if (sub === 'run') {
+            if (!name) throw new Error('usage: /skills run <name>');
+            const catalog = this.opts.skills ?? discoverSkillCatalog(this.opts.workspaceRoot).skills;
+            const resolved = resolveSkillByName(catalog, name);
+            if ('error' in resolved) {
+              this.pushLine({ kind: 'error', text: `  ${resolved.error}`, color: C.red });
+              return;
+            }
+            if (resolved.disabled) {
+              this.pushLine({ kind: 'error', text: `  skill "${resolved.entry.name}" is operator-disabled — re-enable with /skills enable ${resolved.entry.name} first.`, color: C.red });
+              return;
+            }
+            if (resolved.entry.userInvocation === false) {
+              this.pushLine({ kind: 'error', text: `  skill "${resolved.entry.name}" declares user-invocable: false — model-only skill; ask it to load the skill instead.`, color: C.red });
+              return;
+            }
+            const prompt = buildSkillInvocationPrompt(resolved.entry);
+            if (this.running || this.compacting || this.modelChecking || this.switcher.isSwitching) this.queue(prompt);
+            else this.startTurn(prompt);
+            return;
+          }
         } catch (error) {
           this.pushLine({ kind: 'error', text: `  ${(error as Error).message}`, color: C.red });
           return;
@@ -3031,13 +3026,18 @@ export class ShadowApp {
         const discovered = discoverSkillCatalog(this.opts.workspaceRoot);
         const skills = this.opts.skills ?? discovered.skills;
         const conflicts = this.opts.skills ? [] : discovered.conflicts;
+        // W2/W3 surface: operator control over the session snapshot.
+        const disabledList = listDisabledSkills();
         this.pushLine({
           kind: 'system',
           text: '',
-          lines: skills.length
-            ? [...skills.slice(0, 30).map((x) => ({ text: `  ${x.name.padEnd(18)} [${x.source}] ${shortPath(x.path)} — ${x.description}`, dimColor: true })),
-              ...conflicts.map((conflict) => ({ text: `  Precedence: ${JSON.stringify(conflict)}`, dimColor: true }))]
-            : [{ text: 'No skills discovered (workspace .shadow/skills or ~/.shadow/skills).', dimColor: true }],
+          lines: [
+            ...(skills.length
+              ? [...skills.slice(0, 30).map((x) => ({ text: `  ${x.name.padEnd(18)} [${x.source}] ${shortPath(x.path)} — ${x.description}`, dimColor: true })),
+                ...conflicts.map((conflict) => ({ text: `  Precedence: ${JSON.stringify(conflict)}`, dimColor: true }))]
+              : [{ text: 'No skills discovered (workspace .shadow/skills or ~/.shadow/skills).', dimColor: true }]),
+            ...(disabledList.length ? [{ text: `  Operator-disabled (hidden from model + user until re-enabled): ${disabledList.join(', ')}`, dimColor: true }] : []),
+          ],
         });
         return;
       }
@@ -3901,8 +3901,6 @@ export class ShadowApp {
     this.selectModel(entry);
   }
 
-  /** A provider build is asynchronous. Keep queued input behind that barrier and release it only
-   * after ModelSwitcher has cleared its in-flight state, regardless of success or failure. */
   private selectModel(entry: ModelEntry): void {
     void this.switcher.selectModel(entry).finally(() => {
       if (this.exiting) return;
@@ -4090,6 +4088,7 @@ export class ShadowApp {
       close: () => this.closePicker(), repaint: () => this.tui.requestRender(), rows: () => this.terminal.rows,
     }), { anchor: 'center', width: '90%' });
   }
+
 
   private openChanges(scope: ReviewScope): void {
     try {
@@ -4428,43 +4427,6 @@ export class ShadowApp {
       this.pushLine({ text: `${title}: ${approvalText(result.summary)}`, color: result.ok ? C.green : C.yellow });
     } catch (error) { if (!controller.signal.aborted) this.featureError(error); }
     finally { release?.(); this.endTurn(); if (!this.running && !this.exiting) complete?.(); }
-  }
-
-  /** m-4: explicit operator shell escape. The composer's /! prefix routes here BEFORE any
-   * command-token lookup; the shared core rejects unsafe input and busy state, and dispatch
-   * goes through the full execution-policy pipeline (permissions, plan mode, classifier,
-   * denylist, hooks, sandbox, env scrubbing, timeout) via the native tool executor. One
-   * dispatch, no retries; ESC aborts through the standard controller wiring. */
-  private async shellEscape(raw: string): Promise<void> {
-    if (!this.opts.runNativeTool) {
-      // A session without runNativeTool has no shell escape at all. Busy state is judged by
-      // the shared core so the operator gets the real busy refusal, never this message.
-      this.pushLine({ text: '  Shell escape is unavailable in this session.', dimColor: true });
-      return;
-    }
-    try {
-      await runShellEscape({
-        busy: () => this.running || this.compacting || this.modelChecking || this.switcher.isSwitching || this.exiting,
-        errorLine: (text) => this.pushLine({ text: `  ${text}`, color: C.yellow }),
-        outcomeLine: (text, ok) => this.pushLine({ kind: 'system', text: `  ${text}`, color: ok ? C.green : C.yellow }),
-        clearComposer: () => { if (this.editor.getText().trim()) this.editor.setText(''); },
-        armAbort: (controller) => {
-          // Mirror runFeatureTool exactly: ALL live-turn state goes live before the lock.
-          this.closePicker(); this.commitBrandLine(); this.running = true; this.runStart = Date.now();
-          this.controller = controller; this.startTicker(); this.hudRef = this.hudState();
-        },
-        acquireLock: (signal) => runLock.acquire(CLI_HOLDER, { priority: true, signal }),
-        runNativeTool: async (name, input, signal, budget) => {
-          if (!this.opts.runNativeTool) throw new Error('Shell escape is unavailable in this session.');
-          return this.opts.runNativeTool(name, input, signal, budget as Budget);
-        },
-        newBudget: () => new Budget({ maxIterations: 0, ...this.opts.cfg.budget }, this.current.model, this.opts.cfg.priceTable, Date.now()),
-      }, raw);
-    } catch (error) {
-      this.featureError(error);
-    } finally {
-      this.endTurn();
-    }
   }
 
   private doChecks(arg = ''): void {

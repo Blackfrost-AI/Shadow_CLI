@@ -25,7 +25,7 @@ import { join } from 'node:path';
 import { z } from 'zod';
 import { AgentLoop, type LoopDeps } from '../src/agent/loop.js';
 import { Budget, type BudgetLimits } from '../src/agent/budget.js';
-import { Context, TRUNCATED_RESULT_SENTINEL } from '../src/agent/context.js';
+import { Context, isReclaimedContent } from '../src/agent/context.js';
 import { EventBus, type LoopEvent } from '../src/agent/events.js';
 import { ToolRegistry } from '../src/tools/registry.js';
 import { AutoApproveGate } from '../src/agent/approval.js';
@@ -590,7 +590,7 @@ test('E1: a throwing summarizer degrades to local truncation (oldest tool_result
   const block = msgs[2]!.content[0]!;
   assert.equal(block.type, 'tool_result');
   if (block.type === 'tool_result') {
-    assert.equal(block.content, TRUNCATED_RESULT_SENTINEL);
+    assert.ok(isReclaimedContent(block.content), 'reclaim sentinel (legacy exact or locator variant)');
     assert.equal(block.toolCallId, 't1', 'pairing id survives the tombstone');
     assert.equal(block.ok, true, 'the ok flag survives the tombstone');
   }
@@ -601,7 +601,7 @@ test('E2: an EMPTY summary is a failure too and degrades to truncation', async (
   const res = await ctx.maybeSummarize(summarizeProvider('empty'), 'mock', true);
   assert.equal(res, 'truncated');
   const block = ctx.messages()[2]!.content[0]!;
-  assert.equal(block.type === 'tool_result' && block.content, TRUNCATED_RESULT_SENTINEL);
+  assert.ok(block.type === 'tool_result' && isReclaimedContent(block.content));
 });
 
 test('E3: with nothing reclaimable left, the failure is reported as failed (not a silent no-op)', async () => {
@@ -677,7 +677,7 @@ test('E6: the loop surfaces degraded compaction — warn finding + session log +
 
   const allBlocks = context.messages().flatMap((m) => m.content);
   assert.ok(
-    allBlocks.some((b) => b.type === 'tool_result' && b.content === TRUNCATED_RESULT_SENTINEL),
+    allBlocks.some((b) => b.type === 'tool_result' && isReclaimedContent(b.content)),
     'the context carries the tombstone',
   );
 });

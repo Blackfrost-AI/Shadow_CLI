@@ -30,7 +30,10 @@ export const HARNESS_PREAMBLE =
   'edit_file, apply_patch, todo_write). Foreign names (Bash, shell_command, update_plan, Edit) are ' +
   'aliased automatically — call tools via the function-calling channel when possible.';
 
-const PROMPT_REFERENCED_TOOLS = [
+// Tools whose names appear in prompt text. capabilityAwarePrompt() strips lines/sentences
+// referencing tools a session lacks, so a removed tool also removes its prompt guidance.
+// Tool names not in this set rely on whole-module gates above instead.
+const PROMPT_REFERENCED_TOOLS: readonly string[] = [
   'read_file',
   'run_shell',
   'edit_file',
@@ -46,7 +49,17 @@ const PROMPT_REFERENCED_TOOLS = [
   'mission_update',
   'view_image',
   'describe_media',
-] as const;
+  'tool_search',
+  'repository_context',
+  'project_checks',
+  'web_search',
+  'web_fetch',
+  'memory',
+  'watcher',
+  'schedule_wakeup',
+  'infer_recon',
+  'infer_capacity',
+];
 
 const SECURITY_TOOLKIT_TOOLS = [
   'bin_recon',
@@ -179,6 +192,12 @@ function loadInstructionModules(
       if (
         name === 'security-engagement.md' &&
         !SECURITY_TOOLKIT_TOOLS.every((tool) => capabilities.has(tool))
+      ) continue;
+      // Same contract for the inference toolkit: it teaches infer_recon/infer_capacity usage, so
+      // omit it whole when either tool is absent from the session.
+      if (
+        name === 'inference-toolkit.md' &&
+        !(capabilities.has('infer_recon') && capabilities.has('infer_capacity'))
       ) continue;
       const effectiveContent = capabilityAwarePrompt(content, capabilities);
       if (!effectiveContent) continue;

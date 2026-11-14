@@ -943,14 +943,22 @@ export function flattenItem(
         return { key, spans: [{ text: left + head + BORDER.horizontal.repeat(Math.max(0, cols - 2 - displayWidth(head))) + right, color: theme.dim }] };
       };
       out.push(edge(`${kp}rh`, BORDER.topLeft, `∴ ${label}`, BORDER.topRight));
-      // Bound the compact projection before wrapping; the complete original stays on the item
-      // for Ctrl+O. This keeps long reasoning streams cheap to paint on every token.
+      // Bound every compact projection before wrapping — the LIVE stream included. The old
+      // clip was gated on `collapsed`, but a streaming trace is never collapsed, so every
+      // delta wrapped the FULL accumulated text (measured ~39ms/frame at 640k chars →
+      // quadratic per thinking turn); the expanded default made settled traces pay it too.
+      // Streaming always shows only the last 4 rows, so dropping the head before layout is
+      // O(1) per token and visually identical for multi-line reasoning. (A single unbroken
+      // >4000-char line can shift the wrap phase by a few words — the same tail-slice heuristic
+      // the collapsed path already uses.) Settled+expanded still renders the complete original
+      // for Ctrl+O. The complete text stays on the item either way.
       const previewChars = 4000;
-      const clipped = collapsed && item.text.length > previewChars;
+      const compactProjection = collapsed || item.reasoningState === 'streaming';
+      const clipped = compactProjection && item.text.length > previewChars;
       const text = (clipped ? item.text.slice(-previewChars) : item.text).split('\n').map(approvalText).join('\n').trim();
       const body = wrapLine(`${kp}rb`, [{ text, color: theme.dim }], Math.max(1, cols - 4));
       const hidden = collapsed && (clipped || body.length > 4);
-      const shown = collapsed ? body.slice(-4) : body;
+      const shown = compactProjection ? body.slice(-4) : body;
       for (const line of shown) {
         const used = line.spans.reduce((n, span) => n + displayWidth(span.text), 0);
         out.push({ key: line.key, spans: [

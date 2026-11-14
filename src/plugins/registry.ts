@@ -64,6 +64,8 @@ export interface IndexEntry {
   description: string;
   url: string;
   version?: string;
+  /** Optional skill names the plugin claims to carry (W5 skills search). Display-only. */
+  skills?: string[];
 }
 
 export interface IndexResult {
@@ -96,6 +98,16 @@ function coerceEntry(raw: unknown): IndexEntry | null {
     url: r.url,
   };
   if (typeof r.version === 'string') entry.version = displaySafe(r.version, 64);
+  // W5: optional skills list the plugin claims to carry. Names are strictly normalized
+  // (same pattern as the plugin name) and capped — this is DISPLAY-ONLY metadata and must
+  // never inject into anything.
+  if (Array.isArray(r.skills)) {
+    const skills = r.skills
+      .filter((s): s is string => typeof s === 'string' && NAME_RE.test(s))
+      .slice(0, 32)
+      .map((s) => displaySafe(s, 64));
+    if (skills.length) entry.skills = skills;
+  }
   return entry;
 }
 

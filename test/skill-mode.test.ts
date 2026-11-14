@@ -61,11 +61,26 @@ test('with no mode filter, every skill is returned', () => {
     addSkill(ws, 'beta', 'security');
     addSkill(ws, 'gamma', 'coding');
     const skills = discoverSkills(ws, { homedir: join(ws, 'home') });
-    assert.deepEqual(skills.map((s) => s.name).sort(), ['alpha', 'beta', 'gamma']);
+    // Bundled skills ship with the agent and are always present; mode-scoped assertions
+    // compare the disk-authored set only.
+    assert.deepEqual(
+      skills.filter((s) => s.source !== 'bundled').map((s) => s.name).sort(),
+      ['alpha', 'beta', 'gamma'],
+    );
   } finally {
     rmSync(ws, { recursive: true, force: true });
   }
 });
+
+/** Disk-authored names only — bundled skills ship with the agent and are always present. */
+
+function assertDiskNames(skills: Array<{ name: string; source?: string }>, expected: string[], label?: string): void {
+  assert.deepEqual(
+    skills.filter((s) => s.source !== 'bundled').map((s) => s.name).sort(),
+    expected,
+    label,
+  );
+}
 
 test('a mode filter keeps unscoped skills and the matching mode only', () => {
   const ws = workspace();
@@ -74,7 +89,7 @@ test('a mode filter keeps unscoped skills and the matching mode only', () => {
     addSkill(ws, 'beta', 'security');
     addSkill(ws, 'gamma', 'coding');
     const skills = discoverSkills(ws, { homedir: join(ws, 'home'), mode: 'security' });
-    assert.deepEqual(skills.map((s) => s.name).sort(), ['alpha', 'beta']);
+    assertDiskNames(skills, ['alpha', 'beta']);
   } finally {
     rmSync(ws, { recursive: true, force: true });
   }
@@ -85,7 +100,7 @@ test('mode matching is case-insensitive on both sides', () => {
   try {
     addSkill(ws, 'beta', 'Security');
     const skills = discoverSkills(ws, { homedir: join(ws, 'home'), mode: 'SECURITY' });
-    assert.deepEqual(skills.map((s) => s.name), ['beta']);
+    assertDiskNames(skills, ['beta']);
   } finally {
     rmSync(ws, { recursive: true, force: true });
   }
@@ -98,8 +113,9 @@ test('scoping actually reduces the index — the whole point', () => {
     for (let i = 0; i < 30; i++) addSkill(ws, `code${i}`, 'coding');
     const all = discoverSkills(ws, { homedir: join(ws, 'home') });
     const sec = discoverSkills(ws, { homedir: join(ws, 'home'), mode: 'security' });
-    assert.equal(all.length, 60);
-    assert.equal(sec.length, 30);
+    // Disk-authored counts only — bundled skills ship regardless of scope.
+    assert.equal(all.filter((s) => s.source !== 'bundled').length, 60);
+    assert.equal(sec.filter((s) => s.source !== 'bundled').length, 30);
     assert.ok(sec.length < all.length);
   } finally {
     rmSync(ws, { recursive: true, force: true });
@@ -118,12 +134,12 @@ test('a comma-separated mode list matches any of its members', () => {
     addSkill(ws, 'both', 'security, coding');
     addSkill(ws, 'only-sec', 'security');
     addSkill(ws, 'only-code', 'coding');
-    assert.deepEqual(
-      discoverSkills(ws, { homedir: join(ws, 'home'), mode: 'security' }).map((s) => s.name).sort(),
+    assertDiskNames(
+      discoverSkills(ws, { homedir: join(ws, 'home'), mode: 'security' }),
       ['both', 'only-sec'],
     );
-    assert.deepEqual(
-      discoverSkills(ws, { homedir: join(ws, 'home'), mode: 'coding' }).map((s) => s.name).sort(),
+    assertDiskNames(
+      discoverSkills(ws, { homedir: join(ws, 'home'), mode: 'coding' }),
       ['both', 'only-code'],
     );
   } finally {

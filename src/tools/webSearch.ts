@@ -5,6 +5,7 @@ import { htmlToText, readCapped } from './webFetch.js';
 import { assertUrlAllowed } from '../safety/netguard.js';
 import { shadowFetch } from '../safety/egress.js';
 import { envelopUntrusted, fitPayload } from '../safety/envelope.js';
+import { spillReclaimedBody } from '../agent/toolSpill.js';
 
 const DDG_HTML = 'https://duckduckgo.com/html/';
 const DEFAULT_MAX_RESULTS = 6;
@@ -125,8 +126,26 @@ export const webSearch: Tool<WebSearchInput, WebSearchData> = {
     // Render them into ONE enveloped block (previously they sat unwrapped in data.results); the
     // payload is clamped to the result budget BEFORE enveloping so the END marker always survives.
     const rendered = results.map((r, i) => `${i + 1}. ${r.title}\n   ${r.url}\n   ${r.snippet}`).join('\n');
+    // 11.6.0 information survival: oversize rendered results spill the FULL pre-clamp text to the
+    // session spill dir; the locator rides the TRUSTED provenance line (outside the envelope).
+    // read_file returns the raw untrusted text (containment lives at the spill preview boundary,
+    // not on re-read); a failed spill degrades to the
+    // plain clamp, never to an error.
+    const spillLocator =
+      ctx.maxToolResultChars && rendered.length > ctx.maxToolResultChars
+        ? spillReclaimedBody({
+            workspaceRoot: ctx.workspaceRoot,
+            sessionId: ctx.sessionId,
+            toolName: 'web_search',
+            toolCallId: ctx.toolCallId ?? 'call',
+            body: rendered,
+          })
+        : null;
     const payload = ctx.maxToolResultChars ? fitPayload(rendered, ctx.maxToolResultChars) : rendered;
-    const summary = `${results.length} result(s) for "${q}".\n${envelopUntrusted({
+    const provenance = spillLocator
+      ? `${results.length} result(s) for "${q}". Full readable output (${rendered.length} chars) saved to ${spillLocator} — read it with read_file or grep it there.`
+      : `${results.length} result(s) for "${q}".`;
+    const summary = `${provenance}\n${envelopUntrusted({
       tool: 'web_search',
       source: `DuckDuckGo search: ${q}`,
       content: payload,

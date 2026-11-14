@@ -55,7 +55,6 @@ import { ensureVaultReady } from './auth/unlock.js';
 import { makeAgentTool, makeScheduleWakeupTool } from './tools/index.js';
 import { makeProjectJobsTool, makeProjectRoomTool, makeAcceptanceCheckTool } from './tools/projectJobs.js';
 import { makeCollaborationTool } from './agent/collaboration.js';
-import { makeSwarmTool } from './tools/swarmTool.js';
 import type { Tool, ToolContext, ToolResult } from './tools/types.js';
 import type { RunShellData } from './tools/runShell.js';
 import { createMcpManager } from './mcp/manager.js';
@@ -222,6 +221,7 @@ function helpText(): string {
     '                       (catastrophic-command denylist stays on; use --yolo to drop that too).',
     '  --provider <name>    anthropic | openai | mock',
     '  --model <id>         model id (default claude-opus-4-8)',
+    '  --models <a,b,c>     allowlist of model labels for Ctrl+P quick cycling',
     '  --profile <name>     activate a named profile from ~/.shadow/config.json — bundles model +',
     '                       harness + autonomy + context + runtime limits (also SHADOW_PROFILE)',
     '  --harness <id>       use a local harness add-on for this new session (repeatable; also --addon)',
@@ -720,6 +720,118 @@ async function runPlugin(args: string[], offline = false): Promise<void> {
   }
 
   stdout.write(pluginUsage());
+  process.exitCode = 1;
+}
+
+/**
+ * Skills Option C (W5): `shadow skills search|install` — a skills-aware view over the
+ * EXISTING plugin-index machinery. The index is per-plugin (IndexEntry), so installing
+ * a skill means installing the plugin that carries it; the output discloses every
+ * sibling skill the plugin ships. Search stays display-only (local filter of the whole
+ * fetched index — no remote query endpoint, no telemetry). Installs arrive DISABLED.
+ */
+async function runSkillsCommand(args: string[], offline = false): Promise<void> {
+  const { installPluginFromGit, displaySafe } = await import('./plugins/manager.js');
+  const { fetchPluginIndex, filterIndex, resolveIndexUrl } = await import('./plugins/registry.js');
+  const fail = (msg: string): void => {
+    process.stderr.write(msg + '\n');
+    process.exitCode = 1;
+  };
+  const sub = args[0];
+  if (!sub || sub === 'help' || sub === '--help' || sub === '-h') {
+    stdout.write(
+      [
+        'usage: shadow skills <command>',
+        '',
+        '  search [query]     search the configured index for plugins carrying skills',
+        '  install <plugin>   resolve against the index and install the carrying plugin (DISABLED)',
+        '  list               list skills discovered for the current workspace',
+        '',
+        'Skills ship inside data-only plugins: installing a skill installs the whole',
+        'plugin (all its skills are disclosed before enabling). No central catalog exists',
+        'by default — the index is your own configured pluginIndexUrl, fetched directly.',
+      ].join('\n') + '\n',
+    );
+    return;
+  }
+
+  if (sub === 'search') {
+    const query = args.slice(1).join(' ');
+    try {
+      const idx = await fetchPluginIndex(loadGlobalConfig() as IndexCfg);
+      const badge = idx.keyConfigured
+        ? lc.green('signature verified')
+        : lc.yellow('unsigned index — entries are untrusted listings; review before installing');
+      stdout.write(`index: ${displaySafe(idx.sourceUrl, 2048)} (${badge})\n`);
+      // Skills-aware filter: only entries that declare skills in their listing.
+      const rows = filterIndex(idx.entries, query).filter((e) => (e.skills?.length ?? 0) > 0);
+      if (rows.length === 0) {
+        stdout.write('no matching entries carrying skills.\n');
+        return;
+      }
+      for (const e of rows) {
+        stdout.write(`  ${lc.bold(e.name)}${e.version ? ` v${e.version}` : ''} — ${displaySafe(e.description, 300)}\n`);
+        stdout.write(`         ${lc.gray(`skills: ${(e.skills ?? []).map((s) => displaySafe(s, 64)).join(', ')}`)}\n`);
+        stdout.write(`         ${lc.gray(displaySafe(e.url, 2048))}\n`);
+      }
+      stdout.write('Install: shadow skills install <name>  (plugin arrives DISABLED — review before enabling)\n');
+    } catch (err) {
+      return fail((err as Error).message);
+    }
+    return;
+  }
+
+  if (sub === 'install') {
+    const name = (args[1] ?? '').trim();
+    if (!name) return fail('usage: shadow skills install <plugin-name>');
+    try {
+      const gcfg = loadGlobalConfig() as IndexCfg;
+      const url = await resolveIndexUrl(name, gcfg);
+      if (!url) {
+        return fail(
+          `plugin "${name}" (skill carrier) is not in your configured index. Use a direct git URL with shadow plugin add, ` +
+          'or configure pluginIndexUrl. Shadow ships no central catalog — that is the zero-telemetry stance, not an omission.',
+        );
+      }
+      stdout.write(lc.gray(`index entry "${name}" → ${displaySafe(url, 320)}\n`));
+      const info = installPluginFromGit(url, { offline });
+      stdout.write(lc.green(`✓ installed plugin "${info.name}" — DISABLED until you review it`) + '\n');
+      // REVIEW-R6: disclose EVERY skill the plugin carries — installing one name lands siblings too.
+      stdout.write(`  ships ${info.counts.skills ?? 0} skill(s)\n`);
+      if ((info.counts.skills ?? 0) > 1) {
+        stdout.write(lc.yellow('  note: this plugin carries more than one skill — all of them arrive together.\n'));
+      }
+      stdout.write(`  files:  ${info.dir}\n`);
+      stdout.write('  review: shadow plugin doctor ' + info.name + '\n');
+      stdout.write(`  enable: shadow plugin enable ${info.name}   (loads its skills at the next session start)\n`);
+    } catch (err) {
+      return fail((err as Error).message);
+    }
+    return;
+  }
+
+  if (sub === 'list') {
+    const { discoverSkillCatalog } = await import('./skills/loader.js');
+    const cwd = process.cwd();
+    const catalog = discoverSkillCatalog(cwd);
+    const rows = catalog.skills;
+    if (!rows.length) {
+      stdout.write('No skills discovered for this workspace (bundled skills ship regardless; they are part of the agent).\n');
+      return;
+    }
+    for (const s of rows) {
+      stdout.write(`  ${s.name.padEnd(24)} [${s.source}] ${displaySafe(s.description, 120)}\n`);
+    }
+    if (catalog.conflicts.length) {
+      stdout.write(lc.yellow('precedence conflicts (first-seen wins):\n'));
+      for (const c of catalog.conflicts) {
+        stdout.write(`  ${c.name}: ${c.selected} ← ${c.shadowed}\n`);
+      }
+    }
+    return;
+  }
+
+  stdout.write('usage: shadow skills <search|install|list>\n');
   process.exitCode = 1;
 }
 
@@ -1412,6 +1524,10 @@ async function main(): Promise<void> {
     await runPlugin(argv.slice(1), argv.includes('--offline'));
     return;
   }
+  if (argv[0] === 'skills') {
+    await runSkillsCommand(argv.slice(1), argv.includes('--offline'));
+    return;
+  }
   if (argv[0] === 'harness' || argv[0] === 'harnesses') {
     runHarnessCommand(argv.slice(1));
     return;
@@ -1659,13 +1775,12 @@ async function main(): Promise<void> {
 
   // Destructured so the rest of main() reads exactly as it did before the extraction.
   cfg = session.cfg;
-  const { provider, registry, bg, watchers, memory, todoList, planMode, mission, wakeup, skills, facts, sessionLog, offline, context } =
+  const { provider, registry, bg, watchers, memory, todoList, planMode, mission, wakeup, skills, sessionLog, offline, context } =
     session;
   const fullSystemForStyle = session.systemForStyle;
   const fullSystem = session.system;
   void memory;
   void skills;
-  void facts;
 
   // P2-11 (/fork): the transcript target is swappable at runtime — /fork replaces the live log
   // with the fork's. Every writer that outlives a single turn (the bus→recordEvent subscriber
@@ -1849,7 +1964,20 @@ async function main(): Promise<void> {
 
 
   // Deliver bg agent (and future) task results + record launches for snapshot/recovery to the *main* context (not throwaway sub ctxs).
-  const pendingNotifications = attachBgAgentDelivery(bus, context);
+  // 11.6.0: also WAKE on completion. Buffered notifications used to sit unread until the next
+  // human turn — an idle session never picked up a finished (or ceiling-truncated 'partial')
+  // sub-agent. The seam coalesces a batch to one wake and routes through wakeup.tryFire so the
+  // F04-09 rate ceiling + onRateLimited visibility below apply; a dropped wake leaves the buffer
+  // intact (hosts drain only at turn start). The wake line is short and synthetic — the drained
+  // buffer carries the real content. The web host has no attach site; web wake is out of scope.
+  const pendingNotifications = attachBgAgentDelivery(bus, context, () =>
+    wakeup.tryFire(
+      { id: 'bg-task-wake', delaySec: 0, reason: 'background task', task: 'pick up the task notification(s) and continue', at: Date.now() },
+      // Lazy on purpose: wakeupHandler.fire is installed by the host (app/tui/headless) further
+      // down; notifications only arrive once a turn is running, so it is always set by then.
+      (task, reason) => wakeupHandler.fire(task, reason),
+    ),
+  );
 
   // Offline mode: skip MCP servers entirely — they are outbound connectors (another egress
   // vector), so an offline session keeps nothing but the local model.
@@ -2070,7 +2198,6 @@ async function main(): Promise<void> {
   const checkedShell: Tool<unknown, RunShellData> = { ...configuredShell,
     run: (input, ctx) => executeNativeTool('run_shell', input, ctx) as Promise<ToolResult<RunShellData>> };
   const acceptanceTool = makeAcceptanceCheckTool(checkedShell);
-  registry.register({ ...makeSwarmTool((input, ctx) => executeNativeTool('agent', input, ctx), cfg.subagentConcurrency), deferred: true, searchAliases: ['parallel', 'mission', 'dag', 'multi-agent'] });
   registry.register(makeProjectJobsTool());
   registry.register(makeProjectRoomTool());
   registry.register(acceptanceTool);
@@ -2136,6 +2263,7 @@ async function main(): Promise<void> {
       // Feed a denial back so the model can adapt (and headless paths see a result)
       context.append({
         role: 'user',
+        synthetic: true,
         content: [{ type: 'text', text: 'This prompt was blocked by the user_prompt_submit hook.' }],
       });
       automation?.fail('user_prompt_submit hook denied the task', 1);
@@ -2166,6 +2294,9 @@ async function main(): Promise<void> {
       // The wire model (an `autoModel` entry re-reads it from its endpoint), not the entry identity.
       model: session.wireModel,
       system: fullSystem,
+      // Live facts index (11.6.0 B4): rendered per request by the loop — system on non-caching
+      // providers, uncached message tail on caching ones. Never baked into fullSystem.
+      factsProvider: session.factsProvider,
       workspaceRoot,
       additionalRoots,
       forceConfirm,
@@ -2333,6 +2464,23 @@ async function main(): Promise<void> {
         }
       }
     } finally {
+      // One-shot headless (11.6.0 G3): a wake accepted during the LAST turn must not be killed
+      // by the abort-all sweep below — its turn is the release's whole point ("partial results
+      // get picked up and finished"). While scheduled wakeups remain, wait (bounded) for them
+      // to fire and their continuation turns to finish. Only the piped/--task branch benefits:
+      // the REPL awaits a human at its prompt, so an idle REPL still exits on EOF without
+      // waiting out timers (documented limit). A wakeup that schedules another wakeup keeps
+      // the session alive until the rate ceiling drops it (tryFire → false → no new timer) or
+      // the grace bound expires — then the existing F04-09 teardown cancels the rest.
+      const WAKE_GRACE_MS = 30 * 60_000;
+      const graceStart = Date.now();
+      while (
+        (wakeup.hasPending() || runLock.state().holder !== null) &&
+        process.exitCode !== 130 && process.exitCode !== 143 &&
+        Date.now() - graceStart < WAKE_GRACE_MS
+      ) {
+        await new Promise((r) => setTimeout(r, 250));
+      }
       detach();
       for (const controller of liveControllers) controller.abort();
       process.removeListener('SIGINT', onSigint);
@@ -2381,8 +2529,12 @@ async function main(): Promise<void> {
       sessionLogBox,
       forceConfirm,
       system: fullSystem,
+      // Live facts index (11.6.0 B4) — bootstrap's capability-gated provider; the lead loop
+      // renders it per request. Sub-agent factories deliberately do NOT receive it.
+      factsProvider: session.factsProvider,
       workspaceRoot,
       cfg,
+      models: flags.models,
       baseContextPolicy: session.baseContextPolicy,
       autonomy,
       bypass: yolo,

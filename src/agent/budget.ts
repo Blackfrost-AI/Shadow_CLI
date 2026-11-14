@@ -105,31 +105,18 @@ export class Budget {
     },
     now: number,
   ): void {
-    // m-14 security fix (review V2): provider-reported usage is UNTRUSTED. A
-    // hostile endpoint returning negative token counts would drive the
-    // accumulators negative so `total >= max` never trips — erasing every cap.
-    // Reject non-finite values; clamp negatives to zero (fail toward more
-    // accrued spend, never less).
-    const clean = (n: unknown): number => {
-      const v = typeof n === 'number' ? n : 0;
-      if (!Number.isFinite(v)) return 0;
-      return v < 0 ? 0 : v;
-    };
-    this.inputTokens += clean(u.inputTokens);
-    this.outputTokens += clean(u.outputTokens);
-    this.cacheReadTokens += clean(u.cacheReadTokens);
-    this.cacheWriteTokens += clean(u.cacheWriteTokens);
+    this.inputTokens += u.inputTokens;
+    this.outputTokens += u.outputTokens;
+    this.cacheReadTokens += u.cacheReadTokens ?? 0;
+    this.cacheWriteTokens += u.cacheWriteTokens ?? 0;
 
-    const inTok = clean(u.inputTokens);
-    const outTok = clean(u.outputTokens);
-    const crTok = clean(u.cacheReadTokens);
-    const cwTok = clean(u.cacheWriteTokens);
     const p = this.prices[this.model];
     if (p && u.billing !== 'subscription') {
       const M = 1_000_000;
-      const cacheRead = crTok * p.input * (p.cacheReadMult ?? 0.1);
-      const cacheWrite = cwTok * p.input * (p.cacheWriteMult ?? 1.25);
-      this.costUSD += (inTok * p.input + outTok * p.output + cacheRead + cacheWrite) / M;
+      const cacheRead = (u.cacheReadTokens ?? 0) * p.input * (p.cacheReadMult ?? 0.1);
+      const cacheWrite = (u.cacheWriteTokens ?? 0) * p.input * (p.cacheWriteMult ?? 1.25);
+      this.costUSD +=
+        (u.inputTokens * p.input + u.outputTokens * p.output + cacheRead + cacheWrite) / M;
     }
     void now;
   }
@@ -143,6 +130,18 @@ export class Budget {
   check(now: number): BudgetStop {
     if (this.limits.maxIterations > 0 && this.iterations >= this.limits.maxIterations) return 'max_iterations';
     return this.checkSpending(now);
+  }
+
+  /**
+   * Iteration-budget awareness for the per-turn UNCACHED volatile system suffix. The loop re-renders
+   * this every turn (compaction-proof, and kept out of the cached prefix + compaction continuity), so
+   * the model can SEE how many turns it has left and pace itself — synthesize before the ceiling
+   * instead of exploring until it dies. `max === 0` means unlimited (the default agent loop); callers
+   * should omit the block in that case.
+   */
+  iterationState(): { used: number; max: number; remaining: number | null } {
+    const max = this.limits.maxIterations ?? 0;
+    return { used: this.iterations, max, remaining: max > 0 ? Math.max(0, max - this.iterations) : null };
   }
 
   /**

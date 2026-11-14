@@ -23,7 +23,7 @@ test('enableContextCooler resolves an explicit checkout path without saving glob
 });
 
 test('enablePlaywrightBrowser adds the exact isolated Chrome preset', () => {
-  assert.equal(PLAYWRIGHT_MCP_PACKAGE, '@playwright/mcp@0.0.84');
+  assert.equal(PLAYWRIGHT_MCP_PACKAGE, '@playwright/mcp@0.0.79');
   const change = enablePlaywrightBrowser({});
 
   assert.equal(change.ok, true);
@@ -32,9 +32,8 @@ test('enablePlaywrightBrowser adds the exact isolated Chrome preset', () => {
       command: 'npx',
       args: [
         '-y',
-        '@playwright/mcp@0.0.84',
+        '@playwright/mcp@0.0.79',
         '--isolated',
-        '--sandbox',
         '--browser',
         'chrome',
         '--output-dir',
@@ -43,8 +42,7 @@ test('enablePlaywrightBrowser adds the exact isolated Chrome preset', () => {
         '52428800',
       ],
       // P3-08: the preset opts this ONE server out of the OS jail explicitly (a browsing browser
-      // needs sockets + broad fs access); Chromium's own sandbox stays on via `--sandbox`, and the
-      // `--isolated` profile + capped output keep session state separate.
+      // needs sockets + broad fs access); its isolation is the `--isolated` profile + capped output.
       network: true,
       sandbox: false,
     },

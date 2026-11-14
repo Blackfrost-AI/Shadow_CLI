@@ -173,7 +173,12 @@ export interface AgentSession {
   harnessRuntimeReadiness: () => HarnessRuntimeReadiness;
   /** Fail closed after this host has registered its complete runtime tool surface. */
   assertHarnessRuntimeReady: () => void;
-  facts: string;
+  /**
+   * LIVE workspace-facts index, capability-gated (11.6.0 B4). Called per provider request by the
+   * LEAD loop via LoopDeps.factsProvider; '' when the store is empty or the memory tool was
+   * removed. Never baked into `system` — the loop owns placement (system vs. uncached tail).
+   */
+  factsProvider: () => string;
   system: string;
   systemForStyle: (style: OutputStyle) => string;
   sessionLog: SessionLog;
@@ -523,6 +528,9 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     })),
     // Opt-in scoping: unset means every skill is indexed, exactly as before.
     mode: process.env.SHADOW_SKILLS_MODE?.trim() || undefined,
+    // W2: operator-disabled skills are filtered at the catalog choke point — this covers
+    // the index block, the skill tool, /skills run, and /skills listing uniformly.
+    disabled: Array.isArray(cfg.skillsDisabled) ? cfg.skillsDisabled : undefined,
   });
   const skillsBlock = capabilityAwareSkillsIndex(skills, promptCapabilities);
   const baseSystem = [
@@ -776,12 +784,13 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     registry.register(makeDescribeMediaTool(cfg.vision));
   }
 
-  // M4: project memory (known facts) — load, expose as a tool, inject into the prompt.
-  // F08-05: inject the one-line-per-fact INDEX, not full values — the model recalls full values
-  // on demand via the memory tool, so prompt cost stays flat as facts accumulate.
+  // M4: project memory (known facts) — load, expose as a tool. The prompt INDEX is rendered
+  // LIVE per provider request via `factsProvider` below (11.6.0 B4 — single facts render site),
+  // so mid-session memory writes are visible next turn instead of frozen at bootstrap.
+  // F08-05: the index is one line per fact — the model recalls full values on demand via the
+  // memory tool, so prompt cost stays flat as facts accumulate.
   const memory = ProjectMemory.load(workspaceRoot);
   registry.register(makeMemoryTool(memory));
-  const facts = memory.asIndex();
 
   // Agent-maintained todo list — externalizes "what's done / what's next" into a
   // tool. The loop renders the live list into the system prompt each turn (pinned,
@@ -833,8 +842,22 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   } catch {
     setCustomStyles([]);
   }
-  const modelFacts = capabilityAwareFactsIndex(facts, promptCapabilities);
-  const systemForStyle = (style: OutputStyle): string => buildStyledSystem(baseSystem, style, modelFacts);
+  // Facts are NO LONGER baked into the system prompt (11.6.0 B4). `factsProvider` renders the
+  // LIVE index per provider request — asIndex() re-reads the store — through the SAME capability
+  // gate (a removed memory tool hides the index that tells the model to call it). The loop places
+  // the rendered section in the system prompt on non-caching providers and in the uncached message
+  // tail on prompt-caching ones. Lead loops only: the sub-agent factory never receives it.
+  const factsProvider = (): string => {
+    const index = capabilityAwareFactsIndex(memory.asIndex(), promptCapabilities);
+    // adj1: a store-level warning (quarantine / refused overwrite) rides EVERY request as a
+    // one-line banner until an explicit memory op consumes it — never silently swallowed by
+    // the per-turn render. Flattened: a notice must not forge extra prompt sections.
+    const notice = memory.peekNotice();
+    if (!notice) return index;
+    const banner = `⚠ ${notice.replace(/\s+/g, ' ').trim()}`;
+    return index ? `${banner}\n${index}` : banner;
+  };
+  const systemForStyle = (style: OutputStyle): string => buildStyledSystem(baseSystem, style);
   const system = systemForStyle(activeStyle);
 
   // P2-13: opt-in retention sweep — runs BEFORE this session's log is opened so a sweep can
@@ -879,7 +902,7 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     if (recoveredTasks.length) {
       write(` (recovered ${recoveredTasks.length} sub-agent bg task record(s) from prior snapshot)\n`);
       const note = `Recovered bg sub-agent tasks from snapshot: ${JSON.stringify(recoveredTasks)}`;
-      context.append({ role: 'user', content: [{ type: 'text', text: note }] });
+      context.append({ role: 'user', synthetic: true, content: [{ type: 'text', text: note }] });
     }
   } else {
     context = new Context(contextOpts);
@@ -1025,7 +1048,7 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     harnessState,
     harnessRuntimeReadiness,
     assertHarnessRuntimeReady: assertSessionHarnessRuntimeReady,
-    facts,
+    factsProvider,
     system,
     systemForStyle,
     sessionLog,

@@ -43,7 +43,7 @@ function requestContract(req: CompletionRequest): { input: string; validators: M
     'Tool calls in your response are proposals, not actions you have performed. Shadow will validate and execute them, then provide their results in a later request.',
     'Use only listed tool names and inputs matching their JSON Schemas. Honor toolChoice: none forbids calls; any requires at least one; tool requires that named tool. disableParallelToolUse allows at most one call.',
     'For a normal final answer, put the answer in text and use an empty toolCalls array. Do not claim success for work without a recorded tool result.',
-    JSON.stringify({ system: req.system, ...JSON.parse(contract), messages: history }),
+    JSON.stringify({ system: req.systemVolatileSuffix?.trim() ? `${req.system}\n\n${req.systemVolatileSuffix}` : req.system, ...JSON.parse(contract), messages: history }),
   ].join('\n\n');
   if (Buffer.byteLength(input) > 8 * 1024 * 1024) throw new ClaudeCodeError('claude_code_context_limit', 'The conversation exceeds this Claude Code connection’s input limit. Compact the session before continuing.');
   return { input, validators, validateEnvelope: ajv.compile(ENVELOPE_SCHEMA) };

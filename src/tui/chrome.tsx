@@ -308,6 +308,7 @@ export function FlatItem({
   foldLargeTables = true,
   toolRun,
   maxRows,
+  proseMaxCols = PROSE_MAX_COLS,
 }: {
   item: TranscriptItem;
   cols: number;
@@ -319,9 +320,12 @@ export function FlatItem({
   toolRun?: ToolRun;
   /** Live preview: format the complete pending Markdown block, then take its physical tail. */
   maxRows?: number;
+  /** Readability cap on prose width; 0 = fill the terminal width. Default PROSE_MAX_COLS. */
+  proseMaxCols?: number;
 }) {
   const inner = Math.max(20, cols - PAGE_MARGIN * 2);
-  const w = item.kind === 'banner' ? inner : Math.min(inner, PROSE_MAX_COLS);
+  const cap = proseMaxCols > 0 ? proseMaxCols : inner;
+  const w = item.kind === 'banner' ? inner : Math.min(inner, cap);
   // P3-03: epoch-independent memo — a <Static key={staticEpoch}> remount recreates every FlatItem
   // (in-component useMemo would die with it), so the cache lives in flatten.ts, a WeakMap keyed on
   // the ITEM OBJECT (ids restart at 0 per TuiApp mount and would collide across instances) with the

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Context, TRUNCATED_RESULT_SENTINEL } from '../src/agent/context.js';
+import { Context, TRUNCATED_RESULT_SENTINEL, isReclaimedContent } from '../src/agent/context.js';
 import { MockProvider } from '../src/provider/mock.js';
 import type { Provider, ProviderEvent } from '../src/provider/provider.js';
 
@@ -339,7 +339,7 @@ test('degraded truncation spares state-bearing results while reproducible output
   const provider = new MockProvider([[{ type: 'done', stopReason: 'end_turn' }]]);
 
   assert.equal(await ctx.maybeSummarize(provider, 'mock', true), 'truncated');
-  assert.equal(toolResult(ctx, 'r1')?.content, TRUNCATED_RESULT_SENTINEL, 'reproducible output paid the bill');
+  assert.ok(isReclaimedContent(toolResult(ctx, 'r1')?.content ?? ''), 'reproducible output paid the bill (legacy or locator sentinel)');
   assert.equal(toolResult(ctx, 'a1')?.content, 'y'.repeat(800), 'the state-bearing agent answer was spared');
 });
 
@@ -354,8 +354,8 @@ test('degraded truncation only touches state-bearing results once nothing else i
   const provider = new MockProvider([[{ type: 'done', stopReason: 'end_turn' }]]);
 
   assert.equal(await ctx.maybeSummarize(provider, 'mock', true), 'truncated');
-  assert.equal(toolResult(ctx, 'r1')?.content, TRUNCATED_RESULT_SENTINEL, 'pass 1 took the reproducible body');
-  assert.equal(toolResult(ctx, 'a1')?.content, TRUNCATED_RESULT_SENTINEL, 'pass 2 took the state-bearing body — still over after pass 1');
+  assert.ok(isReclaimedContent(toolResult(ctx, 'r1')?.content ?? ''), 'pass 1 took the reproducible body');
+  assert.ok(isReclaimedContent(toolResult(ctx, 'a1')?.content ?? ''), 'pass 2 took the state-bearing body — still over after pass 1');
 });
 
 test('microcompact never overwrites the degradation tombstone', () => {
@@ -370,6 +370,7 @@ test('microcompact never overwrites the degradation tombstone', () => {
   ctx.recordActualTokens(1_000); // push the estimate over the microcompact gate
 
   const cleared = ctx.microcompact(new MockProvider());
+  // B2: prefix-aware guard must spare the legacy tombstone exactly (and locator variants).
   assert.equal(toolResult(ctx, 'x')?.content, TRUNCATED_RESULT_SENTINEL, 'the forensic marker survives');
   assert.equal(cleared, false, 'nothing reclaimable existed — microcompact must not claim it cleared');
 });

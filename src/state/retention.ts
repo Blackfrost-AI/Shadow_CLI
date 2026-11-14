@@ -29,7 +29,7 @@
 // BEFORE any pruning happens; `applyRetention` performs the move and reports what it did so the
 // caller can print a one-line notice.
 
-import { chmodSync, existsSync, lstatSync, mkdirSync, renameSync, statSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, renameSync, rmSync, statSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { SessionLog } from './session.js';
 
@@ -75,8 +75,9 @@ export interface RetentionSweepOpts {
 /** The session id is the log filename minus `.jsonl`, and it is joined DIRECTLY into the
  *  checkpoint-tree path — so a log planted as `.jsonl` (id `''`) or `...jsonl` (id `'..'`)
  *  would make join() walk OUT of the checkpoints dir (the root, or the whole `.shadow` tree).
- *  Accept only conservative filename shapes before touching any path built from an id. */
-function safeSessionId(id: string): boolean {
+ *  Accept only conservative filename shapes before touching any path built from an id. Exported
+ *  for toolSpill.ts — session-scoped spill dirs join the same id into a path. */
+export function safeSessionId(id: string): boolean {
   return /^[0-9A-Za-z][0-9A-Za-z._-]*$/.test(id);
 }
 
@@ -204,8 +205,44 @@ export function applyRetention(
         }
       }
     }
+
+    // 11.6.0 B3: the session's spill tree follows its log — a MOVE, never a delete. Every
+    // `[Old tool result content cleared — full output: …]` locator in the archived log points
+    // into this tree; deleting it would dangle them all. Mirrors the checkpoint move above:
+    // never overwrite an existing archive entry, per-entry failure is non-fatal. The path is
+    // computed inline (join(sessionsDir, id, 'spill')) rather than imported from toolSpill.ts
+    // to keep the agent→state import direction acyclic; it MUST stay in sync with spillDir().
+    const spillFrom = join(SessionLog.sessionsDir(workspaceRoot), c.id, 'spill');
+    if (existsSync(spillFrom)) {
+      const spillTo = join(archiveDir, `spill-${c.id}`);
+      if (!existsSync(spillTo)) {
+        try {
+          renameSync(spillFrom, spillTo);
+        } catch {
+          /* cross-device or busy — the log is archived; the spill stays put (still readable) */
+        }
+      }
+    }
   }
   return result;
+}
+
+/**
+ * Delete a session's spill tree — ONLY for an explicit user-initiated session delete, never from
+ * the retention sweep (B3: archival always MOVES). Best-effort and idempotent; an unsafe id is
+ * refused so a planted `.jsonl` name can never aim rmSync at the sessions root. Returns true when
+ * a tree was removed.
+ */
+export function deleteSessionSpill(workspaceRoot: string, sessionId: string): boolean {
+  if (!safeSessionId(sessionId)) return false;
+  const dir = join(SessionLog.sessionsDir(workspaceRoot), sessionId, 'spill');
+  try {
+    if (!existsSync(dir)) return false;
+    rmSync(dir, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Human-readable byte size for retention reporting. */

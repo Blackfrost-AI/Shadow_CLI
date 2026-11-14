@@ -147,6 +147,34 @@ test('envelope: a fitPayload-clamped envelope never exceeds the budget (END surv
   assert.equal(extractPayload(env2), forged);
 });
 
+// --- fitPayload hard-cap contract (11.6.1 reviewer adjustment) ---
+
+test('fitPayload: the result NEVER exceeds the cap — even below the payload floor', () => {
+  const payload = 'A'.repeat(3_000) + 'Z'.repeat(3_000);
+  for (const cap of [0, 1, 2, 10, 80, 100, 200, 511, 512, 1_000, 2_047, 2_048, 2_559, 2_560, 4_096, 16_384]) {
+    const out = fitPayload(payload, cap);
+    assert.ok(out.length <= cap, `cap ${cap}: got ${out.length} chars — the floor must never lift the result past the cap`);
+  }
+  // Hostile / fractional caps fail closed, never exceed.
+  assert.ok(fitPayload(payload, 100.9).length <= 100, 'fractional caps are floored');
+  assert.equal(fitPayload(payload, Number.NaN), '', 'NaN fails closed to empty');
+  assert.equal(fitPayload(payload, -5), '', 'negative caps fail closed to empty');
+  // Passthrough still wins whenever the content already fits.
+  assert.equal(fitPayload('tiny', 4), 'tiny');
+  assert.equal(fitPayload('tiny', 8), 'tiny');
+});
+
+test('fitPayload: production budgets keep the head/tail behavior unchanged', () => {
+  const payload = 'H'.repeat(30_000) + 'T'.repeat(30_000);
+  for (const cap of [2_560, 4_096, 16_384]) {
+    const out = fitPayload(payload, cap);
+    assert.ok(out.length <= cap - 2_048, `cap ${cap}: budget must stay cap - ENVELOPE_MARGIN`);
+    assert.ok(out.startsWith('HHHH'), 'head retained as a true prefix');
+    assert.ok(out.endsWith('TTTT'), 'tail retained as a true suffix');
+    assert.match(out, /characters omitted — head and tail retained/);
+  }
+});
+
 // --- envelopeSafeSlice: downstream cuts must never leave an envelope open ---
 
 test('envelopeSafeSlice: plain text gets an ordinary prefix cut', () => {

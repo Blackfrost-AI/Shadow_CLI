@@ -13,7 +13,7 @@ import { runtimeContextBlock } from './runtimeContext.js';
 import type { SandboxMode } from '../safety/sandboxPolicy.js';
 import { getLspService, lspNoteFor } from './lsp/index.js';
 import type { LspServiceConfig } from './lsp/service.js';
-import { spillIfOversized } from './toolSpill.js';
+import { spillIfOversized, spillReclaimedBody } from './toolSpill.js';
 import { isFallbackEligible, resolveFallbackEntry } from '../provider/fallback.js';
 import { looksLikeTokenOverflow } from '../provider/stream.js';
 import type { UserQuestion } from './approval.js';
@@ -50,6 +50,7 @@ import { approvalText } from '../util/approvalText.js';
 import { envelopeSafeSlice } from '../safety/envelope.js';
 import { hasKnownReasoningMarker } from '../provider/openai.js';
 import { DEFAULT_EFFORT, effortDirective } from './effort.js';
+import { factsSection } from './system.js';
 import { resolve as resolvePath, join, dirname, basename } from 'node:path';
 import { realpathSync } from 'node:fs';
 import { GLOBAL_DIR } from '../state/globalStore.js';
@@ -191,6 +192,14 @@ export interface LoopDeps {
    */
   spendGuard?: BudgetGuardConfig;
   /**
+   * Loop guard v2 thresholds (optional): cumulative per-(tool,args) failure limits — the
+   * NUDGE refuses the Nth identical failing call with an explicit redirect; the FATAL limit
+   * stops the run when the model ignores that redirect (existing fatal_tool_error plumbing).
+   * 0/0 disables the guard. Absent = built-in defaults (4/8); SHADOW_LOOP_GUARD_MAX_FAILS
+   * overrides both for tests and live diagnostics.
+   */
+  loopGuard2?: { nudge: number; fatal: number };
+  /**
    * SESSION-scoped "approve for session / for prefix" grants. Optional: a loop without one keeps
    * its grants to itself (tests, one-shot runs). Callers that construct a loop PER USER MESSAGE
    * must pass a shared instance, or every grant expires the moment the user types again.
@@ -206,6 +215,16 @@ export interface LoopDeps {
   readTracker?: ReadTracker;
   /** Goal or other durable UI state held outside Context message history. */
   continuityState?: string;
+  /**
+   * LIVE workspace-facts index (11.6.0 B4 — single facts render site). Called once per provider
+   * request; returns the capability-gated one-line-per-fact index ('' when empty or when the
+   * memory tool was removed). The loop renders it through `factsSection` (agent/system.ts): into
+   * the system prompt on non-caching providers (legacy placement), into the uncached volatile
+   * message tail on prompt-caching providers so mid-session memory writes surface next request
+   * without busting the cached prefix. Optional: sub-agent factories deliberately omit it —
+   * delegates never inherit the lead session's facts. Absent = no facts section anywhere.
+   */
+  factsProvider?: () => string;
   /** Session-local check selection/evidence; execution still passes the run_shell guards. */
   checks?: ProjectCheckStore;
   /** Bounded evidence-based correction, sharing this run's original budget (at most two). */
@@ -215,6 +234,8 @@ export interface LoopDeps {
 export interface LoopResult {
   stopReason: StopReasonExt;
   finalAnswer: string;
+  /** Iteration accounting at stop time (used/max), so consumers can label partial coverage N/M. */
+  iterations?: { used: number; max: number };
 }
 
 /** Bad-tool-call-JSON corrections fed back to the model before giving up (per run). */
@@ -230,6 +251,37 @@ const LOOP_GUARD_LIMIT = 3;
 // answer or choose a different action; the 6th identical attempt proves it ignored that recovery
 // window and stops the turn instead of burning the whole iteration budget.
 const LOOP_GUARD_FATAL_LIMIT = 6;
+/**
+ * Loop guard v2 — INTERLEAVED runaway detection (frosty-spark incident, 2026-11-07).
+ * The consecutive-identical guard above is evaded by interleaving: a model that runs
+ * verify(fail) → grep → edit → verify(fail) → … never trips it, and the incident measured
+ * 27 identical failing verify commands / 455 auto-continued turns in 34 minutes. This guard
+ * counts CUMULATIVE failures of the SAME (tool, error-code, normalized-args) key across the
+ * whole run — interleaving no longer resets it. The NUDGE denies the 4th failing attempt with
+ * an explicit redirect (the model has 3 full error transcripts in context); FATAL denies the
+ * 8th and stops the run (existing fatal_tool_error plumbing). Any success of that key clears
+ * its record; a genuine user steer clears all records.
+ */
+const RECURRING_FAIL_NUDGE_LIMIT = 4;
+const RECURRING_FAIL_FATAL_LIMIT = 8;
+/** Bound on distinct failing keys tracked (LRU-evict oldest); pathological arg-churn must not grow memory. */
+const RECURRING_FAIL_KEYS_MAX = 64;
+/**
+ * Loop guard v2 residual risks, recorded where the next engineer will look:
+ * - KEY MUTATION BYPASS: the key is (resolved tool name, JSON of args). A model that churns
+ *   args (whitespace, key order — JSON.stringify is insertion-order sensitive) gets fresh
+ *   keys. Accepted: the incident model repeated byte-identical commands 27×; back-to-back
+ *   repeats remain covered by the v1 consecutive guard; budget/max_iterations backstops all.
+ * - PER-MESSAGE SCOPE: records live on the AgentLoop instance and a fresh loop is built per
+ *   user message, so the attempt budget resets on each user turn — consistent with the
+ *   steer-clears-all philosophy (the user is the authority on unattended runaways).
+ * - PARALLEL ASYMMETRY (deliberate): identical FAILING siblings in one batch DO trip each
+ *   other (the v1 guard's per-sibling exemption does not apply here) — that is the incident
+ *   shape; a uniform failing batch terminates by its third occurrence.
+ * - WAIT-LOOP COST: a legitimate identical-args retry that legitimately needs ≥4 attempts
+ *   (e.g. an external service that must come up) is refused at the nudge limit; the escape
+ *   hatch is raising loopGuardNudge or varying args (backoff), which is the correct pattern.
+ */
 /** Synthetic tool_result content for a tool_use orphaned by an interrupt (ESC/Ctrl-C). */
 const INTERRUPTED_RESULT = 'Tool execution was interrupted (ESC / Ctrl-C) before this call produced a result.';
 const STEERED_RESULT = 'Tool execution was skipped because the user sent a new message before this call started.';
@@ -245,6 +297,19 @@ export class AgentLoop {
   private toolUseRetries = 0; // distinct budget: tool_use signaled but no call parsed
   private lastCallSig: string | null = null; // loop guard: signature of the previous tool call
   private consecutiveRepeats = 0; // loop guard: how many times that signature ran back-to-back
+  /**
+   * Loop guard v2: CUMULATIVE per-key counts for the same (tool, args) across the run —
+   * catches interleaved runaway loops the consecutive guard cannot see. `fails` counts
+   * executed failures; `denied` counts loop-guard refusals the model ignored and re-tried.
+   * The NUDGE refuses the call once `fails` reaches the nudge limit; the FATAL stop fires when
+   * the total attempt count reaches the fatal limit — i.e. the model ignored the redirect.
+   * Cleared per-key on that key's success and wholesale on a genuine user steer.
+   */
+  private readonly recurringFailures = new Map<string, { fails: number; denied: number }>();
+  /** Cap on distinct tracked keys; evict the least-recently-touched when exceeded. */
+  private recurringFailuresMax = RECURRING_FAIL_KEYS_MAX;
+  private recurringFailNudgeLimit = RECURRING_FAIL_NUDGE_LIMIT;
+  private recurringFailFatalLimit = RECURRING_FAIL_FATAL_LIMIT;
   /**
    * Read-before-edit tracker. Session-scoped when the caller passes one (same reason as
    * `approvals`: a loop is built per user message, so a per-loop instance forgot every read from
@@ -353,6 +418,20 @@ export class AgentLoop {
     this.now = deps.now ?? Date.now;
     const g = deps.spendGuard ? createBudgetState(deps.spendGuard) : null;
     this.guard = g && g.active ? g : null;
+    // Loop guard v2 thresholds: config beats built-in defaults; the env override beats both —
+    // it exists for tests and live diagnostics on a device (e.g. SHADOW_LOOP_GUARD_MAX_FAILS=2).
+    // Per-stage disable semantics (config.ts documents "0 disables that stage"): nudge=0 turns
+    // off the pre-execution redirect but leaves the FATAL backstop armed when fatal>0, so no
+    // single knob silently disarms the incident's hard stop. fatal=0 disables only the hard stop.
+    if (deps.loopGuard2 && deps.loopGuard2.nudge >= 0 && deps.loopGuard2.fatal >= 0) {
+      this.recurringFailNudgeLimit = deps.loopGuard2.nudge;
+      this.recurringFailFatalLimit = deps.loopGuard2.fatal;
+    }
+    const envMax = Number.parseInt(process.env.SHADOW_LOOP_GUARD_MAX_FAILS ?? '', 10);
+    if (Number.isFinite(envMax) && envMax >= 0) {
+      this.recurringFailNudgeLimit = envMax;
+      this.recurringFailFatalLimit = Math.max(envMax, RECURRING_FAIL_FATAL_LIMIT);
+    }
     // Continue this SESSION's numbering rather than restarting at 0 for every user message.
     if (deps.sessionLog) {
       try {
@@ -454,6 +533,9 @@ export class AgentLoop {
       content: [{ type: 'text', text: texts.join('\n\n') }],
     });
     for (const text of texts) this.deps.bus.emit({ type: 'steer_applied', text });
+    // Loop guard v2: a genuine user steer is the authority on whether to keep trying — the
+    // cumulative per-key failure records are stale advice now. Clear them wholesale.
+    this.recurringFailures.clear();
     return true;
   }
 
@@ -520,11 +602,48 @@ export class AgentLoop {
    */
   private controlStateBlocks(): string[] {
     const capabilities = { has: (name: string): boolean => this.deps.registry.get(name) !== undefined };
+    // NOTE: the iteration-budget counter is deliberately NOT here. controlStateBlocks() feeds BOTH
+    // the live system prompt AND the durable compaction `continuity` snapshot (maybeCompact). A
+    // per-turn counter baked into a summary would freeze a stale "12/30 left" as authoritative
+    // history. The counter travels only as the request's uncached volatile suffix (see below).
     return [
       this.deps.planMode?.block(capabilities) ?? '',
       this.deps.mission?.block(capabilities) ?? '',
       capabilities.has('todo_write') ? (this.deps.todoList?.block() ?? '') : '',
     ];
+  }
+
+  /**
+   * Compaction-proof iteration-budget awareness. Sent EVERY turn as the request's volatile suffix,
+   * which the Anthropic adapter places at the MESSAGE TAIL — after the rolling cache breakpoint, which
+   * sits on the last persisted history block — so the counter never enters the cached prefix (the
+   * prefix cache-hits every turn) and never reaches compaction continuity. The model always knows how
+   * many turns remain and can synthesize before the ceiling. Only emitted when an iteration cap exists
+   * (subagents); the unlimited main loop gets no block. Near the ceiling it switches to a loud directive
+   * to stop gathering and deliver the answer now.
+   */
+  private renderIterationBudgetBlock(): string {
+    const { used, max, remaining } = this.deps.budget.iterationState();
+    if (max <= 0 || remaining === null) return '';
+    const lines = ['## Iteration budget', `Turns used: ${used}/${max} · ${remaining} left.`];
+    // Warn window: the last ~25% of turns, but never more than 5 turns. A pure percentage would
+    // pressure a 200-turn headless main agent to stop investigating from turn 151 onward; an
+    // absolute cap keeps the "synthesize now" nudge close to the real ceiling on any budget size.
+    const warnWindow = Math.min(5, Math.max(2, Math.ceil(max * 0.25)));
+    if (remaining <= warnWindow) {
+      const urgency = remaining <= 1 ? 'THIS turn — there is no next turn.' : 'THIS turn or next.';
+      lines.push(
+        `⚠️ NEAR THE CEILING. Stop opening new files and stop re-reading. Consolidate what you have ` +
+          `ALREADY learned into your final answer ${urgency} A partial answer with your real ` +
+          'findings beats running out of turns with nothing delivered.',
+      );
+    } else {
+      lines.push(
+        'Pace yourself: keep a running list of findings as you go, and reserve your last turns to ' +
+          'synthesize the final answer. Do not spend turns re-reading material you already saw.',
+      );
+    }
+    return lines.join('\n');
   }
 
   /**
@@ -554,19 +673,32 @@ export class AgentLoop {
     system: string,
     force = false,
     aggressiveKeep = false,
+    /** The request's volatile tail (caching path) — counted so it cannot hide from the trigger. */
+    volatileSuffix?: string,
   ): Promise<boolean> {
+    // 11.6.0 information survival: persist a body BEFORE any reclaim tombstones it, so the
+    // sentinel carries a read_file locator instead of pointing at the void. Context stays fs-free
+    // — the loop owns the write; spillReclaimedBody never throws and never overwrites an existing
+    // full-body spill (B2). Session id comes from the session log (no LoopDeps change).
+    const spillSessionId = this.deps.sessionLog
+      ? SessionLog.sessionIdFromPath(this.deps.sessionLog.path)
+      : undefined;
+    const spillBody = (toolName: string, toolCallId: string, body: string): string | null =>
+      spillReclaimedBody({ workspaceRoot: this.deps.workspaceRoot, sessionId: spillSessionId, toolName, toolCallId, body });
     // P1B-02: cheap in-place reclamation FIRST — clear stale compactable tool_result bodies before
     // the (expensive) summarizer round-trip. Silent by design; if it frees enough, the summarizer
     // no-ops this turn. Wrapped so a microcompaction failure can never suppress the real fallback.
     try {
-      this.deps.context.microcompact(provider);
+      this.deps.context.microcompact(provider, spillBody);
     } catch {
       /* best-effort optimization; summarization below remains the safety net */
     }
     const result = await this.deps.context.maybeSummarize(provider, model, force, this.modelSignal, {
       system,
+      volatileSuffix,
       tools: this.deps.registry.toSchemas(),
       temperature: this.deps.temperature,
+      spillBody,
       continuity: [
         this.deps.continuityState ?? '',
         ...this.controlStateBlocks(),
@@ -695,21 +827,52 @@ export class AgentLoop {
           }
         }
       }
+      // Live facts index (11.6.0 B4 — single facts render site): rendered EVERY request via
+      // factsProvider, so mid-session memory writes are visible next turn. Bootstrap no longer
+      // bakes facts into deps.system. Best-effort: an unreadable memory store must not kill the
+      // turn (facts are durable in memory.json and return when the store heals).
+      let facts = '';
+      try {
+        facts = factsSection(this.deps.factsProvider?.() ?? '');
+      } catch {
+        /* facts are best-effort context, never a turn-blocking dependency */
+      }
+      // Prompt-caching adapters (declaration-driven — Provider.promptCaching, never name-matched)
+      // keep system + persisted history as a cache-stable prefix and deliver the volatile suffix
+      // at the message tail. On those, ALL volatile per-turn state (facts, effort, plan/mission/
+      // todo, iteration budget) travels in the tail so a todo_write or memory write never busts
+      // the cached prefix. Non-caching adapters keep today's all-in-system placement — exactly
+      // ONE channel carries each block per request (they fold the suffix into system themselves).
+      const caching = this.deps.provider.promptCaching === true;
       // Rebuild the system prompt each turn: base profile + the live effort directive
       // (model-agnostic — see agent/effort.ts) + plan/todo blocks. Joined with blank
-      // lines so sections never glue together; empties are dropped.
-      const sys = [
-        this.deps.system,
-        effortDirective(this.effort),
-        ...this.controlStateBlocks(),
-        this.runtimeContext(),
-      ]
+      // lines so sections never glue together; empties are dropped. The facts section sits
+      // right after the styled base — byte-identical to the pre-11.6.0 baked placement.
+      const sys = (
+        caching
+          ? [this.deps.system, this.runtimeContext()]
+          : [this.deps.system, facts, effortDirective(this.effort), ...this.controlStateBlocks(), this.runtimeContext()]
+      )
         .filter((s) => s && s.trim())
         .join('\n\n');
+      // Volatile per-turn state, delivered at the MESSAGE TAIL by caching adapters so it stays
+      // OUT of the cached prefix and out of compaction continuity (see renderIterationBudgetBlock).
+      // Caching path: facts index + effort + control blocks (plan/mission/todo), then the budget
+      // counter LAST. Non-caching path: those live in the system above; the tail carries only the
+      // budget counter. Emits NOTHING when every component is empty (unlimited loop, no live state).
+      // Hoisted above the compaction check so its size is COUNTED (integration-review adj2): the
+      // tail is real request payload — a large plan/todo/facts tail must not hide from the trigger.
+      const volatileSuffix = (
+        caching
+          ? [facts, effortDirective(this.effort), ...this.controlStateBlocks(), this.renderIterationBudgetBlock()]
+          : [this.renderIterationBudgetBlock()]
+      )
+        .filter((s) => s && s.trim())
+        .join('\n\n') || undefined;
       // Check immediately before EVERY provider request. Doing this only after tool execution made
       // text-only sessions skip proactive compaction and depend on a server overflow to recover.
       try {
-        await this.maybeCompact(this.deps.provider, this.deps.model, sys);
+        await this.maybeCompact(this.deps.provider, this.deps.model, sys, false, false, volatileSuffix);
       } catch (err) {
         // Compaction is an optimization; a failed summary must not tear down the turn. But the
         // failure itself must be VISIBLE (F04-11): the estimator/harvest/trim paths can throw on
@@ -735,6 +898,7 @@ export class AgentLoop {
       const req: CompletionRequest = {
         model: this.deps.model,
         system: sys,
+        systemVolatileSuffix: volatileSuffix,
         // Defense-in-depth: an already-corrupt history (e.g. a snapshot taken mid-
         // interrupt by an older build) can end on an assistant tool_use with no
         // matching tool_result — which 400s every request. Heal it before sending.
@@ -841,6 +1005,7 @@ export class AgentLoop {
             emptyNudgeSent = true;
             context.append({
               role: 'user',
+              synthetic: true,
               content: [
                 {
                   type: 'text',
@@ -976,6 +1141,7 @@ export class AgentLoop {
             });
             context.append({
               role: 'user',
+              synthetic: true,
               content: [
                 {
                   type: 'text',
@@ -1002,6 +1168,7 @@ export class AgentLoop {
             bus.emit({ type: 'retry', attempt: this.toolUseRetries, delayMs: 0, reason: 'tool call signaled but none parsed' });
             context.append({
               role: 'user',
+              synthetic: true,
               content: [{ type: 'text', text: 'You indicated a tool call but none was received. Re-send it using the function-calling format.' }],
             });
             continue;
@@ -1718,13 +1885,76 @@ export class AgentLoop {
           call.id,
           false,
           `You have called ${call.name} with these exact arguments ${this.consecutiveRepeats} times in a row ` +
-            `with no other action between. ` +
-            (fatal
-              ? 'Shadow stopped this repeated-call loop; report the missing evidence or choose a different approach on the next user turn.'
-              : 'Take a different action, or stop if the task is complete.'),
+          `with no other action between. ` +
+          (fatal
+            ? 'Shadow stopped this repeated-call loop; report the missing evidence or choose a different approach on the next user turn.'
+            : 'Take a different action, or stop if the task is complete.'),
         ),
         isFatal: fatal,
       };
+    }
+
+    // Loop guard v2 — interleaved runaway detection (frosty-spark incident): the consecutive
+    // counter above is reset by interleaving, so a write→verify(fail)→grep→rewrite cycle ran
+    // 27 identical failing verify commands without ever tripping it. This check counts
+    // CUMULATIVE failures of the same (tool, args) key across the run. The denial happens
+    // BEFORE execution so the failing call cannot burn wall-clock, tokens, or disk state a
+    // fourth (NUDGE) or eighth (FATAL) time; the model still holds the three full error
+    // transcripts of the earlier attempts in context, which is the material it needs to
+    // change strategy.
+    if (!delegatedCheck && (this.recurringFailNudgeLimit > 0 || this.recurringFailFatalLimit > 0)) {
+      const key = this.recurringFailureKey(call);
+      const rec = this.recurringFailures.get(key);
+      if (rec) {
+        // attempts = executed failures + already-refused retries. The NUDGE denies THIS call
+        // when it would be the nudgeLimit-th failing attempt (fails + this one); the FATAL stop
+        // fires when attempts reach the fatal limit — i.e. the model ignored the redirect.
+        // nudge=0 (config) disables the redirect stage but NOT this fatal backstop; the
+        // per-stage semantics are documented on loopGuardNudge/loopGuardFatal in config.ts.
+        const attempts = rec.fails + rec.denied + 1;
+        const fatalLimit = this.recurringFailFatalLimit;
+        if (fatalLimit > 0 && attempts >= fatalLimit) {
+          bus.emit({
+            type: 'tool_denied',
+            call,
+            reason: `repeated failing call persisted after loop guard v2 (${attempts} attempts)`,
+          });
+          return {
+            block: this.resultBlock(
+              call.id,
+              false,
+              `Shadow stopped this call: ${call.name} with these exact arguments has now been attempted ` +
+                `${attempts} times in this run (${rec.fails} real failures, ${rec.denied} refused by the loop ` +
+                `guard) and every executed attempt failed. Re-attempting the identical call cannot succeed. ` +
+                `Report what is missing or choose a fundamentally different approach on the next user turn.`,
+            ),
+            isFatal: true,
+          };
+        }
+        if (attempts >= this.recurringFailNudgeLimit && this.recurringFailNudgeLimit > 0) {
+          rec.denied += 1;
+          // LRU refresh: an actively-denied key must stay the most-recently-touched so the
+          // 64-key cap cannot evict it mid-escalation and silently reset the counters.
+          this.recurringFailures.delete(key);
+          this.recurringFailures.set(key, rec);
+          bus.emit({
+            type: 'tool_denied',
+            call,
+            reason: `repeated failing call (loop guard v2, ${rec.fails} failures)`,
+          });
+          return {
+            block: this.resultBlock(
+              call.id,
+              false,
+              `Shadow refused to run ${call.name} this time: this exact call (same arguments) has already ` +
+                `failed ${rec.fails} times in this run. Running it again will fail the same way. Re-read the ` +
+                `errors above, fix the actual cause (the call itself, its inputs, or the state it depends ` +
+                `on), and take a different action — or stop and report what is missing.`,
+            ),
+            isFatal: false,
+          };
+        }
+      }
     }
 
     const preview = previewOf(call);
@@ -2060,6 +2290,9 @@ export class AgentLoop {
             turn: this.toolTurn,
           }
         : undefined,
+      // 11.6.0: session-scoped spill target for oversize web payloads (same derivation as
+      // checkpoint); absent when no session log exists — tools fall back to the legacy dir.
+      sessionId: sessionLog ? SessionLog.sessionIdFromPath(sessionLog.path) : undefined,
       // Auto-format-after-write (plan 2.1): config block threaded down to the file tools.
       formatters: this.deps.formatters,
       onShellOutput: (chunk, stream) => {
@@ -2187,6 +2420,43 @@ export class AgentLoop {
   private emitToolEnd(call: ToolCall, result: ToolResult): void {
     this.deps.bus.emit({ type: 'tool_end', call, result });
     this.emitFindings(result, call);
+    this.recordRecurringFailure(call, result);
+  }
+
+  /**
+   * Loop guard v2 bookkeeping: count CUMULATIVE failures per (tool, args) key. Called for every
+   * completed tool execution. A success of that key clears its record — the cycle is broken;
+   * other keys' records are untouched. Records never survive a user steer.
+   */
+  private recordRecurringFailure(call: ToolCall, result: ToolResult): void {
+    // nudge=0/fatal>0 still records: the fatal backstop stays armed with the redirect off.
+    if (this.recurringFailNudgeLimit <= 0 && this.recurringFailFatalLimit <= 0) return; // fully disabled
+    const key = this.recurringFailureKey(call);
+    if (result.ok) {
+      this.recurringFailures.delete(key);
+      return;
+    }
+    const rec = this.recurringFailures.get(key) ?? { fails: 0, denied: 0 };
+    rec.fails += 1;
+    // LRU bound: evict the least-recently-updated entry when the cap is hit so pathological
+    // arg-churn cannot grow memory without limit. The victim's count is lost, not others'.
+    if (this.recurringFailures.size >= this.recurringFailuresMax && !this.recurringFailures.has(key)) {
+      const oldestKey = this.recurringFailures.keys().next().value;
+      if (oldestKey !== undefined && oldestKey !== key) this.recurringFailures.delete(oldestKey);
+    }
+    // Map iteration order = insertion order; delete+set moves the touched key to the end.
+    this.recurringFailures.delete(key);
+    this.recurringFailures.set(key, rec);
+  }
+
+  /**
+   * Stable identity for a failing call: the resolved tool name plus the normalized args —
+   * NOT the error code. The incident itself showed the error text SHIFT mid-loop (shell EOF
+   * error → different SyntaxError), so an error-code-keyed counter would have reset exactly
+   * then. Same args failing repeatedly is the loop signature, whatever the error says.
+   */
+  private recurringFailureKey(call: ToolCall): string {
+    return `${call.name}:${safeJson(call.input) ?? ''}`;
   }
 
   private emitFindings(result: ToolResult, call: ToolCall): void {
@@ -2268,6 +2538,8 @@ export class AgentLoop {
         toolName,
         toolCallId,
         workspaceRoot: this.deps.workspaceRoot,
+        // 11.6.0: session-scoped spill dir (derived like the ToolContext checkpoint id).
+        sessionId: this.deps.sessionLog ? SessionLog.sessionIdFromPath(this.deps.sessionLog.path) : undefined,
         // Keep the preview envelope-safe: a head that ends mid-`<<<UNTRUSTED_CONTENT_BEGIN>>>`
         // would make following text look trusted.
         slice: envelopeSafeSlice,
@@ -2496,7 +2768,8 @@ export class AgentLoop {
         extra: { reason, finalAnswer: finalAnswer?.slice(0, 200) },
       });
     }
-    return { stopReason: reason, finalAnswer };
+    const { used, max } = this.deps.budget.iterationState();
+    return { stopReason: reason, finalAnswer, iterations: { used, max } };
   }
 
   /** A profile never supplies an executor or a permission grant. Dispatch the exact resolved
@@ -2564,7 +2837,7 @@ export class AgentLoop {
     this.stopHooksEvaluated = false;
     this.deps.bus.emit({ type: 'retry', attempt: guard.attempts, delayMs: 0, reason: `completion check: ${reasons.join(' ')}` });
     this.deps.sessionLog?.record({ kind: 'completion_correction', attempt: guard.attempts, reasons });
-    this.deps.context.append({ role: 'user', content: [{ type: 'text', text: completionPrompt(reasons, guard.attempts, guard.maxRetries) }] });
+    this.deps.context.append({ role: 'user', synthetic: true, content: [{ type: 'text', text: completionPrompt(reasons, guard.attempts, guard.maxRetries) }] });
     return true;
   }
 

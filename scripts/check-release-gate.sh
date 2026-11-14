@@ -54,6 +54,18 @@ if [ -f scripts/check-webui-assets.mjs ]; then
   fi
 fi
 
+# --- embedded prompts must not be stale (v11.5.0 lesson) ---------------------------------
+# src/system/bundledPrompts.ts is generated from prompts/ by scripts/embed-prompts.mjs.
+# resolveSystem prefers the on-disk tree in dev, so a stale embedding is invisible locally
+# and only shows up in the compiled binary — the exact v10.2.0 landmine class. Fail if
+# regenerating would change the committed file.
+if [ -f scripts/embed-prompts.mjs ]; then
+  if ! node scripts/embed-prompts.mjs --check; then
+    echo "RELEASE BLOCKED: embedded prompts are stale. Run: node scripts/embed-prompts.mjs" >&2
+    exit 1
+  fi
+fi
+
 # --- the packaged Node distribution must match source -----------------------------------
 # package.json publishes dist/, not src/. A green source typecheck is therefore insufficient:
 # stale compiled JavaScript can otherwise ship even though the current TypeScript is correct.

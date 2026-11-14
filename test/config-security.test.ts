@@ -300,6 +300,65 @@ test('maxIterations:0 with no budget gets a wall-clock backstop injected (never 
       typeof cfg.budget.maxWallClockSec === 'number' && cfg.budget.maxWallClockSec > 0,
       'a wall-clock backstop is injected so "unlimited" can never mean "no cap at all"',
     );
+    assert.equal(cfg.budget.maxWallClockSec, 6 * 60 * 60, 'default backstop remains 6h');
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+test('budget.backstopWallClockSec raises the maxIterations:0 ceiling (long-range engagements)', () => {
+  const ws = mkdtempSync(join(tmpdir(), 'cfgsec5-'));
+  try {
+    writeFileSync(
+      join(ws, 'shadow.config.json'),
+      JSON.stringify({ maxIterations: 0, budget: { backstopWallClockSec: 7 * 24 * 60 * 60 } }),
+    );
+    const cfg = loadConfig(ws);
+    assert.equal(
+      cfg.budget.maxWallClockSec,
+      7 * 24 * 60 * 60,
+      'an explicit week-scale backstop replaces the 6h default',
+    );
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+test('budget.backstopWallClockSec:0 disables the injected ceiling (explicit truly-unlimited)', () => {
+  const ws = mkdtempSync(join(tmpdir(), 'cfgsec6-'));
+  try {
+    writeFileSync(
+      join(ws, 'shadow.config.json'),
+      JSON.stringify({ maxIterations: 0, budget: { backstopWallClockSec: 0 } }),
+    );
+    const cfg = loadConfig(ws);
+    assert.equal(cfg.maxIterations, 0, 'unlimited iterations honored');
+    assert.equal(
+      cfg.budget.maxWallClockSec,
+      undefined,
+      'backstopWallClockSec:0 is an explicit opt-out — no ceiling is injected',
+    );
+  } finally {
+    rmSync(ws, { recursive: true, force: true });
+  }
+});
+
+test('an explicit budget.maxWallClockSec is never overridden by the backstop injection', () => {
+  const ws = mkdtempSync(join(tmpdir(), 'cfgsec7-'));
+  try {
+    writeFileSync(
+      join(ws, 'shadow.config.json'),
+      JSON.stringify({
+        maxIterations: 0,
+        budget: { maxWallClockSec: 3600, backstopWallClockSec: 604800 },
+      }),
+    );
+    const cfg = loadConfig(ws);
+    assert.equal(
+      cfg.budget.maxWallClockSec,
+      3600,
+      'the explicit ceiling wins — the injection is skipped entirely when maxWallClockSec is set',
+    );
   } finally {
     rmSync(ws, { recursive: true, force: true });
   }

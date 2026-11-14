@@ -44,9 +44,11 @@ export function fitLines(lines: string[], width: number): string[] {
 }
 
 /** Inner content width for a terminal column count. */
-export function contentWidth(cols: number, kind: string): number {
+export function contentWidth(cols: number, kind: string, proseMaxCols: number = PROSE_MAX_COLS): number {
   const inner = Math.max(1, cols - PAGE_MARGIN * 2);
-  return kind === 'banner' ? inner : Math.min(inner, PROSE_MAX_COLS);
+  // proseMaxCols <= 0 means "fill the terminal width" (no readability cap).
+  const cap = proseMaxCols > 0 ? proseMaxCols : inner;
+  return kind === 'banner' ? inner : Math.min(inner, cap);
 }
 
 // ── committed transcript row ─────────────────────────────────────────────────
@@ -77,6 +79,7 @@ export class FlatCell implements Component {
   private foldTables: boolean;
   private sig: string;
   private image: Image | undefined;
+  private proseMaxCols: number;
 
   constructor(
     private item: FlattenItem,
@@ -84,11 +87,13 @@ export class FlatCell implements Component {
     continuation = false,
     toolRun?: ToolRun,
     foldTables = true,
+    proseMaxCols = PROSE_MAX_COLS,
   ) {
     this.collapsed = collapsed;
     this.continuation = continuation;
     this.toolRun = toolRun;
     this.foldTables = foldTables;
+    this.proseMaxCols = proseMaxCols;
     this.sig = runSig(toolRun);
     // Graphics protocols embed the payload verbatim. Only base64 may cross that boundary;
     // a tool-supplied escape must never terminate the image and become a terminal command.
@@ -126,6 +131,12 @@ export class FlatCell implements Component {
     return this.lines;
   }
 
+  setProseMaxCols(n: number): void {
+    if (n === this.proseMaxCols) return;
+    this.proseMaxCols = n;
+    this.cachedLines = null;
+  }
+
   invalidate(): void {
     this.cachedWidth = -1;
     this.cachedLines = null;
@@ -136,7 +147,7 @@ export class FlatCell implements Component {
     if (this.cachedLines && this.cachedWidth === width) {
       return this.cachedLines;
     }
-    const w = contentWidth(width, this.item.kind);
+    const w = contentWidth(width, this.item.kind, this.proseMaxCols);
     if (this.item.kind === 'image' && this.item.image) {
       const im = this.item.image;
       const label = `[image] ${approvalText(im.alt || 'image')} · ${approvalText(im.mediaType.replace(/^image\//, ''))} ${formatBytes(Buffer.byteLength(im.bytes, 'base64'))}`;
@@ -192,6 +203,13 @@ export class StreamCell implements Component {
   private cachedText = '';
   private cachedContinuation = false;
   private cachedLines: string[] | null = null;
+  private proseMaxCols = PROSE_MAX_COLS;
+
+  setProseMaxCols(n: number): void {
+    if (n === this.proseMaxCols) return;
+    this.proseMaxCols = n;
+    this.cachedLines = null;
+  }
 
   setText(text: string, continuation: boolean): void {
     if (text === this.text && continuation === this.continuation) return;
@@ -225,7 +243,7 @@ export class StreamCell implements Component {
       text: this.text,
       tight: this.continuation,
     };
-    const w = contentWidth(width, 'assistant');
+    const w = contentWidth(width, 'assistant', this.proseMaxCols);
     const lines = flattenItem(item, w, false, PIN_THEME, this.continuation, false);
     const pad = ' '.repeat(Math.min(PAGE_MARGIN, Math.max(0, width - 1)));
     const out = lines.map((ln) => {

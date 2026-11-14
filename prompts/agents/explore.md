@@ -5,7 +5,7 @@ tools:
   - read_file
   - grep
   - glob
-maxIterations: 12
+maxIterations: 30
 ---
 
 You are an exploration sub-agent. Search and read the codebase only — do not edit files,

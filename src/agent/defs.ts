@@ -21,7 +21,10 @@ const BUILTIN_EXPLORE: AgentDef = {
   name: 'explore',
   description: 'Fast read-only codebase exploration',
   tools: ['read_file', 'grep', 'glob', 'repository_context'],
-  maxIterations: 12,
+  // Headroom for a multi-file read-only review. The old 12 was exhausted by re-read thrash after
+  // compaction; budget-awareness + externalization discipline (agentTool/loop) do the real work,
+  // this just gives a genuine review room to finish. Still capped by the parent's ceiling.
+  maxIterations: 30,
   systemPrompt:
     'You are an exploration sub-agent. Search and read the codebase only — do not edit files, ' +
     'run shell commands, or make network requests. Return a concise report of findings.',
@@ -32,7 +35,9 @@ const BUILTIN_REVIEWER: AgentDef = {
   name: 'reviewer',
   description: 'Careful self-review and critique sub-agent. Read/search focused.',
   tools: ['read_file', 'grep', 'glob', 'repository_context'],
-  maxIterations: 10,
+  // A real review reads several files then synthesizes; 10 turns died mid-review. Headroom only —
+  // budget-awareness + the read-only delivery discipline prevent the thrash. Parent-capped.
+  maxIterations: 20,
   systemPrompt: [
     'You are a reviewer sub-agent in the Shadow harness.',
     'Review the delegated task, code, plan or changes with fresh eyes.',

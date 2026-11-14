@@ -26,6 +26,22 @@ test('src/tui.tsx stays under its structural line budget', () => {
   );
 });
 
+/**
+ * The Snowfall shell had NO gate and accreted to exactly 5,000 lines — the same failure mode
+ * tui.tsx had before plan 2.4. Ratchet only: new logic belongs in a src/app/* module
+ * (dialogs, cells, overlay, autocomplete already model this).
+ */
+const APP_MAX_LINES = 5_010;
+
+test('src/app/app.ts stays under its structural line budget', () => {
+  const count = lineCount('src/app/app.ts');
+  assert.ok(
+    count <= APP_MAX_LINES,
+    `src/app/app.ts is ${count} lines; the budget is ${APP_MAX_LINES}. ` +
+      'Extract a module under src/app/ instead of growing the shell — do not raise the budget.',
+  );
+});
+
 test('the plan-2.4 extracted slices exist as their own modules', () => {
   // The line budget is only honest if the slices it was cut into live OUTSIDE tui.tsx. If one of
   // these is missing, someone reverted an extraction to dodge the gate by inlining elsewhere.

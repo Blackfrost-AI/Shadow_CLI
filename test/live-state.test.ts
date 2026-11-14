@@ -77,7 +77,8 @@ test('D3/D4: compaction and its token count are interruptible and bounded', () =
   assert.match(ctx, /signal, \/\/ D3/, 'and passes it to provider.send — the round trip ESC must stop');
   assert.match(ctx, /if \(real > this\.lastActualTokens\) this\.lastActualTokens = real;/,
     'a count must never RATCHET the recorded size down and un-trigger compaction');
-  assert.match(ctx, /system: countCtx\?\.system/, 'the count includes system…');
+  assert.match(ctx, /countCtx\?\.system/, 'the count includes system (caching: system only; non-caching: system+tail)…');
+  assert.match(ctx, /countCtx\?\.volatileSuffix/, '…and the volatile tail is counted where the adapter carries it (adj2)…');
   assert.match(ctx, /tools: countCtx\?\.tools/, '…and tools, so it matches the real request');
   const anth = readFileSync(new URL('../src/provider/anthropic.ts', import.meta.url), 'utf8');
   assert.match(anth, /AbortSignal\.timeout\(10_000\)/, 'countTokens is bounded');

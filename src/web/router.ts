@@ -106,6 +106,16 @@ export async function readJsonBody(req: IncomingMessage, maxBytes = 1 << 20): Pr
 // ── /api/state ───────────────────────────────────────────────────────────────
 
 function registerStateRoutes(route: RouteFn, ctx: ApiContext): void {
+  // Companion handshake: lets Shadow Desktop / mobile confirm this is a Shadow host and learn the
+  // companion protocol version + capabilities before listing sessions. Secret-free by design.
+  route('GET', /^\/api\/host$/, () => ({
+    status: 200,
+    body: {
+      name: 'shadow',
+      protocol: 1,
+      capabilities: ['sessions', 'resume', 'chat', 'interrupt', 'approvals', 'autonomy', 'transcript', 'events', 'projects', 'work'],
+    },
+  }));
   route('GET', /^\/api\/state$/, async () => {
     const cfg = loadGlobalConfig();
     const agents = loadAgentDefs(ctx.workspaceRoot).map((a) => ({

@@ -66,6 +66,20 @@ function resultArtifact(runtime: McpRuntimeOptions, body: string, cap: number, s
 }
 
 /**
+ * 11.6.0 information survival: when resultArtifact persisted the FULL body, point at it from a
+ * TRUSTED provenance line (outside the envelope, host-authored — the id is our own UUID, not
+ * server text). The artifact id used to reach the model only as serialized data JSON; a model
+ * reading the summary missed the recovery path. REUSES the existing McpArtifactStore — no
+ * duplicate spill — and the mcp_artifact tool pages the full body back. When the save failed,
+ * resultArtifact's artifactUnavailable note keeps today's visible degradation: no locator promised.
+ */
+function artifactProvenance(artifactData: unknown): string {
+  const a = (artifactData as { artifact?: { id?: string; characters?: number } } | undefined)?.artifact;
+  if (!a?.id) return '';
+  return `Full result (${a.characters ?? '?'} chars) saved as MCP artifact ${a.id} — retrieve it with the mcp_artifact tool.\n`;
+}
+
+/**
  * F07-12: an MCP tool's NAME and DESCRIPTION are server-controlled and enter the tool schema —
  * the instruction surface the model reads on EVERY request, not only when a result arrives (the
  * P3-05 envelope covers tool RESULTS only). The name is therefore collapsed to the identifier
@@ -324,6 +338,7 @@ export class McpClient implements McpConnection {
       // render a tool result identically.
       const body = mcpResultBody(parts);
       const artifactData = resultArtifact(this.runtime, body, cap, this.name, name);
+      const provenance = artifactProvenance(artifactData);
       // P3-05: a server's reply is untrusted content — a compromised or hostile MCP server can put
       // model-directed instructions in any response. Envelope it (payload byte-for-byte) on BOTH
       // the success and the isError path, and stop duplicating the body into data (the old
@@ -331,11 +346,11 @@ export class McpClient implements McpConnection {
       // to the result budget BEFORE enveloping so the END marker always survives — a downstream
       // cut that severed it would hand a forged END inside the reply its escape wedge.
       if (res.isError) {
-        const msg = body ? envelopUntrusted({ tool: headerTool, source, content: fitPayload(body, cap) }) : 'MCP tool error';
+        const msg = body ? `${provenance}${envelopUntrusted({ tool: headerTool, source, content: fitPayload(body, cap) })}` : 'MCP tool error';
         return { ...fail(toolName, risk, Date.now() - start, 'mcp_error', msg), ...(artifactData ? { data: artifactData } : {}) };
       }
       if (!body) return ok(toolName, risk, Date.now() - start, parts.length ? 'tool returned non-text content' : 'ok');
-      return ok(toolName, risk, Date.now() - start, envelopUntrusted({ tool: headerTool, source, content: fitPayload(body, cap) }), artifactData);
+      return ok(toolName, risk, Date.now() - start, `${provenance}${envelopUntrusted({ tool: headerTool, source, content: fitPayload(body, cap) })}`, artifactData);
     } catch (e) {
       // A JSON-RPC error reply is server-authored — untrusted content too (it used to surface raw
       // via mcp_failed). Our own transport/timeout/abort messages stay plain.
@@ -546,15 +561,16 @@ export class McpHttpClient implements McpConnection {
       const parts = res.content ?? [];
       const body = mcpResultBody(parts);
       const artifactData = resultArtifact(this.runtime, body, cap, this.name, name);
+      const provenance = artifactProvenance(artifactData);
       // P3-05: same containment as the stdio transport — the reply is untrusted content; envelope
       // it on both paths (payload clamped BEFORE enveloping so the END marker survives) and drop
       // the unwrapped data duplicate.
       if (res.isError) {
-        const msg = body ? envelopUntrusted({ tool: headerTool, source, content: fitPayload(body, cap) }) : 'MCP tool error';
+        const msg = body ? `${provenance}${envelopUntrusted({ tool: headerTool, source, content: fitPayload(body, cap) })}` : 'MCP tool error';
         return { ...fail(toolName, risk, Date.now() - start, 'mcp_error', msg), ...(artifactData ? { data: artifactData } : {}) };
       }
       if (!body) return ok(toolName, risk, Date.now() - start, parts.length ? 'tool returned non-text content' : 'ok');
-      return ok(toolName, risk, Date.now() - start, envelopUntrusted({ tool: headerTool, source, content: fitPayload(body, cap) }), artifactData);
+      return ok(toolName, risk, Date.now() - start, `${provenance}${envelopUntrusted({ tool: headerTool, source, content: fitPayload(body, cap) })}`, artifactData);
     } catch (e) {
       // Server-authored JSON-RPC errors are untrusted content too — envelope them; transport
       // failures (timeout/abort/HTTP status) stay plain.

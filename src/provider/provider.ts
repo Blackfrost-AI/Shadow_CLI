@@ -113,6 +113,14 @@ export interface Message {
   responsesReasoning?: { model: string; items: ResponsesReasoningItem[] };
   /** A partial assistant turn retained for resume/export after interruption or stream failure. */
   interrupted?: boolean;
+  /**
+   * Harness-generated turn (corrective nudges, denial notes, recovery notices) — NOT
+   * operator-authored. Excluded from compaction's instruction harvest so machine text can never
+   * become an immortal objective bullet (F1, api-injection-study). Wire mappers build explicit
+   * fields, so this marker never leaves the process; JSON snapshots carry it additively and
+   * legacy snapshots simply lack it (unmarked = legacy semantics).
+   */
+  synthetic?: boolean;
 }
 
 export interface ToolCall {
@@ -169,6 +177,19 @@ export type ProviderEvent =
 export interface CompletionRequest {
   model: string;
   system: string;
+  /**
+   * Volatile per-turn text that MUST NOT enter the cached prompt prefix (e.g. the iteration-budget
+   * counter). The Anthropic adapter appends it at the MESSAGE TAIL, AFTER the rolling cache breakpoint
+   * (which sits on the last persisted history block) and left uncached. Because the cached prefix
+   * terminates on persisted bytes that recur in the next request, the entire tools → system → history
+   * prefix cache-hits every turn while this text changes; only the trailing counter is re-processed.
+   * (Placing it in `system`, even as a second block, would precede the message breakpoint and bust the
+   * rolling cache; placing the breakpoint ON the counter would write an entry ending in bytes that
+   * never recur — unhittable.) Adapters without prompt caching fold it into the system text. It is
+   * request-only and never written back to context, so it cannot accumulate in history or reach a
+   * compaction summary. Omitted ⇒ no suffix. Never put stable instructions here — they would lose caching.
+   */
+  systemVolatileSuffix?: string;
   messages: Message[];
   tools: ToolSchema[];
   maxOutputTokens: number; // per-call OUTPUT cap (distinct from the budget ceiling)
@@ -195,6 +216,15 @@ export type ToolChoice =
 
 export interface Provider {
   readonly name: string;
+  /**
+   * True when this adapter keeps a prompt-cache-stable prefix (system + persisted history) and
+   * delivers `systemVolatileSuffix` at the message tail, AFTER the rolling cache breakpoint.
+   * The loop uses it to route volatile per-turn state (facts index, effort, plan/mission/todo,
+   * iteration budget) out of the cached system into the tail. Optional and declaration-driven:
+   * adapters that don't implement it (mocks, OpenAI-compatible, …) are treated as NON-caching
+   * and keep the legacy all-in-system placement. Never inferred from the provider name.
+   */
+  readonly promptCaching?: boolean;
   /** Account-backed inference must not silently retry error recovery or switch billing connections. */
   readonly allowAutomaticFallback?: boolean;
   send(req: CompletionRequest): AsyncIterable<ProviderEvent>;
