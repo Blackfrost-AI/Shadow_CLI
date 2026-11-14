@@ -9,8 +9,11 @@
 // interpolation: fixed argv, scrubbed env, bounded timeout. The scanner binary is
 // probed on PATH once and cached; absence is an honest failure, never a silent skip.
 //
-// Risk tier 'write': it spawns an external scanner and writes a SARIF artifact (and
-// optionally mutates the evidence store). It never edits source files.
+// Risk tier 'exec': it spawns an external scanner (a subprocess, like run_shell /
+// sample_run / bg_shell) and writes a SARIF artifact (and optionally mutates the
+// evidence store). It never edits source files. 'exec' — not 'write' — so auto-edit
+// still requires confirmation before launching the subprocess (permissions.ts gates
+// exec|network under auto-edit, but auto-approves write).
 
 import { spawnSync } from 'node:child_process';
 import { chmodSync, mkdirSync, readFileSync, existsSync, statSync } from 'node:fs';
@@ -107,7 +110,7 @@ function countByLevel(sarif: unknown): { error: number; warning: number; note: n
 
 export const sastScan: Tool<SastScanInput, SastScanData> = {
   name: 'sast_scan',
-  risk: 'write',
+  risk: 'exec',
   deferred: true,
   searchAliases: [
     'sast', 'semgrep', 'static-analysis', 'code-scan', 'lint-security', 'sarif', 'codeql',
@@ -123,7 +126,7 @@ export const sastScan: Tool<SastScanInput, SastScanData> = {
     'absence is reported honestly. Fixed argv, scrubbed env, bounded timeout.',
   async run(input: SastScanInput, ctx): Promise<ToolResult<SastScanData>> {
     const start = Date.now();
-    const failNow = (code: string, message: string) => fail('sast_scan', 'write', Date.now() - start, code, message);
+    const failNow = (code: string, message: string) => fail('sast_scan', 'exec', Date.now() - start, code, message);
     try {
       const probe = probeSemgrep();
       if (input.action === 'check') {
@@ -131,7 +134,7 @@ export const sastScan: Tool<SastScanInput, SastScanData> = {
           action: 'check',
           semgrep: { available: !!probe.path, ...(probe.path ? { path: probe.path } : {}), ...(probe.version ? { version: probe.version } : {}) },
         };
-        return ok('sast_scan', 'write', Date.now() - start, JSON.stringify(data), data);
+        return ok('sast_scan', 'exec', Date.now() - start, JSON.stringify(data), data);
       }
 
       if (!probe.path) {
@@ -259,7 +262,7 @@ export const sastScan: Tool<SastScanInput, SastScanData> = {
         metricsOff: true,
       };
       const summary = clamp(JSON.stringify(data), MAX_OUTPUT_CHARS);
-      return ok('sast_scan', 'write', Date.now() - start, summary, data);
+      return ok('sast_scan', 'exec', Date.now() - start, summary, data);
     } catch (e) {
       return failNow('scan_error', (e as Error).message);
     }

@@ -227,3 +227,15 @@ test('sast_scan: jail escape on out-of-workspace target refused', async () => {
     rmSync(ws, { recursive: true, force: true });
   }
 });
+
+test('sast_scan: risk tier is exec — a spawned scanner must be gated like run_shell/sample_run', async () => {
+  // sast_scan spawns an external subprocess. It must carry the 'exec' tier so auto-edit
+  // requires confirmation before launch; 'write' would auto-approve the spawn
+  // (permissions.ts: auto-edit gates exec|network, auto-approves write).
+  assert.equal(sastScan.risk, 'exec');
+  const { needsApproval } = await import('../src/safety/permissions.js');
+  assert.equal(needsApproval('exec', 'auto-edit'), true);
+  assert.equal(needsApproval('exec', 'auto-read'), true);
+  assert.equal(needsApproval('exec', 'manual'), true);
+  assert.equal(needsApproval('exec', 'full'), false);
+});

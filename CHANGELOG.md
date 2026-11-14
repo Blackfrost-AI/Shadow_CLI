@@ -7,6 +7,18 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [11.8.1] — 2026-11-13
+
+### Fixed
+
+- **`sast_scan` now carries the `exec` risk tier, not `write`.** It spawns an external
+  semgrep subprocess, so — like `run_shell`, `sample_run`, and `bg_shell` — it must require
+  confirmation under `auto-edit` before launching. `write` auto-approved the spawn
+  (`permissions.ts` gates `exec|network` under `auto-edit` but auto-approves `write`), an
+  inconsistency with every other subprocess tool. Receipt metadata updated to match; a
+  regression test pins the tier and the `auto-edit`/`auto-read`/`manual`/`full` gate behavior.
+- README: corrected the bundled skill name (`security-bounty-hunter`, not `security-scan`).
+
 ## [11.8.0] — 2026-11-13
 
 **Security toolbelt for vulnerability hunters and ethical hackers.** Four deferred,
