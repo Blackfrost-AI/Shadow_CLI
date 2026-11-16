@@ -1,8 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { request } from 'node:http';
-import { EventBus } from '../src/agent/events.js';
-import { startWebServer, type WebServerHandle } from '../src/web/server.js';
+import { isolateHome, assertStoreIsolated } from './helpers/isolateHome.js';
+
+// Isolate ~/.shadow before importing the server (GLOBAL_DIR is import-time) so a real
+// global config (e.g. a set web.token) cannot leak into the boot. `npm test` only.
+const { home: HOME } = isolateHome('web-shell');
+const store = await import('../src/state/globalStore.js');
+assertStoreIsolated(store.GLOBAL_DIR, HOME);
+const { EventBus } = await import('../src/agent/events.js');
+const { startWebServer } = await import('../src/web/server.js');
+type WebServerHandle = import('../src/web/server.js').WebServerHandle;
 
 /**
  * Phase A: the app shell, asset pipeline, and /api/state endpoint. Every test re-asserts

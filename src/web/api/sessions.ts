@@ -157,6 +157,21 @@ export function registerSessionsRoutes(route: RouteFn, ctx: ApiContext): void {
     return { status: 200, body: { interrupted: ctx.registry.interrupt(id) } };
   });
 
+  // Read the session's current mission without building an agent. A host can use this after a
+  // reconnect instead of replaying the whole event stream; null until the session is built.
+  route('GET', /^\/api\/sessions\/([^/]+)\/mission$/, (_req, _res, m) => {
+    const session = ctx.registry.get(m[1]!);
+    if (!session) return { status: 404, body: { error: 'unknown session' } };
+    const mission = session.agent?.mission;
+    return {
+      status: 200,
+      body: {
+        available: mission?.available ?? false,
+        mission: mission ? mission.snapshot() : null,
+      },
+    };
+  });
+
   route('GET', /^\/api\/sessions\/([^/]+)\/work$/, (_req, _res, m) => {
     const session = ctx.registry.get(m[1]!);
     if (!session) return { status: 404, body: { error: 'unknown session' } };

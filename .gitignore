@@ -47,3 +47,6 @@ eval/FINDINGS-*.md
 # Evaluation endpoint definitions are machine-specific; only the template is shared.
 eval/models.*.json
 !eval/models.example.json
+
+# Local scratch build/test logs (release verification evidence stays local).
+.build/

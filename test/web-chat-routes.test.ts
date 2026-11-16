@@ -133,6 +133,12 @@ test('chat with a mission starts a mission and broadcasts mission state', async 
       missions.some((mission) => mission?.active && mission.mission === 'ship the release'),
       'the active mission was broadcast on the session stream',
     );
+    const inspection = await req(h.port, 'GET', `/api/sessions/${id}/mission`, h.token);
+    assert.equal(inspection.status, 200);
+    assert.equal(inspection.json.available, true);
+    const snapshot = inspection.json.mission as { active: boolean; mission: string } | null;
+    assert.equal(snapshot?.active, true);
+    assert.equal(snapshot?.mission, 'ship the release');
   } finally {
     await h.close();
     rmSync(proj, { recursive: true, force: true });

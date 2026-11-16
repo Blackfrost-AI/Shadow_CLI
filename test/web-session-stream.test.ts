@@ -2,9 +2,16 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { request } from 'node:http';
 import type { ServerResponse } from 'node:http';
-import { EventBus } from '../src/agent/events.js';
-import { createSessionStream } from '../src/web/sessionStream.js';
-import { startWebServer } from '../src/web/server.js';
+import { isolateHome, assertStoreIsolated } from './helpers/isolateHome.js';
+
+// Isolate ~/.shadow before importing the server (GLOBAL_DIR is import-time) so a real
+// global config (e.g. a set web.token) cannot leak into the boot. `npm test` only.
+const { home: HOME } = isolateHome('web-session-stream');
+const store = await import('../src/state/globalStore.js');
+assertStoreIsolated(store.GLOBAL_DIR, HOME);
+const { EventBus } = await import('../src/agent/events.js');
+const { createSessionStream } = await import('../src/web/sessionStream.js');
+const { startWebServer } = await import('../src/web/server.js');
 
 /**
  * Unit coverage for the C2 extraction: a stream is per-bus and per-id, the eviction counter is

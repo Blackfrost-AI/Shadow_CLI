@@ -7,6 +7,28 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [11.9.0] — 2026-11-15
+
+### Added
+
+- **Web API: collaboration preset roster.** `GET /api/collaboration` returns the ids,
+  labels and descriptions the `collaborate` tool accepts, so companion hosts and remote
+  clients don't hardcode the list. A route test pins the roster to the tool schema.
+- **Web API: mission inspection without building an agent.**
+  `GET /api/sessions/:id/mission` returns the current mission snapshot (or `null` until
+  built); the host advertises `mission-inspect`. A route test asserts the active goal
+  text after a mission turn.
+
+### Fixed
+
+- **Test isolation.** `web-server`, `web-shell`, `web-session-stream`, and
+  `web-work-center` suites now isolate `~/.shadow` before importing the server, so a
+  configured `web.token` can no longer leak into test boots (it made two test servers
+  share one token and broke the independent-routers assertion).
+- **`claude-code` provider test no longer races child startup under load.** The fake
+  CLI captures its pid before draining stdin and the deadline test allows 1s;
+  `waitForCapture` surfaces non-ENOENT errors instead of spinning to timeout.
+
 ## [11.8.1] — 2026-11-13
 
 ### Fixed

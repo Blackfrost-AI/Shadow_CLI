@@ -17,6 +17,10 @@ const mode = process.env.CC_TEST_CASE;
 if (args.includes('--version')) { console.log('2.1.277 (Claude Code)'); process.exit(0); }
 if (args.includes('--help')) { console.log(mode === 'unsupported' ? '--tools' : ${JSON.stringify(flags)}); process.exit(0); }
 if (args.includes('status')) { console.log(JSON.stringify({ loggedIn: mode !== 'logged-out', authMethod: mode === 'api' ? 'api_key' : 'claude.ai', email: 'private@example.invalid', token: 'TEST-SECRET-DO-NOT-SHOW' })); process.exit(mode === 'logged-out' ? 1 : 0); }
+// Capture identity BEFORE draining stdin: under full-suite load the provider's
+// deadline can fire before stdin EOF, and the test still needs the pid to assert
+// the process was killed.
+fs.writeFileSync(process.env.CC_TEST_CAPTURE, JSON.stringify({ args, input: '', env: process.env, pid: process.pid }));
 let input = '';
 for await (const part of process.stdin) input += part;
 fs.writeFileSync(process.env.CC_TEST_CAPTURE, JSON.stringify({ args, input, env: process.env, pid: process.pid }));
@@ -56,7 +60,13 @@ async function fixture(mode = 'ok', envelope?: unknown) {
     let lastError: unknown;
     for (let i = 0; i < 1000; i++) {
       try { return await capture(); }
-      catch (error) { lastError = error; await new Promise((resolve) => setTimeout(resolve, 10)); }
+      catch (error) {
+        lastError = error;
+        // ENOENT means the child never ran — keep polling. EACCES means cleanup
+        // raced a late write; surface it instead of spinning 10s.
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
     }
     throw lastError;
   };
@@ -157,7 +167,7 @@ test('Claude Code timeout and user abort terminate the process and emit no compl
   for (const userAbort of [false, true]) await t.test(userAbort ? 'abort' : 'deadline', async () => {
     const f = await fixture('hang'); const controller = new AbortController();
     try {
-      const running = collect(new ClaudeCodeProvider({ model: 'sonnet', timeoutMs: userAbort ? 5000 : 100 }, f.runtime), request({ signal: controller.signal }));
+      const running = collect(new ClaudeCodeProvider({ model: 'sonnet', timeoutMs: userAbort ? 5000 : 1000 }, f.runtime), request({ signal: controller.signal }));
       const captured = userAbort ? await f.waitForCapture() : undefined;
       if (userAbort) controller.abort();
       const events = await running;

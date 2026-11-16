@@ -1,8 +1,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { request } from 'node:http';
-import { EventBus } from '../src/agent/events.js';
-import { startWebServer, type WebServerHandle } from '../src/web/server.js';
+import { isolateHome, assertStoreIsolated } from './helpers/isolateHome.js';
+
+// Isolate ~/.shadow BEFORE importing the server (GLOBAL_DIR is import-time). Without this the
+// suite boots against the REAL global config: once `web.token` is set there (companion pairing),
+// every server resolves the SAME configured token and "two servers … independent routers" fails
+// its notEqual-token assertion — and the suite would be reading live credentials. `npm test` only.
+const { home: HOME } = isolateHome('web-server');
+
+const store = await import('../src/state/globalStore.js');
+assertStoreIsolated(store.GLOBAL_DIR, HOME);
+const { EventBus } = await import('../src/agent/events.js');
+type EventBus = import('../src/agent/events.js').EventBus;
+const { startWebServer } = await import('../src/web/server.js');
+type WebServerHandle = import('../src/web/server.js').WebServerHandle;
 
 /**
  * `Host` is a forbidden header for `fetch` — undici overwrites it with the real authority,

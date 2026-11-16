@@ -19,6 +19,40 @@ export const collaborationSchema = z.object({
   concurrency: z.number().int().min(1).max(3).default(2),
 });
 export type CollaborationInput = z.infer<typeof collaborationSchema>;
+
+/** Roster metadata for hosts that render preset pickers. Keep ids in sync with the schema. */
+export const COLLABORATION_PRESETS = [
+  {
+    id: 'second-opinion',
+    label: 'Second opinion',
+    description: 'One independent reviewer examines the same task.',
+  },
+  {
+    id: 'implement-review',
+    label: 'Implement & review',
+    description: 'An implementer works in an isolated checkout; an independent reviewer inspects it.',
+  },
+  {
+    id: 'parallel-team',
+    label: 'Parallel team',
+    description: 'Workers take independent perspectives; the lead synthesizes and cites the job ids.',
+  },
+  {
+    id: 'pipeline',
+    label: 'Pipeline',
+    description: 'Explicit ordered steps, each building on the previous artifact.',
+  },
+  {
+    id: 'debate',
+    label: 'Debate',
+    description: 'Two assessments and an evidence-citing judge; disagreements stay visible.',
+  },
+  {
+    id: 'solve',
+    label: 'Planner/solver',
+    description: 'A planner decomposes the task, then a solver uses the recorded evidence.',
+  },
+] as const;
 export interface CollaborationDeps {
   agentTool: Tool<AgentToolInput, AgentToolData>;
   /** Must authorize through the host's live approval policy before calling the

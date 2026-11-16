@@ -10,6 +10,7 @@ import { registerAgentsRoutes } from './api/agents.js';
 import { registerMcpRoutes, maskConfig as maskMcp } from './api/mcp.js';
 import { registerHookRoutes } from './api/hooks.js';
 import { registerPluginRoutes } from './api/plugins.js';
+import { registerCollaborationRoutes } from './api/collaboration.js';
 import { registerSessionsRoutes } from './api/sessions.js';
 import { registerProjectsRoutes } from './api/projects.js';
 import type { SessionRegistry } from './registry.js';
@@ -115,7 +116,7 @@ function registerStateRoutes(route: RouteFn, ctx: ApiContext): void {
     body: {
       name: 'shadow',
       protocol: 1,
-      capabilities: ['sessions', 'resume', 'chat', 'compact', 'interrupt', 'approvals', 'autonomy', 'transcript', 'events', 'projects', 'work', 'mission', 'collaborate', 'hooks', 'plugins'],
+      capabilities: ['sessions', 'resume', 'chat', 'compact', 'interrupt', 'approvals', 'autonomy', 'transcript', 'events', 'projects', 'work', 'mission', 'mission-inspect', 'collaborate', 'hooks', 'plugins'],
     },
   }));
   route('GET', /^\/api\/state$/, async () => {
@@ -172,6 +173,7 @@ export function createApiRouter(ctx: ApiContext): Dispatch {
   registerMcpRoutes(route, ctx);
   registerHookRoutes(route, ctx);
   registerPluginRoutes(route, ctx);
+  registerCollaborationRoutes(route, ctx);
   registerSessionsRoutes(route, ctx);
   registerProjectsRoutes(route, ctx);
 
