@@ -1,4 +1,3 @@
-import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { ApiContext, RouteFn } from '../router.js';
 import {
   listPlugins,
