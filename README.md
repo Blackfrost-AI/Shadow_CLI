@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/Blackfrost-AI/Shadow_CLI/releases"><img src="https://img.shields.io/badge/release-v11.9.0-7fb4d8?style=flat-square" alt="Release v11.9.0"></a>
+  <a href="https://github.com/Blackfrost-AI/Shadow_CLI/releases"><img src="https://img.shields.io/badge/release-v11.9.1-7fb4d8?style=flat-square" alt="Release v11.9.1"></a>
   <img src="https://img.shields.io/badge/node-%E2%89%A522.19.0-3c873a?style=flat-square" alt="Node ≥ 22.19.0">
   <img src="https://img.shields.io/badge/telemetry-zero-2ea043?style=flat-square" alt="Zero telemetry">
   <img src="https://img.shields.io/badge/providers-any-8b949e?style=flat-square" alt="Provider-neutral">
@@ -12,7 +12,7 @@
 
 # Shadow CLI
 
-Current build: **`v11.9.0`** — the security toolbelt: `secrets_scan` (masked credential sweep), `osv_query` (brokered CVE/GHSA lookup), `sast_scan` (privacy-first semgrep bridge), and `bin_recon` now reading ELF and PE alongside Mach-O. Three bundled security skills ship in the prompt bundle. Local-first and zero-telemetry throughout; the one network tool is brokered, fixed-endpoint, and identity-only. 11.9.0 extends the web API for companion clients: the collaboration preset roster (`GET /api/collaboration`) and mission inspection without building an agent (`GET /api/sessions/:id/mission`).
+Current build: **`v11.9.1`** — the security toolbelt: `secrets_scan` (masked credential sweep), `osv_query` (brokered CVE/GHSA lookup), `sast_scan` (privacy-first semgrep bridge), and `bin_recon` now reading ELF and PE alongside Mach-O. Three bundled security skills ship in the prompt bundle. Local-first and zero-telemetry throughout; the one network tool is brokered, fixed-endpoint, and identity-only. 11.9.0 extends the web API for companion clients: the collaboration preset roster (`GET /api/collaboration`) and mission inspection without building an agent (`GET /api/sessions/:id/mission`). 11.9.1 is a hygiene patch: lint cleanup and the WireGuard relay script tracked in-repo.
 
 Shadow is a local-first, provider-neutral security engineering agent. Its built-in Security
 foundation covers investigation, hardening, incident response, defensive automation, secure coding,
@@ -23,6 +23,15 @@ receipts stay under your control. Shadow requires no Shadow account and includes
 **Built for security professionals who want zero telemetry and full control.** Every model call goes
 to the endpoint *you* configure; every network request is brokered, receipted, and can be switched
 off entirely with `--offline`. Nothing phones home.
+
+## What's new in v11.9.1
+
+- **Lint cleanup.** Removed two unused `node:http` type imports from the web plugins route;
+  `npm run lint` now reports zero warnings.
+- **WireGuard relay tracked in-repo.** `scripts/shadow-relay.mjs` (loopback web → WireGuard
+  bind for the phone companion) now ships in the repository with a neutral usage example.
+  It logs request paths only (query stripped, since it may carry `?token=`) and never headers
+  or bodies. No runtime behavior change.
 
 ## What's new in v11.9.0
 

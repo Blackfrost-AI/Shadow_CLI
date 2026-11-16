@@ -7,6 +7,17 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [11.9.1] — 2026-11-15
+
+### Changed
+
+- **Lint cleanup.** Removed two unused `node:http` type imports from the web plugins
+  route (`src/web/api/plugins.ts`); `npm run lint` now reports zero warnings.
+- **WireGuard relay tracked in-repo.** `scripts/shadow-relay.mjs` (loopback web →
+  WireGuard bind for the phone companion) was running untracked; it now ships in the
+  repository with a neutral usage example. It logs request paths only (query stripped,
+  since it may carry `?token=`) and never headers or bodies. No runtime behavior change.
+
 ## [11.9.0] — 2026-11-15
 
 ### Added
