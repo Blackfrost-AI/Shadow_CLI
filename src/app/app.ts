@@ -124,6 +124,8 @@ import type { MissionSnapshot } from '../agent/mission.js';
 import { PendingDialog, dialogArmMs } from './dialogs.js';
 import { ModelSwitcher } from './modelSwitch.js';
 import { SnowfallEditor, snowfallLayout, type SnowfallState } from './snowfall.js';
+import { runOpsSlashCommand, makeOpsAdapter } from './opsCommand.js';
+import { usageStatsLines } from './usage.js';
 import { StreamRate, formatTokPerSec } from './streamRate.js';
 import { emitNotification } from '../util/notify.js';
 import type { SubAgentView } from '../tui/subagentPanel.js';
@@ -196,6 +198,7 @@ interface HudState {
   costUSD: number;
   goal: string | null;
   missionLine: string;
+  opsLine: string;
   mcpConnecting: boolean;
   mcpFailed: boolean;
   planMode: boolean;
@@ -525,6 +528,7 @@ export class ShadowApp {
         costUSD: 0,
         goal: null,
         missionLine: '',
+        opsLine: '',
         mcpConnecting: false,
         mcpFailed: false,
         planMode: false,
@@ -544,6 +548,9 @@ export class ShadowApp {
     s.costUSD = this.costUSD;
     s.goal = this.goal;
     s.missionLine = missionHudLine(this.mission);
+    // Ops summary (§9): recomputed on the same cadence as the mission line (tick + bus events).
+    // Existence-checked inside the closure — no DB creation, '' when no ops run.
+    s.opsLine = this.opts.opsHud?.() ?? '';
     s.mcpConnecting = this.mcpConnecting;
     s.mcpFailed = this.mcpFailed;
     s.planMode = this.planMode;
@@ -2398,25 +2405,13 @@ export class ShadowApp {
           this.pushLine({ text: '  No usage recorded yet this session.', dimColor: true });
           return;
         }
-        this.pushLine({
-          kind: 'system',
-          text: 'cost',
-          lines: [
-            {
-              text: `Session (${this.sessionTurns} turn${this.sessionTurns === 1 ? '' : 's'}): ${this.sessionInputTokens.toLocaleString()} in · ${this.sessionOutputTokens.toLocaleString()} out · ${(this.sessionInputTokens + this.sessionOutputTokens).toLocaleString()} total`,
-              bold: true,
-            },
-            this.costUSD > 0
-              ? { text: `Session cost: $${this.costUSD.toFixed(4)}`, color: C.cyan }
-              : { text: 'Session cost: none — local/unpriced model', dimColor: true },
-            ...(this.lastUsage
-              ? [{
-                  text: `Last turn: ${this.lastUsage.inputTokens.toLocaleString()} in · ${this.lastUsage.outputTokens.toLocaleString()} out${this.lastUsage.costUSD > 0 ? ` · $${this.lastUsage.costUSD.toFixed(4)}` : ''}`,
-                  dimColor: true,
-                }]
-              : []),
-          ],
-        });
+        this.pushLine({ kind: 'system', text: 'cost', lines: usageStatsLines({
+          sessionTurns: this.sessionTurns,
+          sessionInputTokens: this.sessionInputTokens,
+          sessionOutputTokens: this.sessionOutputTokens,
+          costUSD: this.costUSD,
+          lastUsage: this.lastUsage ?? undefined,
+        }, C.cyan) });
         return;
       case '/context':
         this.openContextInspector(arg);
@@ -2445,6 +2440,11 @@ export class ShadowApp {
         } else if (this.opts.workCenter) this.openWorkBrowser(true);
         else this.printTasks();
         return;
+      case '/ops': {
+        // Security ops operator surface (§9) — shared adapter, same code as Ink slash.ts.
+        runOpsSlashCommand(this.opts.opsCommand, arg, makeOpsAdapter((l) => this.pushLine(l), { prefix: '  ', errorColor: C.red }));
+        return;
+      }
       case '/goal': {
         // Mission mode (8.4), ported from slash.ts: /goal <text> starts a REAL mission — plan
         // mode engages, a kickoff turn runs, and the harness pins the mission in front of the

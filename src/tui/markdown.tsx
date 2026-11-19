@@ -37,16 +37,21 @@ function codeRoleColor(role: CodeRole): string | undefined {
   }
 }
 
-/** Cap assistant prose to a readable measure so lines don't run edge-to-edge on wide terminals,
- *  and cap it IDENTICALLY for the streaming and committed renders so a finished turn never reflows.
- *  The `width` prop now constrains the whole block (previously it only reached table layout, so prose
- *  wrapped at the full pane width). */
-export const PROSE_MAX_COLS = 100;
+/** Default prose cap: 0 = FILL the available width (the 10.6.3 full-width contract; a positive
+ *  `proseMaxCols` config is an opt-in reading measure). Whatever cap applies must be IDENTICAL for
+ *  the streaming and committed renders so a finished turn never reflows. The `width` prop constrains
+ *  the whole block (previously it only reached table layout, so prose wrapped at the full pane width). */
+export const PROSE_MAX_COLS = 0;
 
 export function Markdown({ source, color = C.fg, width = PROSE_MAX_COLS }: { source: string; color?: string; width?: number }) {
   const blocks = parseMarkdown(source);
+  // width 0 (the default) = fill. Structural elements (underlines, list wraps, rules, tables,
+  // charts) need a CONCRETE measure; without an explicit width use the terminal's inner width so
+  // the exported component honors the fill contract too. Live transcript paths always pass width.
+  const w = width > 0 ? width : Math.max(20, (process.stdout.columns ?? 80) - 4);
   return (
-    <Box flexDirection="column" width={width}>
+    // An explicit 0-width Box would collapse every row to nothing — omit width in fill mode.
+    <Box flexDirection="column" {...(width > 0 ? { width } : {})}>
       {blocks.map((b, i) => {
         switch (b.type) {
           case 'heading': {
@@ -62,7 +67,7 @@ export function Markdown({ source, color = C.fg, width = PROSE_MAX_COLS }: { sou
                 <Inline spans={deepItalic ? b.spans.map((s) => ({ ...s, italic: true })) : b.spans} color={hue} bold />
                 {b.level <= 2 ? (
                   <Text color={C.dim} wrap="truncate">
-                    {'─'.repeat(Math.min(width, Math.max(3, b.spans.reduce((n, s) => n + s.text.length, 0))))}
+                    {'─'.repeat(Math.min(w, Math.max(3, b.spans.reduce((n, s) => n + s.text.length, 0))))}
                   </Text>
                 ) : null}
               </Box>
@@ -71,7 +76,7 @@ export function Markdown({ source, color = C.fg, width = PROSE_MAX_COLS }: { sou
           case 'paragraph':
             return (
               <Box key={i} flexDirection="column" marginTop={i === 0 ? 0 : 1}>
-                {wrapSpans(b.spans, width).map((ln, k) => (
+                {wrapSpans(b.spans, w).map((ln, k) => (
                   <Inline key={k} spans={ln} color={color} />
                 ))}
               </Box>
@@ -95,7 +100,7 @@ export function Markdown({ source, color = C.fg, width = PROSE_MAX_COLS }: { sou
                     ? `${depth === 0 ? ordinal++ : itemOrdinal}. `
                     : `${bullets[Math.min(depth, bullets.length - 1)]} `;
                   const lead = indent + marker;
-                  const wrapped = wrapSpans(it, Math.max(1, width - lead.length));
+                  const wrapped = wrapSpans(it, Math.max(1, w - lead.length));
                   return (
                     <Box key={j} flexDirection="column">
                       {wrapped.map((ln, k) => (
@@ -113,7 +118,7 @@ export function Markdown({ source, color = C.fg, width = PROSE_MAX_COLS }: { sou
           case 'quote':
             return (
               <Box key={i} flexDirection="column" marginTop={i === 0 ? 0 : 1}>
-                {wrapSpans(b.spans, Math.max(1, width - 2)).map((ln, k) => (
+                {wrapSpans(b.spans, Math.max(1, w - 2)).map((ln, k) => (
                   <Box key={k}>
                     <Text color={C.yellow}>│ </Text>
                     <Inline spans={ln} color={color} dim />
@@ -127,7 +132,7 @@ export function Markdown({ source, color = C.fg, width = PROSE_MAX_COLS }: { sou
             if (b.closed && CHART_LANGS.has((b.lang || '').toLowerCase())) {
               const spec = parseChartSpec(b.code);
               if (spec) {
-                const chartRows = renderChart(spec, Math.min(width, 72));
+                const chartRows = renderChart(spec, Math.min(w, 72));
                 return (
                   <Box key={i} flexDirection="column" marginTop={i === 0 ? 0 : 1}>
                     {chartRows.map((spans, j) => (
@@ -175,13 +180,13 @@ export function Markdown({ source, color = C.fg, width = PROSE_MAX_COLS }: { sou
           case 'rule':
             return (
               <Box key={i} marginTop={i === 0 ? 0 : 1}>
-                <Text color={C.dim}>{'─'.repeat(Math.max(1, width))}</Text>
+                <Text color={C.dim}>{'─'.repeat(Math.max(1, w))}</Text>
               </Box>
             );
           case 'table': {
             // Live preview: full grid with dim chrome (same as committed flatten path). Large-table
             // folding is a committed-transcript concern (Ctrl-O); the live slot is already ≤2 rows.
-            const lines = renderTableLines(b, width);
+            const lines = renderTableLines(b, w);
             const isGrid = /^[╭┌]/.test(lines[0] ?? '');
             const sepIdx = isGrid ? lines.findIndex((l) => l.startsWith('├')) : -1;
             return (

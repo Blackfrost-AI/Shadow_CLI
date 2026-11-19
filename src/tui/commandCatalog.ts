@@ -41,6 +41,7 @@ export const TERMINAL_COMMANDS: readonly TerminalCommand[] = [
   { name: '/clear', desc: 'Clear the screen and reset the conversation', renderers: both('clear') },
   { name: '/new', desc: 'Start a fresh conversation (alias for /clear)', dispatch: '/clear', renderers: both('clear') },
   { name: '/goal', desc: 'Start a mission: plan, tasks, then verify', renderers: both('goal') },
+  { name: '/ops', desc: 'Security ops run: status, graph, pause/resume, stop, recover, prove, complete', renderers: both('ops') },
   { name: '/model', desc: 'Manage or test models; dated capability history in Snowfall', renderers: both('model') },
   { name: '/role', desc: 'Switch to a named model role: /role smol|slow|plan (config.roles)', renderers: piOnly('role', 'Named model roles use Snowfall. Start SHADOW_TUI=pi shadow.') },
   { name: '/table', desc: 'Open collaboration (Snowfall presets; legacy Ink roundtable)', renderers: both('table') },

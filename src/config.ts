@@ -399,9 +399,11 @@ const ConfigSchema = z.object({
   // on; set false to keep clicks inert (terminal-native handling).
   linkClickOpen: z.boolean().default(true),
   // Readability cap on transcript prose width (columns). Chrome always spans the full
-  // terminal; body text wraps at min(terminal, proseMaxCols) so lines don't stretch
-  // edge-to-edge on wide windows. 0 = fill the terminal width (no cap). Default 100.
-  proseMaxCols: z.number().int().min(0).max(1000).default(100),
+  // terminal; body text wraps at min(terminal, proseMaxCols). 0 = fill the terminal
+  // width (no cap) — the DEFAULT, restoring the 10.6.3 full-width layout contract that
+  // an earlier default of 100 regressed (dead right gutter on wide terminals). Opt-in
+  // knob for users who want a fixed reading measure.
+  proseMaxCols: z.number().int().min(0).max(1000).default(0),
   // Named model roles (OMP --smol/--slow/--plan parity). Each value is a model label from
   // `models`; /role <name> switches to it. Optional — unset roles simply aren't offered.
   roles: z.object({
@@ -544,6 +546,10 @@ const ConfigSchema = z.object({
   // at once (provider connections + context windows + GPU contention on local rigs). Raise it
   // on powerful machines; 1 serializes sub-agents entirely.
   subagentConcurrency: z.number().int().min(1).max(16).default(4),
+  // Automatic per-sub-agent wall-clock BACKSTOP in minutes (not an operator ceiling — never
+  // inherited by children). 120 min lets deep builds/reviews finish; a runaway still dies.
+  // The old hard-coded 30 min killed real work mid-flight with tokens unspent.
+  subagentWallClockMinutes: z.number().int().min(1).max(24 * 60).default(120),
 
   // T2 — session-wide stream-resilience defaults. The per-model `idleTimeoutMs` /
   // `firstByteTimeoutMs` / `streamRetries` knobs on `models[]` entries cover preset users; this
@@ -621,7 +627,9 @@ const ConfigSchema = z.object({
       // Backstop wall-clock ceiling (seconds) INJECTED when `maxIterations: 0` (unlimited) is
       // used with no other budget axis — keeps "unlimited iterations" from meaning "no cap at
       // all" while letting long-range engagements opt into a much longer (or truly unlimited,
-      // via 0) duration. Default 6h. See the loadConfig injection below.
+      // via 0) duration. Default 6h. See the loadConfig injection below. NOTE: this INJECTED
+      // ceiling lives in budget limits and IS inherited by sub-agents (operator-style) — distinct
+      // from `subagentWallClockMinutes`, the non-inheritable per-sub-agent automatic backstop.
       backstopWallClockSec: z.number().int().nonnegative().optional(),
       // Spend guardrails (soft): warn once at warnRatio, then pause and ask via the
       // approval seam; approve grants exactly one more allowance window (same limits

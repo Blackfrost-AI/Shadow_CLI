@@ -2,7 +2,12 @@ import { existsSync, readFileSync, readdirSync, writeFileSync, unlinkSync, renam
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { enabledPluginDirs } from '../plugins/manager.js';
+import { OPS_ARCHETYPES, BUILTIN_RECON, BUILTIN_AUDITOR, BUILTIN_VERIFIER } from '../security/ops/archetypes.js';
 import type { Effort } from '../provider/provider.js';
+
+// Canonical ops archetypes (plan §6). The constants live in security/ops/archetypes.ts to keep
+// the security module free of runtime deps on defs.ts; re-exported here per the build contract.
+export { BUILTIN_RECON, BUILTIN_AUDITOR, BUILTIN_VERIFIER };
 
 export interface AgentDef {
   name: string;
@@ -152,6 +157,7 @@ export function loadAgentDefs(workspaceRoot: string): AgentDef[] {
   }
   if (!byName.has('explore')) byName.set('explore', BUILTIN_EXPLORE);
   if (!byName.has('reviewer')) byName.set('reviewer', BUILTIN_REVIEWER);
+  for (const [name, def] of Object.entries(OPS_ARCHETYPES)) if (!byName.has(name)) byName.set(name, def);
   return [...byName.values()];
 }
 
@@ -175,7 +181,7 @@ export function resolveAgentDef(type: string, workspaceRoot: string): AgentDef |
  * shadow `explore` by dropping a file in the agents dir (the loader prefers user files), but
  * the write API refuses to touch the reserved names so the built-ins always remain restorable.
  */
-const BUILTIN_NAMES = new Set(['explore', 'reviewer']);
+const BUILTIN_NAMES = new Set(['explore', 'reviewer', 'recon', 'auditor', 'verifier']);
 
 /** Validate an agent name. Matches the credRef slug rule so filenames stay filesystem-safe. */
 export function isValidAgentName(name: string): boolean {

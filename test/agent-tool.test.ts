@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync, execSync } from 'node:child_process';
-import { makeAgentTool, resolveSubagentIterations, SUBAGENT_ITERATION_HARD_CAP } from '../src/tools/agentTool.js';
+import { makeAgentTool, resolveSubagentIterations, SUBAGENT_ITERATION_HARD_CAP, SUBAGENT_MIN_REQUESTED_ITERATIONS } from '../src/tools/agentTool.js';
 import { formatTaskNotification } from '../src/agent/busListeners.js';
 import { Budget } from '../src/agent/budget.js';
 import { Context } from '../src/agent/context.js';
@@ -651,15 +651,47 @@ function outcomeHarness(provider: Provider, maxIterations = 10, concurrency = 4)
   };
 }
 
-test('prepared jobs reject different task input before invoking a provider', async () => {
-  let calls = 0;
-  const h = outcomeHarness(new MockProvider([() => { calls++; return [{ type: 'text', delta: 'answer' }, { type: 'done', stopReason: 'end_turn' }]; }]));
+test('prepared jobs ADOPT the recorded task input instead of rejecting a natural retry', async () => {
+  // Regression (2026-11-17): prepare_retry appends a follow-up to the stored prompt; the model
+  // naturally re-sends its ORIGINAL prompt and the old byte-identical check refused every retry
+  // ("Prepared job prompt differs…"). The recorded input is authoritative — adopt and disclose.
+  let calls = 0; let sawPrompt = '';
+  const provider: Provider = { name: 'fixture', estimateTokens: () => 1,
+    async *send(request) {
+      calls++;
+      sawPrompt = JSON.stringify(request.messages);
+      yield { type: 'text', delta: 'answer' }; yield { type: 'done', stopReason: 'end_turn' };
+    } };
+  const h = outcomeHarness(provider);
   const store = new JobStore(h.ctx.workspaceRoot);
   try {
     store.createJob({ prompt: 'recorded task' }, { id: 'prepared' });
     const result = await h.tool.run({ prompt: 'different task', job_id: 'prepared' }, h.ctx);
-    assert.equal(result.ok, false); assert.match(result.summary, /prompt differs/); assert.equal(calls, 0);
-    assert.equal(store.get('prepared')?.attempts.length, 0);
+    assert.equal(result.ok, true, result.summary);
+    assert.equal(calls, 1);
+    assert.ok(sawPrompt.includes('recorded task'), 'provider saw the RECORDED prompt');
+    assert.ok(!sawPrompt.includes('different task'), 'caller prompt was replaced, not merged');
+    assert.deepEqual(result.data?.adoptedJobInput, ['prompt']);
+    assert.match(result.summary, /adopted its recorded input for prompt/);
+    assert.equal(store.get('prepared')?.attempts.length, 1);
+  } finally { store.close(); h.close(); }
+});
+
+test('job adoption never downgrades caller-requested worktree isolation', async () => {
+  const provider: Provider = { name: 'fixture', estimateTokens: () => 1,
+    async *send() { yield { type: 'text', delta: 'answer' }; yield { type: 'done', stopReason: 'end_turn' }; } };
+  const h = outcomeHarness(provider);
+  const store = new JobStore(h.ctx.workspaceRoot);
+  try {
+    // Isolation needs a repository with a committed HEAD.
+    execFileSync('git', ['init', '-q'], { cwd: h.ctx.workspaceRoot });
+    execFileSync('git', ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '--allow-empty', '-qm', 'initial'], { cwd: h.ctx.workspaceRoot });
+    store.createJob({ prompt: 'recorded task', isolation: 'none' }, { id: 'prepared' });
+    const result = await h.tool.run({ prompt: 'recorded task', isolation: 'worktree', job_id: 'prepared' }, h.ctx);
+    assert.equal(result.ok, true, result.summary);
+    const adopted = result.data?.adoptedJobInput ?? [];
+    assert.ok(adopted.some((f) => f.startsWith('isolation (kept caller worktree')), `containment preserved + disclosed: ${JSON.stringify(adopted)}`);
+    assert.ok(!adopted.includes('isolation'), 'no silent downgrade to the recorded unisolated mode');
   } finally { store.close(); h.close(); }
 });
 
@@ -670,7 +702,9 @@ test('closing report usage is charged once to the inherited budget', async () =>
   ]), 1);
   try {
     const parent = new Budget({ maxIterations: 100, maxTotalTokens: 1_000_000 }, 'mock', PRICE, Date.now());
-    const result = await h.tool.run({ prompt: 'fixture' }, { ...h.ctx, parentBudget: parent, rootBudget: parent });
+    // max_iterations:1 is an OPERATOR-tight parent ceiling — the workable floor must NOT widen it;
+    // the child still stops partial at 1 turn (the floor only raises explicit REQUESTS).
+    const result = await h.tool.run({ prompt: 'fixture', max_iterations: 1 }, { ...h.ctx, parentBudget: parent, rootBudget: parent });
     assert.equal(result.data?.status, 'partial');
     assert.equal(parent.totalInputTokens, 24); assert.equal(parent.totalOutputTokens, 12);
     const store = new JobStore(h.ctx.workspaceRoot);
@@ -824,7 +858,7 @@ test('a controlled budget stop is a recoverable incomplete result, never ok', as
     assert.equal(result.error?.code, 'agent_partial');
     assert.equal(result.error?.recoverable, true);
     assert.equal(result.data?.status, 'partial');
-    assert.match(result.data!.answer!, /budget ceiling \(\d+\/\d+ iterations\) before producing an answer/);
+    assert.match(result.data!.answer!, /budget ceiling \(\d+\/\d+ iterations\) — tokens budget exhausted before producing an answer/);
     assert.equal(h.events.find((e) => e.type === 'subagent_end')?.ok, false);
   } finally { h.close(); }
 });
@@ -873,10 +907,10 @@ test('subagent listeners are released after sync success, failure, throw, and qu
   } finally { release(); await first; h.close(); }
 });
 
-test('sub-agent iteration ceiling: default 15, raisable on request, never past the parent ceiling', () => {
-  assert.equal(resolveSubagentIterations(50), 15, 'default stays 15');
+test('sub-agent iteration ceiling: default 30, workable floor on requests, never past the parent ceiling', () => {
+  assert.equal(resolveSubagentIterations(50), 30, 'default raised 15→30 (real multi-file work burned 15/15)');
   assert.equal(resolveSubagentIterations(8), 8, 'default never exceeds the parent');
-  assert.equal(resolveSubagentIterations(0), 15, 'unlimited parent still gets a backstop');
+  assert.equal(resolveSubagentIterations(0), 30, 'unlimited parent still gets a backstop');
   assert.equal(resolveSubagentIterations(50, 30), 30, 'agent definition value applies');
   assert.equal(resolveSubagentIterations(20, 500), 20, 'agent definition is bounded by the parent');
   assert.equal(resolveSubagentIterations(0, 500), SUBAGENT_ITERATION_HARD_CAP, 'agent definition is bounded by the hard cap for an unlimited parent');
@@ -884,7 +918,24 @@ test('sub-agent iteration ceiling: default 15, raisable on request, never past t
   assert.equal(resolveSubagentIterations(50, 10, 40), 40, 'explicit request overrides the definition');
   assert.equal(resolveSubagentIterations(20, undefined, 500), 20, 'request is bounded by the parent');
   assert.equal(resolveSubagentIterations(0, undefined, 500), SUBAGENT_ITERATION_HARD_CAP, 'unlimited parent: hard cap');
-  assert.equal(resolveSubagentIterations(50, undefined, 2.7), 2, 'fractional request floors');
+  // Workable floor (2026-11-17): a fleet asked for 1- and 3-turn reviewers and got empty reviews.
+  assert.equal(resolveSubagentIterations(50, undefined, 1), SUBAGENT_MIN_REQUESTED_ITERATIONS, '1-turn request raised to the workable floor');
+  assert.equal(resolveSubagentIterations(50, undefined, 3), SUBAGENT_MIN_REQUESTED_ITERATIONS, '3-turn request raised to the workable floor');
+  assert.equal(resolveSubagentIterations(50, undefined, 2.7), SUBAGENT_MIN_REQUESTED_ITERATIONS, 'fractional micro-request floors at whole turns, then raises');
+  assert.equal(resolveSubagentIterations(50, undefined, 12.9), 12, 'fractional request above the floor truncates');
+  assert.equal(resolveSubagentIterations(5, undefined, 1), 5, 'floor never widens a tighter parent cap');
+  assert.equal(resolveSubagentIterations(50, 3, undefined), 3, 'operator-authored definition ceiling passes untouched (no request)');
+});
+
+test('micro-ceiling request is raised AND disclosed to the caller', async () => {
+  const h = outcomeHarness(new MockProvider([[{ type: 'text', delta: 'review findings' }, { type: 'done', stopReason: 'end_turn' }]]), 50);
+  try {
+    const result = await h.tool.run({ prompt: 'review this', subagent_type: 'reviewer', max_iterations: 1 }, h.ctx);
+    assert.equal(result.ok, true, result.summary);
+    assert.deepEqual(result.data?.requestedIterations, { requested: 1, applied: SUBAGENT_MIN_REQUESTED_ITERATIONS });
+    assert.match(result.summary, /raised to the workable floor/);
+    assert.equal(result.data?.iterations?.max, SUBAGENT_MIN_REQUESTED_ITERATIONS);
+  } finally { h.close(); }
 });
 
 test('agent tool honours max_iterations: sub-agent runs past the default 15 when asked', async () => {

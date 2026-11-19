@@ -74,6 +74,7 @@ import type { TuiOpts } from '../tui.js';
 import { commandHandler, findTerminalCommand, terminalCommandsFor } from './commandCatalog.js';
 import { SAFE_CONFIG_KEYS, formatTemperature, parseSafeConfig } from '../config/safeInteractiveConfig.js';
 import { executeWorkCommand } from './workCommand.js';
+import { runOpsSlashCommand, makeOpsAdapter } from '../app/opsCommand.js';
 import { harnessDetailLines, harnessInventoryLines, updateHarnessSelection } from '../harness/manage.js';
 import {
   activateSkillCandidate,
@@ -505,6 +506,13 @@ export function runSlashCommand(ctx: SlashCtx, cmd: SlashCommand, rawLine?: stri
       showBanner();
       pushLine({ text: 'Cleared — conversation reset. (mission kept — use /goal clear to drop it)', dimColor: true });
       break;
+    case '/ops': {
+      // Security ops operator surface (§9). Sync, never throws — shared adapter keeps the
+      // two renderers from drifting. Operator origin is real here: this path is typed by
+      // the human, unreachable from model tool calls.
+      runOpsSlashCommand(opts.opsCommand, arg, makeOpsAdapter(pushLine, { prefix: '', errorColor: C.red }));
+      break;
+    }
     case '/goal': {
       // Mission mode (8.4): /goal <text> starts a REAL mission — plan mode engages, a
       // kickoff turn runs, and the harness pins the mission + tasks in front of the model

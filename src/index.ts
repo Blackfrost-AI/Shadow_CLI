@@ -76,6 +76,9 @@ import { Budget } from './agent/budget.js';
 import { Context } from './agent/context.js';
 import { AgentLoop } from './agent/loop.js';
 import { buildLoopDeps } from './agent/loopDeps.js';
+import { makeOpsWorkerGate } from './security/ops/workerGate.js';
+import { runOpsCommand } from './security/ops/operator.js';
+import { makeOpsDispatchTool } from './tools/opsDispatch.js';
 import { subProviderFor } from './auth/spec.js';
 import { runAccountLogin } from './auth/login.js';
 import { codexAuthPath, grokAuthPath, importOfficialCredential, type SubProvider } from './auth/index.js';
@@ -2133,7 +2136,9 @@ async function main(): Promise<void> {
           registry,
           gate: currentGate,
           bus,
-          budget: new Budget({ maxIterations: Math.min(cfg.maxIterations, 15) }, activeAgentModel, cfg.priceTable, Date.now()),
+          // Placeholder budget — agentTool builds the real per-sub-agent budget (default 30
+          // iterations, clamped to parent/operator caps); this value is overridden before use.
+          budget: new Budget({ maxIterations: cfg.maxIterations }, activeAgentModel, cfg.priceTable, Date.now()),
           context: new Context({
             contextBudget: cfg.contextBudget,
             triggerRatio: cfg.summarizeTriggerRatio,
@@ -2165,10 +2170,18 @@ async function main(): Promise<void> {
       maxIterations: cfg.maxIterations,
       priceTable: cfg.priceTable,
       subagentConcurrency: cfg.subagentConcurrency, // F06-10
+      subagentWallClockMinutes: cfg.subagentWallClockMinutes,
       resolveProfile: (reference, options) => profiles.resolve(reference, options),
       getConsultation: (id) => consultations?.continuation(id),
+      // Ops worker enforcement (§4b): dispatched ops archetypes get a fail-closed policy gate.
+      makeOpsGate: (workspace, jobId) => makeOpsWorkerGate(workspace, jobId),
     });
   registry.register(agentTool);
+  // Ops dispatcher (§7.2): rebind to the PERMISSION-GATED agent wrapper so spawned workers
+  // face the same native pipeline as any agent launch. Bootstrap's by-name fallback would
+  // resolve the ungated tool; the terminal host always rebinds here after gatedAgent exists.
+  registry.unregister('ops_dispatch');
+  registry.register(makeOpsDispatchTool(session.opsRuntime.deps(), () => gatedAgent));
   const consultations = new ConsultationService({ cfg, profiles, agent: () => gatedAgent, workspaceRoot, additionalRoots,
     sessionLog: () => sessionLogBox.current });
   consultations.adopt(sessionLog, resumeSessionPath);
@@ -2297,6 +2310,9 @@ async function main(): Promise<void> {
       // Live facts index (11.6.0 B4): rendered per request by the loop — system on non-caching
       // providers, uncached message tail on caching ones. Never baked into fullSystem.
       factsProvider: session.factsProvider,
+      // Live ops trigger feed (§7) — lead-only, capability-gated in bootstrap. Sub-agent
+      // factories deliberately do NOT receive it (workers plan from their claimed intent).
+      opsFeed: session.opsFeed,
       workspaceRoot,
       additionalRoots,
       forceConfirm,
@@ -2532,6 +2548,16 @@ async function main(): Promise<void> {
       // Live facts index (11.6.0 B4) — bootstrap's capability-gated provider; the lead loop
       // renders it per request. Sub-agent factories deliberately do NOT receive it.
       factsProvider: session.factsProvider,
+      // Ops HUD + /ops operator surface (§9). sessionId is read from the LIVE holder at call
+      // time (post-/fork correct) so the dispatcher lock matches claim_and_spawn's ctx.
+      opsHud: session.opsHud,
+      opsCommand: (arg, pushLine) =>
+        runOpsCommand(arg, {
+          workspace: workspaceRoot,
+          sessionId: SessionLog.sessionIdFromPath((sessionLogBox.current ?? sessionLog).path),
+          pushLine,
+          deps: session.opsDeps,
+        }),
       workspaceRoot,
       cfg,
       models: flags.models,
@@ -2591,6 +2617,8 @@ async function main(): Promise<void> {
   } finally {
     // F04-09 teardown: cancel pending wakeups so none can fire after the TUI exits.
     wakeup.clear();
+    // Ops runtime: drain enrichment and close every graph/ledger handle (§7).
+    await session.opsRuntime.dispose().catch(() => {});
     // The mirror holds an open listener; without closing it the process would not exit.
     if (webMirror) await webMirror.close().catch(() => {});
     await stopGgufServers();

@@ -50,14 +50,27 @@ export class Budget {
   private subOutputTokens = 0;
   private subCostUSD = 0;
   private startMs: number;
+  /**
+   * Automatic wall-clock backstop, deliberately SEPARATE from `limits.maxWallClockSec`.
+   * A backstop is a harness safety net ("a runaway sub-agent can never run forever"), not an
+   * operator ceiling: checkSpending enforces it, but inheritableCeilings NEVER exports it, so a
+   * child admitted late in its parent's life gets its OWN full backstop window instead of the
+   * parent's leftover minutes. Operator-set wall ceilings still live in `limits` and still
+   * inherit at every depth. (2026-11-17: the old design put the 30-min sub-agent backstop into
+   * limits, so ceiling inheritance squeezed a late-admitted child to ~8 min and it died
+   * `budget` with iterations unspent.)
+   */
+  private readonly backstopWallClockSec?: number;
 
   constructor(
     private readonly limits: BudgetLimits,
     private model: string,
     private readonly prices: PriceTable,
     now: number,
+    backstopWallClockSec?: number,
   ) {
     this.startMs = now;
+    if (backstopWallClockSec !== undefined && backstopWallClockSec > 0) this.backstopWallClockSec = backstopWallClockSec;
   }
 
   /**
@@ -154,18 +167,26 @@ export class Budget {
   checkSpending(now: number): BudgetStop {
     // P3-09 (F04-08): OWN + rolled-up sub-agent spend counts against the same ceilings — before
     // this, a fleet of sub-agents could burn tokens/cost that never touched the parent's
-    // maxTotalTokens / maxCostUSD at all.
+    // maxTotalTokens / maxCostUSD at all. Axis arithmetic lives in spendingAxis (one source of
+    // truth, same precedence); this wrapper keeps the historical stop shape.
+    return this.spendingAxis(now) ? 'budget' : null;
+  }
+
+  /**
+   * WHICH spending axis tripped checkSpending, if any (undefined = not spent). Lets a caller
+   * tell a wall-clock stop (time ran out; tokens/cost may remain) from a token/cost stop (hard
+   * spend exhausted) without re-deriving the arithmetic. Same checks and precedence as
+   * checkSpending; the iteration cap is deliberately NOT a spending axis.
+   */
+  spendingAxis(now: number): 'tokens' | 'cost' | 'wallclock' | undefined {
     const total = this.inputTokens + this.outputTokens + this.subInputTokens + this.subOutputTokens;
-    if (this.limits.maxTotalTokens != null && total >= this.limits.maxTotalTokens) return 'budget';
+    if (this.limits.maxTotalTokens != null && total >= this.limits.maxTotalTokens) return 'tokens';
     const cost = this.costUSD + this.subCostUSD;
-    if (this.limits.maxCostUSD != null && cost >= this.limits.maxCostUSD) return 'budget';
-    if (
-      this.limits.maxWallClockSec != null &&
-      (now - this.startMs) / 1000 >= this.limits.maxWallClockSec
-    ) {
-      return 'budget';
-    }
-    return null;
+    if (this.limits.maxCostUSD != null && cost >= this.limits.maxCostUSD) return 'cost';
+    const elapsedSec = (now - this.startMs) / 1000;
+    if (this.limits.maxWallClockSec != null && elapsedSec >= this.limits.maxWallClockSec) return 'wallclock';
+    if (this.backstopWallClockSec != null && elapsedSec >= this.backstopWallClockSec) return 'wallclock';
+    return undefined;
   }
 
   /**
@@ -208,7 +229,9 @@ export class Budget {
   /**
    * P3-09 (F04-08): the REMAINING headroom on each configured spending ceiling, for a sub-agent to
    * inherit as its own ceiling at admission. An axis the parent never configured inherits none
-   * (the sub-agent keeps its own iteration cap and wall-clock backstop on that axis). Never
+   * (the sub-agent keeps its own iteration cap and wall-clock backstop on that axis). The
+   * automatic backstop (constructor arg) is NOT a configured ceiling and is never exported.
+   * Never
    * negative — an exhausted parent yields a zero ceiling, and the sub-agent's between-turns
    * budget check (which runs BEFORE the first provider call) stops it immediately with zero spend.
    */

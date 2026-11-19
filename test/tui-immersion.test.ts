@@ -1,6 +1,6 @@
 // Regression contract for the 11.7.0 TUI-immersion features:
 //   F1 — clicked OSC 8 links open in the browser (http/https only, no shell injection)
-//   F2 — proseMaxCols config knob (0 = fill terminal width; default 100)
+//   F2 — proseMaxCols config knob (0 = fill terminal width — the DEFAULT; positive = opt-in cap)
 //   F3 — Snowfall image save+open fallback wiring
 import assert from 'node:assert/strict';
 import test from 'node:test';
@@ -38,10 +38,12 @@ test('isOpenableUrl is not fooled by shell metacharacters in a valid URL', () =>
 });
 
 // ── F2: prose width cap ───────────────────────────────────────────────────────
-test('contentWidth default cap stays 100 for backward compatibility', () => {
-  assert.equal(PROSE_MAX_COLS, 100);
-  assert.equal(contentWidth(200, 'assistant'), 100);
-  assert.equal(contentWidth(200, 'user'), 100);
+test('contentWidth default fills the terminal width (10.6.3 full-width contract)', () => {
+  // Regression: 11.7.0 re-introduced a default 100-col cap, leaving a dead right gutter on
+  // wide terminals. The DEFAULT must fill; a positive proseMaxCols is opt-in only.
+  assert.equal(PROSE_MAX_COLS, 0);
+  assert.equal(contentWidth(200, 'assistant'), 196);
+  assert.equal(contentWidth(200, 'user'), 196);
   // Narrow terminals are never widened.
   assert.equal(contentWidth(60, 'assistant'), 56); // 60 - 2*PAGE_MARGIN(2)
 });
@@ -66,12 +68,13 @@ test('contentWidth banner always spans full width regardless of cap', () => {
 });
 
 // ── F2: config knob ───────────────────────────────────────────────────────────
-test('config defaults: linkClickOpen=true, proseMaxCols=100', () => {
+test('config defaults: linkClickOpen=true, proseMaxCols=0 (fill terminal)', () => {
   const dir = mkdtempSync(join(tmpdir(), 'shadow-immersion-'));
   try {
     const cfg = loadConfig(dir);
     assert.equal(cfg.linkClickOpen, true);
-    assert.equal(cfg.proseMaxCols, 100);
+    assert.equal(cfg.proseMaxCols, 0);
+    assert.equal(cfg.subagentWallClockMinutes, 120, 'automatic sub-agent wall-clock backstop default');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

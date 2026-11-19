@@ -62,6 +62,7 @@ const PIN_THEME = {
  *  than a crowding card, and (unlike the old side panel) never sits beside <Static>. */
 export function PinnedState({
   goal,
+  ops,
   plan,
   todos,
   showPlan,
@@ -71,6 +72,8 @@ export function PinnedState({
   maxItems,
 }: {
   goal: string | null;
+  /** Ops summary row (§9) — its own truncate row inside the block, never the 🎯 Goal slot. */
+  ops?: string | null;
   plan: PlanSnapshot;
   todos: TodoItem[];
   showPlan: boolean;
@@ -110,6 +113,7 @@ export function PinnedState({
     <Box flexDirection="column" flexShrink={0} marginTop={1} width={cols} paddingLeft={PAGE_MARGIN}>
       <Text color={C.dim}>{rule}</Text>
       {goal ? <Text wrap="truncate" bold color={C.purple}>{`🎯 Goal: ${goal}`}</Text> : null}
+      {ops ? <Text wrap="truncate" color={C.cyan}>{ops}</Text> : null}
       {header ? (
         <Text wrap="truncate" bold color={planActive ? C.yellow : C.green}>
           {header}
@@ -320,7 +324,7 @@ export function FlatItem({
   toolRun?: ToolRun;
   /** Live preview: format the complete pending Markdown block, then take its physical tail. */
   maxRows?: number;
-  /** Readability cap on prose width; 0 = fill the terminal width. Default PROSE_MAX_COLS. */
+  /** Readability cap on prose width; 0 (default) = fill the terminal width. */
   proseMaxCols?: number;
 }) {
   const inner = Math.max(20, cols - PAGE_MARGIN * 2);

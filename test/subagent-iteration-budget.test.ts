@@ -341,3 +341,59 @@ test('a completed end_turn answer is not reclassified by the intent filter', asy
     assert.equal(answer, finalText, 'the completed answer must be returned verbatim');
   } finally { rmSync(ws, { recursive: true, force: true }); }
 });
+
+// ── subagentWallClockMinutes plumbing (review finding I) ─────────────────────────────────────
+test('subagentWallClockMinutes knob bounds the child wall-clock and names the axis', async () => {
+  const ws = mkdtempSync(join(tmpdir(), 'wallclock-knob-'));
+  try {
+    // Deterministic wall-clock: the child budget is born at admission (T); the provider advances
+    // the fake clock past the 1-min knob MID-TURN, so the post-response check trips wall-clock
+    // while tokens/cost remain unspent. (Advancing before tool.run would not work: makeLoopDeps
+    // is lazy, so the budget would simply be born at the later time.)
+    const T = 1_000_000_000_000;
+    let now = T;
+    const realNow = Date.now;
+    Date.now = () => now;
+    try {
+      const provider: Provider = {
+        name: 'clock-probe',
+        estimateTokens: (msgs) => estimateTokensFromMessages(msgs),
+        async *send(_req: CompletionRequest): AsyncIterable<ProviderEvent> {
+          yield { type: 'text', delta: 'partial work' };
+          now = T + 2 * 60_000; // turn "took" 2 minutes — past the 1-min backstop
+          yield { type: 'done', stopReason: 'end_turn' };
+        },
+      };
+      const tool = makeAgentTool({
+        makeLoopDeps: () => makeDeps(ws, provider, 50),
+        getAutonomy: () => 'full',
+        contextBudget: 1_000_000, triggerRatio: 0.75, keepLastTurns: 6, maxIterations: 50, priceTable: PRICE,
+        subagentWallClockMinutes: 1,
+      });
+      const ctx: ToolContext = { workspaceRoot: ws, signal: new AbortController().signal, log: () => {}, dryRun: false };
+      const res = await tool.run({ prompt: 'task' }, ctx);
+      assert.equal(res.data?.status, 'partial', 'knob wall-clock stop must be partial, not success');
+      assert.equal(res.data?.stopReason, 'budget');
+      const answer = String(res.data?.answer ?? '');
+      assert.match(answer, /wall-clock time ran out \(token\/cost budget may remain\)/, `axis named, got: ${answer}`);
+    } finally { Date.now = realNow; }
+  } finally { rmSync(ws, { recursive: true, force: true }); }
+});
+
+// ── workable floor vs a TIGHT PARENT BUDGET (review finding H) ───────────────────────────────
+test('the workable floor never widens a tight parentBudget iteration ceiling', async () => {
+  const ws = mkdtempSync(join(tmpdir(), 'floor-parent-cap-'));
+  try {
+    const provider = new MockProvider([[{ type: 'text', delta: 'partial' }, { type: 'done', stopReason: 'end_turn' }]]);
+    const tool = makeAgentTool({
+      makeLoopDeps: () => makeDeps(ws, provider, 50),
+      getAutonomy: () => 'full',
+      contextBudget: 1_000_000, triggerRatio: 0.75, keepLastTurns: 6, maxIterations: 50, priceTable: PRICE,
+    });
+    const parent = new Budget({ maxIterations: 5 }, 'mock', PRICE, Date.now());
+    const ctx: ToolContext = { workspaceRoot: ws, signal: new AbortController().signal, log: () => {}, dryRun: false, parentBudget: parent, rootBudget: parent };
+    const res = await tool.run({ prompt: 'task', max_iterations: 1 }, ctx);
+    assert.equal(res.data?.iterations?.max, 5, 'request 1 → floor 10 → clamped to the parent cap 5');
+    assert.deepEqual(res.data?.requestedIterations, { requested: 1, applied: 5 });
+  } finally { rmSync(ws, { recursive: true, force: true }); }
+});

@@ -33,6 +33,8 @@ export interface SnowfallState {
   costUSD: number;
   goal: string | null;
   missionLine: string;
+  /** One-line ops summary (§9); '' when no ops run. Same strip slot rules as missionLine. */
+  opsLine: string;
   mcpConnecting: boolean;
   mcpFailed: boolean;
   /** Null while idle; an em dash means a running stream has no reliable rate yet. */
@@ -94,6 +96,7 @@ export class SnowfallStatus implements Component {
     let left = parts.join(separator);
     const summaries: string[] = [];
     if (s.missionLine && width >= 110) summaries.push(style.dim(cut(safe(s.missionLine), 28)));
+    if (s.opsLine && width >= 110) summaries.push(style.dim(cut(safe(s.opsLine), 34)));
     const activeAgents = s.agents.filter((agent) => !agent.done).length;
     if (activeAgents) summaries.push(style.dim(`${activeAgents} agent${activeAgents === 1 ? '' : 's'}`));
     if (s.todos.length) summaries.push(style.dim(`${s.todos.filter((t) => t.status === 'completed').length}/${s.todos.length} tasks`));

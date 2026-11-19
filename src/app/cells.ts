@@ -26,8 +26,10 @@ import { formatBytes, fullscreenImageProtocol } from '../util/termImage.js';
 
 /** Left/right page margin — floats transcript content off the terminal edges. */
 export const PAGE_MARGIN = SPACING.page;
-/** Cap prose so lines don't run edge-to-edge on wide terminals (matches the Ink path). */
-export const PROSE_MAX_COLS = 100;
+/** Default prose cap: 0 = FILL the terminal width — the 10.6.3 full-width layout contract.
+ *  A positive `proseMaxCols` config is an opt-in reading measure, never a silent default
+ *  (the 11.7.0 default of 100 regressed wide terminals to a dead right gutter). Matches the Ink path. */
+export const PROSE_MAX_COLS = 0;
 
 /**
  * Guarantee every row fits the viewport. Cheap in the normal case (visibleWidth is cached and

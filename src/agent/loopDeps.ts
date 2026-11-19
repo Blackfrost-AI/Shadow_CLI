@@ -66,6 +66,8 @@ export interface LoopDepsInput {
    * (like `mission`) — delegates must not inherit the lead session's facts.
    */
   factsProvider?: LoopDeps['factsProvider'];
+  /** LIVE ops trigger feed — LEAD loop only (sub-agent factories omit it, like facts). */
+  opsFeed?: LoopDeps['opsFeed'];
   resolveFallback?: LoopDeps['resolveFallback'];
   /** The previous run's stop reason when the caller tracks it (honest empty-response diagnosis — P1A-08). */
   priorStopReason?: LoopDeps['priorStopReason'];
@@ -101,6 +103,7 @@ export function buildLoopDeps(input: LoopDepsInput): LoopDeps {
     readTracker: input.readTracker,
     continuityState: input.continuityState,
     factsProvider: input.factsProvider,
+    opsFeed: input.opsFeed,
     resolveFallback: input.resolveFallback,
     priorStopReason: input.priorStopReason,
 

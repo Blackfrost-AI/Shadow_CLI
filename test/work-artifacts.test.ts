@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createWorktree } from '../src/tools/worktree.js';
@@ -135,6 +135,57 @@ test('ignored outputs retain their checkout and cannot be silently discarded out
     assert.deepEqual(artifact.ignoredFiles, ['generated.txt']);
     assert.throws(() => discardWorkArtifact(h.ws, artifact.id), /ignored files/);
     assert.equal(readFileSync(join(h.wt.path, 'generated.txt'), 'utf8'), 'valuable generated result\n');
+  } finally { h.close(); }
+});
+
+test('capture survives a GITIGNORED .shadow dir (R5 regression: add --all exclude pathspec went fatal)', () => {
+  // Reproduced with git 2.50.1: `git add --all -- . :(exclude).shadow` exits FATAL ("paths are
+  // ignored… use -f") when the excluded path is itself gitignored — the whole artifact snapshot
+  // was lost. Two-step staging (add -u + ls-files --others | add --pathspec-from-file) must
+  // capture tracked edits, untracked adds, and deletions while leaving ignored output outside.
+  const h = fixture();
+  try {
+    writeFileSync(join(h.wt.path, '.gitignore'), '.shadow/\nbuild-cache/\n');
+    mkdirSync(join(h.wt.path, '.shadow', 'sessions'), { recursive: true });
+    writeFileSync(join(h.wt.path, '.shadow', 'sessions', 'log.jsonl'), '{"secret":"runtime state"}\n');
+    mkdirSync(join(h.wt.path, 'build-cache'), { recursive: true });
+    writeFileSync(join(h.wt.path, 'build-cache', 'big.bin'), 'cache');
+    writeFileSync(join(h.wt.path, 'a.txt'), 'edited tracked file\n');
+    writeFileSync(join(h.wt.path, 'new-source.ts'), 'export const x = 1;\n');
+    // Pathspec-magic filename: must be staged LITERALLY, not interpreted as an exclude rule.
+    writeFileSync(join(h.wt.path, ':(exclude)trap.ts'), 'export const trap = 1;\n');
+    const artifact = finishWorkArtifact(h.ws, h.record.id, { status: 'completed' });
+    assert.equal(artifact.state, 'ready');
+    assert.equal(artifact.error, undefined, 'no fatal from the ignored excluded path');
+    assert.deepEqual([...artifact.changedFiles].sort(), [...[':(exclude)trap.ts', '.gitignore', 'a.txt', 'new-source.ts']].sort());
+    // .shadow is excluded from the CONTENT pathspec entirely (runtime state — never listed, never patched).
+    assert.ok(!artifact.ignoredFiles?.some((f) => f.startsWith('.shadow/')));
+    assert.ok(artifact.ignoredFiles?.includes('build-cache/big.bin'));
+    const { patch } = inspectWorkArtifact(h.ws, h.record.id);
+    assert.ok(!patch.includes('runtime state'), 'ignored runtime state never enters the patch');
+    assert.match(patch, /new-source\.ts/);
+    const applied = applyWorkArtifact(h.ws, h.record.id);
+    assert.equal(applied.state, 'applied');
+    assert.equal(readFileSync(join(h.ws, 'a.txt'), 'utf8'), 'edited tracked file\n');
+    assert.equal(readFileSync(join(h.ws, 'new-source.ts'), 'utf8'), 'export const x = 1;\n');
+    assert.equal(existsSync(join(h.ws, '.shadow', 'sessions', 'log.jsonl')), false, 'ignored output not applied');
+  } finally { h.close(); }
+});
+
+test('capture stages tracked DELETIONS alongside untracked adds', () => {
+  const h = fixture();
+  try {
+    writeFileSync(join(h.wt.path, '.gitignore'), '.shadow/\n');
+    mkdirSync(join(h.wt.path, '.shadow'), { recursive: true });
+    rmSync(join(h.wt.path, 'a.txt'));
+    writeFileSync(join(h.wt.path, 'replacement.txt'), 'takes over\n');
+    const artifact = finishWorkArtifact(h.ws, h.record.id, { status: 'completed' });
+    assert.equal(artifact.state, 'ready');
+    assert.deepEqual([...artifact.changedFiles].sort(), ['.gitignore', 'a.txt', 'replacement.txt']);
+    const applied = applyWorkArtifact(h.ws, h.record.id);
+    assert.equal(applied.state, 'applied');
+    assert.equal(existsSync(join(h.ws, 'a.txt')), false, 'deletion carried through the patch');
+    assert.equal(readFileSync(join(h.ws, 'replacement.txt'), 'utf8'), 'takes over\n');
   } finally { h.close(); }
 });
 

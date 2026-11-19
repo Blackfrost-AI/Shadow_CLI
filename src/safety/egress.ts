@@ -59,6 +59,7 @@ export type EgressPurpose =
   | 'plugin-index' // user-configured plugin registry lookup (P3-07; off unless pluginIndexUrl is set)
   | 'plugin-clone' // `shadow plugin add <git-url>` — git child process (broker-bypass), journaled here
   | 'osv' // osv_query tool — package vulnerability lookup (api.osv.dev, user-initiated)
+  | 'ops-enrich' // ops network enricher egress (osv-lookup; operator-approved via allow-network engagement scope)
   | 'dispatch'; // caught at the dispatcher layer without a broker purpose
 
 export type EgressVerdict = 'allowed' | 'denied';

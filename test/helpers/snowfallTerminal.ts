@@ -61,6 +61,7 @@ export const snowfallFixtureState = (): SnowfallState => ({
   autonomy: 'auto-read', planMode: false, bypass: false, running: false, startedAt: 0,
   tick: 0, reducedMotion: true, queued: 0, toolLine: null, contextPct: 0.28, costUSD: 0.0123,
   goal: 'Make the terminal feel like Shadow.', missionLine: '', mcpConnecting: false, mcpFailed: false, tokPerSec: null,
+  opsLine: '',
   todos: [
     { id: '1', subject: 'Build the crystalline layout', status: 'completed' },
     { id: '2', subject: 'Check narrow terminals', status: 'in_progress' },

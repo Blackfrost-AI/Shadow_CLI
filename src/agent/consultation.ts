@@ -149,7 +149,10 @@ export class ConsultationService {
           maxTotalTokens: tighter(cfg.budget.maxTotalTokens, remaining.maxTotalTokens === undefined ? undefined : remaining.maxTotalTokens + spent.inputTokens + spent.outputTokens),
           maxCostUSD: tighter(cfg.budget.maxCostUSD, remaining.maxCostUSD === undefined ? undefined : remaining.maxCostUSD + spent.costUSD),
           maxWallClockSec: tighter(cfg.budget.maxWallClockSec, remaining.maxWallClockSec),
-        }, raw.model ?? cfg.model, cfg.priceTable, Date.now());
+        }, raw.model ?? cfg.model, cfg.priceTable, Date.now(),
+        // Restored records must keep a wall bound too: the automatic backstop is no longer part
+        // of the persisted remaining ceilings, so re-apply it here (same rule as new records).
+        cfg.budget.maxWallClockSec === undefined ? 1800 : undefined);
         budget.accrueSubagent(spent);
         const interrupted = raw.summary.status === 'running';
         this.records.set(raw.summary.id, {
@@ -192,7 +195,15 @@ export class ConsultationService {
     const record: RecordState = {
       summary: { id, title: (request.title ?? request.prompt).trim().slice(0, 120), profile: request.profile ?? this.options.profiles.currentSelection(), status: 'ready', turns: 0 },
       context: new Context({ contextBudget: cfg.contextBudget, triggerRatio: cfg.summarizeTriggerRatio, keepLastTurns: cfg.keepLastTurns }),
-      budget: new Budget({ maxIterations: 0, ...cfg.budget, maxWallClockSec: cfg.budget.maxWallClockSec ?? 1800 }, cfg.model, cfg.priceTable, Date.now()),
+      budget: new Budget(
+        { maxIterations: 0, ...cfg.budget },
+        cfg.model,
+        cfg.priceTable,
+        Date.now(),
+        // The 30-min default is an automatic BACKSTOP (non-inheritable), not an operator ceiling.
+        // An operator-set maxWallClockSec stays in limits above and still inherits normally.
+        cfg.budget.maxWallClockSec === undefined ? 1800 : undefined,
+      ),
     };
     this.records.set(id, record);
     const scoped = request.scopedContext?.trim();

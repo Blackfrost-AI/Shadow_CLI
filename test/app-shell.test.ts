@@ -81,9 +81,11 @@ test('every FlatCell row fits the width it was asked for, at many widths', () =>
   }
 });
 
-test('contentWidth caps prose but lets the banner use the full inner measure', () => {
-  assert.equal(contentWidth(200, 'assistant'), 100);
-  assert.equal(contentWidth(200, 'banner'), 200 - PAGE_MARGIN * 2);
+test('contentWidth fills by default; an opt-in cap still spares the banner', () => {
+  // Default 0 = FILL (10.6.3 full-width contract restored); positive cap is opt-in.
+  assert.equal(contentWidth(200, 'assistant'), 200 - PAGE_MARGIN * 2);
+  assert.equal(contentWidth(200, 'assistant', 100), 100);
+  assert.equal(contentWidth(200, 'banner', 100), 200 - PAGE_MARGIN * 2, 'banner always full inner measure');
   assert.equal(contentWidth(50, 'assistant'), 50 - PAGE_MARGIN * 2);
 });
 

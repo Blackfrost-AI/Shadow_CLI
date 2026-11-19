@@ -99,7 +99,18 @@ function capture(artifact: WorkArtifact): WorkArtifact {
   const env = { ...process.env, GIT_INDEX_FILE: indexPath };
   try {
     git(artifact.worktreePath, ['read-tree', artifact.baseCommit], { env });
-    git(artifact.worktreePath, ['add', '--all', '--', ...CONTENT_PATHS], { env });
+    // Two-step staging (git ≥2.32): `add --all -- . :(exclude).shadow` exits FATAL when
+    // the excluded path is itself gitignored ("paths are ignored… use -f"), losing the
+    // whole artifact. Step 1 stages tracked modifications/deletions (ignore rules don't
+    // apply to tracked files); step 2 adds untracked non-ignored files via an explicit
+    // NUL pathspec list — `ls-files --others --exclude-standard` never lists ignored
+    // paths, so no fatal, and empty stdin is a clean no-op.
+    git(artifact.worktreePath, ['add', '-u', '--', ...CONTENT_PATHS], { env });
+    const untracked = git(artifact.worktreePath, ['ls-files', '--others', '--exclude-standard', '-z', '--', ...CONTENT_PATHS], { env });
+    // `:(literal)` prefix: a worker-planted filename like `:(exclude)x.ts` would otherwise be
+    // interpreted as pathspec MAGIC by add --pathspec-from-file and suppress other additions.
+    const literalSpecs = untracked.split('\0').filter((p) => p.length > 0).map((p) => `:(literal)${p}`).join('\0');
+    git(artifact.worktreePath, ['add', '--pathspec-from-file=-', '--pathspec-file-nul', '--'], { env, input: literalSpecs });
     const tree = git(artifact.worktreePath, ['write-tree'], { env }).trim();
     const patch = git(artifact.worktreePath, ['diff', '--binary', '--full-index', '--no-ext-diff', '--no-textconv', artifact.baseCommit, tree, '--', ...CONTENT_PATHS]);
     artifact.changedFiles = git(artifact.worktreePath, ['diff', '--name-only', '-z', artifact.baseCommit, tree, '--', ...CONTENT_PATHS]).split('\0').filter(Boolean);

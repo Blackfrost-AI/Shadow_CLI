@@ -162,6 +162,45 @@ test('inheritableCeilings reports remaining headroom, clamps at zero, omits unco
   assert.equal(ec.maxWallClockSec, undefined);
 });
 
+test('automatic wall-clock BACKSTOP is enforced but NEVER inherited (R1 regression 2026-11-17)', () => {
+  // Old defect: the sub-agent's auto 30-min backstop lived in limits.maxWallClockSec, so
+  // inheritableCeilings exported the parent's REMAINING minutes — a child admitted 22 min into
+  // its parent's life died `budget` at 8 min with iterations unspent. The backstop is now a
+  // separate constructor field: enforced locally, invisible to inheritance.
+  const parent = new Budget({ maxIterations: 100 }, 'mock', PRICE, t0, 1800);
+  const late = t0 + 22 * 60_000; // 22 min elapsed
+  assert.equal(parent.checkSpending(late), null, 'backstop not yet tripped at 22 min');
+  assert.equal(parent.inheritableCeilings(late).maxWallClockSec, undefined, 'backstop NEVER exports as an inheritable ceiling');
+
+  const child = new Budget({ maxIterations: 35 }, 'mock', PRICE, late, 1800);
+  child.applyInheritedCeilings(parent.inheritableCeilings(late));
+  assert.equal(child.checkSpending(late + 10 * 60_000), null, 'late-admitted child keeps its OWN full window (old design killed it here)');
+  assert.equal(child.checkSpending(late + 31 * 60_000), 'budget', 'child backstop still enforced at its own 30 min');
+  assert.equal(child.spendingAxis(late + 31 * 60_000), 'wallclock', 'spendingAxis names the wall-clock axis');
+
+  // Operator-set wall ceilings still live in limits and STILL inherit remaining headroom.
+  const operator = new Budget({ maxIterations: 100, maxWallClockSec: 3600 }, 'mock', PRICE, t0);
+  assert.equal(operator.inheritableCeilings(late).maxWallClockSec, 3600 - 22 * 60, 'operator ceiling inherits remaining seconds');
+  const opChild = new Budget({ maxIterations: 35 }, 'mock', PRICE, late, 7200);
+  opChild.applyInheritedCeilings(operator.inheritableCeilings(late));
+  assert.equal(opChild.checkSpending(late + 17 * 60_000), null, '17 min into the remaining 38-min operator window is fine');
+  assert.equal(opChild.checkSpending(late + 39 * 60_000), 'budget', 'operator remaining ceiling (38 min) binds the child before its own 120-min backstop');
+  assert.equal(opChild.spendingAxis(late + 39 * 60_000), 'wallclock');
+});
+
+test('spendingAxis distinguishes tokens/cost/wallclock and stays undefined when unspent', () => {
+  const b = new Budget({ maxIterations: 5, maxTotalTokens: 100, maxCostUSD: 1 }, 'mock', PRICE, t0, 60);
+  assert.equal(b.spendingAxis(t0), undefined);
+  b.recordUsage({ inputTokens: 100, outputTokens: 0 }, t0);
+  assert.equal(b.spendingAxis(t0), 'tokens');
+  const c = new Budget({ maxIterations: 5, maxCostUSD: 0.00005 }, 'mock', PRICE, t0);
+  c.recordUsage({ inputTokens: 100, outputTokens: 0 }, t0); // 100/1e6 > ceiling
+  assert.equal(c.spendingAxis(t0), 'cost');
+  const w = new Budget({ maxIterations: 5 }, 'mock', PRICE, t0, 60);
+  assert.equal(w.checkSpending(t0 + 61_000), 'budget');
+  assert.equal(w.spendingAxis(t0 + 61_000), 'wallclock');
+});
+
 test('applyInheritedCeilings adopts missing axes, takes the tighter of two, never widens', () => {
   const b = new Budget({ maxIterations: 10, maxCostUSD: 0.002, maxWallClockSec: 1800 }, 'mock', PRICE, t0);
   // Inherited: cost tighter, tokens new, wall-clock looser.

@@ -21,6 +21,8 @@ import type { Effort } from '../provider/provider.js';
 import type { ApprovalGate } from '../agent/approval.js';
 import type { ResolvedModelProfile } from '../agent/modelProfiles.js';
 import { checksForRegistry } from '../checks/registry.js';
+import { isOpsArchetype } from '../security/ops/workerGate.js';
+import { OPS_ARCHETYPES } from '../security/ops/archetypes.js';
 
 /**
  * Budget + externalization discipline appended to every subagent's system prompt. Read-only
@@ -47,19 +49,38 @@ function subagentDiscipline(registry: ToolRegistry): string {
 
 /** Upper bound for a requested sub-agent ceiling when the parent itself runs unlimited (maxIterations 0). */
 export const SUBAGENT_ITERATION_HARD_CAP = 100;
-const SUBAGENT_DEFAULT_ITERATIONS = 15;
+const SUBAGENT_DEFAULT_ITERATIONS = 30;
+/**
+ * Minimum WORKABLE ceiling for an explicit `max_iterations` request (2026-11-17). A fleet run
+ * asked for 1- and 3-turn reviewers: a 1-turn agent cannot read anything AND answer, so the
+ * harness silently produced empty "reviews". Requests below this floor are raised to it (then
+ * still clamped by the parent cap) and the raise is DISCLOSED in the tool result
+ * (`requestedIterations` + an answer note), never silently applied.
+ * Defaults and agent-definition ceilings are operator-authored intent and pass through untouched.
+ */
+export const SUBAGENT_MIN_REQUESTED_ITERATIONS = 10;
+/** Default automatic wall-clock backstop for a sub-agent (minutes). Config: `subagentWallClockMinutes`.
+ *  30 min killed a real build at 44/100 iterations with tokens to spare; 120 min gives deep work
+ *  room while still bounding a runaway. This is a BACKSTOP, not an operator ceiling — it is never
+ *  inherited by children (see Budget's backstopWallClockSec). */
+export const SUBAGENT_DEFAULT_WALL_CLOCK_MINUTES = 120;
 
 /**
  * Resolve a sub-agent's iteration ceiling. A sub-agent always keeps at least one working backstop
- * (never 0 = unlimited). Precedence: an explicit `max_iterations` request, then the agent
- * definition's own value, then min(parent, 15). A request may raise the default but never exceeds
+ * (never 0 = unlimited). Precedence: an explicit `max_iterations` request (floored at
+ * SUBAGENT_MIN_REQUESTED_ITERATIONS), then the agent definition's own value, then
+ * min(parent, SUBAGENT_DEFAULT_ITERATIONS). A request may raise the default but never exceeds
  * the parent's ceiling — or SUBAGENT_ITERATION_HARD_CAP when the parent is unlimited — so a model
- * cannot use delegation to escape the operator's iteration limit.
+ * cannot use delegation to escape the operator's iteration limit. The floor never overrides a
+ * tighter parent cap or an operator-authored definition ceiling.
  */
 export function resolveSubagentIterations(parentMax: number, defMax?: number, requested?: number): number {
   const parentCap = parentMax > 0 ? parentMax : SUBAGENT_ITERATION_HARD_CAP;
   const fallback = Math.min(parentCap, SUBAGENT_DEFAULT_ITERATIONS);
-  const selected = requested && requested > 0 ? requested : defMax && defMax > 0 ? defMax : fallback;
+  // Floor at whole-turn granularity BEFORE selection: a fractional ask like 2.7 must not slip
+  // under the floor only to be truncated to 2 afterwards.
+  const requestedEffective = requested && requested > 0 ? Math.max(Math.floor(requested), SUBAGENT_MIN_REQUESTED_ITERATIONS) : undefined;
+  const selected = requestedEffective ?? (defMax && defMax > 0 ? defMax : fallback);
   return Math.max(1, Math.min(Math.floor(selected), parentCap));
 }
 
@@ -76,7 +97,7 @@ const inputSchema = z.object({
   run_in_background: z.boolean().optional(),
   priority: z.enum(['low', 'normal', 'high']).optional().describe('Queue priority for background work.'),
   max_iterations: z.number().int().positive().optional().describe(
-    `Iteration ceiling for this sub-agent (default 15). Raise it for deep reviews or large sweeps; bounded by the parent's own ceiling (or ${SUBAGENT_ITERATION_HARD_CAP} when the parent is unlimited).`,
+    `Iteration ceiling for this sub-agent (default ${SUBAGENT_DEFAULT_ITERATIONS}; requests below ${SUBAGENT_MIN_REQUESTED_ITERATIONS} are raised to it). Raise it for deep reviews or large sweeps; bounded by the parent's own ceiling (or ${SUBAGENT_ITERATION_HARD_CAP} when the parent is unlimited).`,
   ),
 });
 
@@ -258,7 +279,7 @@ function isPureIntent(text: string): boolean {
 }
 
 /** One outcome contract for the synchronous result, background delivery, and lifecycle UI. */
-function agentOutcome(result: LoopResult, salvage: string | null, diagnostic: string, aborted: boolean): {
+function agentOutcome(result: LoopResult, salvage: string | null, diagnostic: string, aborted: boolean, budget?: Budget): {
   ok: boolean;
   answer: string;
   status: 'completed' | 'partial' | 'failed' | 'cancelled';
@@ -284,6 +305,10 @@ function agentOutcome(result: LoopResult, salvage: string | null, diagnostic: st
   if (result.stopReason === 'budget' || result.stopReason === 'max_iterations') {
     const iter = result.iterations;
     const iterLabel = iter && iter.max > 0 ? ` (${iter.used}/${iter.max} iterations)` : '';
+    // Name the exhausted axis so the parent can tell "time ran out, tokens remain" (retry with a
+    // longer window) from "hard spend exhausted" (do not blindly retry).
+    const axis = result.stopReason === 'budget' ? budget?.spendingAxis(Date.now()) : undefined;
+    const axisLabel = axis ? ` — ${axis === 'wallclock' ? 'wall-clock time ran out (token/cost budget may remain)' : `${axis} budget exhausted`}` : '';
     return {
       // A controlled ceiling is incomplete work, so it is NOT ok: a parent (or any consumer)
       // reading the coarse signal must not see success beside a partial body. It stays
@@ -291,7 +316,7 @@ function agentOutcome(result: LoopResult, salvage: string | null, diagnostic: st
       // the partial coverage still travels in the answer and `data`.
       ok: false,
       answer: withPartial(
-        `INCOMPLETE — sub-agent stopped by its ${result.stopReason} ceiling${iterLabel}${hasPartial ? '; the text below is partial coverage, not a finished result.' : ' before producing an answer.'}` +
+        `INCOMPLETE — sub-agent stopped by its ${result.stopReason} ceiling${iterLabel}${axisLabel}${hasPartial ? '; the text below is partial coverage, not a finished result.' : ' before producing an answer.'}` +
         `\n\nRecovery: this run is incomplete, not automatically resumed. An operator can retry it from the work center with /work retry <task_id> --confirm; use /consult to start a new consultation.`,
       ),
       status: 'partial',
@@ -324,8 +349,16 @@ export interface AgentToolDeps {
   priceTable: PriceTable;
   /** F06-10: max sub-agents admitted at once (session-level semaphore). Default 4. */
   subagentConcurrency?: number;
+  /** Automatic per-sub-agent wall-clock backstop in minutes (never inherited). Default 120. */
+  subagentWallClockMinutes?: number;
   resolveProfile?: (reference: string, options: { effort?: Effort; signal: AbortSignal }) => Promise<ResolvedModelProfile>;
   getConsultation?: (id: string) => { context: Context; profile?: string; gate?: ApprovalGate } | undefined;
+  /**
+   * Ops worker gate factory (plan §4b). When the resolved subagent_type is a canonical ops
+   * archetype, the worker loop gets a fail-closed policy gate bound to (workspace, taskId).
+   * Absent in hosts without the ops runtime — an ops dispatch there fails at ops_dispatch.
+   */
+  makeOpsGate?: (workspace: string, jobId: string) => LoopDeps['opsGate'];
 }
 
 export type AgentToolInput = z.infer<typeof inputSchema>;
@@ -342,6 +375,10 @@ export interface AgentToolData {
   stopReason?: LoopResult['stopReason'];
   iterations?: { used: number; max: number };
   artifactIds?: string[];
+  /** Fields adopted from the prepared job's recorded input on a retry claim (R4). */
+  adoptedJobInput?: string[];
+  /** Caller asked for fewer iterations than the workable floor; what was applied instead (R3). */
+  requestedIterations?: { requested: number; applied: number };
 }
 
 /** Claude Agent tool parity — isolated sub-loop with fresh context, returns final answer.
@@ -447,6 +484,12 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         return fail('agent', 'read', Date.now() - start, 'aborted', 'Sub-agent aborted.');
       }
       const base = deps.makeLoopDeps();
+      // A prepared job's RECORDED input is authoritative (it may carry an operator follow-up
+      // appended by prepare_retry). Adopt it instead of demanding the caller echo it byte-for-byte
+      // — the old strict comparison refused every natural retry ("Prepared job prompt differs…").
+      // Only the six persisted fields are adopted; fresh values for unpersisted knobs
+      // (max_iterations, run_in_background, require_priced_usage) legitimately pass.
+      const adoptedJobInput: string[] = [];
       if (input.job_id) {
         const preparedStore = new JobStore(base.workspaceRoot);
         try {
@@ -455,7 +498,20 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
           const blockers = preparedStore.blockers(prepared);
           if (blockers.length) throw new Error(`Job is blocked by: ${blockers.join(', ')}`);
           for (const key of ['prompt', 'profile', 'subagent_type', 'isolation', 'priority', 'consultation_id'] as const) {
-            if (input[key] !== prepared.input[key]) throw new Error(`Prepared job ${key} differs from the requested task. Use its recorded input.`);
+            if (input[key] !== prepared.input[key]) {
+              // Containment is never silently downgraded: if the CALLER asked for worktree
+              // isolation, keep it even when the recorded job ran unisolated (and disclose).
+              if (key === 'isolation' && input.isolation === 'worktree' && prepared.input.isolation !== 'worktree') {
+                adoptedJobInput.push('isolation (kept caller worktree — recorded job ran unisolated)');
+                continue;
+              }
+              // Value-level disclosure for identity/containment fields (never echo prompt content).
+              const detail = key === 'profile' || key === 'subagent_type' || key === 'isolation'
+                ? `${key} (${String(input[key] ?? 'default')} → ${String(prepared.input[key] ?? 'default')})`
+                : key;
+              adoptedJobInput.push(detail);
+              (input as Record<string, unknown>)[key] = prepared.input[key];
+            }
           }
         } catch (error) {
           return fail('agent', 'read', Date.now() - start, 'job_failed', (error as Error).message);
@@ -463,7 +519,9 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
       }
       ensureControlBus(base.bus);
       const agentType = input.subagent_type ?? 'general-purpose';
-      const def = resolveAgentDef(agentType, ctx.workspaceRoot);
+      // Ops archetypes resolve ONLY from the canonical constant — a workspace
+      // `.shadow/agents/<name>.md` must never widen a worker's tool surface (plan §6).
+      const def = isOpsArchetype(agentType) ? OPS_ARCHETYPES[agentType] : resolveAgentDef(agentType, ctx.workspaceRoot);
       const consultation = input.consultation_id ? deps.getConsultation?.(input.consultation_id) : undefined;
       if (input.consultation_id && !consultation) {
         return fail(
@@ -515,19 +573,29 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
       // A sub-agent MUST always keep at least one working backstop. `Math.min(deps.maxIterations, 15)`
       // yields 0 when the parent set maxIterations:0 ("unlimited"), which disabled EVERY Budget guard and
       // let a stuck sub-agent burn unbounded API cost. Clamp iterations to ≥1 AND always attach a
-      // wall-clock ceiling so a runaway sub-agent can never run forever regardless of the iteration count.
+      // wall-clock backstop so a runaway sub-agent can never run forever regardless of the iteration count.
+      // The backstop is a SEPARATE Budget field, not an operator ceiling: it is enforced but never
+      // inherited, so a child admitted late in its parent's life gets its own full window (the old
+      // design leaked the parent's remaining minutes into the child and killed it mid-work).
       // This tool instance is shared by the delegation tree. deps holds the root ceiling,
       // whereas the stamped parentBudget belongs to the immediate caller.
-      const rootCap = resolveSubagentIterations(deps.maxIterations, undefined, Number.MAX_SAFE_INTEGER);
-      const parentCap = resolveSubagentIterations(
-        ctx.parentBudget?.iterationLimit ?? deps.maxIterations, undefined, rootCap,
-      );
+      // Caps are OPERATOR/parent intent — computed WITHOUT the request floor (routing them through
+      // the `requested` parameter would let the floor WIDEN a tight operator cap, e.g. 1 → 10).
+      const rootCap = deps.maxIterations > 0 ? deps.maxIterations : SUBAGENT_ITERATION_HARD_CAP;
+      const parentLimit = ctx.parentBudget?.iterationLimit ?? deps.maxIterations;
+      const parentCap = Math.max(1, Math.min(parentLimit > 0 ? parentLimit : SUBAGENT_ITERATION_HARD_CAP, rootCap));
       const maxIter = resolveSubagentIterations(parentCap, def?.maxIterations, input.max_iterations);
+      const requestedBelowFloor = input.max_iterations !== undefined
+        && input.max_iterations > 0
+        && input.max_iterations < SUBAGENT_MIN_REQUESTED_ITERATIONS
+        && maxIter > input.max_iterations;
+      const backstopSec = (deps.subagentWallClockMinutes ?? SUBAGENT_DEFAULT_WALL_CLOCK_MINUTES) * 60;
       const budget = new Budget(
-        { maxIterations: maxIter, maxWallClockSec: 30 * 60 },
+        { maxIterations: maxIter },
         profile?.model ?? base.model,
         deps.priceTable,
         Date.now(),
+        backstopSec,
       );
 
       let registry = base.registry;
@@ -697,6 +765,10 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         // background agent at ANY depth rolls its spend up into the turn/run budget even after
         // intermediate ancestors have finished (a top-level call's parent budget IS the root).
         rootBudget: ctx.rootBudget ?? ctx.parentBudget ?? undefined,
+        // Ops worker enforcement (§4b): a dispatched ops archetype gets a fail-closed policy
+        // gate for EVERY tool call (and the inner project_checks shell). Ordinary delegates
+        // are untouched. The gate rebuilds its policy from durable state per call.
+        opsGate: deps.makeOpsGate && isOpsArchetype(agentType) ? deps.makeOpsGate(subWorkspaceRoot, taskId) : undefined,
       };
       const loop = new AgentLoop(loopDeps, deps.getAutonomy());
       activeWorkspaces.set(subWorkspaceRoot, (activeWorkspaces.get(subWorkspaceRoot) ?? 0) + 1);
@@ -745,7 +817,8 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         : semaphore;
       // Applied immediately before the loop runs (after any queue wait + clock restart) so the
       // wall-clock share reflects real remaining time. An axis the parent never configured inherits
-      // none — the sub-agent keeps its own iteration cap + 30-minute wall-clock backstop there.
+      // none — the sub-agent keeps its own iteration cap + wall-clock backstop (default 120 min,
+      // config `subagentWallClockMinutes`) there. The backstop itself is NEVER inherited.
       const inheritCeilings = (): void => {
         if (parentBudget) budget.applyInheritedCeilings(parentBudget.inheritableCeilings(Date.now()));
       };
@@ -779,6 +852,14 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
       // Cancel subscription for the SYNC path (the background path has its own `offCancel`).
       // Declared here so both the subscribe site and the two teardown sites below can see it.
       let offCancelSync: (() => void) | null = null;
+
+      // Ceiling/job-input disclosures — shared by the launch result AND the background
+      // task_notification answers so every consumer sees the same adjustments.
+      const launchNotes = [
+        requestedBelowFloor ? `Requested max_iterations ${input.max_iterations} raised to the workable floor ${maxIter}.` : '',
+        adoptedJobInput.length ? `Adopted recorded job input for: ${adoptedJobInput.join(', ')}.` : '',
+      ].filter(Boolean).join(' ');
+      const withLaunchNotes = (text: string): string => launchNotes ? `${text}\n\n[agent] ${launchNotes}` : text;
 
       if (isBg) {
         // record launch metadata via bus to main context (the real persisted one in outer scope); base.context here is throwaway from makeLoopDeps
@@ -827,7 +908,7 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
             // budget/wall-clock stop is a hard spend limit and must not trigger any provider call.
             const salvage = res.stopReason === 'max_iterations' && !loopDeps.signal.aborted ? (await salvageFinalAnswer(loopDeps)) ?? null : null;
             accrue(bgAccrualTarget);
-            const outcome = agentOutcome(res, salvage, lastStopError, loopDeps.signal.aborted);
+            const outcome = agentOutcome(res, salvage, lastStopError, loopDeps.signal.aborted, budget);
             const stopReason = outcome.status === 'cancelled' ? 'interrupted' : res.stopReason;
             if (base.hooks?.subagent_stop?.length) {
               runHookPhase('subagent_stop', base.hooks.subagent_stop, { workspaceRoot: subWorkspaceRoot, extra: { agentType, taskId, result: outcome.status === 'completed' ? 'bg_done' : `bg_${outcome.status}` } });
@@ -835,7 +916,7 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
             const output = finishArtifact(outcome.status, stopReason, outcome.answer);
             { const snap = budget.snapshot(Date.now()); base.bus.emit({ type: 'subagent_usage', costUSD: budget.currentCostUSD, subagent: agentType, taskId, inputTokens: snap.inputTokens, outputTokens: snap.outputTokens }); }
             base.bus.emit({ type: 'subagent_end', taskId, jobId, ok: outcome.status === 'completed', subagentType: agentType, status: outcome.status, stopReason, ...output });
-            base.bus.emit({ type: 'task_notification', taskId: taskId!, answer: output.answer, fromSubagent: agentType, status: outcome.status, stopReason });
+            base.bus.emit({ type: 'task_notification', taskId: taskId!, answer: withLaunchNotes(output.answer), fromSubagent: agentType, status: outcome.status, stopReason });
           } catch (e) {
             accrue(bgAccrualTarget); // P3-09: a thrown run still spent tokens/cost — roll it up.
             if (base.hooks?.subagent_stop?.length) {
@@ -847,7 +928,7 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
             const stopReason = cancelled ? 'interrupted' : 'provider_error';
             const output = finishArtifact(status, stopReason, queuedAbort ? 'agent cancelled while waiting for a slot' : `agent bg error: ${(e as Error).message}`);
             base.bus.emit({ type: 'subagent_end', taskId, jobId, ok: false, subagentType: agentType, status, stopReason, ...output });
-            base.bus.emit({ type: 'task_notification', taskId: taskId!, answer: output.answer, fromSubagent: agentType, status, stopReason });
+            base.bus.emit({ type: 'task_notification', taskId: taskId!, answer: withLaunchNotes(output.answer), fromSubagent: agentType, status, stopReason });
           } finally {
             permit?.();
             offCancel();
@@ -857,11 +938,13 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
             releaseWorkspace();
           }
         })();
-        return ok('agent', 'read', Date.now() - start, `Background agent started as ${taskId}. Results will arrive as task-notification.`, {
+        return ok('agent', 'read', Date.now() - start, `Background agent started as ${taskId}. Results will arrive as task-notification.${launchNotes ? ` ${launchNotes}` : ''}`, {
           taskId: taskId!,
           jobId,
           status: 'started',
           artifactIds: artifactId ? [artifactId] : undefined,
+          adoptedJobInput: adoptedJobInput.length ? adoptedJobInput : undefined,
+          requestedIterations: requestedBelowFloor ? { requested: input.max_iterations!, applied: maxIter } : undefined,
         });
       }
 
@@ -932,7 +1015,7 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
                 const result = await runPromise;
                 const salvage = result.stopReason === 'max_iterations' && !loopDeps.signal.aborted ? (await salvageFinalAnswer(loopDeps)) ?? null : null;
                 accrue(parentBudget);
-                const outcome = agentOutcome(result, salvage, lastStopError, loopDeps.signal.aborted);
+                const outcome = agentOutcome(result, salvage, lastStopError, loopDeps.signal.aborted, budget);
                 status = outcome.status;
                 stopReasonFinal = outcome.status === 'cancelled' ? 'interrupted' : result.stopReason;
                 if (base.hooks?.subagent_stop?.length) {
@@ -960,7 +1043,9 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
             })();
             return ok('agent', 'read', Date.now() - start,
               `A new user message arrived while this ${agentType} sub-agent was working, so it is now running in the BACKGROUND as ${taskId} instead of holding the turn. Its result will arrive as a task-notification. Continue with the user's latest instruction now; do not wait for it.`,
-              { ...profileIdentity, taskId, jobId, status: 'started' });
+              { ...profileIdentity, taskId, jobId, status: 'started',
+                adoptedJobInput: adoptedJobInput.length ? adoptedJobInput : undefined,
+                requestedIterations: requestedBelowFloor ? { requested: input.max_iterations!, applied: maxIter } : undefined });
           }
         }
         const result = await runPromise;
@@ -973,7 +1058,7 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         // wall-clock stop is a hard spend limit and must not trigger any provider call.
         const salvage = result.stopReason === 'max_iterations' && !loopDeps.signal.aborted ? (await salvageFinalAnswer(loopDeps)) ?? null : null;
         accrue(parentBudget);
-        const outcome = agentOutcome(result, salvage, lastStopError, loopDeps.signal.aborted);
+        const outcome = agentOutcome(result, salvage, lastStopError, loopDeps.signal.aborted, budget);
         const stopReason = outcome.status === 'cancelled' ? 'interrupted' : result.stopReason;
         if (base.hooks?.subagent_stop?.length) {
           runHookPhase('subagent_stop', base.hooks.subagent_stop, { workspaceRoot: subWorkspaceRoot, extra: { agentType, result: outcome.status === 'completed' ? 'done' : outcome.status } });
@@ -983,10 +1068,17 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         // TOTAL spend once — otherwise sub-agent tokens would silently vanish from /cost.
         { const snap = budget.snapshot(Date.now()); base.bus.emit({ type: 'subagent_usage', costUSD: budget.currentCostUSD, subagent: agentType, taskId, inputTokens: snap.inputTokens, outputTokens: snap.outputTokens }); }
         base.bus.emit({ type: 'subagent_end', taskId, jobId, ok: outcome.status === 'completed', subagentType: agentType, status: outcome.status, stopReason, ...output });
-        const data: AgentToolData = { ...output, taskId, jobId, ...profileIdentity, status: outcome.status, stopReason, iterations: result.iterations };
+        const data: AgentToolData = { ...output, taskId, jobId, ...profileIdentity, status: outcome.status, stopReason, iterations: result.iterations,
+          adoptedJobInput: adoptedJobInput.length ? adoptedJobInput : undefined,
+          requestedIterations: requestedBelowFloor ? { requested: input.max_iterations!, applied: maxIter } : undefined };
+        // Disclose ceiling adjustments so the parent model can correct its delegation habits —
+        // a silently-rewritten ceiling would keep teaching it that 1-turn reviewers "work".
+        if (requestedBelowFloor) data.answer = `${data.answer ?? ''}\n\n[agent] Requested max_iterations ${input.max_iterations} raised to the workable floor ${maxIter}; a sub-agent needs turns to read, act, and answer.`;
+        if (adoptedJobInput.length) data.answer = `${data.answer ?? ''}\n\n[agent] Prepared job ${jobId}: adopted its recorded input for ${adoptedJobInput.join(', ')} (a retry follow-up may extend the stored prompt).`;
+        const finalAnswer = data.answer ?? output.answer;
         return outcome.ok
-          ? ok('agent', 'read', Date.now() - start, output.answer, data)
-          : { ...fail('agent', 'read', Date.now() - start, outcome.errorCode ?? 'agent_failed', output.answer), data };
+          ? ok('agent', 'read', Date.now() - start, finalAnswer, data)
+          : { ...fail('agent', 'read', Date.now() - start, outcome.errorCode ?? 'agent_failed', finalAnswer), data };
       } catch (e) {
         accrue(parentBudget); // P3-09: a thrown run still spent tokens/cost — roll it up.
         if (base.hooks?.subagent_stop?.length) {
@@ -996,7 +1088,9 @@ export function makeAgentTool(deps: AgentToolDeps): Tool<z.infer<typeof inputSch
         const stopReason = loopDeps.signal.aborted ? 'interrupted' : 'provider_error';
         const output = finishArtifact(status, stopReason, (e as Error).message);
         base.bus.emit({ type: 'subagent_end', taskId, jobId, ok: false, subagentType: agentType, status, stopReason, ...output });
-        return { ...fail('agent', 'read', Date.now() - start, 'agent_failed', output.answer), data: { ...output, taskId, jobId, ...profileIdentity, status, stopReason } };
+        return { ...fail('agent', 'read', Date.now() - start, 'agent_failed', output.answer), data: { ...output, taskId, jobId, ...profileIdentity, status, stopReason,
+          adoptedJobInput: adoptedJobInput.length ? adoptedJobInput : undefined,
+          requestedIterations: requestedBelowFloor ? { requested: input.max_iterations!, applied: maxIter } : undefined } };
       } finally {
         // A promoted agent's continuation owns all of this now — releasing here would free its
         // concurrency slot and drop its workspace refcount while it is still working.

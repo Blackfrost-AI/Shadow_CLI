@@ -316,6 +316,11 @@ export interface TuiOpts {
    * mounts/tests omit it (no facts section). Sub-agents never receive it.
    */
   factsProvider?: () => string;
+  /** One-line ops HUD summary (§9); '' when no ops run. Recomputed per render; may lag one
+   *  paint behind worker writes (workers emit on subBus) — acceptable for a status line. */
+  opsHud?: () => string;
+  /** `/ops` operator command (§9). Sync; never throws — errors arrive via its pushLine. */
+  opsCommand?: (arg: string, pushLine: (text: string, opts?: { error?: boolean; system?: boolean }) => void) => void;
   workspaceRoot: string;
   cfg: ShadowConfig;
   /** --models allowlist: model labels for Ctrl+P quick cycling (OMP parity). Optional. */
@@ -1018,6 +1023,8 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   styleRef.current = style;
   missionRef.current = missionSnap;
   const goal = missionHudLine(missionSnap); // ONE pinned row, same slot the standing goal used
+  // Ops summary (§9): one more segment on the SAME truncated pinned row — never an extra row.
+  const opsLine = opts.opsHud?.() ?? '';
 
   // Set the composer text and move the caret to the end (history nav, autocomplete, clear).
   const setLine = useCallback((v: string) => {
@@ -3473,6 +3480,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const showFullPinned = wantFullBlock && terminalSize.rows >= 16;
   const hudPinnedLine = [
     goal, // missionHudLine(missionSnap) — 🎯 mission · phase n/m, one row
+    opsLine, // ops: <run> goals m/t · intents … — same row, filtered when empty
     showPlan ? `${planMode.mode === 'planning' ? 'plan' : 'implement'}: ${planMode.title ?? ''}` : '',
     showTodo
       // The glyph mirrors what actually RENDERED: '▾' only when the full block is truly open —
@@ -3495,7 +3503,7 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
   const maxComposerRows = composerMaxRows(
     terminalSize.rows,
     !todoCollapsed && !!(showPlan || showTodo),
-    !!goal,
+    !!(goal || opsLine),
     !!(showPlan && planMode.path),
     !!customStatus,
   );
@@ -3768,13 +3776,14 @@ export function TuiApp({ opts }: { opts: TuiOpts }) {
       {menuOpen ? null : showFullPinned ? (
         <PinnedState
           goal={missionPinnedRow(missionSnap)}
+          ops={opsLine || null}
           plan={planMode}
           todos={todoItems}
           showPlan={showPlan}
           showTodo={showTodo}
           collapsed={todoCollapsed}
           cols={layout.cols}
-          maxItems={pinnedMaxItems(terminalSize.rows, !!goal, !!(showPlan && planMode.path), !!customStatus, composerInputRows)}
+          maxItems={pinnedMaxItems(terminalSize.rows, !!(goal || opsLine), !!(showPlan && planMode.path), !!customStatus, composerInputRows)}
         />
       ) : hudFit.pinned ? (
         // Single-row summary — used while running, and idle on a terminal too short for the full block.

@@ -1,4 +1,6 @@
 import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { homedir } from 'node:os';
 import {
   normalizeBaseUrl,
@@ -21,6 +23,12 @@ import { BgRegistry } from '../tools/bgShell.js';
 import { WatcherRegistry } from './watcher.js';
 import { attachProjectChecks, checksForRegistry } from '../checks/registry.js';
 import { makeSecurityFindingsTool } from '../tools/securityFindings.js';
+import { makeOpsGraphTool, makeOpsWritebackTool, makeOpsEnrichTool } from '../tools/opsTools.js';
+import { makeOpsDispatchTool } from '../tools/opsDispatch.js';
+import { OpsRuntime } from '../security/ops/runtime.js';
+import type { OpsToolDeps } from '../tools/opsTools.js';
+import { OPS_DB_PATH } from '../security/ops/types.js';
+import { renderOpsFeed, opsHudLine } from '../security/ops/feed.js';
 import {
   makeAskUserQuestionTool,
   makeEnterPlanModeTool,
@@ -179,6 +187,14 @@ export interface AgentSession {
    * removed. Never baked into `system` — the loop owns placement (system vs. uncached tail).
    */
   factsProvider: () => string;
+  /**
+   * LIVE ops trigger feed (§7), capability-gated like facts: '' unless ops_graph survived
+   * harness.tools.remove AND the ops DB exists (a render path never creates the store).
+   * Lead loop only — passed at the lead buildLoopDeps site, never to sub-agent factories.
+   */
+  opsFeed: () => string;
+  /** One-line ops HUD summary for the TUIs; '' when no run/DB. Existence-checked, best-effort. */
+  opsHud: () => string;
   system: string;
   systemForStyle: (style: OutputStyle) => string;
   sessionLog: SessionLog;
@@ -212,6 +228,10 @@ export interface AgentSession {
   connectMcp: () => Promise<Array<{ stop(): void }>>;
   /** Build and activate a complete model entry for automatic fallback. */
   activateModel: (entry: ModelEntry, signal?: AbortSignal) => Promise<{ provider: ReturnType<typeof createProvider>; model: string; capabilityTarget: Readonly<CapabilityTarget> }>;
+  /** Ops-graph swarm runtime: per-call store handles + session-lived enricher pool. Dispose at shutdown. */
+  opsRuntime: OpsRuntime;
+  /** Refcounted per-call graph handles — the /ops UI path shares the tools' pool. */
+  opsDeps: OpsToolDeps;
 }
 
 /**
@@ -820,6 +840,16 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   registry.register(makeRepositoryContextTool(cfg.lsp, { isPathExcluded: (path) => context.isSourceExcluded(path) }));
   attachProjectChecks(registry);
   registry.register(makeSecurityFindingsTool((workspace) => checksForRegistry(registry, workspace)));
+  // Ops-graph swarm surface (§7): deferred tools, harness-derived origin, deterministic gate.
+  // The runtime owns per-call handles + the session-lived enricher pool; disposed at shutdown.
+  const opsRuntime = new OpsRuntime();
+  const opsDeps = opsRuntime.deps();
+  registry.register(makeOpsGraphTool(opsDeps));
+  registry.register(makeOpsWritebackTool(opsDeps));
+  registry.register(makeOpsEnrichTool(opsDeps));
+  // The dispatcher needs the host's real `agent` tool, which the terminal registers later.
+  // Late-bound by name at call time; hosts without it (web/ACP) fail closed at dispatch.
+  registry.register(makeOpsDispatchTool(opsDeps, () => registry.get('agent')));
   registry.setDenied(harness.tools.remove);
   registry.register(makeToolSearch(registry));
 
@@ -859,6 +889,52 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
   };
   const systemForStyle = (style: OutputStyle): string => buildStyledSystem(baseSystem, style);
   const system = systemForStyle(activeStyle);
+
+  // Ops trigger feed + HUD (§7/§9). Capability-gated exactly like facts: if ops_graph was
+  // removed by the harness, the feed must not instruct the lead to call a missing tool.
+  // Existence-checked: a render path NEVER creates the ops DB (review R5) — no ops usage,
+  // no store, zero cost. Handles come from the session runtime's refcounted pool; every
+  // failure is swallowed (the feed is best-effort context, never turn-blocking).
+  const opsDbExists = (): boolean => existsSync(join(opts.workspaceRoot, OPS_DB_PATH));
+  const opsEnabled = (): boolean => runtimeCapabilities.availableTools.has('ops_graph') && opsDbExists();
+  const opsFeed = (): string => {
+    if (!opsEnabled()) return '';
+    try {
+      const g = opsDeps.graph(opts.workspaceRoot);
+      try {
+        const run = g.activeRun();
+        if (!run) return '';
+        // Oldest-100 window (graph default); through_seq = max seq OF THE WINDOW — dropped
+        // lines are consumed unseen with a visible omitted-counter (feed.ts documents why).
+        const triggers = g.pendingTriggers(run.id);
+        return renderOpsFeed(run, triggers, (id) => {
+          try {
+            return g.getNode(id);
+          } catch {
+            return undefined;
+          }
+        });
+      } finally {
+        opsDeps.release(opts.workspaceRoot);
+      }
+    } catch {
+      return '';
+    }
+  };
+  const opsHud = (): string => {
+    if (!opsDbExists()) return '';
+    try {
+      const g = opsDeps.graph(opts.workspaceRoot);
+      try {
+        const run = g.activeRun() ?? g.listRuns().sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+        return run ? opsHudLine(run, g.coverage(run.id)) : '';
+      } finally {
+        opsDeps.release(opts.workspaceRoot);
+      }
+    } catch {
+      return '';
+    }
+  };
 
   // P2-13: opt-in retention sweep — runs BEFORE this session's log is opened so a sweep can
   // never archive the very session that is starting (even with sessionRetentionKeep: 0), and
@@ -1049,6 +1125,8 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     harnessRuntimeReadiness,
     assertHarnessRuntimeReady: assertSessionHarnessRuntimeReady,
     factsProvider,
+    opsFeed,
+    opsHud,
     system,
     systemForStyle,
     sessionLog,
@@ -1064,5 +1142,7 @@ export async function createAgentSession(opts: CreateAgentSessionOptions): Promi
     additionalRoots,
     connectMcp,
     activateModel,
+    opsRuntime,
+    opsDeps,
   };
 }

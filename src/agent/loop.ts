@@ -2,6 +2,7 @@ import type { CompletionRequest, ContentBlock, Effort, ImageBlock, Message, Prov
 import type { ToolRegistry } from '../tools/registry.js';
 import type { ToolContext, ToolResult, ToolRisk } from '../tools/types.js';
 import { fail } from '../tools/types.js';
+import { OpsGraph } from '../security/ops/graph.js';
 import { isAutonomyAtLeast, needsApproval, type AutonomyLevel } from '../safety/permissions.js';
 import { isBashReadOnly, commandReadsOutsideRoots } from '../safety/bashReadOnly.js';
 import { classifyToolCall } from '../safety/classifier.js';
@@ -50,7 +51,7 @@ import { approvalText } from '../util/approvalText.js';
 import { envelopeSafeSlice } from '../safety/envelope.js';
 import { hasKnownReasoningMarker } from '../provider/openai.js';
 import { DEFAULT_EFFORT, effortDirective } from './effort.js';
-import { factsSection } from './system.js';
+import { factsSection, opsFeedSection } from './system.js';
 import { resolve as resolvePath, join, dirname, basename } from 'node:path';
 import { realpathSync } from 'node:fs';
 import { GLOBAL_DIR } from '../state/globalStore.js';
@@ -225,8 +226,22 @@ export interface LoopDeps {
    * delegates never inherit the lead session's facts. Absent = no facts section anywhere.
    */
   factsProvider?: () => string;
+  /**
+   * LIVE pending-trigger feed for the LEAD loop (ops-graph §7). Same channel discipline as
+   * factsProvider: system prompt on non-caching providers, uncached tail on caching ones.
+   * LEAD ONLY — the render site guards on nestedAgent and sub-agent factories omit it; a
+   * worker must never see (or consume) the lead's chaining queue. Absent = no feed.
+   */
+  opsFeed?: () => string;
   /** Session-local check selection/evidence; execution still passes the run_shell guards. */
   checks?: ProjectCheckStore;
+  /**
+   * Ops worker policy gate (plan §4b). Present ONLY inside a dispatched ops worker loop.
+   * Consulted after alias canonicalization and before permissions/classifier, and again
+   * inside executeProjectCheck before the inner shell is admitted. It can only DENY —
+   * an allow still faces the full Shadow safety pipeline. Absent = ordinary loop.
+   */
+  opsGate?: (call: { name: string; input: unknown }) => { allow: true } | { allow: false; reason: string };
   /** Bounded evidence-based correction, sharing this run's original budget (at most two). */
   completion?: CompletionPolicy;
 }
@@ -846,6 +861,15 @@ export class AgentLoop {
       } catch {
         /* facts are best-effort context, never a turn-blocking dependency */
       }
+      // Ops trigger feed (§7): same best-effort discipline as facts, LEAD ONLY. The nestedAgent
+      // guard holds even if a future factory accidentally spreads the field in — workers plan
+      // from their claimed intent, never from the lead's queue.
+      let opsFeed = '';
+      try {
+        opsFeed = this.deps.nestedAgent ? '' : opsFeedSection(this.deps.opsFeed?.() ?? '');
+      } catch {
+        /* a broken ops store must not kill the turn; the feed returns when it heals */
+      }
       // Prompt-caching adapters (declaration-driven — Provider.promptCaching, never name-matched)
       // keep system + persisted history as a cache-stable prefix and deliver the volatile suffix
       // at the message tail. On those, ALL volatile per-turn state (facts, effort, plan/mission/
@@ -860,7 +884,7 @@ export class AgentLoop {
       const sys = (
         caching
           ? [this.deps.system, this.runtimeContext()]
-          : [this.deps.system, facts, effortDirective(this.effort), ...this.controlStateBlocks(), this.runtimeContext()]
+          : [this.deps.system, facts, opsFeed, effortDirective(this.effort), ...this.controlStateBlocks(), this.runtimeContext()]
       )
         .filter((s) => s && s.trim())
         .join('\n\n');
@@ -873,7 +897,7 @@ export class AgentLoop {
       // tail is real request payload — a large plan/todo/facts tail must not hide from the trigger.
       const volatileSuffix = (
         caching
-          ? [facts, effortDirective(this.effort), ...this.controlStateBlocks(), this.renderIterationBudgetBlock()]
+          ? [facts, opsFeed, effortDirective(this.effort), ...this.controlStateBlocks(), this.renderIterationBudgetBlock()]
           : [this.renderIterationBudgetBlock()]
       )
         .filter((s) => s && s.trim())
@@ -1215,6 +1239,10 @@ export class AgentLoop {
           return this.stop('refusal', finalAnswer);
         }
         if ((turn.stopReason ?? 'end_turn') === 'end_turn' && this.requestCompletionCorrection(finalAnswer)) continue;
+        // The wall-clock ceiling binds even on a clean end_turn: if the deadline passed DURING
+        // this turn (a slow final provider call), the run exceeded its time budget — report a
+        // budget stop with the text as partial coverage instead of claiming an on-time success.
+        if (this.deps.budget.checkSpending(this.now())) return this.stop('budget', finalAnswer);
         return this.stop(turn.stopReason ?? 'end_turn', finalAnswer);
       }
 
@@ -1863,6 +1891,24 @@ export class AgentLoop {
     // rules, the gate, schema validation, and history — must key on the real tool, not the
     // alias, or a `bash`/`shell` call would slip past the run_shell guards.
     call.name = tool.name;
+
+    // Ops worker policy gate (§4b): consulted on the CANONICAL name, before permissions,
+    // classifier, and the approval gate. Only subtracts — an allow here still faces every
+    // downstream guard. The denial is durable negative evidence: tool_denied on the bus
+    // (forwarded to the lead) and a policy-origin hint on the ops graph.
+    // Harness-created inner check shells are exempt HERE: executeProjectCheck already
+    // re-checked the bound profile against the same gate before admitting them (§4b point 2).
+    if (this.deps.opsGate && !this.projectCheckShellCalls.has(call)) {
+      const verdict = this.deps.opsGate({ name: call.name, input: call.input });
+      if (!verdict.allow) {
+        bus.emit({ type: 'tool_denied', call, reason: verdict.reason });
+        this.recordOpsDenial(call, verdict.reason);
+        return {
+          block: this.resultBlock(call.id, false, `Blocked by the ops engagement policy: ${verdict.reason} Stay inside the engagement scope and your archetype's tool plan, or finish_intent with outcome blocked and report what is missing.`),
+          isFatal: false,
+        };
+      }
+    }
 
     // Loop guard: a model stuck calling the same tool with the same args gets a
     // distinct result so it changes course, instead of spinning to the iteration cap.
@@ -2567,6 +2613,36 @@ export class AgentLoop {
   }
 
   /**
+   * Durable negative evidence for an ops-policy denial (§4b): a policy-origin hint anchored
+   * to the worker's running intent. Best-effort — a failure to record never changes the deny,
+   * and the gate itself already failed closed. Uses its own short-lived graph handle so it
+   * works even when the lead's runtime is disposed.
+   */
+  private recordOpsDenial(call: ToolCall, reason: string): void {
+    const workId = this.deps.currentWorkId;
+    if (!workId) return;
+    try {
+      const g = new OpsGraph(this.deps.workspaceRoot, { findingStatus: () => 'open' });
+      try {
+        const run = g.activeRun();
+        if (!run) return;
+        const intent = g.listNodes(run.id, { kind: 'intent', state: 'running' }).find((n) => (n as { ownerJob?: string }).ownerJob === workId);
+        if (!intent) return;
+        const note = `tool denied by ops policy: ${call.name} — ${reason}`.slice(0, 2000);
+        try {
+          g.addNode({ runId: run.id, kind: 'hint', payload: { note, tool: call.name, jobId: workId }, origin: 'policy', anchors: [intent.id] });
+        } catch {
+          g.addNode({ runId: run.id, kind: 'hint', payload: { note: `tool denied by ops policy: ${call.name} (reason withheld by payload gate)`, tool: call.name, jobId: workId }, origin: 'policy', anchors: [intent.id] });
+        }
+      } finally {
+        g.close();
+      }
+    } catch {
+      /* evidence is best-effort; the denial stands regardless */
+    }
+  }
+
+  /**
    * Build a synthetic {ok:false} tool_result for every call in `calls` that isn't
    * already paired in `have`. Used to repair the unpaired tool_use an interrupt
    * (ESC/Ctrl-C) leaves behind — a committed tool_use with no matching tool_result
@@ -2796,6 +2872,16 @@ export class AgentLoop {
     // A successful explicit run selects its check for this task without erasing others.
     store.select([...new Set([...store.snapshot().filter((item) => item.selected).map((item) => item.profile.id), profile.id])]);
     const innerCall: ToolCall = { id: innerId, name: 'run_shell', input: store.shellInput(profile) };
+    // Second ops enforcement point (§4b): the inner shell is harness-created and bypasses
+    // the outer gate, so the profile binding is re-checked HERE before it is admitted.
+    if (this.deps.opsGate) {
+      const verdict = this.deps.opsGate({ name: 'project_checks', input: { action: 'run', id: profile.id } });
+      if (!verdict.allow) {
+        this.deps.bus.emit({ type: 'tool_denied', call, reason: verdict.reason });
+        this.recordOpsDenial(call, verdict.reason);
+        return fail('project_checks', 'exec', 0, 'denied', `Blocked by the ops engagement policy: ${verdict.reason}`);
+      }
+    }
     this.projectCheckShellCalls.add(innerCall);
     let result: ToolResult;
     try { result = await this.runToolCall(innerCall); }
