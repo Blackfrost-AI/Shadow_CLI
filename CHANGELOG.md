@@ -7,6 +7,38 @@ and the project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [12.0.0] — 2026-11-19
+
+### Added
+
+- **Security ops graph.** A durable, per-engagement SQLite evidence graph
+  (`src/security/ops/`): runs, nodes, edges, anchors, read-only views, a redaction
+  gate, schema migrations, and a policy default-deny matrix (`parseScope` targets
+  plus a literal `allow-network` token).
+- **Model tools:** `ops_graph`, `ops_writeback` (operator-gated evidence writeback),
+  and `ops_enrich` with archetype-driven payload shaping
+  (finding/asset/observation/decision/coverage).
+- **Background ops workers:** lead-only `ops_dispatch` with durable engagement
+  reads; the worker gate enforces policy at BOTH dispatch and worker-loop entry
+  and fails closed on an unreadable engagement.
+- **Chained enrichers:** local `file-hash` and `git-provenance`, plus a brokered
+  `osv-lookup` network enricher (purpose `ops-enrich`, 15s timeout, 1 MiB cap)
+  behind the literal `allow-network` engagement scope token — fail-closed default,
+  fixed-endpoint, identity-only, zero telemetry.
+- **`/ops` slash command + HUD row** in both renderers (Snowfall and Ink);
+  `/cost` `/usage` `/stats` line builder extracted to `src/app/usage.ts`.
+- **128 new tests** across 12 `test/ops-*.test.ts` files (fetch doubles — no live
+  network; real background worker + worker-loop gate coverage).
+
+### Fixed
+
+- **Sub-agent/reviewer regressions:** budget/iteration-ceiling plumbing with
+  parent-cap inheritance and floor; final-answer salvage on `max_iterations`
+  ceiling stops; full-width TUI layout restored.
+- **Test type errors surfaced by `typecheck:all`** (which covers `test/`, unlike
+  the tsx test runner): enricher signatures, provider fixture shapes, tool-result
+  `meta` shapes, trigger-kind fixtures, coverage counters, Snowfall fixtures.
+
 ## [11.9.1] — 2026-11-15
 
 ### Changed

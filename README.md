@@ -82,8 +82,8 @@ The public installers download standalone binaries and verify their signed check
 pinned public key) before anything is placed on your PATH.
 
 Shadow's website and installers are at [blackfrostai.com/shadow](https://blackfrostai.com/shadow).
-The latest signed binary release is [v11.1.0](https://github.com/Blackfrost-AI/Shadow_CLI/releases/tag/v11.1.0);
-newer tags are source-only. Existing standalone installations can upgrade with `shadow update`.
+The latest signed binary release is [v12.0.0](https://github.com/Blackfrost-AI/Shadow_CLI/releases/tag/v12.0.0).
+Existing standalone installations can upgrade with `shadow update`.
 
 macOS / Linux:
 
